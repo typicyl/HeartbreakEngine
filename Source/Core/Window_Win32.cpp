@@ -1,0 +1,246 @@
+// Core/Window_Win32.cpp - Win32 implementation of the platform window.
+#include "Core/Window.h"
+#include "Core/Input.h"
+#include "Core/Log.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
+#include <windows.h>
+#include <windowsx.h>
+
+namespace hbe {
+
+namespace {
+constexpr const wchar_t* kWindowClassName = L"HeartbreakEngineWindowClass";
+}
+
+Window::Window(const WindowDesc& desc) {
+    HINSTANCE hinstance = ::GetModuleHandleW(nullptr);
+
+    WNDCLASSEXW wc{};
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+    wc.lpfnWndProc   = reinterpret_cast<WNDPROC>(&Window::WndProcThunk);
+    wc.hInstance     = hinstance;
+    wc.hCursor       = ::LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kWindowClassName;
+    ::RegisterClassExW(&wc); // idempotent enough for a single-window foundation
+
+    DWORD style;
+    int x, y, w, h;
+    if (desc.fullscreen) {
+        // Borderless windowed fullscreen: a chromeless popup covering the
+        // primary monitor. No exclusive mode / display-mode change, so it plays
+        // nicely with the swapchain and alt-tab.
+        style = WS_POPUP;
+        const int sw = ::GetSystemMetrics(SM_CXSCREEN);
+        const int sh = ::GetSystemMetrics(SM_CYSCREEN);
+        x = 0;
+        y = 0;
+        w = sw;
+        h = sh;
+        width_ = static_cast<u32>(sw);
+        height_ = static_cast<u32>(sh);
+    } else {
+        // Convert desired client size to an outer window rect.
+        style = WS_OVERLAPPEDWINDOW;
+        RECT rect{0, 0, static_cast<LONG>(desc.width), static_cast<LONG>(desc.height)};
+        ::AdjustWindowRect(&rect, style, FALSE);
+        x = desc.posX >= 0 ? desc.posX : CW_USEDEFAULT;
+        y = desc.posY >= 0 ? desc.posY : CW_USEDEFAULT;
+        w = rect.right - rect.left;
+        h = rect.bottom - rect.top;
+        width_ = desc.width;
+        height_ = desc.height;
+    }
+
+    HWND hwnd = ::CreateWindowExW(0, kWindowClassName, desc.title.c_str(), style, x, y, w, h,
+                                  nullptr, nullptr, hinstance, this);
+
+    if (!hwnd) {
+        HBE_ERROR("CreateWindowExW failed (GetLastError={})", ::GetLastError());
+        return;
+    }
+
+    native_.hwnd = hwnd;
+    native_.hinstance = hinstance;
+
+    ::ShowWindow(hwnd, SW_SHOW); // already screen-sized when fullscreen
+    ::UpdateWindow(hwnd);
+    HBE_INFO("Window created ({}x{}{})", width_, height_,
+             desc.fullscreen ? ", fullscreen" : "");
+}
+
+Window::~Window() {
+    if (native_.hwnd) {
+        ::DestroyWindow(static_cast<HWND>(native_.hwnd));
+        native_.hwnd = nullptr;
+    }
+    ::UnregisterClassW(kWindowClassName, ::GetModuleHandleW(nullptr));
+}
+
+bool Window::PumpMessages() {
+    MSG msg{};
+    while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        ::TranslateMessage(&msg);
+        ::DispatchMessageW(&msg);
+        if (msg.message == WM_QUIT) {
+            closing_ = true;
+        }
+    }
+    return !closing_;
+}
+
+i64 __stdcall Window::WndProcThunk(void* hwnd, u32 msg, u64 wparam, i64 lparam) {
+    HWND h = static_cast<HWND>(hwnd);
+
+    if (msg == WM_NCCREATE) {
+        // Stash the Window* passed via CreateWindowExW's lpParam.
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        auto* self = static_cast<Window*>(cs->lpCreateParams);
+        ::SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+    }
+
+    auto* self = reinterpret_cast<Window*>(::GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (self) {
+        return self->HandleMessage(hwnd, msg, wparam, lparam);
+    }
+    return ::DefWindowProcW(h, msg, static_cast<WPARAM>(wparam), static_cast<LPARAM>(lparam));
+}
+
+void Window::FeedInput(u32 msg, u64 wparam, i64 lparam) {
+    if (!input_) return;
+    HWND h = static_cast<HWND>(native_.hwnd);
+
+    auto button = [&](MouseButton b, bool down) {
+        input_->OnMouseButton(b, down);
+        // Keep receiving mouse moves while any button is held (drag past edge).
+        if (down) {
+            if (mouseCapture_++ == 0) ::SetCapture(h);
+        } else {
+            if (mouseCapture_ > 0 && --mouseCapture_ == 0) ::ReleaseCapture();
+        }
+    };
+
+    switch (msg) {
+        case WM_KEYDOWN: case WM_SYSKEYDOWN:
+            input_->OnKeyVK(static_cast<u32>(wparam), true);
+            break;
+        case WM_KEYUP: case WM_SYSKEYUP:
+            input_->OnKeyVK(static_cast<u32>(wparam), false);
+            break;
+        case WM_LBUTTONDOWN: button(MouseButton::Left, true);    break;
+        case WM_LBUTTONUP:   button(MouseButton::Left, false);   break;
+        case WM_RBUTTONDOWN: button(MouseButton::Right, true);   break;
+        case WM_RBUTTONUP:   button(MouseButton::Right, false);  break;
+        case WM_MBUTTONDOWN: button(MouseButton::Middle, true);  break;
+        case WM_MBUTTONUP:   button(MouseButton::Middle, false); break;
+        case WM_XBUTTONDOWN:
+            button(GET_XBUTTON_WPARAM(wparam) == XBUTTON1 ? MouseButton::X1
+                                                          : MouseButton::X2, true);
+            break;
+        case WM_XBUTTONUP:
+            button(GET_XBUTTON_WPARAM(wparam) == XBUTTON1 ? MouseButton::X1
+                                                          : MouseButton::X2, false);
+            break;
+        case WM_MOUSEMOVE:
+            if (cursorLocked_) {
+                // Mouse-look: report the move as a delta from the window centre,
+                // then snap the cursor back so it never reaches a screen edge.
+                HWND mh = static_cast<HWND>(native_.hwnd);
+                RECT rc{};
+                ::GetClientRect(mh, &rc);
+                const i32 cx = (rc.right - rc.left) / 2, cy = (rc.bottom - rc.top) / 2;
+                const i32 dx = GET_X_LPARAM(lparam) - cx, dy = GET_Y_LPARAM(lparam) - cy;
+                if (dx != 0 || dy != 0) {
+                    input_->OnMouseLockedDelta(static_cast<f32>(dx), static_cast<f32>(dy));
+                    POINT p{cx, cy};
+                    ::ClientToScreen(mh, &p);
+                    ::SetCursorPos(p.x, p.y);
+                }
+            } else {
+                input_->OnMouseMove(static_cast<f32>(GET_X_LPARAM(lparam)),
+                                    static_cast<f32>(GET_Y_LPARAM(lparam)));
+            }
+            break;
+        case WM_MOUSEWHEEL:
+            input_->OnMouseWheel(static_cast<f32>(GET_WHEEL_DELTA_WPARAM(wparam)) /
+                                 static_cast<f32>(WHEEL_DELTA));
+            break;
+        case WM_KILLFOCUS:
+            input_->OnFocusLost();
+            if (mouseCapture_ > 0) {
+                mouseCapture_ = 0;
+                ::ReleaseCapture();
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+void Window::SetCursorLocked(bool locked) {
+    if (locked == cursorLocked_) return;
+    cursorLocked_ = locked;
+    HWND h = static_cast<HWND>(native_.hwnd);
+    if (locked) {
+        while (::ShowCursor(FALSE) >= 0) {} // hide (counter-based)
+        ::SetCapture(h);
+        RECT rc{};
+        ::GetClientRect(h, &rc);
+        POINT p{(rc.right - rc.left) / 2, (rc.bottom - rc.top) / 2};
+        ::ClientToScreen(h, &p);
+        ::SetCursorPos(p.x, p.y);
+    } else {
+        while (::ShowCursor(TRUE) < 0) {} // show
+        if (mouseCapture_ == 0) ::ReleaseCapture();
+        if (input_) input_->ResetMousePos(); // avoid a delta spike on the next move
+    }
+}
+
+i64 Window::HandleMessage(void* hwnd, u32 msg, u64 wparam, i64 lparam) {
+    HWND h = static_cast<HWND>(hwnd);
+
+    // The engine input state sees every event, even ones an overlay consumes;
+    // higher layers (editor) decide what counts as "game" input.
+    FeedInput(msg, wparam, lparam);
+
+    // Give an overlay (ImGui) first chance at the message.
+    if (wndHook_) {
+        const i64 consumed = wndHook_(hwnd, msg, wparam, lparam);
+        if (consumed) return consumed;
+    }
+
+    switch (msg) {
+        case WM_SIZE: {
+            const u32 w = LOWORD(lparam);
+            const u32 hgt = HIWORD(lparam);
+            width_  = w;
+            height_ = hgt;
+            if (onResize_ && wparam != SIZE_MINIMIZED) {
+                onResize_(w, hgt);
+            }
+            return 0;
+        }
+        // Escape no longer closes the window: games own the Escape key (pause
+        // menus etc.) and the editor must not exit on a stray press. Keyboard
+        // state is already captured by FeedInput above; let WM_KEYDOWN fall
+        // through to DefWindowProc.
+        case WM_CLOSE:
+            closing_ = true;
+            ::PostQuitMessage(0);
+            return 0;
+        case WM_DESTROY:
+            ::PostQuitMessage(0);
+            return 0;
+        default:
+            break;
+    }
+    return ::DefWindowProcW(h, msg, static_cast<WPARAM>(wparam), static_cast<LPARAM>(lparam));
+}
+
+} // namespace hbe

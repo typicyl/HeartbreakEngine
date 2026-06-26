@@ -1,0 +1,32 @@
+// Core/Log.h - minimal, dependency-free logging with severity levels.
+#pragma once
+
+#include <format>
+#include <string>
+#include <string_view>
+
+namespace hbe {
+
+enum class LogLevel { Trace, Info, Warn, Error };
+
+// Most-recent log lines (oldest first), newline-joined, up to `maxLines`. Thread-
+// safe. Backs the studio/boot screen's {log} token so it reads like a boot console.
+std::string RecentLog(unsigned maxLines = 12);
+
+namespace detail {
+// Writes an already-formatted line to the console (and the debugger on Windows).
+void LogWrite(LogLevel level, std::string_view message);
+} // namespace detail
+
+template <typename... Args>
+void Log(LogLevel level, std::format_string<Args...> fmt, Args&&... args) {
+    detail::LogWrite(level, std::format(fmt, std::forward<Args>(args)...));
+}
+
+} // namespace hbe
+
+// Convenience macros - compile to nothing-special but read cleanly at call sites.
+#define HBE_TRACE(...) ::hbe::Log(::hbe::LogLevel::Trace, __VA_ARGS__)
+#define HBE_INFO(...)  ::hbe::Log(::hbe::LogLevel::Info,  __VA_ARGS__)
+#define HBE_WARN(...)  ::hbe::Log(::hbe::LogLevel::Warn,  __VA_ARGS__)
+#define HBE_ERROR(...) ::hbe::Log(::hbe::LogLevel::Error, __VA_ARGS__)

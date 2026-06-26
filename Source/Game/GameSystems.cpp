@@ -1,0 +1,127 @@
+// Game/GameSystems.cpp - objectives + checkpoints implementation.
+#include "Game/GameSystems.h"
+
+#include "Core/Log.h"
+#include "Scene/Components.h"
+#include "Scene/Scene.h"
+
+#include <entt/entt.hpp>
+#include <glm/glm.hpp>
+#include <nlohmann/json.hpp>
+
+#include <unordered_set>
+
+namespace hbe::game {
+
+namespace {
+std::vector<Objective> g_objectives;
+std::unordered_set<std::string> g_reached;
+bool g_saveRequested = false;
+std::string g_saveId;
+} // namespace
+
+void SetObjective(const std::string& id, const std::string& text) {
+    for (Objective& o : g_objectives)
+        if (o.id == id) {
+            o.text = text;
+            o.done = false;
+            return;
+        }
+    g_objectives.push_back({id, text, false});
+    HBE_INFO("[Objective] {} - {}", id, text);
+}
+
+void CompleteObjective(const std::string& id) {
+    for (Objective& o : g_objectives)
+        if (o.id == id) {
+            if (!o.done) HBE_INFO("[Objective] completed: {}", id);
+            o.done = true;
+            return;
+        }
+}
+
+const std::vector<Objective>& Objectives() { return g_objectives; }
+
+std::string CurrentObjectiveText() {
+    for (const Objective& o : g_objectives)
+        if (!o.done) return o.text;
+    return {};
+}
+
+void ReachCheckpoint(const std::string& id, bool requestSave) {
+    if (id.empty()) return;
+    if (!g_reached.insert(id).second) return; // already reached
+    HBE_INFO("[Checkpoint] reached: {}", id);
+    if (requestSave) {
+        g_saveRequested = true;
+        g_saveId = id;
+    }
+}
+
+bool CheckpointReached(const std::string& id) { return g_reached.count(id) != 0; }
+
+bool ConsumeSaveRequest(std::string& outId) {
+    if (!g_saveRequested) return false;
+    g_saveRequested = false;
+    outId = g_saveId;
+    return true;
+}
+
+void UpdateCheckpoints(Scene& scene) {
+    entt::registry& reg = scene.Registry();
+    // Player = the (first) CharacterController entity.
+    auto players = reg.view<Transform, CharacterController>();
+    if (players.begin() == players.end()) return;
+    const glm::vec3 player = glm::vec3(scene.WorldMatrix(*players.begin())[3]);
+
+    for (const entt::entity e : reg.view<Transform, Checkpoint>()) {
+        Checkpoint& cp = reg.get<Checkpoint>(e);
+        if (!cp.triggerOnEnter || cp.id.empty()) continue;
+        if (cp.once && CheckpointReached(cp.id)) {
+            cp.reached = true;
+            continue;
+        }
+        const glm::vec3 c = glm::vec3(scene.WorldMatrix(e)[3]);
+        const glm::vec3 d = glm::abs(player - c);
+        if (d.x <= cp.halfExtents.x && d.y <= cp.halfExtents.y && d.z <= cp.halfExtents.z) {
+            ReachCheckpoint(cp.id, cp.saveOnReach);
+            cp.reached = true;
+            if (!cp.setObjective.empty()) SetObjective(cp.id, cp.setObjective);
+            if (!cp.completesObjective.empty()) CompleteObjective(cp.completesObjective);
+        }
+    }
+}
+
+std::string SerializeState() {
+    nlohmann::json j;
+    nlohmann::json& objs = j["objectives"] = nlohmann::json::array();
+    for (const Objective& o : g_objectives)
+        objs.push_back({{"id", o.id}, {"text", o.text}, {"done", o.done}});
+    nlohmann::json& cps = j["checkpoints"] = nlohmann::json::array();
+    for (const std::string& id : g_reached) cps.push_back(id);
+    return j.dump();
+}
+
+void DeserializeState(const std::string& json) {
+    Reset();
+    if (json.empty()) return;
+    try {
+        const nlohmann::json j = nlohmann::json::parse(json);
+        for (const nlohmann::json& o : j.value("objectives", nlohmann::json::array()))
+            g_objectives.push_back(
+                {o.value("id", std::string()), o.value("text", std::string()), o.value("done", false)});
+        for (const nlohmann::json& c : j.value("checkpoints", nlohmann::json::array()))
+            g_reached.insert(c.get<std::string>());
+    } catch (const std::exception& e) {
+        HBE_WARN("game: failed to parse save state: {}", e.what());
+    }
+}
+
+void Reset() {
+    g_objectives.clear();
+    g_reached.clear();
+    g_saveRequested = false;
+    g_saveId.clear();
+}
+
+} // namespace hbe::game
