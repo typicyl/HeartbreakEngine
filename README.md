@@ -1,605 +1,386 @@
 # Heartbreak Engine
 
-A 3D game engine built on a clean, backend-agnostic **RHI (Render Hardware
-Interface)**. The same renderer drives both **Direct3D 12** and **Vulkan**
-today, with room to add more backends (Metal, D3D12 work-graphs, console APIs)
-behind the same interface.
+A from-scratch 3D game engine built on a clean, backend-agnostic **RHI (Render
+Hardware Interface)**. One renderer drives **three** graphics backends —
+**Direct3D 12**, **Vulkan**, and **OpenGL 4.6** — behind a single bindless
+interface. On top of it sits an **EnTT** ECS, **Jolt** physics, a fiber job
+system, world streaming, **Recast & Detour** navigation, a photorealistic HDR
+renderer, a **visual-scripting** system (schematics, transpiled to C++ for
+shipping), an **adaptive music** director, a painterly **Art Editor**, and a
+Unity-style **Dear ImGui + ImGuizmo** editor.
 
-> Status: **a real game engine.** **Both** the D3D12 and Vulkan backends
-> render depth-tested, **textured** Cook-Torrance PBR with **image-based
-> lighting**, a **skybox**, **directional shadow maps (PCF)** and a
-> **skin/subsurface** option, **punctual point/spot lights + emissive
-> materials**, driven by an **EnTT** ECS with a **transform
-> hierarchy** (parent/child, drag-drop reparenting in the editor) and
-> **Jolt rigid-body physics** (fixed-step, editor "Simulate" toggle). A
-> **platform input layer** (keyboard/mouse + XInput gamepad) feeds a shared
-> fly-camera in both the editor and the runtime. The **Unity-style Dear ImGui +
-> ImGuizmo editor** renders the scene to an offscreen target in a dockable
-> Viewport panel (Hierarchy tree / Inspector / Stats / Assets around it).
-> Everything runs identically on both backends. `--model <file>` loads a
-> glTF/GLB/OBJ/FBX scene via Assimp. Shaders compile to DXIL **and** SPIR-V at
-> build time.
+> **Status — a real engine.** All three backends render textured Cook-Torrance
+> PBR with image-based lighting, cascaded shadows, an HDR post stack and a
+> physically-based day/night sky. The D3D12 and Vulkan backends are at full
+> feature parity; the OpenGL backend renders the lit scene, sky, IBL and UI and
+> is being brought up to post-stack parity. The engine ships as five
+> executables (runtime, full editor, art editor, project hub, schematic baker),
+> drives gameplay with a node-graph visual scripting system, and exports a
+> clean, self-contained shipping folder. Everything is authored in projects of
+> `.uaf` assets packed into `.uap` containers.
 
 ---
 
-## Architecture
+## Table of contents
 
-```
-Source/
-  Core/        Platform-agnostic primitives
-    Types.h            fixed-width aliases, NonCopyable
-    Log.{h,cpp}        leveled logging (std::format)
-    Window.h           platform window interface
-    Window_Win32.cpp   Win32 implementation (feeds the input sink)
-    Input.h            keyboard/mouse/gamepad state (engine input seam)
-    Input_Win32.cpp    Win32 VK translation + XInput gamepads
-  Assets/      CPU-side content
-    Mesh.h             GLM Vertex, Material, MeshData, Model
-    MeshGenerator.*    procedural cube / UV sphere
-    ModelLoader.*      Assimp import (glTF/GLB/OBJ/FBX)
-  Scene/       ECS scene graph (EnTT)
-    Components.h       Transform, Parent, MeshInstance, RigidBody, Name, ...
-    Scene.{h,cpp}      registry + environment; world matrices; draw/view extraction
-  Physics/     Rigid-body simulation
-    PhysicsWorld.*     Jolt behind a plain API (fixed step, transform sync)
-  Editor/      Dear ImGui + ImGuizmo editor
-    Editor.{h,cpp}     hierarchy tree (drag-drop reparent), inspector, gizmo
-  RHI/         Render Hardware Interface (the backend seam)
-    RHI.h              IRenderDevice, Format, SceneView, DrawItem, MeshHandle
-    RHIFactory.{h,cpp} backend selection / device creation
-    D3D12/D3D12Device.cpp   Direct3D 12 backend (device + geometry)
-    Vulkan/VulkanDevice.cpp Vulkan backend (device + present)
-  Renderer/    High-level rendering
-    Camera.h           GLM perspective fly-camera (RH, [0,1] depth)
-    CameraController.* input-driven fly camera (editor + runtime + gamepad)
-    Renderer.{h,cpp}   owns the RHI device, shadow + scene + sky passes
-    IBL.{h,cpp}        CPU-precomputed IBL + sky environment
-  Engine/
-    Engine.{h,cpp}     window + input + physics + renderer + main loop
-  main_editor.cpp / main_runtime.cpp   the two entry points
+- [Executables](#executables)
+- [Rendering backends & the RHI](#rendering-backends--the-rhi)
+- [Building](#building)
+- [Running & command-line flags](#running--command-line-flags)
+- [Source layout](#source-layout)
+- [Rendering & photorealism](#rendering--photorealism)
+- [Day / night / weather sky](#day--night--weather-sky)
+- [Scenes, levels & streaming](#scenes-levels--streaming)
+- [Schematics (visual scripting)](#schematics-visual-scripting)
+- [Gameplay systems](#gameplay-systems)
+- [The Art Editor (painting)](#the-art-editor-painting)
+- [Audio & adaptive music](#audio--adaptive-music)
+- [Assets & shipping](#assets--shipping)
+- [Editor UX](#editor-ux)
+- [Concurrency, navigation & physics](#concurrency-navigation--physics)
+- [Requirements](#requirements)
+- [License](#license)
 
-Shaders/       Authored HLSL (compiled to DXIL + SPIR-V via DXC at build time)
-  Common.hlsli       constant buffers, bindless table, shadows (PCF), ACES
-  BRDF.hlsli         Cook-Torrance: GGX, Smith, Fresnel-Schlick
-  MeshPBR.hlsl       textured metallic-roughness PBR + IBL + shadows
-  Sky.hlsl           fullscreen environment background pass
-  PBR.hlsl           full textured metallic-roughness PBR (for the textured path)
+---
 
-cmake/         Dependencies.cmake (GLM, Assimp, EnTT, Jolt, ...), ShaderCompile.cmake
-```
+## Executables
 
-The renderer talks **only** to `hbe::rhi::IRenderDevice`. Each backend is a
-private implementation selected at runtime through `rhi::CreateRenderDevice`.
-Math is GLM; models load through Assimp. Dependencies are fetched automatically
-by CMake (FetchContent) on first configure — no manual install beyond the SDKs.
+The build produces **five** programs from one shared engine library, so the
+editor never ships inside a game:
 
-## Requirements
-
-- Windows 10/11, x64
-- CMake ≥ 3.21
-- A C++20 toolchain (MSVC / Visual Studio 2022 recommended)
-- [Vulkan SDK](https://vulkan.lunarg.com/) (sets the `VULKAN_SDK` env var) —
-  only needed when the Vulkan backend is enabled
-- Direct3D 12 ships with the Windows SDK; no extra install
-
-## Editor vs. runtime
-
-The build produces **two** executables so the editor never ships in the game:
-
-- **`HeartbreakEditor`** — runtime **+** the editor (Dear ImGui, viewport, gizmo,
-  asset browser). A tool. Links `hbe_editor` (compiled with `HBE_EDITOR=1`).
-- **`HeartbreakRuntime`** — the game runtime only: **no** editor, **no** ImGui
-  (0 ImGui symbols in the binary). Links `hbe` (`HBE_EDITOR=0`).
+| Exe | What it is |
+|-----|------------|
+| **`HeartbreakRuntime`** | The game runtime only — **no** editor, **no** ImGui symbols. Links `hbe` (`HBE_EDITOR=0`). Boots straight from `.uap` packs. |
+| **`HeartbreakEditor`** | The full editor: viewport, gizmo, hierarchy, inspector, asset browser, every authoring panel (incl. painting, music, schematics). Links `hbe_editor` (`HBE_EDITOR=1`). |
+| **`HeartbreakArtEditor`** | The same editor in a painting-focused layout (wide Art Editor + viewport, paint mode on at boot, engine/tech UI hidden) for 2D artists. |
+| **`HeartbreakHub`** | A standalone project manager that launches the editor (recent/create/open projects). |
+| **`HeartbreakBaker`** | A headless tool that **transpiles a project's schematics to C++** so shipped runtimes execute compiled gameplay instead of interpreting graphs. |
 
 A **project** is a folder with a `.hbproj` file and an `Assets/` directory. The
-editor opens with a **Project Manager** (recent projects, create new, open
-existing — or pass `--project path/to/file.hbproj`). Imported content (images,
-models, audio) is converted to the **`.uaf` Unified Asset Format** (a binary
-container, like Unreal's `.uasset`) and browsed in an **icon grid with folders**
-(thumbnails for textures, drag-drop to organize); the runtime loads `.uaf`
-files, never raw source files. Entities are edited as ECS components in the
-Inspector: add/remove **Transform, Mesh, Rigid Body, Directional Light**, with
-the scene's sun itself being an entity.
+editor opens with a Project Manager (recent projects, create new, open existing,
+or `--project path/to/file.hbproj`).
+
+## Rendering backends & the RHI
+
+The renderer talks **only** to `hbe::rhi::IRenderDevice`; each backend is a
+private implementation selected at runtime by `rhi::CreateRenderDevice`. The
+core abstraction is **unified bindless texturing** — a global texture array
+indexed by integer (D3D12 unbounded SRV table / Vulkan `VK_EXT_descriptor_
+indexing` / per-draw binding on GL), so all three backends share one HLSL shader
+set compiled to **DXIL + SPIR-V** at build time (the GL backend uses
+hand-written GLSL, since GL has no runtime descriptor arrays).
+
+- **Direct3D 12** and **Vulkan** — full feature parity (the reference path).
+- **OpenGL 4.6** — a WGL core-context backend (`clipControl` for RH zero-to-one
+  depth, mirrored winding). Renders the textured, IBL-lit scene, the
+  physically-based sky and the in-game UI overlay; the full HDR post stack /
+  shadows / GI are being ported to parity.
+
+**Boot-time backend selection.** Before any rendering, the engine resolves a
+**backend fallback chain** from the project's per-platform **build profile**
+(e.g. *D3D12 → Vulkan → OpenGL*) and initializes the first one that succeeds, so
+a game still launches on a machine where the preferred API is unavailable.
+Backends can also be forced per run (`--d3d12` / `--vulkan` / `--opengl`) or
+disabled at configure time.
 
 ## Building
 
 ```powershell
-# Configure (Visual Studio generator)
+# Configure (Visual Studio generator — no Ninja)
 cmake -S . -B out/build/x64 -G "Visual Studio 17 2022" -A x64
 
-# Build (produces HeartbreakEditor.exe and HeartbreakRuntime.exe)
+# Build all five exes
 cmake --build out/build/x64 --config Debug
 ```
 
-Backends can be toggled at configure time:
+Backends are toggled at configure time (all ON by default):
 
 ```powershell
-cmake -S . -B out/build/x64 -DHBE_ENABLE_VULKAN=OFF   # D3D12 only
-cmake -S . -B out/build/x64 -DHBE_ENABLE_D3D12=OFF     # Vulkan only
+cmake -S . -B out/build/x64 -DHBE_ENABLE_VULKAN=OFF   # drop Vulkan
+cmake -S . -B out/build/x64 -DHBE_ENABLE_OPENGL=OFF   # drop OpenGL
 ```
 
-## Running
+Dependencies (GLM, Assimp, EnTT, Jolt, Dear ImGui, ImGuizmo, nlohmann/json, stb,
+miniaudio, Recast/Detour) are fetched automatically by CMake (FetchContent) on
+first configure and linked **statically**, so a shipped build is self-contained.
+Shaders compile to DXIL (DXC from the Windows SDK) and SPIR-V (DXC from the
+Vulkan SDK) as part of the build.
+
+## Running & command-line flags
 
 ```powershell
-HeartbreakEditor.exe              # editor, Direct3D 12 (default)
-HeartbreakEditor.exe --vulkan     # editor on Vulkan
-HeartbreakRuntime.exe             # game runtime (no editor)
-HeartbreakRuntime.exe --vulkan --width 1920 --height 1080
+HeartbreakEditor.exe                      # editor, Direct3D 12 (default)
+HeartbreakEditor.exe --vulkan             # editor on Vulkan
+HeartbreakRuntime.exe --opengl            # runtime on OpenGL
+HeartbreakRuntime.exe --width 1920 --height 1080
 ```
 
-On **both backends** you should see a 3D grid of PBR spheres (metallic varies
-vertically, roughness horizontally) over a ground plane, lit by the procedural
-sky with directional shadows. In the **runtime**, physics runs immediately —
-the spheres drop, bounce, and roll; fly with RMB + WASD/QE (Shift = fast) or a
-gamepad (sticks + triggers). In the **editor**, select entities in the
-**Hierarchy** tree (drag-drop to reparent), manipulate them with the gizmo,
-edit materials in the **Inspector**, and tick **"Simulate physics"** in the
-Stats panel to run the simulation. Pass `--model path/to/scene.glb` to load a
-model instead. Press `Esc` to quit.
+Useful flags (editor/runtime): `--project <file.hbproj>`, `--model <file>` (load
+a glTF/GLB/OBJ/FBX), `--world <file.hbworld>` (stream a world), `--play` (boot
+straight into play), `--time <hours>` / `--daynight` / `--clouds` (force
+time-of-day and weather), `--import <file>` (headless content import),
+`--pack` (cook asset packs), plus headless self-tests (`--navtest`,
+`--worldtest`). `Esc` quits.
 
-## Roadmap
+## Source layout
 
-Done so far: RHI seam; **both** backends present and render geometry; GLM +
-Assimp + EnTT + ImGui; build-time DXC shader compilation; CPU asset pipeline;
-analytic PBR mesh path; ECS scene graph with Assimp scene loading; ImGui +
-ImGuizmo editor; **unified bindless texturing** (global texture array indexed by
-int — D3D12 unbounded SRV table + Vulkan `VK_EXT_descriptor_indexing`); **IBL**
-(CPU-precomputed irradiance / GGX-prefiltered specular / split-sum BRDF LUT as
-bindless equirect maps — no cubemaps/render-targets needed).
+```
+Source/
+  Core/        Types, Log, Win32 Window/Input (kbd/mouse + XInput), JobSystem (fibers)
+  Assets/      Mesh, MeshGenerator, ModelLoader (Assimp), UAF/UAP (.uaf/.uap), VFS,
+               MaterialAsset (.hbmat), AudioEvent (.hbevent), MusicGraph (.hbmusic)
+  Scene/       EnTT ECS: Components, Scene, Level, SceneSerializer, SceneStreamer,
+               StreamingWorld, AnimationSystem, CameraSystem, CharacterController,
+               TerrainSystem, PaintSystem (painting), ParticleSystem
+  Physics/     PhysicsWorld (Jolt behind a plain API)
+  Navigation/  GridNav (real-time grid A*) + Recast/Detour navmesh
+  Game/        GameSystems (objectives, checkpoints, deferred music commands)
+  Audio/       AudioSystem (miniaudio: bus tree, events, 3D voices, music director)
+  Schematic/   Schematic (graph + node catalog), SchematicSystem (interpreter),
+               SchematicTranspile (graph -> C++)
+  RHI/         IRenderDevice + RHIFactory; D3D12/, Vulkan/, GL/ backends
+  Renderer/    Camera, Renderer (shadow/scene/sky/post passes), IBL, probes/GI
+  Editor/      Dear ImGui + ImGuizmo editor (all panels), Importer, thumbnails
+  Engine/      Engine (window + input + physics + audio + renderer + main loop)
+  Tools/       SchematicBaker (the HeartbreakBaker exe)
+  main_runtime / main_editor / main_hub / main_arteditor
 
-## Concurrency & streaming
-
-**Fiber job system** (`Core/JobSystem`, after Naughty Dog's "Parallelizing the
-Naughty Dog Engine Using Fibers"). Worker threads — one per logical core by
-default — are converted to fibers and run a scheduler loop; jobs execute on a
-pool of 128 pre-allocated fibers. The key property is that a job can **wait on a
-counter mid-execution without blocking its worker thread**: the fiber is parked,
-the worker picks up other work, and the parked fiber is later resumed — possibly
-on a *different* thread — once the counter is satisfied. That makes fine-grained,
-deeply-nested parallelism cheap (a wait is a fiber switch, not a thread block).
-
-```cpp
-jobs::ParallelFor(count, group, [&](u32 begin, u32 end) { /* work */ });   // blocks until done
-jobs::Counter* c = jobs::Kick(decls, n); jobs::Wait(c);                     // batch + wait
-jobs::RunDetached(fn, arg);                                                 // fire-and-forget
+Shaders/       HLSL -> DXIL + SPIR-V (Common, BRDF, MeshPBR, Sky, post stack, UI,
+               paint, particles, brush strokes, ...)
+cmake/         Dependencies.cmake, ShaderCompile.cmake
 ```
 
-A startup self-test exercises the whole machinery (a flat parallel-for plus jobs
-that themselves wait on nested parallel-fors — the park/resume path) and logs the
-result. **Skeletal animation** now poses every character across the workers.
+## Rendering & photorealism
 
-**World streaming** (`Scene/StreamingWorld`) — distance-based world partition. A
-world is a set of cells, each backed by a `.hbscene`; as a focus point (the
-camera) moves, cells within `loadRadius` are loaded and cells past `unloadRadius`
-are unloaded (the gap is hysteresis, so cells don't thrash at the boundary).
-Loads are **asynchronous on the job system** — parse + asset IO run on workers;
-only the bounded GPU instantiate of a finished load touches the main thread, so
-streaming never stalls the frame. Cells are described by a `.hbworld` JSON
-manifest (`--world path.hbworld`); `--worldtest` runs a built-in smoke test that
-sweeps the focus across a line of cells. The scene serializer's asset caches are
-now lock-protected so worker-thread staging and main-thread instantiation can run
-concurrently.
+A full **HDR render-pass pipeline** (D3D12 + Vulkan; OpenGL in progress):
 
-## Navigation
+- **HDR scene pass** into RGBA16F with a thin **G-buffer** (octahedral world
+  normal + roughness + metalness) and a screen **velocity** buffer; tonemapping
+  happens in post.
+- **Cascaded shadow maps** — 4 camera-fit cascades, texel-snapped, 3×3 PCF in a
+  4096² atlas.
+- **Per-object / skinned velocity** — the mesh VS reprojects through the
+  previous model + bone palette, so TAA and motion blur track moving and
+  animated geometry.
+- **GTAO** — ground-truth horizon-based ambient occlusion (Jimenez 2016) using
+  the G-buffer normal, with a multi-bounce term.
+- **SSR** — per-material glossy screen-space reflections (follow the shading
+  normal, fade on rough surfaces).
+- **SSGI** — one indirect diffuse bounce for screen-space colour bleeding.
+- **Volumetric fog + light scattering** — a camera-to-depth ray-march samples
+  the sun through the cascaded shadow map (god-rays) plus punctual-light
+  in-scatter over exponential height fog.
+- **Bloom** (soft-knee 6-mip pyramid), **TAA** (Halton jitter + depth-reprojected
+  neighbourhood-clamped history), **depth of field** (disk bokeh from a
+  reconstructed CoC), **camera motion blur**, **FXAA**, **auto/manual exposure**
+  (256-tap log-luminance with eye adaptation), ACES tonemap, vignette, grade.
+- **Probe-based global illumination** — local light/reflection probes bake into
+  a **full SH-irradiance GI volume** (DDGI-style octahedral depth + Chebyshev
+  visibility, BVH bake, area/emissive lights), cached to `.hbgi`, sampled
+  trilinearly in the mesh shader — fixes sealed-room sky leak and adds off-screen
+  bounce the on-screen SSGI can't see.
 
-**Navmesh + pathfinding** (`Source/Navigation/NavMesh`, built on **Recast &
-Detour**). `NavMesh::Build` bakes a Detour navmesh from a world-space triangle
-soup through the Recast pipeline (voxelize → filter → regions → contours → poly +
-detail mesh); `FindPath` answers world-space queries (nearest-poly snap →
-`findPath` → `findStraightPath`), with `NearestPoint` and `DebugTriangles`
-alongside. `nav::BuildFromScene` gathers walkable geometry straight from the
-scene, rebuilding CPU triangles from each mesh entity's `MeshRef` provenance
-("prim:\*" / "uaf:rel#n"). The Recast/Detour types stay inside the `.cpp`
-(opaque handles in the header) — the same seam used for physics and audio.
-**Components.** `NavigationAgent` pathfinds to a `target` and `nav::UpdateAgents`
-steers the entity's Transform along the path each frame (seek + arrival, snapped
-onto the mesh, facing its motion) while softly avoiding `NavigationObstacle`s and
-other agents; obstacles are dynamic local-avoidance volumes. Both are editable in
-the Inspector (Add Component → Navigation Agent / Obstacle), saved with the
-scene, and tick while the simulation runs (play mode / runtime), like physics.
+All post effects are per-scene `PostSettings`, tunable live in the **Post
+Process** panel and saved with the scene; **Post Volumes** apply a per-region
+look (the camera blends between them) with a project-global AA/GTAO stamp.
 
-The editor's **Navigation** panel bakes the scene's navmesh with live agent
-settings, overlays it in the viewport, and tests paths (start/end from the
-selection); the **Streaming** panel loads/inspects a `.hbworld`. `--navtest`
-headlessly bakes a floor + obstacle, confirms a path routes around it, *and*
-walks a `NavigationAgent` from corner to corner. Next: DetourCrowd-quality local
-avoidance + spatial hashing for big crowds, navmesh carving (tile cache),
-off-mesh links, and a C# pathfinding API.
+**Character rendering.** Per-material flags drive: **pre-integrated skin** (Penner
+diffusion-profile LUT by `N·L`/curvature + thickness transmission), **cloth**
+(Charlie sheen + Neubelt visibility), and **eyes** (parallax-refracted iris +
+cornea catchlight). Blendshapes, OIT hair and Jolt soft-body cloth are next.
 
-## Toward photorealism
+**Painterly rendering.** The oil-on-canvas look is produced by *authored* paint,
+not an automatic filter: the Art Editor's painted impasto/bristle relief lit by
+PBR, and free-floating 3D brush strokes (see the Art Editor). Earlier automatic
+painterly passes — a 2D post filter and an auto stroke-splatting layer — were
+removed in favour of this.
 
-What the renderer has today (verified in the New Sponza scene at ~120 FPS):
-textured Cook-Torrance metallic-roughness PBR (albedo / normal / metal-rough /
-AO), CPU-precomputed IBL (irradiance + GGX-prefiltered specular + split-sum
-BRDF LUT), a sky background, a subsurface approximation, punctual lights and
-emissive materials — and, on **both backends**, a full **HDR render-pass
-pipeline**:
+## Day / night / weather sky
 
-- **HDR scene pass** — geometry + sky render linear radiance into RGBA16F with
-  a sampleable depth buffer; tonemapping happens in post, not in the mesh shader
-- **Cascaded shadow maps** — 4 camera-fit cascades (practical split scheme,
-  texel-snapped, scene-bounds caster clamping) in a 4096² atlas, 3x3 PCF
-- **SSR** — screen-space reflections composited into the HDR before bloom:
-  depth-reconstructed normals + a binary-refined world-space ray march, with
-  Fresnel and screen-edge fade (`--ssr`; uniform reflectivity without a G-buffer)
-- **SSAO** — half-res depth-reconstructed hemispheric AO + box blur
-- **Bloom** — soft-knee bright pass into a 6-mip 13-tap down / tent-up pyramid
-- **Tonemap composite** — exposure (manual, plus optional **auto-exposure**: a
-  256-tap log-luminance average with temporal eye adaptation, `--autoexposure`),
-  ACES, AO/bloom mix, vignette, saturation/contrast grade (per-scene
-  `PostSettings` on the environment)
-- **TAA** — temporal anti-aliasing (both backends): the camera jitters sub-pixel
-  each frame (Halton 2,3) and a depth-reprojected, neighbourhood-clamped history
-  accumulates a supersampled, temporally stable image; the jitter and history
-  live entirely in the backend, so the renderer is unaware
-- **Depth of field** (both backends, off by default) — a single-pass depth-aware
-  disk-bokeh blur: per-pixel circle-of-confusion from the reconstructed world
-  distance vs. a focus distance/range, gathered over a golden-angle disk with
-  foreground samples down-weighted so sharp edges don't bleed (`--dof` to try it)
-- **Motion blur** (both backends, off by default) — camera motion blur: per-pixel
-  velocity reprojected from depth, colour averaged along it (`--motionblur`)
-- **FXAA** — post-AA resolve into the final target (viewport texture or swapchain)
-- **Texture polish** — anisotropic sampling (8x) + sRGB-correct CPU mip
-  generation for all loaded `.uaf` textures
+The sky is a real-time **analytic atmosphere** (Rayleigh + Mie) in `Sky.hlsl`,
+driven by a **time-of-day** system that moves the sun across the day. Night is a
+navy-graded gradient with sharp three-layer **stars** and a **moon** (real night
+isn't black). **Weather** adds FBM **clouds** that drift with a **wind**
+direction, plus overcast/haze. The same atmosphere model feeds the IBL bake, so
+the background and the ambient light share one physically-based source. Authored
+in **Project Settings** (time of day, day length, dynamic sky, cloud
+coverage/density, overcast, wind) and serialized in the `.hbproj`; forceable per
+run with `--time` / `--daynight` / `--clouds`.
 
-Post passes read inputs through the existing bindless table, so both backends
-share one shader set (`Shaders/PostCommon.hlsli` + SSAO/Bloom*/Tonemap/FXAA).
-If the post shaders are missing the renderer falls back to the legacy
-direct-to-LDR path (`gOutputLinear == 0` re-enables inline tonemapping).
+## Scenes, levels & streaming
 
-All of the above are **on by default** (per-scene `PostSettings`) and tunable
-live in the editor's **Post Process** panel — toggles plus sliders for every
-effect — and the settings are **saved with the scene** (`.hbscene`).
+- **Scenes** (`.hbscene`) — JSON serialization of every component; a Scene
+  manager lists them, marks the startup scene, and loads / streams / renames /
+  duplicates / deletes.
+- **Levels** — a Naughty-Dog-style **level** is a pair of scene files (static +
+  dynamic) with the UI separate; `Engine::LoadLevel` composes them, and the
+  navmesh bakes the static half.
+- **World streaming** — distance-based world partition: cells (each a `.hbscene`)
+  load within `loadRadius` and unload past `unloadRadius` (hysteresis), loaded
+  **asynchronously on the job system** so streaming never stalls the frame.
+  Described by a `.hbworld` manifest.
+- **Prefabs** (`.hbprefab`) — save a subtree as a reusable prefab; browse and
+  instantiate it (reuses the copy/paste plumbing).
+- **Keyframe animation** — AnimationTrack + a Timeline panel with
+  scrubbing/keys/transport.
 
-Done on **both backends**: TAA (camera jitter + depth-reprojected history), SSR,
-depth of field, camera motion blur, and auto + manual exposure.
+## Schematics (visual scripting)
 
-A **photorealism pass** is now underway, adding (in dependency order) a thin
-G-buffer, per-object velocity, GTAO, volumetric fog, a physically-based
-atmosphere, and DDGI-style probe GI. Landed so far (**both backends**):
+Gameplay is authored as **node graphs** (`.hbschem`) in an ImGui node editor —
+**this replaced the previous C# scripting subsystem.** A graph has event nodes
+(Start/Update), flow (Branch/Sequence/Delay), variables, math/logic, transform
+and gameplay actions. In the editor and during development the graphs run through
+an **interpreter**; for shipping, **HeartbreakBaker transpiles them to C++** so
+the runtime executes compiled gameplay (the interpreter is the fallback for
+unbaked graphs).
 
-- **Thin G-buffer** — the forward pass writes a second MRT (`RGBA16F`:
-  octahedral world normal + roughness + metalness) and a third (`RG16F`) screen
-  **velocity** buffer alongside the HDR colour. The editor preview/asset-viewer
-  mini-pass uses single-RT pipeline variants, and the sky pass masks off the
-  extra targets so sky pixels read as "no surface".
-- **Per-object velocity buffer** — the mesh VS reprojects each vertex through its
-  *previous* model + bone palette (the scene caches both per entity), so **TAA
-  and motion blur now track moving and skinned geometry** instead of ghosting.
-- **Per-material glossy SSR** — SSR reads the G-buffer normal + roughness, so
-  reflections follow the shading normal and fade out on rough/diffuse materials.
-- **GTAO** — the ambient-occlusion pass is now **ground-truth AO** (Jimenez 2016):
-  horizon-based, using the G-buffer shading normal instead of a depth-derivative
-  estimate, with a multi-bounce term (replaces the 12-tap hemisphere SSAO; reuses
-  the same half-res target, blur and `ssaoRadius`/`ssaoIntensity` controls).
-- **Volumetric fog + light scattering** — a ray-march from the camera to the
-  scene depth accumulates sun in-scatter sampled through the cascaded shadow map
-  (so windows and gaps throw **god-rays**) plus punctual-light in-scatter with a
-  Henyey-Greenstein phase over an exponential height fog, composited into the HDR
-  before bloom. Tunable via the `PostSettings` `fog*` fields.
-- **Physically-based atmosphere** — the sky is now a **Rayleigh + Mie
-  single-scattering** ray-march (Earth atmosphere) baked into the HDR equirect;
-  the irradiance and prefiltered-specular convolutions sample that baked sky, so
-  the background **and** the ambient lighting share one physically-based model
-  (fixes the old washed-out gradient). The bake runs across the job system, so
-  the whole IBL set builds *faster* than the old procedural one (~1.4 s).
-- **Screen-space global illumination (SSGI)** — one indirect diffuse bounce:
-  cosine-weighted rays over the G-buffer normal are ray-marched against depth and
-  each hit contributes the lit HDR colour of that surface, composited additively
-  into the HDR. Gives **colour bleeding** from nearby geometry (a red wall tints
-  the floor beside it); the downstream TAA denoises the gather. Screen-space, so
-  off-screen light is missed — a **hardware-RT / capture-based DDGI** probe field
-  is the documented upgrade for off-screen, leak-free GI.
+Node categories include **Game** (Reach Checkpoint, Set/Complete Objective) and
+**Music** (Set Music State, Set Music Param, Play Stinger) — gameplay drives the
+adaptive score directly from a graph. Side-effecting nodes that need engine
+systems route through a small deferred command queue the engine drains each
+frame.
 
-What "ultra photorealism" still needs next, roughly in impact order:
+## Gameplay systems
 
-1. **Off-screen GI** — hardware-ray-traced or capture-based DDGI probes (the SSGI
-   here is the on-screen first bounce; probes add off-screen + leak-free light)
-2. **Parallax occlusion mapping**, physically-based bloom energy (the G-buffer
-   that unblocks per-material SSR roughness is now in place)
+- **Player movement** — a `CharacterController` (move/jump/gravity, camera-
+  relative) for kinematic player control; the runtime uses the game camera (no
+  freecam in shipped play).
+- **Game cameras & rigs** — a `CameraComponent` with behaviour presets (Static,
+  First/Third Person, Orbit, Distance, Spline) and rotation modes (Free, Look At,
+  Slow Follow, Spin, Fixed), damped follows, `CameraSpline` paths, and
+  **Camera Zones** (trigger volumes that switch the active rig by priority).
+- **Game flow** — a runtime state machine: **main menu → loading → playing**,
+  with cursor lock and project slots for the menu / HUD / loading / studio-splash
+  scenes; `UIElement` action buttons drive transitions.
+- **Checkpoints & objectives** — a `Checkpoint` component + objective tracker
+  (HUD `{objective}` token), `.hbsave` save/load, and schematic game nodes. A
+  shipped-build **dev overlay** (Ctrl+`, gated by `BuildSettings.devMenu`) aids
+  debugging.
+- **Particles** — a pooled CPU simulation + a GPU billboard pass (both backends).
+- **In-game UI** — Unity-CanvasScaler-style canvases with Panel / Label / Button
+  / Image / Progress-bar-or-wheel elements, real TrueType text (stb_truetype
+  atlas), through a textured UI overlay pass in every backend (the runtime has no
+  ImGui).
+- **Terrain** — an editable chunked heightfield with a sculpt brush
+  (Raise/Lower/Smooth/Flatten) updating chunk meshes in place.
+- **IK & locomotion** — two-bone IK constraints (foot/hand), a **Rotator**
+  (constant spin), and **Motion Matching** (data-driven locomotion from a rig's
+  clips).
 
-## Character rendering (in progress)
+## The Art Editor (painting)
 
-A character pipeline (toward TLOU2 / Detroit-quality faces) is underway. Landed so
-far (**both backends**), all driven by per-material flags on the existing material
-system:
+A painting workflow for surfacing and 2.5D scene painting, available as the
+dedicated `HeartbreakArtEditor` exe **and** as the **Art Editor** panel in the
+full editor (with a one-click **Paint** toggle in the menu bar).
 
-- **Pre-integrated skin (SSS)** — the subsurface material is now Penner
-  pre-integrated scattering: a CPU-baked diffusion-profile LUT, sampled by
-  `(N·L, curvature)` (curvature reconstructed from screen-space derivatives), gives
-  the soft reddened terminator of skin, plus thickness-map **transmission** so thin
-  back-lit regions (ears/nose) glow.
-- **Cloth (fabric sheen)** — a Charlie sheen NDF + Neubelt visibility lobe so
-  garments read as cotton/velvet/silk instead of plastic.
-- **Eyes** — a parallax-refracted iris (the visible iris shifts with view angle
-  through the cornea) + a sharp cornea catchlight.
+**Surface painting** — paint pigment + PBR material + relief directly onto a
+mesh's UV texture:
 
-Still to come: **blendshapes / morph targets** (facial animation), an
-**order-independent transparency** pass + **anisotropic hair**, and **simulated
-cloth** (Jolt soft bodies).
+- A **stroke database** is the editable source of truth; the painted layer
+  textures are a baked cache (replay strokes → flatten), so undo/redo is a cheap
+  stroke pop + rebake. Persists to `.hbpaint`.
+- **Projection (3D-aware) painting** stamps by surface proximity in mesh-local
+  space, so a stroke crosses UV-island seams and never stretches.
+- **UV-seam edge dilation** pads painted texels into the gutter so filtering and
+  mips don't bleed across island boundaries.
+- An **oil-paint look** — directional **bristle** micro-relief baked into the
+  height (impasto ridges that catch raking light), bristle value-streaks in the
+  pigment, and bold **broken colour** — produced by the painted data under PBR
+  lighting, **not** a post filter.
+- Paint **layers** (composited with opacity/transparency), per-object box vs
+  mesh-UV unwrap, distance-LOD mip averaging, and a brush library + brush editor
+  (custom procedural or imported/hand-painted tips).
 
-Done since: textured PBR (normal/MR/AO via bindless), skin/subsurface scattering,
-flythrough freecam, a Unity-style editor viewport (scene rendered to an
-offscreen target shown in an ImGui panel) on both backends, a **platform input
-abstraction** (keyboard/mouse/XInput gamepad behind `Core/Input`), a **skybox**
-background pass, **directional shadow maps** (depth-only pass + 3x3 PCF, both
-backends), a **transform hierarchy** (Parent component, world-matrix
-composition, editor drag-drop reparenting), and **Jolt rigid-body physics**
-(RigidBody component, fixed-step world, editor Simulate toggle), and **audio
-playback** (miniaudio behind `Audio/AudioSystem`; .uaf audio assets play from
-the editor's asset browser).
+**3D brush strokes (grease-pencil)** — draw in screen space and the stroke
+becomes its **own free-floating object** in real space, placed on a plane
+tangent to the surface you start on (depth + orientation from the first hit, not
+the camera). Strokes are double-sided, **shadeless** (they show the colour you
+picked), with a baked oil bristle-streak texture, and carry **Photoshop/GIMP-
+style brush dynamics**: start/end **taper**, procedural **size jitter** and path
+**wobble**, and path **smoothing**.
 
-Also done: **scenes** (`.hbscene` JSON serialization of all components, Scene
-menu, startup scene per project, **additive streaming** off a worker thread,
-drag a scene into the viewport to stream it in), **keyframe animation**
-(AnimationTrack + Timeline panel with scrubbing/keys/transport), **3D
-positional audio** (listener follows the camera; AudioSource entities emit
-spatialized .uaf audio), **drag-drop spawning** (mesh tiles drop onto the
-surface under the cursor), **CPU-rasterized mesh thumbnails**, **UAP asset
-packs**, and **HeartbreakHub** - a standalone project-manager exe that
-launches the editor.
+## Audio & adaptive music
 
-**Asset packs (.uap):** assets are cooked into chunked packs of **50 fixed
-slots** each (`MyProject_0.uap`, `MyProject_1.uap`, ...). An asset keeps its
-slot for life - assignments persist in `MyProject.uapmanifest` next to the
-project - so **deleting an asset frees its slot without shifting the rest**
-(untouched packs stay byte-identical across updates, which keeps patches
-small), and the next imported asset fills the lowest free slot. Cook from the
-Project menu ("Build Asset Pack") or headlessly with
-`HeartbreakEditor --project X.hbproj --pack`. "Build Shipping Folder"
-assembles `Build/` with the runtime exe, shaders, project file, assets, and
-packs; all third-party dependencies link statically so the folder is
-self-contained.
+A FMOD/Wwise-style audio middleware over **miniaudio**:
 
-**Punctual lights + emissive (done):** up to 16 **point and spot lights** per
-frame (ECS `PointLightComponent` / `SpotLightComponent`, windowed inverse-square
-falloff, smooth spot cones) shade every PBR surface alongside the shadowed sun,
-and materials carry an **emissive color/intensity + emissive map**. Lights are
-created from the Hierarchy's "+ Create" menu, edited in the Inspector, and
-serialized in scenes.
+- **Mixer bus tree** — Master → Music/SFX/Ambience plus user buses, persisted in
+  the project and edited live in the **Audio Mixer** panel (per-bus volume/mute).
+- **Audio events** (`.hbevent`) — weighted random sound pools with volume/pitch
+  randomization, bus routing and 3D attenuation, posted by name.
+- **3D positional audio** — the listener follows the camera; `AudioSource`
+  entities emit spatialized `.uaf` audio.
+- **Adaptive music** — a graph (`.hbmusic`) of **states** (sections), each made
+  of synced looping **layers** (stems) that **crossfade** on a state change, plus
+  runtime **parameters** (e.g. *intensity*) that fade individual layers in/out
+  over a range. Authored in the **Music** panel (drag stems onto layers, bind
+  them to parameters, set start state + fade) with **live preview** (play a
+  state, drag a parameter and hear the mix adapt). The runtime auto-starts the
+  project's score when the game begins; gameplay drives it through the **Music**
+  schematic nodes (or stingers — one-shot accents). Beat-quantized transitions
+  and a dialogue duck are the documented next steps.
 
-**Material assets (.hbmat):** a full PBR material is a small JSON asset (base
-color, metallic, roughness, emissive, subsurface, and five texture-map refs).
-Create one with the asset browser's **New Material** button, edit it in the
-**Asset Viewer** panel (live sphere preview, texture pickers over the project's
-imported textures), then **drag the material onto any object in the viewport**
-to apply it — entities remember the link via a `MaterialRef` component, saving
-a material re-applies it to every user in the open scene, and scenes reload
-materials from the asset on load.
+## Assets & shipping
 
-**Asset Viewer:** click any asset tile to inspect it — textures show a large
-preview with size/format/mips, meshes show a rasterized turntable preview with
-submesh/vertex/triangle stats, audio shows duration/format with a Play button,
-scenes show entity counts with load/stream buttons, and materials open the
-full material editor.
+- **Unified Asset Format (`.uaf`)** — imported content (images, models, audio) is
+  cooked into a binary container (like `.uasset`); the runtime loads `.uaf`, not
+  raw files. Skeletal rigs + clips are stored in the mesh asset.
+- **Material assets (`.hbmat`)** — a full PBR material as JSON (base colour,
+  metal, roughness, emissive, subsurface, five texture refs), edited in the
+  **Asset Viewer** with a live preview and drag-applied onto objects (entities
+  remember the link via `MaterialRef`). Importing a model generates a `.hbmat`
+  per material.
+- **Asset packs (`.uap`)** — assets cook into chunked packs of 50 fixed slots; a
+  slot is kept for an asset's life (deleting one frees its slot without shifting
+  the rest, so patches stay small). Packs are **LZMS-compressed** and also carry
+  the **compiled shaders** and the **project file** as packed extras.
+- **Shipping** — *Project → Build Settings…* configures the game (name, version,
+  backend/build profile, resolution, startup scene, dev menu). **Build**
+  assembles a clean `Build/` folder that is **just the runtime exe + `.uap`
+  packs + any DLLs** (no loose `shaders/`, `.hbproj` or `Assets/`). The runtime
+  auto-discovers the packs next to the exe, mounts them through the VFS, and
+  reads the project, shaders and every asset back out of them.
 
-**Scene manager:** the **Scenes** panel lists every `.hbscene` in the project
-with the **startup (default) scene** marked; set the default with one click,
-and load / stream additively / rename / duplicate / delete from the context
-menu. Both the editor and the runtime boot into the project's default scene.
+## Editor UX
 
-**Build configurator + shipping:** *Project → Build Settings…* configures the
-shipped game — game name (window title), company, version, **graphics backend**
-(D3D12/Vulkan), resolution, startup scene, and packing options — all persisted
-in the `.hbproj`. One **Build** action (menu or Build Settings window) cooks the
-packs, verifies them, and assembles a **clean, minimal `Build/` folder that is
-nothing but the game application, the asset packs, and DLLs**:
+A Unity-style dockable layout: **Viewport** (scene to an offscreen target) +
+Hierarchy (drag-drop reparenting), Inspector, Asset browser (icon grid + folders,
+right-click context menu, universal drag-drop), Asset Viewer, Scenes, Audio
+Mixer, **Music**, **Art Editor**, **Schematic Editor**, Post Process, Navigation,
+Streaming, Stats, Timeline, Project Settings. A **Window** menu shows/hides every
+panel with Show All / Reset Layout.
 
-- **`HeartbreakRuntime.exe`** — the newest runtime exe across configs (a Release
-  runtime is ~3 MB vs ~15 MB Debug).
-- **`<name>_N.uap`** — **LZMS-compressed** asset packs (Windows Compression API;
-  per-asset, skipped when it doesn't shrink) that now also carry the engine's
-  **compiled shaders** and the **project file** as packed extras — so the build
-  ships **no loose `shaders/` folder, no `.hbproj`, and no loose `Assets/`**.
-- **DLLs only** — native dependencies (static today, so usually none) plus, *only
-  when the project has compiled C# scripts*, the managed scripting core,
-  `Scripts.dll`, and the managed DLL's two mandatory .NET hosting JSON sidecars.
-  A scriptless game ships as **just the exe + packs**.
+- **Undo/redo** (Ctrl+Z / Ctrl+Y, 64 steps) over every scene mutation — gizmo
+  drags, inspector edits, create/delete/spawn, reparenting, component add/remove,
+  material applies, scene loads. Snapshots are in-memory scene JSON with
+  process-wide GPU caches, so restoring even a large scene is instant.
+- **Gizmo grid snapping** (Ctrl override) and **prefabs** (`.hbprefab`).
+- **Play / Pause / Stop** in the Game tab snapshot the scene on Play and restore
+  it on Stop; the primary `CameraComponent` drives the view in play mode and the
+  runtime.
 
-The runtime boots straight from the packs: it **auto-discovers the `.uap` packs
-next to the exe, mounts them through a VFS, reads the project (and shaders) back
-out of them**, and serves every scene/material/texture/audio read from the packs
-(falling back to disk for anything unpacked). Shaders flow through an RHI
-**shader provider** the engine wires to the VFS for packed builds, so both
-backends fetch their bytecode from the packs instead of a loose folder. "Pack
-only scene-referenced assets" walks every scene's mesh/material/texture/audio
-references and packs just those (the shaders + project are always included).
+## Concurrency, navigation & physics
 
-**Undo/redo (Ctrl+Z / Ctrl+Y):** every scene mutation — gizmo drags, inspector
-edits, entity create/delete/spawn, reparenting, component add/remove, material
-applies, scene loads — captures a snapshot first; the Edit menu and shortcuts
-walk the history (64 steps). Snapshots are in-memory scene JSON, and the
-serializer keeps **process-wide GPU caches** (mesh source → handle, texture →
-handle), so restoring even a multi-hundred-MB scene is instant: nothing is
-re-read or re-uploaded.
+- **Fiber job system** (`Core/JobSystem`, after Naughty Dog's fiber talk) — one
+  worker per core; jobs run on a pool of 128 fibers and can **wait on a counter
+  mid-execution without blocking the worker** (the fiber parks and resumes later,
+  possibly on another thread). `jobs::ParallelFor` / `Kick`+`Wait` /
+  `RunDetached`. Skeletal animation poses every character across the workers, and
+  streaming loads run on them.
+- **Navigation** — real-time grid A* (`GridNav`, auto-rebuilt from static
+  geometry) plus a **Recast & Detour** navmesh; `NavigationAgent`s steer along
+  paths each frame with local avoidance around `NavigationObstacle`s. The
+  **Navigation** panel bakes/overlays the navmesh and tests paths; `--navtest`
+  runs a headless bake-and-walk.
+- **Physics** — **Jolt** rigid bodies behind a plain API (fixed step, transform
+  sync), an editor *Simulate* toggle, and raycasts used by the camera/gameplay.
 
-**Material import from 3D files:** importing a model now **generates a
-`.hbmat` material asset per material** (into `<model>_Materials/`), with
-factors, emissive, and texture refs all wired up; spawned entities link to
-them via `MaterialRef`, so imported models are immediately editable in the
-material editor. Texture URIs are percent-decoded and searched in
-conventional locations, refs are stored **relative to the Assets root** (they
-survive organizing assets into folders), and the VFS gained a **filename-search
-fallback** that heals refs in older assets that broke when files were moved —
-existing white models re-texture themselves on the next load, no re-import
-needed.
+## Requirements
 
-## C# scripting
-
-The engine hosts the **.NET 8 runtime in-process** (CoreCLR via hostfxr — no
-Mono). Gameplay code is plain C# deriving from `HeartbreakEngine.Script`:
-
-```csharp
-using HeartbreakEngine;
-
-public class Spinner : Script
-{
-    public override void OnStart()
-    {
-        Debug.Log($"hello from '{Entity.Name}'");
-        Entity.SetEmissive(new Color(0.2f, 1.0f, 0.5f), 3.0f);
-    }
-
-    public override void OnUpdate(float dt)
-    {
-        Entity.Rotation = Quaternion.FromAxisAngle(Vector3.Up, 90f * dt) * Entity.Rotation;
-        if (Input.WasKeyPressed(Key.Space)) Entity.AddImpulse(Vector3.Up * 5f);
-    }
-}
-```
-
-- **API**: `Entity` (transform, name, find/create/destroy, base color,
-  emissive, point lights, rigid-body velocity/impulse), `Input`
-  (keyboard/mouse), `Debug`, `Time`, plus `Vector2/3`, `Quaternion`, `Color` —
-  all marshaled through a function-pointer interop table (no reflection on the
-  hot path; one native call per frame fans out to every script).
-- **Workflow**: the Assets panel's **New Script** drops a templated `.cs`;
-  double-click any script to open it in the **Script Editor** panel (docked
-  with the Viewport). **Saving (Ctrl+S) compiles the project's scripts with
-  `dotnet build` and hot-reloads them**: the old assembly unloads (collectible
-  `AssemblyLoadContext`), the new one loads, and every script instance is
-  recreated with its entity binding intact. Compile errors show in the panel.
-- **ECS**: attach scripts with the inspector's **Script (C#)** component (a
-  dropdown of compiled classes); the component serializes in scenes, works
-  with undo/redo, and instances follow entity lifetime (deletes/scene loads
-  clean up through registry hooks). Scripts run while **Simulate** is on in
-  the editor and always in the runtime; shipped builds carry `Scripts.dll` +
-  the managed core next to the exe (players need the .NET 8 runtime, not the
-  SDK). Without the .NET SDK the engine just disables scripting.
-
-**Game cameras + Game tab:** a `CameraComponent` (FOV / near / far / primary,
-created from "+ Create → Camera") turns any entity into a game camera — the
-**primary camera drives rendering in play mode and in the runtime**, while the
-editor's Scene view keeps its own fly camera. The **Game tab**'s
-Play / Pause / Stop snapshot the scene on Play and restore it exactly on Stop.
-
-**Camera rigs (presets + rotation modes):** every `CameraComponent` has a
-**behaviour preset** — `Static`, `First Person`, `Third Person` (boom that
-trails a target), `Orbit` (auto-spins around a target), `Distance` (fixed
-framing), or `Spline` (travels a Catmull-Rom path) — and a **rotation mode** —
-`Free`, `Look At`, `Slow Follow` (damped), `Spin` (continuous yaw), or `Fixed`.
-Targets are referenced by entity name and resolved each frame; position/aim
-**damping** smooths follows and blends transitions. A **`CameraSpline`**
-component (created from "+ Create → Camera Spline", points editable in the
-inspector or "Add at Camera") supplies the path for Spline mode. The whole rig
-is driven by `Scene/CameraSystem` and serialized in scenes.
-
-**Camera Zones:** a **`CameraZone`** is a trigger volume (an oriented box from
-the entity's Transform + half-extents) that switches the active camera when a
-tracked entity enters it — so a level can blend between rigs as the player
-moves (e.g. a first-person interior zone inside a third-person world).
-Overlapping zones resolve by `priority`; with none active the scene's primary
-camera is used. Zones draw their volume in the Scene view (green = active).
-
-**In-game UI (canvas):** `UIElement` components — **Panel, Label, Button,
-Image, Progress Bar / Wheel** — lay out on a configurable reference canvas
-(normalized anchor + pixel offset/size, color, per-element text size,
-visibility). Text is real **TrueType** (a Segoe UI/Arial atlas baked with
-`stb_truetype`, anti-aliased at any size), Images and Panels/Buttons take any
-imported texture (picked from a dropdown), and progress bars fill linearly or
-as a **radial wheel** — all through a dedicated **textured UI overlay pass in
-both backends** (the runtime has no ImGui). **Canvas scaling is
-Unity-CanvasScaler-style**: Stretch, Match Height (UI keeps its size, width
-follows the aspect ratio), or Pixel-Perfect, with the reference resolution
-configurable in Build Settings. Buttons hover/press-shade and report clicks;
-C# scripts drive everything via `Entity.SetUIText / UIClicked / UIHovered /
-SetUIVisible / SetUIFill`. Created from "+ Create → UI", serialized in
-scenes, live in both the Scene and Game views.
-
-**Project Settings (environment / skybox):** a **Project Settings** panel
-(Project menu) edits the project-wide environment stored in the `.hbproj`: a
-**custom procedural skybox** (horizon / zenith / ground colours, sun direction
-/ tint / intensity, overall sky brightness) that regenerates the sky **and the
-image-based lighting** derived from it live ("Rebuild Sky"), plus the fallback
-**directional sun** (colour / intensity), **ambient** and **exposure**. New
-scenes inherit these defaults; per-scene values still win.
-
-**Editor UX:** a **Window menu** shows/hides every dockable panel (and any
-panel's close button hides it), with **Show All** / **Reset Layout** to restore
-the default Unity-style arrangement (Hierarchy left, Inspector/Asset
-Viewer/Project Settings right, content browser + tool/log tabs split across the
-bottom). The **Script Editor** now auto-closes brackets/quotes, types over
-matching closers, auto-indents new lines (extra level after `{`), and offers a
-**completion popup** for the C# scripting API + keywords (Tab accepts the top
-match; toggleable).
-
-**Primitives + components:** the mesh library now has **plane, cylinder, cone,
-capsule and torus** alongside cube/sphere ("+ Create → 3D Object" and the
-inspector's "Add Component → Mesh"). New components: **Rotator** (constant spin),
-**Motion Matching** (data-driven locomotion — builds a feature database from a
-rig's clips and auto-selects idle/walk/run by movement speed), and the terrain
-and IK systems below. **Save All** (Project menu / Ctrl+Shift+S) writes the scene
-and the `.hbproj` together; every component serializes.
-
-**Terrain editor:** a **`TerrainComponent`** materializes an editable heightfield
-as a grid of independently cullable mesh **chunks** (procedurally seeded with fbm
-noise). The **sculpt tool** (Terrain inspector → Sculpt) lets you drag in the
-Scene view to **Raise / Lower / Smooth / Flatten** under a falloff brush, with a
-projected brush ring; edits update only the affected chunk meshes **in place**
-via a new RHI `UpdateMesh` (no GPU-buffer churn), and the sculpted heightmap is
-saved with the scene.
-
-**Inverse kinematics:** an **`IKConstraint`** holds two-bone IK chains (foot /
-hand / etc.). After skeletal animation poses the skeleton, each chain solves
-analytically so its end joint reaches a world-space target (optionally another
-entity's position), with a pole hint for the bend direction and a 0..1 blend
-weight — applied as corrective local rotations and recomposed so descendants
-follow. Targets are resolved before the parallel pose pass.
-
-Next:
-
-Editor/runtime systems pass (2026-06-12): the **3D Asset Viewer** is a real
-mesh editor (Unreal-style) — the RHI renders a second, independent preview
-scene (HDR mini-pass + tonemap on both backends) with orbit/zoom, per-submesh
-**material slot** assignment, and Save back into the `.uaf`; the asset
-browser's actions moved into a **right-click context menu** (Import / Create
-Folder-Material-Script-Audio Event / Refresh); the in-game UI is **Unity-style**
-(UICanvas component roots + hierarchical RectTransform layout with
-anchorMin/anchorMax/pivot, stretch presets, parenting via the scene hierarchy,
-per-canvas scale modes and sort order — old single-anchor scenes still load);
-audio grew an **FMOD/Wwise-style middleware layer**: a mixer **bus tree**
-(Master/Music/SFX/Ambience + user buses, persisted in the project, edited live
-in the new Audio Mixer panel) and **audio event assets** (`.hbevent`: weighted
-random sound pools, volume/pitch randomization, bus routing, 3D attenuation)
-posted via `AudioSystem::PostEvent`; the sphere-grid demo scene is gone (the
-default world is just a sun + sky).
-
-**Skeletal animation** (2026-06-12): full GPU-skinned character animation on
-both backends. Rigged models (glTF/FBX/...) import with their skeleton +
-clips intact (the flattening pre-transform only applies to static models);
-vertices carry 4 joint influences, and `.uaf` v5 stores the rig (older assets
-still load). At runtime the **Animator** component samples a clip into a
-joint palette (uploaded per frame to a bindless bone buffer; the vertex
-shader skins position/normal/tangent, shadows included), with play/loop/speed
-control in the Inspector. **Real-time retargeting**: clips address joints *by
-name*, so an Animator can play any other rigged asset's clips - joints match
-by canonical name (DCC prefixes like `mixamorig:` stripped), unmatched joints
-hold their bind pose, and translations scale by the skeletons' bone-length
-ratio. **Root motion** (Animator toggle): the clip's horizontal root travel
-drives the entity's Transform (loop-seam aware) so the character animates in
-place yet moves through the world. FBX import collapses Assimp's pivot helper
-nodes and applies the file's unit scale (Mixamo rigs import correctly), and an
-over-budget skeleton degrades to a static mesh instead of hanging the GPU. The
-editor's `--import <file>` flag scripts the content pipeline.
-
-**Universal drag & drop** (2026-06-12): every asset drags from the browser and
-drops where it makes sense — materials paint objects (viewport or hierarchy
-row), scripts attach as components, audio clips become AudioSources, fonts
-restyle UI text, meshes spawn (as children when dropped on an entity), scenes
-stream additively, and **dropping a texture onto an object auto-creates a
-material** (`<name>_Mat.hbmat` beside the texture; sibling
-Normal/Metal-Rough/AO/Emissive maps are picked up by naming convention) and
-applies it. Inspector and Asset Viewer slot widgets (UI texture/font, material
-texture maps, audio-event sounds, mesh material slots) accept drops too.
-
-1. **Embedded glTF textures** — load material maps from .glb binaries
-2. **Frame graph** — automatic barriers and transient resource aliasing
-3. ~~**Post** — HDR pipeline, bloom, SSAO, CSM, FXAA~~ **done** (see "Toward
-   photorealism"); TAA/SSR/GI remain
-4. **More backends** — the RHI seam is ready for them
-5. **Scripting v2** — script properties in the inspector, OnCollision events,
-   more component APIs
-6. **UI v3** — nine-slice panels, layout groups, input fields, UI animation
+- Windows 10/11, x64
+- CMake ≥ 3.21 and a C++20 toolchain (Visual Studio 2022 / MSVC recommended)
+- [Vulkan SDK](https://vulkan.lunarg.com/) (sets `VULKAN_SDK`) — only when the
+  Vulkan backend is enabled (also provides the SPIR-V DXC)
+- Direct3D 12 and OpenGL ship with Windows; no extra install
 
 ## License
 
