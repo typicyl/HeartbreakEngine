@@ -4,7 +4,7 @@ A from-scratch 3D game engine built on a clean, backend-agnostic **RHI (Render
 Hardware Interface)**. One renderer drives **three** graphics backends —
 **Direct3D 12**, **Vulkan**, and **OpenGL 4.6** — behind a single bindless
 interface. On top of it sits an **EnTT** ECS, **Jolt** physics, a fiber job
-system, world streaming, **Recast & Detour** navigation, a photorealistic HDR
+system, world streaming, real-time grid-A\* navigation, a photorealistic HDR
 renderer, a **visual-scripting** system (schematics, transpiled to C++ for
 shipping), an **adaptive music** director, a painterly **Art Editor**, and a
 Unity-style **Dear ImGui + ImGuizmo** editor.
@@ -101,8 +101,8 @@ cmake -S . -B out/build/x64 -DHBE_ENABLE_OPENGL=OFF   # drop OpenGL
 ```
 
 Dependencies (GLM, Assimp, EnTT, Jolt, Dear ImGui, ImGuizmo, nlohmann/json, stb,
-miniaudio, Recast/Detour) are fetched automatically by CMake (FetchContent) on
-first configure and linked **statically**, so a shipped build is self-contained.
+miniaudio) are fetched automatically by CMake (FetchContent) on first configure
+and linked **statically**, so a shipped build is self-contained.
 Shaders compile to DXIL (DXC from the Windows SDK) and SPIR-V (DXC from the
 Vulkan SDK) as part of the build.
 
@@ -133,7 +133,7 @@ Source/
                StreamingWorld, AnimationSystem, CameraSystem, CharacterController,
                TerrainSystem, PaintSystem (painting), ParticleSystem
   Physics/     PhysicsWorld (Jolt behind a plain API)
-  Navigation/  GridNav (real-time grid A*) + Recast/Detour navmesh
+  Navigation/  GridNav (real-time grid A* pathfinder + dynamic obstacles)
   Game/        GameSystems (objectives, checkpoints, deferred music commands)
   Audio/       AudioSystem (miniaudio: bus tree, events, 3D voices, music director)
   Schematic/   Schematic (graph + node catalog), SchematicSystem (interpreter),
@@ -366,11 +366,11 @@ panel with Show All / Reset Layout.
   possibly on another thread). `jobs::ParallelFor` / `Kick`+`Wait` /
   `RunDetached`. Skeletal animation poses every character across the workers, and
   streaming loads run on them.
-- **Navigation** — real-time grid A* (`GridNav`, auto-rebuilt from static
-  geometry) plus a **Recast & Detour** navmesh; `NavigationAgent`s steer along
-  paths each frame with local avoidance around `NavigationObstacle`s. The
-  **Navigation** panel bakes/overlays the navmesh and tests paths; `--navtest`
-  runs a headless bake-and-walk.
+- **Navigation** — an in-house real-time **grid A\*** pathfinder (`GridNav`,
+  auto-rebuilt from static geometry each frame, no bake and no external nav
+  dependency); `NavigationAgent`s steer along paths with local avoidance around
+  dynamic `NavigationObstacle`s. The **Navigation** panel tunes/visualises it and
+  tests paths; `--navtest` runs a headless route-and-walk check.
 - **Physics** — **Jolt** rigid bodies behind a plain API (fixed step, transform
   sync), an editor *Simulate* toggle, and raycasts used by the camera/gameplay.
 
