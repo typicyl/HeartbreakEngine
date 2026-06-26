@@ -184,6 +184,18 @@ struct Gen {
                 out += "        game::CompleteObjective((" + IN(1) + ").s);\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
+            case NodeType::SetMusicState:
+                out += "        game::SetMusicState((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetMusicParam:
+                out += "        game::SetMusicParameter((" + IN(1) + ").s, (" + IN(2) + ").f);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::PlayStinger:
+                out += "        game::PlayStinger((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
             case NodeType::EventStart:
             case NodeType::EventUpdate:
             default:

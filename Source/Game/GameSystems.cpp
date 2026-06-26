@@ -10,6 +10,8 @@
 #include <nlohmann/json.hpp>
 
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace hbe::game {
 
@@ -18,7 +20,41 @@ std::vector<Objective> g_objectives;
 std::unordered_set<std::string> g_reached;
 bool g_saveRequested = false;
 std::string g_saveId;
+// Deferred adaptive-music commands (drained by the engine).
+bool g_musicStatePending = false;
+std::string g_musicState;
+std::vector<std::pair<std::string, f32>> g_musicParams;
+std::vector<std::string> g_stingers;
 } // namespace
+
+void SetMusicState(const std::string& state) {
+    g_musicState = state;
+    g_musicStatePending = true;
+}
+void SetMusicParameter(const std::string& name, f32 value) {
+    g_musicParams.emplace_back(name, value);
+}
+void PlayStinger(const std::string& asset) { g_stingers.push_back(asset); }
+
+bool ConsumeMusicState(std::string& outState) {
+    if (!g_musicStatePending) return false;
+    g_musicStatePending = false;
+    outState = g_musicState;
+    return true;
+}
+bool ConsumeMusicParameter(std::string& outName, f32& outValue) {
+    if (g_musicParams.empty()) return false;
+    outName = g_musicParams.front().first;
+    outValue = g_musicParams.front().second;
+    g_musicParams.erase(g_musicParams.begin());
+    return true;
+}
+bool ConsumeStinger(std::string& outAsset) {
+    if (g_stingers.empty()) return false;
+    outAsset = g_stingers.front();
+    g_stingers.erase(g_stingers.begin());
+    return true;
+}
 
 void SetObjective(const std::string& id, const std::string& text) {
     for (Objective& o : g_objectives)
@@ -122,6 +158,10 @@ void Reset() {
     g_reached.clear();
     g_saveRequested = false;
     g_saveId.clear();
+    g_musicStatePending = false;
+    g_musicState.clear();
+    g_musicParams.clear();
+    g_stingers.clear();
 }
 
 } // namespace hbe::game

@@ -227,6 +227,18 @@ private:
                 game::CompleteObjective(EvalInput(n.id, 1, 0).s);
                 Follow(n.id, 0, depth);
                 break;
+            case NodeType::SetMusicState:
+                game::SetMusicState(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::SetMusicParam:
+                game::SetMusicParameter(EvalInput(n.id, 1, 0).s, EvalInput(n.id, 2, 0).f);
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::PlayStinger:
+                game::PlayStinger(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
             default:
                 Follow(n.id, 0, depth);
                 break;

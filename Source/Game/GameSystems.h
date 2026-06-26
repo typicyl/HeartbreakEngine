@@ -45,6 +45,17 @@ bool ConsumeSaveRequest(std::string& outId);
 // applies their objective). Call while the simulation is playing.
 void UpdateCheckpoints(Scene& scene);
 
+// --- Adaptive music (deferred commands) -------------------------------------
+// Schematics/scripts drive the score through these without touching the
+// AudioSystem; the engine drains the queues each frame into the music director.
+void SetMusicState(const std::string& state);          // crossfade to a music state
+void SetMusicParameter(const std::string& name, f32 value); // e.g. "intensity"
+void PlayStinger(const std::string& asset);            // one-shot `.uaf` (rel. Assets)
+// Engine-side drains: the latest pending state, then the parameter + stinger queues.
+bool ConsumeMusicState(std::string& outState);
+bool ConsumeMusicParameter(std::string& outName, f32& outValue);
+bool ConsumeStinger(std::string& outAsset);
+
 // --- Run-state save/load (objectives + checkpoints) -------------------------
 // The SCENE snapshot is saved by the engine; this is just the gameplay bookkeeping.
 std::string SerializeState();

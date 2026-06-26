@@ -2,6 +2,7 @@
 #include "Audio/AudioSystem.h"
 
 #include "Assets/AudioEvent.h"
+#include "Assets/MusicGraph.h"
 #include "Assets/UAF.h"
 #include "Core/Log.h"
 #include "Scene/Components.h"
@@ -97,6 +98,74 @@ struct AudioSystem::Impl {
         voices.clear();
     }
 
+    // -- Adaptive music director ------------------------------------------------
+    // A music STATE's layers play as looping non-spatial voices on the Music bus,
+    // started together (sample-aligned) so they stay in sync. Each layer's gain
+    // lerps toward its target (param-driven, or 0 when its state is leaving).
+    struct MusicLayerVoice {
+        Voice voice;
+        f32 baseVolume = 1.0f;
+        std::string parameter; // empty = always at baseVolume
+        f32 paramLo = 0.0f, paramHi = 1.0f;
+        f32 current = 0.0f;    // current gain (lerped each UpdateMusic)
+        bool fadingOut = false; // its state was left -> fade to 0, then reap
+    };
+    MusicGraph musicGraph;
+    std::filesystem::path musicAssets;
+    std::unordered_map<std::string, f32> musicParams; // name -> live value
+    std::list<MusicLayerVoice> musicLayers;
+    std::string musicState;     // current state ("" = stopped)
+    f32 musicFade = 2.0f;       // active crossfade seconds
+    bool musicHasGraph = false;
+
+    void DestroyMusic() {
+        for (MusicLayerVoice& m : musicLayers) {
+            ma_sound_uninit(&m.voice.sound);
+            ma_audio_buffer_uninit(&m.voice.buffer);
+        }
+        musicLayers.clear();
+        musicState.clear();
+    }
+
+    // Starts a looping, non-spatial voice on the Music bus at volume 0 (the director
+    // fades it in). Returns false if the audio is unusable.
+    bool StartMusicVoice(Voice& v, const uaf::Audio& audio) {
+        ma_format format;
+        switch (audio.bitsPerSample) {
+            case 8:  format = ma_format_u8;  break;
+            case 16: format = ma_format_s16; break;
+            case 32: format = ma_format_f32; break;
+            default: return false;
+        }
+        const usize bytesPerFrame = (audio.bitsPerSample / 8) * audio.channels;
+        if (bytesPerFrame == 0 || audio.pcm.size() < bytesPerFrame) return false;
+        v.data = audio.pcm;
+        ma_audio_buffer_config cfg = ma_audio_buffer_config_init(
+            format, audio.channels, audio.pcm.size() / bytesPerFrame, v.data.data(), nullptr);
+        cfg.sampleRate = audio.sampleRate;
+        if (ma_audio_buffer_init(&cfg, &v.buffer) != MA_SUCCESS) return false;
+        if (ma_sound_init_from_data_source(&engine, &v.buffer, MA_SOUND_FLAG_NO_SPATIALIZATION,
+                                           GroupOf("Music"), &v.sound) != MA_SUCCESS) {
+            ma_audio_buffer_uninit(&v.buffer);
+            return false;
+        }
+        ma_sound_set_looping(&v.sound, MA_TRUE);
+        ma_sound_set_volume(&v.sound, 0.0f);
+        ma_sound_start(&v.sound);
+        return true;
+    }
+
+    // The layer's parameter-driven target gain (1 when unbound).
+    f32 LayerGain(const MusicLayerVoice& m) const {
+        if (m.parameter.empty()) return m.baseVolume;
+        f32 v = 0.0f;
+        if (const auto it = musicParams.find(m.parameter); it != musicParams.end()) v = it->second;
+        const f32 lo = m.paramLo, hi = m.paramHi;
+        const f32 t = (std::fabs(hi - lo) < 1e-5f) ? (v >= lo ? 1.0f : 0.0f)
+                                                   : glm::smoothstep(lo, hi, v);
+        return m.baseVolume * t;
+    }
+
     // Starts a voice from raw PCM on a bus. Returns nullptr on failure.
     Voice* StartVoice(const void* pcm, usize bytes, u32 channels, u32 sampleRate,
                       u32 bitsPerSample, const std::string& bus, f32 volume,
@@ -150,6 +219,7 @@ struct AudioSystem::Impl {
 
     ~Impl() {
         DestroyVoices();
+        DestroyMusic();
         for (auto& [id, sv] : spatial) DestroySpatial(sv);
         spatial.clear();
         DestroyBuses();
@@ -177,6 +247,7 @@ void AudioSystem::ConfigureBuses(const std::vector<AudioBusDesc>& buses) {
     if (!IsAvailable()) return;
     // Rebuilding the tree invalidates every attachment: stop voices first.
     impl_->DestroyVoices();
+    impl_->DestroyMusic();
     for (auto& [id, sv] : impl_->spatial) impl_->DestroySpatial(sv);
     impl_->spatial.clear();
     impl_->DestroyBuses();
@@ -363,6 +434,113 @@ bool AudioSystem::PlayUAF(const std::filesystem::path& uafPath, const std::strin
     }
     return PlayPCM(audio->pcm.data(), audio->pcm.size(), audio->channels,
                    audio->sampleRate, audio->bitsPerSample, bus);
+}
+
+void AudioSystem::SetMusicGraph(const MusicGraph& graph,
+                                const std::filesystem::path& assetsDir) {
+    if (!impl_) return;
+    impl_->DestroyMusic();
+    impl_->musicGraph = graph;
+    impl_->musicAssets = assetsDir;
+    impl_->musicHasGraph = true;
+    impl_->musicParams.clear();
+    for (const MusicParameter& p : graph.parameters)
+        impl_->musicParams[p.name] = glm::clamp(p.defaultValue, p.min, p.max);
+    impl_->musicFade = glm::max(graph.defaultFade, 0.01f);
+}
+
+void AudioSystem::PlayMusicState(const std::string& state, f32 fadeSeconds) {
+    if (!IsAvailable() || !impl_->musicHasGraph) return;
+    if (state == impl_->musicState) return; // already there
+    const MusicState* st = impl_->musicGraph.FindState(state);
+    if (!st) {
+        HBE_WARN("Music: no state '{}'.", state);
+        return;
+    }
+    impl_->musicFade =
+        glm::max(fadeSeconds < 0.0f ? impl_->musicGraph.defaultFade : fadeSeconds, 0.01f);
+    // The outgoing state's layers fade to silence and get reaped.
+    for (Impl::MusicLayerVoice& m : impl_->musicLayers) m.fadingOut = true;
+    // Bring the new state's layers in together (started this tick = in sync).
+    for (const MusicLayer& layer : st->layers) {
+        if (layer.asset.empty()) continue;
+        const std::optional<uaf::Audio> audio =
+            uaf::ReadAudio(impl_->musicAssets / layer.asset);
+        if (!audio) {
+            HBE_WARN("Music: layer '{}' failed to load.", layer.asset);
+            continue;
+        }
+        Impl::MusicLayerVoice mv;
+        mv.baseVolume = glm::max(layer.volume, 0.0f);
+        mv.parameter = layer.parameter;
+        mv.paramLo = layer.paramLo;
+        mv.paramHi = layer.paramHi;
+        mv.current = 0.0f;
+        if (!impl_->StartMusicVoice(mv.voice, *audio)) continue;
+        impl_->musicLayers.push_back(std::move(mv));
+    }
+    impl_->musicState = state;
+    HBE_INFO("Music: -> '{}' ({} layers, {:.1f}s fade).", state, st->layers.size(),
+             impl_->musicFade);
+}
+
+void AudioSystem::StopMusic(f32 fadeSeconds) {
+    if (!IsAvailable()) return;
+    impl_->musicFade =
+        glm::max(fadeSeconds < 0.0f ? impl_->musicGraph.defaultFade : fadeSeconds, 0.01f);
+    for (Impl::MusicLayerVoice& m : impl_->musicLayers) m.fadingOut = true;
+    impl_->musicState.clear();
+}
+
+void AudioSystem::SetMusicParameter(const std::string& name, f32 value) {
+    if (!impl_) return;
+    f32 v = value;
+    for (const MusicParameter& p : impl_->musicGraph.parameters)
+        if (p.name == name) { v = glm::clamp(value, p.min, p.max); break; }
+    impl_->musicParams[name] = v;
+}
+
+f32 AudioSystem::MusicParameterValue(const std::string& name) const {
+    if (!impl_) return 0.0f;
+    const auto it = impl_->musicParams.find(name);
+    return it != impl_->musicParams.end() ? it->second : 0.0f;
+}
+
+std::string AudioSystem::CurrentMusicState() const {
+    return impl_ ? impl_->musicState : std::string();
+}
+
+bool AudioSystem::HasMusicGraph() const { return impl_ && impl_->musicHasGraph; }
+
+void AudioSystem::PostStinger(const std::filesystem::path& uafPath, const std::string& bus,
+                              f32 volume) {
+    if (!IsAvailable()) return;
+    const std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
+    if (!audio) {
+        HBE_WARN("Music: stinger '{}' failed to load.", uafPath.string());
+        return;
+    }
+    impl_->StartVoice(audio->pcm.data(), audio->pcm.size(), audio->channels,
+                      audio->sampleRate, audio->bitsPerSample, bus, glm::max(volume, 0.0f),
+                      1.0f, false, nullptr, 1.0f, 30.0f);
+}
+
+void AudioSystem::UpdateMusic(f32 dt) {
+    if (!IsAvailable()) return;
+    const f32 step = dt / glm::max(impl_->musicFade, 0.01f); // gain change this frame
+    for (auto it = impl_->musicLayers.begin(); it != impl_->musicLayers.end();) {
+        Impl::MusicLayerVoice& m = *it;
+        const f32 target = m.fadingOut ? 0.0f : impl_->LayerGain(m);
+        m.current += glm::clamp(target - m.current, -step, step);
+        ma_sound_set_volume(&m.voice.sound, m.current);
+        if (m.fadingOut && m.current <= 0.001f) {
+            ma_sound_uninit(&m.voice.sound);
+            ma_audio_buffer_uninit(&m.voice.buffer);
+            it = impl_->musicLayers.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void AudioSystem::Update() {

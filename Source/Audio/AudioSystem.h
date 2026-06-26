@@ -24,6 +24,7 @@ namespace hbe {
 
 class Scene;
 struct AudioEvent;
+struct MusicGraph;
 
 // One mixer bus. Parentage forms the routing tree under the implicit "Master"
 // root (an empty/unknown parent attaches to Master).
@@ -72,6 +73,30 @@ public:
 
     // Convenience: loads a .uaf Audio asset and plays it.
     bool PlayUAF(const std::filesystem::path& uafPath, const std::string& bus = {});
+
+    // -- Adaptive music director -------------------------------------------------
+    // Interactive music: a graph of STATES (each a set of synced looping LAYERS)
+    // that crossfade, with runtime PARAMETERS that fade layers in/out for a smooth,
+    // gameplay-reactive score. See MusicGraph (.hbmusic).
+    //
+    // Installs the graph (copies it) and resets parameters to their defaults. Stops
+    // any music currently playing. `assetsDir` resolves the layers' `.uaf` stems.
+    void SetMusicGraph(const MusicGraph& graph, const std::filesystem::path& assetsDir);
+    // Crossfades to `state` (its layers loop in sync). `fadeSeconds` < 0 uses the
+    // graph's default fade. An unknown state is ignored (a warning is logged).
+    void PlayMusicState(const std::string& state, f32 fadeSeconds = -1.0f);
+    void StopMusic(f32 fadeSeconds = -1.0f);
+    // Sets a runtime parameter (e.g. "intensity"): layers bound to it fade between
+    // their paramLo/paramHi range. Clamped to the parameter's declared min/max.
+    void SetMusicParameter(const std::string& name, f32 value);
+    f32  MusicParameterValue(const std::string& name) const;
+    std::string CurrentMusicState() const; // "" when stopped
+    bool HasMusicGraph() const;
+    // One-shot musical accent over the current music (fire-and-forget on `bus`).
+    void PostStinger(const std::filesystem::path& uafPath, const std::string& bus = "Music",
+                     f32 volume = 1.0f);
+    // Advances crossfades + applies parameter-driven layer gains; call once a frame.
+    void UpdateMusic(f32 dt);
 
     // Reaps finished voices; call once per frame.
     void Update();

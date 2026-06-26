@@ -8,6 +8,7 @@
 #include "Navigation/GridNav.h"
 #include "Renderer/CameraController.h"
 #include "RHI/RHI.h"
+#include "Assets/MusicGraph.h"
 #include "Scene/Components.h"
 #include "Scene/PaintSystem.h"
 #include "Scene/SceneStreamer.h"
@@ -344,6 +345,16 @@ private:
     // FMOD-style: the "Audio Mixer" panel edits the project's bus tree live;
     // .hbevent assets edit in the Asset Viewer and post through the mixer.
     void DrawAudioMixer(Engine& engine);
+
+    // Adaptive music authoring ("Music" panel): edit a .hbmusic graph (states +
+    // layers + parameters), set it as the project's music, and PREVIEW live - play a
+    // state, drag a parameter and hear the layers fade. Backed by musicEdit_.
+    void DrawMusicEditor(Engine& engine);
+    MusicGraph musicEdit_;            // working copy of the project's music graph
+    std::string musicEditPath_;       // .hbmusic path relative to Assets
+    bool musicLoaded_ = false;        // musicEdit_ synced from the project this session
+    int  musicStateSel_ = 0;          // selected state row
+    bool musicPreviewing_ = false;    // a state is auditioning in the editor
     // Creates Assets/<dir>/NewAudioEvent[N].hbevent and returns its path.
     std::filesystem::path CreateAudioEventAsset(const std::filesystem::path& dir,
                                                 const std::string& name = {});
@@ -536,7 +547,7 @@ private:
         Panel_AssetViewer, Panel_ProjectSettings, Panel_PostProcess,
         Panel_Navigation, Panel_Streaming, Panel_Stats, Panel_Timeline,
         Panel_Scenes, Panel_AudioMixer, Panel_Assets,
-        Panel_ArtEditor, Panel_SchematicEditor,
+        Panel_ArtEditor, Panel_SchematicEditor, Panel_Music,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

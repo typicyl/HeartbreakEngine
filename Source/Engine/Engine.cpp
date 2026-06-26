@@ -8,6 +8,7 @@
 #include "Core/Window.h"
 #include "Game/GameSystems.h"
 #include "Physics/PhysicsWorld.h"
+#include "Assets/MusicGraph.h"
 #include "Project/Project.h"
 #include "Navigation/GridNav.h"
 #include "Scene/AnimationSystem.h"
@@ -543,6 +544,7 @@ int Engine::Run(const EngineConfig& configIn) {
     f32 worldTestT = 0.0f;                 // smoke-test focus-sweep clock
     cam::CameraState cameraState;          // persistent camera smoothing/blend state
     bool prevGameCamEnabled = false;       // rising edge -> snap the camera
+    bool musicStarted = false;             // adaptive music armed while the game runs
 
     while (true) {
         // Roll input edge state, then pump: this frame's events land in `input`.
@@ -666,6 +668,41 @@ int Engine::Run(const EngineConfig& configIn) {
                           renderer.GetCamera().Forward(),
                           physics.IsRunning()); // autoplay only when the game runs
         audio.Update();
+        // Adaptive music: install + start the project's graph on the edge into the
+        // running game; crossfade out when it stops. Parameters/state are then driven
+        // by gameplay (schematics) or the editor's Music panel preview.
+        {
+            const bool running = physics.IsRunning();
+            if (running && !musicStarted) {
+                if (Project::HasActive() && !Project::Active().Settings().musicGraph.empty()) {
+                    const std::filesystem::path assets = Project::Active().AssetsDir();
+                    if (auto g = assets::LoadMusicGraph(
+                            assets / Project::Active().Settings().musicGraph)) {
+                        audio.SetMusicGraph(*g, assets);
+                        const std::string& start = Project::Active().Settings().musicStartState;
+                        audio.PlayMusicState(start.empty() ? g->initialState : start, 0.5f);
+                    }
+                }
+                musicStarted = true;
+            } else if (!running && musicStarted) {
+                audio.StopMusic();
+                musicStarted = false;
+            }
+            // Drain deferred music commands queued by gameplay (schematics): state
+            // changes, parameter sets, and one-shot stingers.
+            if (running) {
+                const std::filesystem::path mAssets =
+                    Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+                std::string st;
+                if (game::ConsumeMusicState(st)) audio.PlayMusicState(st);
+                std::string pn;
+                f32 pv = 0.0f;
+                while (game::ConsumeMusicParameter(pn, pv)) audio.SetMusicParameter(pn, pv);
+                std::string sa;
+                while (game::ConsumeStinger(sa)) audio.PostStinger(mAssets / sa, "Music");
+            }
+            audio.UpdateMusic(dt);
+        }
         renderer.Update(dt);
         // The active game camera (zone-selected or primary) overrides the
         // editor/orbit camera when enabled (play mode and the runtime). Snap

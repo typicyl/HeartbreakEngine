@@ -79,6 +79,12 @@ std::array<NodeDesc, static_cast<usize>(NodeType::Count)> BuildCatalog() {
                                  {EXEC, {"Id", P::String}, {"Text", P::String}}, {EXEC}});
     set(NodeType::CompleteObjective, {"Complete Objective", "Game",
                                       {EXEC, {"Id", P::String}}, {EXEC}});
+    set(NodeType::SetMusicState, {"Set Music State", "Music",
+                                  {EXEC, {"State", P::String}}, {EXEC}});
+    set(NodeType::SetMusicParam, {"Set Music Param", "Music",
+                                  {EXEC, {"Name", P::String}, {"Value", P::Float}}, {EXEC}});
+    set(NodeType::PlayStinger, {"Play Stinger", "Music",
+                                {EXEC, {"Asset", P::String}}, {EXEC}});
     return c;
 }
 } // namespace
@@ -101,6 +107,10 @@ Value DefaultLiteral(NodeType t, u32 inPin, PinType pt) {
     if (t == NodeType::SetObjective && inPin == 1) return Value::Str("obj1");
     if (t == NodeType::SetObjective && inPin == 2) return Value::Str("Reach the goal");
     if (t == NodeType::CompleteObjective && inPin == 1) return Value::Str("obj1");
+    if (t == NodeType::SetMusicState && inPin == 1) return Value::Str("Combat");
+    if (t == NodeType::SetMusicParam && inPin == 1) return Value::Str("intensity");
+    if (t == NodeType::SetMusicParam && inPin == 2) return Value::Float(1.0f);
+    if (t == NodeType::PlayStinger && inPin == 1) return Value::Str("Music/stinger.uaf");
     switch (pt) {
         case PinType::Bool:   return Value::Bool(false);
         case PinType::Vec3:   return Value::Vec3({0.0f, 0.0f, 0.0f});

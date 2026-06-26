@@ -32,6 +32,8 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     s.hudScene = j.value("hudScene", "");
     s.loadingScene = j.value("loadingScene", "");
     s.studioLoadingScene = j.value("studioLoadingScene", "");
+    s.musicGraph = j.value("musicGraph", "");
+    s.musicStartState = j.value("musicStartState", "");
     s.audioBuses.clear();
     if (const auto it = j.find("audioBuses"); it != j.end() && it->is_array()) {
         for (const json& jb : *it) {
@@ -190,6 +192,8 @@ bool Project::Save() const {
     j["hudScene"] = settings_.hudScene;
     j["loadingScene"] = settings_.loadingScene;
     j["studioLoadingScene"] = settings_.studioLoadingScene;
+    j["musicGraph"] = settings_.musicGraph;
+    j["musicStartState"] = settings_.musicStartState;
     j["engine"] = "HeartbreakEngine";
     j["version"] = 1;
     const BuildSettings& b = settings_.build;

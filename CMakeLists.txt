@@ -24,6 +24,7 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/VFS.cpp"
     "Source/Assets/MaterialAsset.cpp"
     "Source/Assets/AudioEvent.cpp"
+    "Source/Assets/MusicGraph.cpp"
     "Source/Assets/AssetLoader.cpp")
 
 set(HBE_SCENE_SOURCES

@@ -132,6 +132,10 @@ struct ProjectSettings {
     EnvironmentSettings environment;
     // The project's audio mixer (empty = engine defaults: Music/SFX/Ambience).
     std::vector<AudioBusSetting> audioBuses;
+    // Adaptive-music graph (.hbmusic, relative to Assets). When set, the runtime
+    // installs it on boot and crossfades into `musicStartState` when the game runs.
+    std::string musicGraph;
+    std::string musicStartState; // state played on game start (empty = graph default)
 };
 
 class Project {

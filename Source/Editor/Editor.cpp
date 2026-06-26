@@ -571,6 +571,7 @@ void Editor::BuildUI(Engine& engine) {
         ImGui::DockBuilderDockWindow("Stats", bottomRight);
         ImGui::DockBuilderDockWindow("Timeline", bottomRight);
         ImGui::DockBuilderDockWindow("Audio Mixer", bottomRight);
+        ImGui::DockBuilderDockWindow("Music", bottomRight);
         ImGui::DockBuilderDockWindow("Streaming", bottomRight);
         ImGui::DockBuilderDockWindow("Viewport", center);
         ImGui::DockBuilderDockWindow("Game", center);
@@ -604,6 +605,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawAssetViewer(engine);
     DrawSceneManager(engine);
     DrawAudioMixer(engine);
+    DrawMusicEditor(engine);
     DrawBuildSettings(engine);
     DrawArtEditor(engine);
     DrawSchematicEditor(engine);
@@ -646,7 +648,7 @@ void Editor::DrawWindowMenu() {
         "Asset Viewer", "Project Settings", "Post Process", "Navigation",
         "Streaming",    "Stats",      "Timeline",    "Scenes",
         "Audio Mixer",  "Assets",     "Art Editor",
-        "Schematic Editor"};
+        "Schematic Editor", "Music"};
     if (artMode_) {
         // Artist build: only the painting-relevant panels are listed/reachable.
         static const Panel kArtPanels[] = {Panel_Viewport, Panel_ArtEditor,
@@ -7092,6 +7094,189 @@ std::filesystem::path Editor::CreateAudioEventAsset(const std::filesystem::path&
     return assets::SaveAudioEvent(p, AudioEvent{}) ? p : std::filesystem::path{};
 }
 
+void Editor::DrawMusicEditor(Engine& engine) {
+    if (!panelOpen_[Panel_Music]) return;
+    AudioSystem& audio = engine.GetAudio();
+    ImGui::Begin("Music", &panelOpen_[Panel_Music]);
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("No project open.");
+        ImGui::End();
+        return;
+    }
+    ProjectSettings& settings = Project::Active().Settings();
+    const std::filesystem::path assets = Project::Active().AssetsDir();
+
+    // Sync the working graph from the project once per session.
+    if (!musicLoaded_) {
+        musicLoaded_ = true;
+        musicEditPath_ = settings.musicGraph;
+        musicEdit_ = MusicGraph{};
+        if (!settings.musicGraph.empty()) {
+            if (auto g = assets::LoadMusicGraph(assets / settings.musicGraph)) musicEdit_ = *g;
+        }
+        if (musicEdit_.parameters.empty()) musicEdit_.parameters.push_back(MusicParameter{});
+    }
+
+    // Small char-buffer InputText helper (the project avoids the std::string backend).
+    const auto editStr = [](const char* label, std::string& s, float width = 0.0f) {
+        char buf[260];
+        std::snprintf(buf, sizeof(buf), "%s", s.c_str());
+        if (width > 0.0f) ImGui::SetNextItemWidth(width);
+        if (ImGui::InputText(label, buf, sizeof(buf))) { s = buf; return true; }
+        return false;
+    };
+
+    // --- Asset + save ---------------------------------------------------------
+    editStr("Asset (.hbmusic)", musicEditPath_);
+    ImGui::SameLine();
+    if (ImGui::Button("Save")) {
+        if (musicEditPath_.empty()) musicEditPath_ = "Music/score.hbmusic";
+        std::error_code ec;
+        std::filesystem::create_directories((assets / musicEditPath_).parent_path(), ec);
+        if (assets::SaveMusicGraph(assets / musicEditPath_, musicEdit_)) {
+            settings.musicGraph = musicEditPath_;
+            settings.musicStartState = musicEdit_.initialState;
+            Project::Active().Save();
+            buildResult_ = "Saved music graph '" + musicEditPath_ + "'.";
+        }
+    }
+    ImGui::SliderFloat("Default fade (s)", &musicEdit_.defaultFade, 0.0f, 10.0f, "%.1f");
+    // Initial state (played when the game starts).
+    if (ImGui::BeginCombo("Start state", musicEdit_.initialState.c_str())) {
+        for (const MusicState& s : musicEdit_.states)
+            if (ImGui::Selectable(s.name.c_str(), s.name == musicEdit_.initialState))
+                musicEdit_.initialState = s.name;
+        ImGui::EndCombo();
+    }
+
+    // --- Parameters -----------------------------------------------------------
+    ImGui::SeparatorText("Parameters (gameplay drives these 0..1 knobs)");
+    int paramRemove = -1;
+    for (int i = 0; i < static_cast<int>(musicEdit_.parameters.size()); ++i) {
+        MusicParameter& p = musicEdit_.parameters[static_cast<usize>(i)];
+        ImGui::PushID(i);
+        editStr("##pname", p.name, 130.0f);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        ImGui::DragFloat("min##p", &p.min, 0.01f);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        ImGui::DragFloat("max##p", &p.max, 0.01f);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::SliderFloat("default##p", &p.defaultValue, p.min, p.max, "%.2f");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X##p")) paramRemove = i;
+        ImGui::PopID();
+    }
+    if (paramRemove >= 0) musicEdit_.parameters.erase(musicEdit_.parameters.begin() + paramRemove);
+    if (ImGui::Button("Add Parameter")) musicEdit_.parameters.push_back(MusicParameter{});
+
+    // --- States + layers ------------------------------------------------------
+    ImGui::SeparatorText("States (sections)");
+    if (ImGui::Button("Add State")) {
+        MusicState s;
+        s.name = "State" + std::to_string(musicEdit_.states.size() + 1);
+        musicEdit_.states.push_back(std::move(s));
+        musicStateSel_ = static_cast<int>(musicEdit_.states.size()) - 1;
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("a state's layers loop together; switching crossfades");
+
+    // State tabs.
+    musicStateSel_ = glm::clamp(musicStateSel_, 0, glm::max(0, static_cast<int>(musicEdit_.states.size()) - 1));
+    for (int i = 0; i < static_cast<int>(musicEdit_.states.size()); ++i) {
+        if (i > 0) ImGui::SameLine();
+        const bool sel = musicStateSel_ == i;
+        if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button((musicEdit_.states[i].name + "##st" + std::to_string(i)).c_str()))
+            musicStateSel_ = i;
+        if (sel) ImGui::PopStyleColor();
+    }
+
+    if (musicStateSel_ < static_cast<int>(musicEdit_.states.size())) {
+        MusicState& st = musicEdit_.states[static_cast<usize>(musicStateSel_)];
+        ImGui::PushID(musicStateSel_ + 1000);
+        editStr("Name##st", st.name, 160.0f);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Delete State")) {
+            musicEdit_.states.erase(musicEdit_.states.begin() + musicStateSel_);
+            ImGui::PopID();
+            ImGui::End();
+            return; // indices shifted; redraw next frame
+        }
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::DragFloat("BPM", &st.bpm, 0.5f, 1.0f, 400.0f, "%.0f");
+
+        ImGui::TextDisabled("Layers (looping stems):");
+        int layerRemove = -1;
+        for (int li = 0; li < static_cast<int>(st.layers.size()); ++li) {
+            MusicLayer& L = st.layers[static_cast<usize>(li)];
+            ImGui::PushID(li);
+            editStr("##lname", L.name, 110.0f);
+            ImGui::SameLine();
+            // Asset: type the path, or drag a .uaf from the Assets panel onto it.
+            editStr("##lasset", L.asset, 180.0f);
+            AssetDropTarget(".uaf", uaf::AssetType::Unknown,
+                            [&](const std::filesystem::path& src) { L.asset = src.generic_string(); });
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(90.0f);
+            ImGui::SliderFloat("vol##l", &L.volume, 0.0f, 1.5f, "%.2f");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("X##l")) layerRemove = li;
+            // Parameter binding: fades this layer in over [lo, hi] of the parameter.
+            ImGui::SetNextItemWidth(120.0f);
+            if (ImGui::BeginCombo("param##l", L.parameter.empty() ? "(always on)" : L.parameter.c_str())) {
+                if (ImGui::Selectable("(always on)", L.parameter.empty())) L.parameter.clear();
+                for (const MusicParameter& p : musicEdit_.parameters)
+                    if (ImGui::Selectable(p.name.c_str(), p.name == L.parameter)) L.parameter = p.name;
+                ImGui::EndCombo();
+            }
+            if (!L.parameter.empty()) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80.0f);
+                ImGui::DragFloat("lo##l", &L.paramLo, 0.01f);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80.0f);
+                ImGui::DragFloat("hi##l", &L.paramHi, 0.01f);
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (layerRemove >= 0) st.layers.erase(st.layers.begin() + layerRemove);
+        if (ImGui::Button("Add Layer")) st.layers.push_back(MusicLayer{});
+        ImGui::PopID();
+    }
+
+    // --- Live preview ---------------------------------------------------------
+    ImGui::SeparatorText("Preview");
+    if (!audio.IsAvailable()) {
+        ImGui::TextDisabled("No audio device.");
+    } else {
+        if (ImGui::Button("Play state") && musicStateSel_ < static_cast<int>(musicEdit_.states.size())) {
+            audio.SetMusicGraph(musicEdit_, assets); // install the working graph
+            audio.PlayMusicState(musicEdit_.states[static_cast<usize>(musicStateSel_)].name);
+            musicPreviewing_ = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Stop")) {
+            audio.StopMusic(0.5f);
+            musicPreviewing_ = false;
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled(musicPreviewing_ ? "(now: %s)" : "(stopped)",
+                            audio.CurrentMusicState().c_str());
+        // Live parameter knobs - drag and hear the layers fade in/out.
+        for (const MusicParameter& p : musicEdit_.parameters) {
+            f32 v = audio.MusicParameterValue(p.name);
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::SliderFloat(p.name.c_str(), &v, p.min, p.max, "%.2f"))
+                audio.SetMusicParameter(p.name, v);
+        }
+    }
+    ImGui::End();
+}
+
 void Editor::DrawAudioMixer(Engine& engine) {
     if (!panelOpen_[Panel_AudioMixer]) return;
     AudioSystem& audio = engine.GetAudio();
@@ -8966,6 +9151,8 @@ void Editor::OnProjectChanged() {
     cpuMeshCache_.clear();  // CPU geometry belongs to the previous project
     paintStrokeOrder_.clear();
     paintStrokeRedo_.clear();
+    musicLoaded_ = false;   // re-sync the music graph from the new project
+    musicPreviewing_ = false;
     brushesLoaded_ = false; // reload the new project's brush library (brushes.json)
     scene::ClearInstantiateCaches();
 

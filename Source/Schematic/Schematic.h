@@ -64,6 +64,9 @@ enum class NodeType : u16 {
     ReachCheckpoint,                         // exec in + Id(string) -> exec (saves)
     SetObjective,                            // exec in + Id + Text(string) -> exec
     CompleteObjective,                       // exec in + Id(string) -> exec
+    SetMusicState,                           // exec in + State(string) -> exec
+    SetMusicParam,                           // exec in + Name(string) + Value(float) -> exec
+    PlayStinger,                             // exec in + Asset(string) -> exec
     Count
 };
 
