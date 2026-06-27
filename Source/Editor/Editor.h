@@ -454,6 +454,7 @@ private:
     void SelectBrush(int index);      // load preset -> working brush + tool defaults
     void DrawBrushEditor();           // preset library + param editor (in Art Editor)
     glm::vec4 brushColor_{0.82f, 0.24f, 0.27f, 1.0f};
+    bool colorPickMode_ = false;      // eyedropper armed: next scene click samples a pixel
     f32  brushRadius_ = 0.35f;        // brush radius (world units)
     f32  brushFlow_ = 0.6f;           // 0..1 paint build-up per stamp
     f32  brushHeight_ = 0.2f;         // relief raised per stamp (impasto)

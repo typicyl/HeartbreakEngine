@@ -1603,6 +1603,15 @@ void Editor::DrawArtEditor(Engine& engine) {
                         ImGuiColorEditFlags_PickerHueWheel |
                             ImGuiColorEditFlags_NoSidePreview |
                             ImGuiColorEditFlags_AlphaBar);
+    // Eyedropper: sample a colour straight off the rendered scene. Arm it, then click
+    // anywhere in the Scene view and that on-screen pixel becomes the brush colour.
+    if (colorPickMode_) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        if (ImGui::Button("Picking - click the scene (Esc to cancel)")) colorPickMode_ = false;
+        ImGui::PopStyleColor();
+    } else if (ImGui::Button("Pick from scene (eyedropper)")) {
+        colorPickMode_ = true;
+    }
 
     // PBR material the brush lays down (when "Paint material" is on).
     ImGui::SeparatorText("Material");
@@ -1844,6 +1853,26 @@ void Editor::DrawArtEditor(Engine& engine) {
 
 void Editor::UpdateArtTool(Engine& engine) {
     paintConsumedClick_ = false;
+    // Eyedropper: while armed, the next left-click in the Scene view grabs that pixel's
+    // on-screen colour (the lit, painted result you see) as the brush colour. Reads the
+    // OS framebuffer at the cursor, so it samples exactly what's displayed.
+    if (colorPickMode_) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) colorPickMode_ = false;
+        if (vpVisible_ && vpHovered_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            POINT pt{};
+            if (::GetCursorPos(&pt)) {
+                HDC dc = ::GetDC(nullptr); // screen DC
+                const COLORREF c = ::GetPixel(dc, pt.x, pt.y);
+                ::ReleaseDC(nullptr, dc);
+                if (c != CLR_INVALID)
+                    brushColor_ = glm::vec4(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
+                                            GetBValue(c) / 255.0f, brushColor_.a);
+            }
+            colorPickMode_ = false;
+            paintConsumedClick_ = true; // don't paint / pick an entity with this click
+        }
+        return; // suppress painting while the eyedropper is armed
+    }
     if (!paintActive_ || !vpVisible_ || freecamActive_) {
         paintStroking_ = false;
         return;
