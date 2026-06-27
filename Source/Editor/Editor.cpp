@@ -465,9 +465,13 @@ void Editor::BuildUI(Engine& engine) {
     {
         const ImGuiIO& io = ImGui::GetIO();
         if (io.KeyCtrl && !io.WantTextInput) {
-            // While the paint tool is active, Ctrl+Z/Y drive the stroke-level
-            // paint history (the scene undo would not capture canvas pixels).
-            const bool paintHistory = paintActive_ && (!paintStrokeOrder_.empty() || !paintStrokeRedo_.empty());
+            // While the *surface* paint tool is active, Ctrl+Z/Y drive the
+            // stroke-level paint history (the scene undo would not capture canvas
+            // pixels). In 3D-stroke mode the strokes are real scene entities, so
+            // undo must route to the scene history instead - otherwise undoing a
+            // 3D stroke would pop a stale surface stroke from a different mode.
+            const bool paintHistory = paintActive_ && !paintStrokeMode_ &&
+                                      (!paintStrokeOrder_.empty() || !paintStrokeRedo_.empty());
             if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
                 SaveAll(engine); // Ctrl+Shift+S: save project + scene
             } else if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
@@ -1096,6 +1100,17 @@ std::string Editor::EnsureRibbonMaterial() {
     return matRel;
 }
 
+// Small deterministic per-stroke depth offset (0..~12mm) so stacked, otherwise-coplanar
+// brush strokes don't z-fight. A high-frequency hash of the stroke centroid means even
+// near-identical positions map to well-separated offsets; being position-derived (not a
+// running counter) it never accumulates into a visible float and is stable across
+// reload/replay.
+static float StrokeDepthJitter(const glm::vec3& seed) {
+    const float s =
+        std::sin(seed.x * 127.1f + seed.y * 311.7f + seed.z * 74.7f) * 43758.5453f;
+    return 0.012f * (s - std::floor(s));
+}
+
 void Editor::SpawnStroke(Engine& engine, const glm::vec3& hitWorld, const glm::vec3& worldNormal) {
     if (!Project::HasActive()) return;
     Scene& scene = engine.GetScene();
@@ -1119,7 +1134,8 @@ void Editor::SpawnStroke(Engine& engine, const glm::vec3& hitWorld, const glm::v
     else if (d < -0.9999f) q = glm::angleAxis(3.14159265f, glm::vec3(1.0f, 0.0f, 0.0f));
     else q = glm::angleAxis(std::acos(d), glm::normalize(glm::cross(up, N)));
     Transform t;
-    t.position = hitWorld + N * 0.02f; // lift slightly off the surface
+    // Lift off the surface + a per-stroke depth nudge so stacked taps don't z-fight.
+    t.position = hitWorld + N * (0.02f + StrokeDepthJitter(hitWorld));
     t.rotation = q;
     t.scale = glm::vec3(brushRadius_ * 2.0f, 1.0f, brushRadius_ * 2.0f);
     reg.emplace<Transform>(e, t);
@@ -1220,7 +1236,13 @@ void Editor::BuildSplineStroke(Engine& engine) {
     const rhi::MeshHandle handle = renderer.UploadMesh(ribbon);
     const entt::entity e = scene.CreateEntity("Stroke");
     Transform t;
-    t.position = centroid;
+    // Per-stroke depth nudge along the draw-plane normal. Every ribbon is lifted the
+    // SAME +0.03 in BuildRibbon, so where several strokes cross they become coplanar
+    // and z-fight. A tiny deterministic offset (high-frequency hash of the centroid,
+    // 0..~12mm) decorrelates their depths so they layer cleanly. Hash-based (not a
+    // counter) so it's stable across reload/replay and never accumulates into a
+    // visible float no matter how many strokes the object carries.
+    t.position = centroid + strokePlaneN_ * StrokeDepthJitter(centroid);
     reg.emplace<Transform>(e, t);
     const std::optional<MaterialAsset> mat =
         matRel.empty() ? std::nullopt : assets::LoadMaterial(assets / matRel);
@@ -1951,6 +1973,12 @@ void Editor::UpdateArtTool(Engine& engine) {
                         planeP = glm::vec3(w * glm::vec4(hit.localPos, 1.0f));
                         const glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(w)));
                         planeN = glm::normalize(nm * hit.localNormal); // surface normal
+                        // RaycastMesh accepts either winding, so the geometric
+                        // normal can point AWAY from the camera. The ribbon lifts
+                        // along +N; if N faces away the stroke is pushed into the
+                        // mesh and "falls through" (gets occluded). Force N to face
+                        // the viewer so the lift always lands in front of the surface.
+                        if (glm::dot(planeN, rd) > 0.0f) planeN = -planeN;
                     }
                 }
             }

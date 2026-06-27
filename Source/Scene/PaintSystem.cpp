@@ -292,7 +292,7 @@ MeshData BuildRibbon(const std::vector<glm::vec3>& pts,
         const f32 taper = glm::smoothstep(0.0f, 0.14f, t) * glm::smoothstep(0.0f, 0.14f, 1.0f - t);
         const f32 w = width * std::max(taper, 0.1f);
         const f32 u = len[i] / wTile;
-        const glm::vec3 lift = N * 0.02f;
+        const glm::vec3 lift = N * 0.03f; // clear the surface (N is forced viewer-facing)
         auto vert = [&](const glm::vec3& pos, f32 vv) {
             Vertex v;
             v.position = pos;
@@ -346,7 +346,7 @@ MeshData BuildRibbon(const std::vector<glm::vec3>& pts,
         const glm::vec3 B = glm::normalize(glm::cross(N, T));
         const f32 w = std::max(halfWidths[i], 0.0f); // taper/jitter already applied
         const f32 u = arcLengthUV ? (len[i] / total) : (len[i] / wTile);
-        const glm::vec3 lift = N * 0.02f;
+        const glm::vec3 lift = N * 0.03f; // clear the surface (N is forced viewer-facing)
         auto vert = [&](const glm::vec3& pos, f32 vv) {
             Vertex v;
             v.position = pos;
