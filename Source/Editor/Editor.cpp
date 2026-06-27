@@ -1075,17 +1075,22 @@ std::string Editor::EnsureRibbonMaterial() {
     MaterialAsset m;
     m.name = "Stroke";
     m.albedoTex = tipRel;
-    // SHADELESS paint: the stroke shows the colour you PICKED regardless of scene
-    // light (like a real paint program), via emissive. The grayscale texture shapes
-    // it (alpha = coverage, rgb = value) and is reused as the emissive map so the
-    // mark glows its own colour; a little albedo keeps it grounded in the scene.
-    m.baseColor = glm::vec4(glm::vec3(brushColor_) * 0.25f, brushColor_.a);
+    // LIT paint: the picked colour is the ALBEDO, so the stroke reacts to the scene -
+    // the sun/lights/IBL shade and tint it and shadows darken it, like any surface.
+    // A small emissive FLOOR (same texture, dim) keeps the paint readable in shadow
+    // or at night so it never crushes to black; lighting dominates above it.
+    m.baseColor = brushColor_; // .a = stroke opacity
     m.metallic = brushMetallic_;
     m.roughness = brushRoughness_;
     m.emissiveTex = tipRel;
-    m.emissiveColor = glm::vec3(brushColor_);
+    m.emissiveColor = glm::vec3(brushColor_) * 0.12f; // self-lit floor
     m.emissiveIntensity = 1.0f;
-    m.flags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow;
+    // NoShadow: free-floating strokes shouldn't cast onto the surface they hover over
+    // (they still RECEIVE the shadowed sun + lights, so they react to lighting).
+    // DepthWrite: the stroke writes depth + velocity so depth of field + TAA treat it
+    // as a real in-focus surface, instead of blurring it where it floats off a surface.
+    m.flags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow |
+              rhi::MaterialFlag_DepthWrite;
     if (!assets::SaveMaterial(assets / matRel, m)) return {};
     strokeMatCache_[sig] = matRel;
     return matRel;
@@ -1229,6 +1234,18 @@ void Editor::BuildSplineStroke(Engine& engine) {
     glm::vec3 mn, mx;
     ComputeBounds(ribbon, mn, mx);
     reg.emplace<AABB>(e, AABB{mn, mx});
+    // Group strokes under one "Paint Strokes" node so they don't clutter the root
+    // hierarchy. Find-or-create by name (reused across strokes + scene reloads); it's
+    // an empty node at the origin, so a child keeps its world position. The whole
+    // group moves/duplicates/hides together and collapses to a single tree row.
+    entt::entity group = entt::null;
+    for (const entt::entity ge : reg.view<Name>())
+        if (reg.get<Name>(ge).value == "Paint Strokes") { group = ge; break; }
+    if (group == entt::null) {
+        group = scene.CreateEntity("Paint Strokes");
+        reg.emplace<Transform>(group, Transform{});
+    }
+    reg.emplace<Parent>(e, Parent{group});
     selected_ = e;
     strokePath_.clear(); strokePathN_.clear();
 }
@@ -2221,6 +2238,12 @@ void Editor::DrawProjectSettings(Engine& engine) {
     ImGui::TextDisabled("Project: %s", ps.name.c_str());
     ImGui::Spacing();
 
+    // Day/Night + Weather are project-global (applied to the scene by
+    // SetupEnvironment / stamped each frame), so they must persist to the .hbproj.
+    // Auto-save when the user finishes an edit (no item active) - matches the AA/GTAO
+    // controls below, and means the day/night state ships in a build without needing
+    // a manual "Save Project" (the bug where dynamic sky worked live but not built).
+    static bool s_skyDirty = false;
     if (ImGui::CollapsingHeader("Day / Night", ImGuiTreeNodeFlags_DefaultOpen)) {
         SceneEnvironment& se = engine.GetScene().Environment();
         ImGui::TextDisabled("Real-time analytic sky; the sun is driven by the time of day.");
@@ -2228,15 +2251,19 @@ void Editor::DrawProjectSettings(Engine& engine) {
         if (ImGui::Checkbox("Dynamic sky (day/night cycle)", &dyn)) {
             env.dynamicSky = dyn ? 1u : 0u;
             se.dynamicSky = env.dynamicSky; // live
+            s_skyDirty = true;
         }
         ImGui::BeginDisabled(!dyn);
         if (ImGui::SliderFloat("Time of Day", &env.timeOfDay, 0.0f, 24.0f, "%.1f h")) {
             se.timeOfDay = env.timeOfDay; // live scrub
             se.dynamicSky = env.dynamicSky;
+            s_skyDirty = true;
         }
         if (ImGui::DragFloat("Day Length (sec)", &env.dayLengthSeconds, 1.0f, 0.0f, 3600.0f,
-                             "%.0f"))
+                             "%.0f")) {
             se.dayLengthSeconds = env.dayLengthSeconds;
+            s_skyDirty = true;
+        }
         ImGui::EndDisabled();
         ImGui::TextDisabled("0 day length = time held; scrub it above. No re-bake needed.");
     }
@@ -2244,16 +2271,30 @@ void Editor::DrawProjectSettings(Engine& engine) {
     if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
         SceneEnvironment& se = engine.GetScene().Environment();
         ImGui::TextDisabled("Procedural cloud layer, sun-lit, drifting over time.");
-        if (ImGui::SliderFloat("Cloud Cover", &env.cloudCoverage, 0.0f, 1.0f, "%.2f"))
+        if (ImGui::SliderFloat("Cloud Cover", &env.cloudCoverage, 0.0f, 1.0f, "%.2f")) {
             se.cloudCoverage = env.cloudCoverage;
-        if (ImGui::SliderFloat("Cloud Density", &env.cloudDensity, 0.0f, 1.0f, "%.2f"))
+            s_skyDirty = true;
+        }
+        if (ImGui::SliderFloat("Cloud Density", &env.cloudDensity, 0.0f, 1.0f, "%.2f")) {
             se.cloudDensity = env.cloudDensity;
-        if (ImGui::SliderFloat("Overcast", &env.overcast, 0.0f, 1.0f, "%.2f"))
+            s_skyDirty = true;
+        }
+        if (ImGui::SliderFloat("Overcast", &env.overcast, 0.0f, 1.0f, "%.2f")) {
             se.overcast = env.overcast;
-        if (ImGui::SliderFloat("Wind Direction", &env.windAngle, 0.0f, 360.0f, "%.0f deg"))
+            s_skyDirty = true;
+        }
+        if (ImGui::SliderFloat("Wind Direction", &env.windAngle, 0.0f, 360.0f, "%.0f deg")) {
             se.windAngle = env.windAngle;
-        if (ImGui::SliderFloat("Wind Speed", &env.windSpeed, 0.0f, 0.2f, "%.3f"))
+            s_skyDirty = true;
+        }
+        if (ImGui::SliderFloat("Wind Speed", &env.windSpeed, 0.0f, 0.2f, "%.3f")) {
             se.windSpeed = env.windSpeed;
+            s_skyDirty = true;
+        }
+    }
+    if (s_skyDirty && !ImGui::IsAnyItemActive()) {
+        Project::Active().Save();
+        s_skyDirty = false;
     }
 
     if (ImGui::CollapsingHeader("Skybox", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -8775,6 +8816,11 @@ bool Editor::BuildShipping(std::string& outMessage) {
         outMessage = "No project open.";
         return false;
     }
+    // Persist the live project settings BEFORE packing - the build packs the
+    // `.hbproj` from disk (below), so anything edited live but not yet saved (e.g.
+    // the Dynamic Sky / day-night toggle, weather, build settings) would otherwise
+    // ship stale. This makes a build always reflect the current editor state.
+    Project::Active().Save();
     namespace fs = std::filesystem;
     std::error_code ec;
     const std::string& name = Project::Active().Settings().name;

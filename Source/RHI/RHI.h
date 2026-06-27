@@ -334,6 +334,11 @@ enum MaterialFlags : u32 {
     MaterialFlag_Hair       = 1u << 3, // anisotropic Kajiya-Kay hair
     MaterialFlag_Transparent= 1u << 4, // alpha-blended transparency pass
     MaterialFlag_NoShadow   = 1u << 5, // excluded from the shadow-casting pass
+    // A "solid" transparent (e.g. a paint stroke): alpha-blended like Transparent,
+    // but WRITES depth + velocity so depth-based post (depth of field, TAA) treats it
+    // as a real in-focus surface instead of inheriting the far-background depth and
+    // blurring where it floats off a surface. Use together with Transparent.
+    MaterialFlag_DepthWrite = 1u << 6,
 };
 
 // One mesh instance to draw with a metallic-roughness material.

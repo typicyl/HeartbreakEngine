@@ -181,15 +181,22 @@ float3 Clouds(float3 dir, float3 sunDir, float coverage, float density, float ti
     alpha = saturate(c * lerp(0.6f, 1.0f, density));
     alpha *= saturate((dir.y - 0.03f) * 3.0f);           // thin out at the horizon
 
-    // Lighting: bright toward the sun (forward scatter / silver lining), darker
-    // base; scaled by daylight so clouds go dark + warm at dusk and at night.
+    // Lighting: bright toward the sun (forward scatter / silver lining) over a
+    // darker base, tinted + dimmed by the sun's elevation. The warm sunset glow is
+    // confined to the horizon band (dusk/dawn); at true night the clouds take a cool
+    // moonlit blue-grey so they don't read as orange against the navy night sky.
     float sunAmt = saturate(dot(dir, sunDir));
     float lit = 0.5f + 0.5f * pow(sunAmt, 4.0f);
-    float day = saturate(sunDir.y * 4.0f + 0.1f);
-    float3 warmSun = lerp(float3(1.0f, 0.55f, 0.3f), float3(1.0f, 0.98f, 0.92f),
-                          saturate(sunDir.y * 3.0f));
+    float elev = sunDir.y;                              // sun elevation (-1..1)
+    float day = saturate(elev * 4.0f + 0.1f);          // 0 night -> 1 day
+    float warmth = saturate(1.0f - abs(elev) * 6.0f);  // glow only near the horizon
+    float3 dayTint   = float3(1.0f, 0.98f, 0.92f);
+    float3 warmTint  = float3(1.0f, 0.55f, 0.30f);     // sunset orange
+    float3 nightTint = float3(0.42f, 0.50f, 0.66f);    // moonlit, cool blue-grey
+    float3 tint = lerp(nightTint, dayTint, day);                // night -> day
+    tint = lerp(tint, warmTint, warmth * (1.0f - 0.5f * day));  // dusk/dawn glow at the horizon
     float3 base = lerp(float3(0.20f, 0.22f, 0.26f), float3(0.95f, 0.96f, 1.0f), lit);
-    float3 col = base * warmSun * (0.15f + 1.1f * day);
+    float3 col = base * tint * (0.12f + 1.1f * day);
     return col;
 }
 

@@ -332,6 +332,7 @@ private:
     VkPipelineLayout      pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline            meshPipeline_ = VK_NULL_HANDLE;       // main MRT pass
     VkPipeline            meshPipelineTransparent_ = VK_NULL_HANDLE; // alpha-blended pass
+    VkPipeline            meshPipelineTransparentDepth_ = VK_NULL_HANDLE; // solid transparent (depth+vel)
     VkPipeline            skyPipeline_ = VK_NULL_HANDLE;        // background pass
     VkPipeline            meshPipelineSingle_ = VK_NULL_HANDLE; // editor preview (single color)
     VkPipeline            skyPipelineSingle_ = VK_NULL_HANDLE;  // editor preview sky
@@ -1620,6 +1621,15 @@ bool VulkanDevice::CreateMeshPipeline() {
                                       &meshPipelineTransparent_) != VK_SUCCESS) {
             HBE_WARN("[Vulkan] Transparent mesh pipeline failed; transparency disabled.");
             meshPipelineTransparent_ = VK_NULL_HANDLE;
+        }
+        // "Solid transparent" variant (MaterialFlag_DepthWrite, e.g. paint strokes):
+        // same alpha blend but WRITES depth + velocity so DoF/TAA treat the stroke as a
+        // real in-focus surface (no off-surface blur). G-buffer (tcba[1]) stays masked.
+        tcba[2].colorWriteMask = rgba; // velocity
+        tds.depthWriteEnable = VK_TRUE;
+        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &tp, nullptr,
+                                      &meshPipelineTransparentDepth_) != VK_SUCCESS) {
+            meshPipelineTransparentDepth_ = VK_NULL_HANDLE;
         }
 
         // Particle billboards: own VS/PS + vertex layout, world-space, depth-test
@@ -3493,8 +3503,22 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
                 const f32 db = glm::distance(glm::vec3(items[b].transform[3]), view.cameraPos);
                 return da > db; // farthest first
             });
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipelineTransparent_);
-            for (u32 idx : tlist) drawItem(idx);
+            VkPipeline cur = meshPipelineTransparent_;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, cur);
+            for (u32 idx : tlist) {
+                // Solid transparents (paint strokes) use the depth-writing variant so
+                // DoF/TAA keep them sharp where they float off a surface.
+                const VkPipeline want =
+                    (meshPipelineTransparentDepth_ != VK_NULL_HANDLE &&
+                     (items[idx].materialFlags & MaterialFlag_DepthWrite))
+                        ? meshPipelineTransparentDepth_
+                        : meshPipelineTransparent_;
+                if (want != cur) {
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+                    cur = want;
+                }
+                drawItem(idx);
+            }
         }
     }
 
@@ -4240,6 +4264,8 @@ VulkanDevice::~VulkanDevice() {
     if (skyPipeline_) vkDestroyPipeline(device_, skyPipeline_, nullptr);
     if (meshPipeline_) vkDestroyPipeline(device_, meshPipeline_, nullptr);
     if (meshPipelineTransparent_) vkDestroyPipeline(device_, meshPipelineTransparent_, nullptr);
+    if (meshPipelineTransparentDepth_)
+        vkDestroyPipeline(device_, meshPipelineTransparentDepth_, nullptr);
     if (skyPipelineSingle_) vkDestroyPipeline(device_, skyPipelineSingle_, nullptr);
     if (meshPipelineSingle_) vkDestroyPipeline(device_, meshPipelineSingle_, nullptr);
     if (pipelineLayout_) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);

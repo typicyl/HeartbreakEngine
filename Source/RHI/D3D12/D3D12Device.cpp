@@ -348,6 +348,7 @@ private:
     ComPtr<ID3D12RootSignature> meshRootSig_;
     ComPtr<ID3D12PipelineState> meshPSO_;       // main HDR pass (MRT: color+gbuffer+velocity)
     ComPtr<ID3D12PipelineState> meshPSOTransparent_; // alpha-blended pass (depth-write off)
+    ComPtr<ID3D12PipelineState> meshPSOTransparentDepth_; // solid transparent: depth+velocity write
     ComPtr<ID3D12PipelineState> skyPSO_;        // background pass (shares meshRootSig_)
     ComPtr<ID3D12PipelineState> meshPSOSingle_; // single-RT variant (editor preview)
     ComPtr<ID3D12PipelineState> skyPSOSingle_;  // single-RT sky (editor preview)
@@ -1371,6 +1372,17 @@ bool D3D12Device::CreateMeshPipeline() {
         if (FAILED(device_->CreateGraphicsPipelineState(&tp, IID_PPV_ARGS(&meshPSOTransparent_)))) {
             HBE_WARN("[D3D12] Transparent mesh pipeline failed; transparency disabled.");
             meshPSOTransparent_.Reset();
+        }
+        // "Solid transparent" variant (MaterialFlag_DepthWrite, e.g. paint strokes):
+        // identical alpha blend but WRITES depth (+ velocity for TAA) so DoF/TAA treat
+        // the stroke as a real in-focus surface instead of the far background. The
+        // G-buffer stays masked (kept out of SSR/AO).
+        tp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        if (postPipelinesReady_)
+            tp.BlendState.RenderTarget[2].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(device_->CreateGraphicsPipelineState(
+                &tp, IID_PPV_ARGS(&meshPSOTransparentDepth_)))) {
+            meshPSOTransparentDepth_.Reset();
         }
     }
 
@@ -2812,8 +2824,21 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
                 const f32 db = glm::distance(glm::vec3(items[b].transform[3]), view.cameraPos);
                 return da > db; // farthest first
             });
-            cmdList_->SetPipelineState(meshPSOTransparent_.Get());
-            for (u32 idx : tlist) drawItem(idx);
+            ID3D12PipelineState* cur = meshPSOTransparent_.Get();
+            cmdList_->SetPipelineState(cur);
+            for (u32 idx : tlist) {
+                // Solid transparents (paint strokes) use the depth-writing variant so
+                // DoF/TAA keep them sharp where they float off a surface.
+                ID3D12PipelineState* want =
+                    (meshPSOTransparentDepth_ && (items[idx].materialFlags & MaterialFlag_DepthWrite))
+                        ? meshPSOTransparentDepth_.Get()
+                        : meshPSOTransparent_.Get();
+                if (want != cur) {
+                    cmdList_->SetPipelineState(want);
+                    cur = want;
+                }
+                drawItem(idx);
+            }
         }
     }
 

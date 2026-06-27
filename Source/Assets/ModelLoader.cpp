@@ -10,6 +10,9 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -93,7 +96,7 @@ Material ConvertMaterial(const aiMaterial* src) {
     return mat;
 }
 
-MeshData ConvertMesh(const aiMesh* src, const aiScene* scene) {
+MeshData ConvertMesh(const aiMesh* src, const aiScene* scene, bool flipV) {
     MeshData mesh;
     mesh.name = src->mName.C_Str();
     mesh.vertices.reserve(src->mNumVertices);
@@ -115,11 +118,18 @@ MeshData ConvertMesh(const aiMesh* src, const aiScene* scene) {
             // w = handedness so the shader rebuilds the right bitangent
             // (cross(N,T) * w). Mirrored UVs flip it; hardcoding +1 broke their
             // normal maps. Compare Assimp's bitangent to the reconstructed one.
-            const f32 w = glm::dot(glm::cross(v.normal, t), b) < 0.0f ? -1.0f : 1.0f;
+            f32 w = glm::dot(glm::cross(v.normal, t), b) < 0.0f ? -1.0f : 1.0f;
+            // Flipping V (below) mirrors the bitangent, so flip handedness with it -
+            // otherwise normal maps light inverted on FBX/OBJ imports.
+            if (flipV) w = -w;
             v.tangent = glm::vec4(t, w);
         }
         if (hasUVs) {
-            v.uv = {src->mTextureCoords[0][i].x, src->mTextureCoords[0][i].y};
+            const f32 vy = src->mTextureCoords[0][i].y;
+            // This engine samples textures top-left (V-down), like glTF. FBX/OBJ
+            // author UVs bottom-left (V-up), so flip V or the texture maps upside-
+            // down (a Mixamo character's atlas lands scrambled).
+            v.uv = {src->mTextureCoords[0][i].x, flipV ? 1.0f - vy : vy};
         }
         mesh.vertices.push_back(v);
     }
@@ -323,6 +333,14 @@ std::optional<Model> LoadModel(const std::string& path, Rig* outRig,
         animated = scene->mMeshes[i]->HasBones();
     }
 
+    // Texture-coordinate origin: the engine samples top-left (V-down), which glTF
+    // already uses, but FBX/OBJ/DAE/etc. author V-up (bottom-left). Flip V on those
+    // so imported textures (e.g. a Mixamo character's atlas) map the right way up.
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    const bool flipV = !(ext == ".gltf" || ext == ".glb");
+
     // Build the rig up front when present. We deliberately do NOT use
     // aiProcess_PreTransformVertices: instead we walk the node hierarchy and
     // bake each node's global transform into its (non-skinned) meshes ourselves.
@@ -355,7 +373,7 @@ std::optional<Model> LoadModel(const std::string& path, Rig* outRig,
         const glm::mat4 global = parent * ToGlm(node->mTransformation);
         for (u32 i = 0; i < node->mNumMeshes; ++i) {
             const aiMesh* src = scene->mMeshes[node->mMeshes[i]];
-            MeshData mesh = ConvertMesh(src, scene);
+            MeshData mesh = ConvertMesh(src, scene, flipV);
             if (!mesh.Empty()) {
                 if (animated && src->HasBones()) {
                     // Skinned: vertices stay in bind space; the joint palette
