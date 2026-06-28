@@ -545,6 +545,9 @@ int Engine::Run(const EngineConfig& configIn) {
     cam::CameraState cameraState;          // persistent camera smoothing/blend state
     bool prevGameCamEnabled = false;       // rising edge -> snap the camera
     bool musicStarted = false;             // adaptive music armed while the game runs
+    f32 dtSmooth = 0.0f;                   // EMA of frame delta (motion smoothing)
+    f32 winMaxDt = 0.0f;                   // worst frame in the current report window
+    u32 winJank = 0;                       // frames slower than 45 FPS this window
 
     while (true) {
         // Roll input edge state, then pump: this frame's events land in `input`.
@@ -552,16 +555,33 @@ int Engine::Run(const EngineConfig& configIn) {
         if (!window.PumpMessages()) break;
 
         const auto now = clock::now();
-        const f32 dt = std::chrono::duration<f32>(now - last).count();
+        f32 rawDt = std::chrono::duration<f32>(now - last).count();
         last = now;
+        // Frame pacing. A stall (asset/PSO upload, window drag, a missed vsync) yields a
+        // huge delta that would teleport physics/animation/camera; clamp it so a hitch
+        // briefly slows time instead of jolting. Then lightly smooth (EMA) so per-frame
+        // jitter - vsync beat, measurement noise - doesn't make motion shimmer. The raw
+        // value still feeds the stability counters below so spikes stay visible.
+        winMaxDt = glm::max(winMaxDt, rawDt);
+        if (rawDt > 1.0f / 45.0f) ++winJank;
+        rawDt = glm::clamp(rawDt, 0.0f, 0.1f); // <= 100 ms floor (never < 10 FPS of sim)
+        dtSmooth = (dtSmooth <= 0.0f) ? rawDt : glm::mix(dtSmooth, rawDt, 0.2f);
+        const f32 dt = dtSmooth;
         dt_ = dt;
 
         // Periodic FPS report.
         if (++fpsFrames >= 1) {
             const f32 elapsed = std::chrono::duration<f32>(now - fpsLast).count();
             if (elapsed >= 2.0f) {
-                HBE_INFO("Perf: {:.1f} FPS ({:.2f} ms/frame)", fpsFrames / elapsed,
-                         1000.0f * elapsed / fpsFrames);
+                // Average AND worst-case: an average alone hides stutter. "worst" is
+                // the single slowest frame in the window; "jank" counts frames under
+                // 45 FPS - both > 0 with a smooth average means uneven pacing.
+                HBE_INFO("Perf: {:.1f} FPS avg ({:.2f} ms) | worst {:.1f} ms | {} jank "
+                         "frame(s) <45 FPS",
+                         fpsFrames / elapsed, 1000.0f * elapsed / fpsFrames,
+                         1000.0f * winMaxDt, winJank);
+                winMaxDt = 0.0f;
+                winJank = 0;
                 if (streamingWorld.Active()) {
                     const StreamingWorld::Stats st = streamingWorld.GetStats();
                     HBE_INFO("Streaming: {}/{} cells loaded, {} loading, {} entities "

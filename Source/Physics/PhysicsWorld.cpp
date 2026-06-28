@@ -421,7 +421,13 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
 
             cv->SetLinearVelocity(
                 JPH::Vec3(cc.desiredVelocity.x, cc.velocityY, cc.desiredVelocity.z));
-            cv->ExtendedUpdate(kStep, JPH::Vec3(0.0f, -cc.gravity, 0.0f), charUpdate,
+            // Stair step-up MUST scale with the capsule. Jolt's default (0.4 m) is
+            // ~half a 1-unit player, so moving into the smallest contact "steps it up"
+            // and it floats away. Cap the step to a fraction of the capsule radius.
+            JPH::CharacterVirtual::ExtendedUpdateSettings cu = charUpdate;
+            cu.mWalkStairsStepUp =
+                JPH::Vec3(0.0f, glm::clamp(cc.radius * 0.75f, 0.04f, 0.4f), 0.0f);
+            cv->ExtendedUpdate(kStep, JPH::Vec3(0.0f, -cc.gravity, 0.0f), cu,
                                charBpFilter, charObjFilter, charBodyFilter, charShapeFilter,
                                impl_->tempAlloc);
             cc.grounded =

@@ -25,7 +25,10 @@ MeshData GenerateCone(f32 radius = 0.5f, f32 height = 1.0f, u32 segments = 24);
 
 // Capsule along Y (cylinder + two hemispheres), centered. `height` is the TOTAL
 // height (so the cylindrical mid-section is height - 2*radius, clamped >= 0).
-MeshData GenerateCapsule(f32 radius = 0.5f, f32 height = 2.0f, u32 segments = 24,
+// Defaults to a 1-unit-tall pill so it shares the same base size as the cube /
+// sphere / cylinder / cone / plane (all 1 unit at scale 1) - scale it up for a
+// humanoid (the Player preset uses scale 2 = the classic 2-unit character).
+MeshData GenerateCapsule(f32 radius = 0.25f, f32 height = 1.0f, u32 segments = 24,
                          u32 rings = 8);
 
 // Torus in the XZ plane around +Y. `major` = ring radius, `minor` = tube radius.

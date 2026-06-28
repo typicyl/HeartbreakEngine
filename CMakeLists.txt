@@ -173,6 +173,18 @@ endfunction()
 # ---------------------------------------------------------------------------
 # Libraries
 # ---------------------------------------------------------------------------
+# The fiber job system migrates fibers between worker threads, which read
+# thread_local state (t_scheduler / t_active) across SwitchToFiber. Without /GT
+# the optimizer caches the TLS slot address in a register; after a fiber resumes
+# on a DIFFERENT thread that cached address is stale, so it switches into a fiber
+# already running elsewhere -> stack corruption (access violation that even
+# defeats SEH). /GT = MSVC fiber-safe TLS: re-fetch TLS per access. Debug doesn't
+# cache TLS, which is why only optimized builds crashed.
+if(MSVC)
+    set_source_files_properties("Source/Core/JobSystem.cpp"
+                                PROPERTIES COMPILE_OPTIONS "/GT")
+endif()
+
 add_library(hbe STATIC ${HBE_RUNTIME_SOURCES})
 add_library(HBE::Runtime ALIAS hbe)
 hbe_configure_engine_lib(hbe 0)

@@ -4182,9 +4182,13 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
         // that follows it. Instant playable movement (press Play, WASD/stick).
         if (ImGui::MenuItem("Player (Character)")) {
             PushUndo(scene);
-            MeshData md = mesh::GeneratePrimitive("capsule"); // spans y in [-1, 1]
+            // A 1-unit capsule at scale 1 (same base size as every other primitive -
+            // no weird x2 scale, and it reads smaller than a 2x-scaled wall). Bottom
+            // sits on the floor: prim spans y[-0.5,0.5], +0.5 position -> [0,1].
+            // Want a taller character? Scale it up (and match the controller below).
+            MeshData md = mesh::GeneratePrimitive("capsule");
             const entt::entity e = scene.CreateEntity("Player");
-            reg.emplace<Transform>(e, Transform{{0.0f, 1.0f, 0.0f}});
+            reg.emplace<Transform>(e, Transform{{0.0f, 0.5f, 0.0f}});
             if (!md.vertices.empty()) {
                 MeshInstance mi;
                 mi.mesh = renderer.UploadMesh(md);
@@ -4197,8 +4201,12 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
                 reg.emplace<AABB>(e, AABB{bmin, bmax});
             }
             CharacterController cc;
-            cc.radius = 0.5f; // match the capsule prim (r 0.5, total height 2)
-            cc.height = 2.0f;
+            // Collision is in WORLD units (built directly from these, NOT transform-
+            // scaled), so match the 1-unit mesh exactly - otherwise the visible
+            // capsule floats above / sinks into its collision capsule.
+            cc.radius = 0.25f;
+            cc.height = 1.0f;
+            cc.turnSpeed = 8.0f; // gentler body turn -> the follow-cam swings less
             reg.emplace<CharacterController>(e, cc);
 
             // A ground to stand on (thin static box, top at y=0). Delete it if
@@ -4232,12 +4240,21 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
             for (const entt::entity other : reg.view<CameraComponent>())
                 reg.get<CameraComponent>(other).primary = false;
             const entt::entity cam = scene.CreateEntity("Player Camera");
-            reg.emplace<Transform>(cam, Transform{{0.0f, 3.0f, 8.0f}});
+            reg.emplace<Transform>(cam, Transform{{0.0f, 1.2f, 4.0f}});
             CameraComponent c;
             c.mode = CameraComponent::Mode::ThirdPerson;
             c.rotation = CameraComponent::RotationMode::SlowFollow;
             c.target = "Player";
             c.primary = true;
+            // Sized + damped for a 1-unit player. The default offset (1.7m eye height)
+            // and distance 6 are for a 2m human and would frame empty air above a
+            // 1-unit capsule; look at its upper body from closer in. Lower damping =
+            // a softer, less "whiplash" follow when the player turns to face movement.
+            c.offset = {0.0f, 0.6f, 0.0f};
+            c.distance = 4.0f;
+            c.pitch = 12.0f;
+            c.positionDamping = 5.0f;  // was 10 (snappy)
+            c.rotationDamping = 3.5f;  // was 8  (snappy aim swing)
             reg.emplace<CameraComponent>(cam, c);
             selected_ = e;
         }
@@ -8052,14 +8069,34 @@ void Editor::DrawAssetViewer(Engine& engine) {
         }
 
         ImGui::SeparatorText("Texture maps");
+        // One filter buffer is enough: only a single combo popup is ever open at once.
+        static char texFilter[64] = "";
+        const auto texMatches = [](const std::string& choice, const char* filter) {
+            if (!filter[0]) return true;
+            std::string h = choice, n = filter;
+            std::transform(h.begin(), h.end(), h.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::transform(n.begin(), n.end(), n.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return h.find(n) != std::string::npos;
+        };
         const auto texPicker = [&](const char* label, std::string& ref) {
             const std::string current = ref.empty() ? "(none)" : ref;
             if (ImGui::BeginCombo(label, current.c_str())) {
+                // A search box at the top of the list (texture libraries get large).
+                // Reset + focus it each time this picker opens so you can just type.
+                if (ImGui::IsWindowAppearing()) {
+                    texFilter[0] = '\0';
+                    ImGui::SetKeyboardFocusHere();
+                }
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                ImGui::InputTextWithHint("##texfilter", "Search...", texFilter, sizeof(texFilter));
                 if (ImGui::Selectable("(none)", ref.empty())) {
                     ref.clear();
                     edited = true;
                 }
                 for (const std::string& choice : texChoices) {
+                    if (!texMatches(choice, texFilter)) continue;
                     if (ImGui::Selectable(choice.c_str(), choice == ref)) {
                         ref = choice;
                         edited = true;

@@ -21,8 +21,10 @@ float4 PSMain(FSOutput input) : SV_Target
     velocity = clamp(velocity, -maxLen, maxLen);
     if (dot(velocity, velocity) < 1e-9f) return float4(color, 1.0f);
 
-    // Average symmetric taps along the velocity vector.
-    const int kTaps = 12;
+    // Average symmetric taps along the velocity vector. 8 reads nearly the same as
+    // 12 but is ~1/3 cheaper - this pass only runs when the camera/objects MOVE
+    // (still camera early-outs above), so its taps are the on-motion FPS dip.
+    const int kTaps = 8;
     float3 sum = color;
     float weight = 1.0f;
     [unroll]

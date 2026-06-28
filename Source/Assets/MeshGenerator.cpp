@@ -338,7 +338,7 @@ MeshData GeneratePrimitive(const std::string& name) {
     if (name == "plane") return GeneratePlane(1.0f, 1);
     if (name == "cylinder") return GenerateCylinder(0.5f, 1.0f, 24);
     if (name == "cone") return GenerateCone(0.5f, 1.0f, 24);
-    if (name == "capsule") return GenerateCapsule(0.5f, 2.0f, 24, 8);
+    if (name == "capsule") return GenerateCapsule(0.25f, 1.0f, 24, 8); // 1-unit pill, like the rest
     if (name == "torus") return GenerateTorus(0.5f, 0.2f, 32, 16);
     return {};
 }

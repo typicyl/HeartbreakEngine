@@ -556,7 +556,16 @@ json BuildSubtreeJson(const Scene& scene, entt::entity root) {
             if (pp && static_cast<u32>(pp->entity) == key) stack.push_back(c);
         }
     }
-    for (const entt::entity e : order) arr.push_back(EntityToJson(reg, e, indexOf));
+    for (const entt::entity e : order) {
+        json je = EntityToJson(reg, e, indexOf);
+        // Preserve each entity's level layer (Static/Dynamic) so copy/paste, duplicate
+        // and prefab instancing keep the same layer instead of being re-auto-classified
+        // on paste. (sceneSrc is deliberately NOT copied - a clone belongs to whatever
+        // scene it is pasted into, but it should stay on the layer it was authored on.)
+        if (const SceneLayer* sl = reg.try_get<SceneLayer>(e))
+            je["sceneLayer"] = ToString(sl->kind);
+        arr.push_back(std::move(je));
+    }
     return doc;
 }
 

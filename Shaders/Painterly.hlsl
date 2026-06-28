@@ -75,8 +75,12 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float levels = gPostParams2.y;
 
     const float3 orig = FetchHDR(gInput0, uv);
-    const float dc = SamplePost(gInput2, uv).r;              // centre depth
-    const float3 nc = OctDecode(SamplePost(gInput1, uv).rg); // centre normal
+    // Silhouette edge-stopping only matters when edgeKeep > 0; at edgeKeep == 0 the
+    // per-tap depth weight is multiplied out (lerp t=0), so skip the centre + per-tap
+    // depth samples and their exp() entirely. edgeKeep is a uniform, so this branch is
+    // coherent across the whole pass (free) and the output is identical.
+    const bool useEdge = edgeKeep > 0.001f;
+    const float dc = useEdge ? SamplePost(gInput2, uv).r : 0.0f; // centre depth
 
     // Stroke length scale in pixels (the slider reads 1..7; paint wants real size).
     const float px = size * 3.0f;
@@ -114,10 +118,19 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float kSector = 8.0f / 6.2831853f;
     const float depthEdge = 700.0f * (0.15f + edgeKeep); // higher = stricter silhouettes
 
-    const int STEPS = 5;                 // 11x11 grid; ~90 taps (strokes cover the base)
+    // 9x9 grid (~64 disc taps). The Kuwahara output is smooth, so dropping from an
+    // 11x11 grid is nearly invisible but ~1/3 cheaper. Each tap also samples ONE
+    // texture (HDR colour) + depth; the per-tap NORMAL sample was removed - depth
+    // discontinuity alone stops strokes at silhouettes (different objects differ in
+    // depth), which is what made this pass cost ~5 ms fullscreen.
+    // UNROLLED: the grid cell `e`, its `r2`, the spatial weight exp(-2*r2), the
+    // disc cull and the sector atan2 are all CELL-CONSTANT (same for every pixel),
+    // so unrolling lets the compiler fold them to literals - ~64 atan2 + ~64 exp per
+    // pixel vanish, and `sec` becomes a static index. Identical output, big ALU cut.
+    const int STEPS = 4;
     const float inv = 1.0f / STEPS;
-    [loop] for (int gyi = -STEPS; gyi <= STEPS; ++gyi) {
-        [loop] for (int gxi = -STEPS; gxi <= STEPS; ++gxi) {
+    [unroll] for (int gyi = -STEPS; gyi <= STEPS; ++gyi) {
+        [unroll] for (int gxi = -STEPS; gxi <= STEPS; ++gxi) {
             const float2 e = float2(gxi, gyi) * inv; // [-1,1]^2
             const float r2 = dot(e, e);
             if (r2 > 1.0f) continue;
@@ -126,14 +139,15 @@ float4 PSMain(FSOutput input) : SV_Target {
             const float2 suv = uv + off * d;
             const float3 c = FetchHDR(gInput0, suv);
 
-            // Don't pull colour across a silhouette: weight by depth proximity +
-            // normal agreement to the centre pixel (lost & found edges).
-            const float ds = SamplePost(gInput2, suv).r;
-            const float3 ns = OctDecode(SamplePost(gInput1, suv).rg);
-            const float wDepth = exp(-depthEdge * abs(ds - dc));
-            const float wNorm = saturate(dot(ns, nc) * 0.5f + 0.5f);
-            const float wEdge = lerp(1.0f, wDepth * wNorm, edgeKeep);
-
+            // Don't pull colour across a silhouette: weight by depth proximity to
+            // the centre pixel (lost & found edges). Only when edgeKeep > 0 - else the
+            // sample + exp are skipped (see useEdge above). Depth alone catches object
+            // boundaries; the old per-tap normal sample was dropped for cost.
+            float wEdge = 1.0f;
+            if (useEdge) {
+                const float ds = SamplePost(gInput2, suv).r;
+                wEdge = lerp(1.0f, exp(-depthEdge * abs(ds - dc)), edgeKeep);
+            }
             const float w = exp(-2.0f * r2) * wEdge + 1e-5f;
             const float nl = NLuma(c);
             const int sec = clamp((int)floor((atan2(e.y, e.x) + kPI) * kSector), 0, 7);
