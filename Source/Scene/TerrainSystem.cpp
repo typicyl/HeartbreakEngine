@@ -87,7 +87,9 @@ MeshData BuildChunk(const TerrainComponent& t, u32 cx, u32 cz) {
             v.position = {wx, h, wz};
             v.normal = glm::normalize(glm::vec3(hl - hr, 2.0f * step, hd - hu));
             v.tangent = {1.0f, 0.0f, 0.0f, 1.0f};
-            v.uv = {wx / t.chunkSize, wz / t.chunkSize};
+            // Terrain-wide UV (whole terrain -> [0,1]^2) so ONE paint canvas on the
+            // terrain entity maps seamlessly across every chunk (material painting).
+            v.uv = {(wx + total * 0.5f) / total, (wz + total * 0.5f) / total};
             m.vertices.push_back(v);
         }
     }
@@ -173,6 +175,18 @@ void Update(Scene& scene, Renderer& renderer) {
                 reg.emplace<AABB>(ce, AABB{bmin, bmax});
                 reg.emplace<Parent>(ce, Parent{e});
                 reg.emplace<TerrainChunk>(ce, TerrainChunk{cx, cz});
+
+                // Static triangle-mesh collider so characters/physics walk on the
+                // terrain. Geometry is the chunk mesh (local space, identity chunk
+                // transform -> the parent terrain's world places it); rebuilt with the
+                // chunk each time the heightmap is sculpted, so collision tracks shape.
+                RigidBody rb;
+                rb.shape = RigidBody::Shape::Mesh;
+                rb.motion = RigidBody::Motion::Static;
+                rb.collisionVertices.reserve(md.vertices.size());
+                for (const Vertex& v : md.vertices) rb.collisionVertices.push_back(v.position);
+                rb.collisionIndices = md.indices;
+                reg.emplace<RigidBody>(ce, rb);
             }
         }
         reg.get<TerrainComponent>(e).dirty = false;

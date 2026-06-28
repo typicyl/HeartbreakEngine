@@ -186,6 +186,15 @@ bool SaveScene(const Scene& scene, const std::filesystem::path& path,
 bool LoadScene(Scene& scene, Renderer& renderer, const std::filesystem::path& path,
                LoadMode mode = LoadMode::Replace);
 
+// Build-time level split: reads a merged scene file and writes <base>.static.hbscene +
+// <base>.dynamic.hbscene partitioned by each entity's per-object Static/Dynamic tag
+// (default Static), so the editor authors ONE scene while the runtime keeps its
+// two-file level loader. JSON-level (no GPU); returns true only if the source had both
+// layers. See [[heartbreak-engine-levels]] merge.
+bool SplitSceneFile(const std::filesystem::path& src,
+                    const std::filesystem::path& staticOut,
+                    const std::filesystem::path& dynamicOut);
+
 // --- Levels (Naughty-Dog-style static / dynamic / UI split) -----------------
 // A level is three sibling scene files sharing a base name:
 //   <base>.static.hbscene   <base>.dynamic.hbscene   <base>.ui.hbscene

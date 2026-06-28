@@ -300,11 +300,14 @@ void UpdateMotionMatching(Scene& scene, const std::filesystem::path& assetsDir, 
         if (db->empty()) continue;
         mm.dbKey = reinterpret_cast<u64>(rig.get());
 
-        // Desired ground velocity: a NavigationAgent's velocity, else the field
-        // a script/inspector set.
+        // Desired ground velocity drives the locomotion match. Auto-source it from
+        // whatever moves this entity: a NavigationAgent (AI) or a CharacterController
+        // (the player) - so a skinned player animates straight from its movement.
+        // Else use the field a script/inspector set.
         glm::vec3 dv = mm.desiredVelocity;
         if (mm.useNavVelocity) {
             if (const NavigationAgent* na = reg.try_get<NavigationAgent>(e)) dv = na->velocity;
+            else if (const CharacterController* cc = reg.try_get<CharacterController>(e)) dv = cc->desiredVelocity;
         }
         const f32 desiredSpeed = glm::length(glm::vec2(dv.x, dv.z));
 

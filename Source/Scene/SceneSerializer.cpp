@@ -19,7 +19,9 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace hbe::scene {
 
@@ -516,15 +518,16 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                {"playing", a->playing},
                                {"keys", std::move(keys)}};
         }
-        // Runtime-only tags (in-memory snapshots: play mode, undo/redo). NOT
-        // written to on-disk scene files, which are partitioned per SceneSource;
-        // here they preserve the level-layer grouping across a snapshot restore
-        // so entities don't lose their scene/layer and get re-shuffled.
+        // Per-object Static/Dynamic layer is authored INTO the one scene file (the
+        // editor works in a single scene; the build splits .static/.dynamic from
+        // these tags). Always written on disk now, not just snapshots.
+        if (const SceneLayer* sl = reg.try_get<SceneLayer>(e))
+            je["sceneLayer"] = ToString(sl->kind);
+        // SceneSource (which FILE an entity belongs to) stays snapshot-only: it's a
+        // load-time partition tag, meaningless inside a single authored scene.
         if (runtimeTags) {
             if (const SceneSource* ss = reg.try_get<SceneSource>(e); ss && !ss->scene.empty())
                 je["sceneSrc"] = ss->scene;
-            if (const SceneLayer* sl = reg.try_get<SceneLayer>(e))
-                je["sceneLayer"] = ToString(sl->kind);
         }
     return je;
 }
@@ -950,6 +953,68 @@ bool SaveScene(const Scene& scene, const fs::path& path,
     out << root.dump(2);
     HBE_INFO("Scene: saved {} entities to '{}'.", root["entities"].size(), path.string());
     return true;
+}
+
+bool SplitSceneFile(const fs::path& src, const fs::path& staticOut, const fs::path& dynamicOut) {
+    // The editor authors ONE merged scene; the build splits it into the two layer
+    // files the runtime's level loader expects. Done at the JSON level (no GPU /
+    // instantiate): partition entities by their "sceneLayer" tag (default static) and
+    // REMAP parent indices per partition. A tagged subtree shares one layer (the
+    // Inspector toggle tags whole subtrees), so a parent is always in the same file;
+    // any cross-layer parent gracefully becomes a root. Returns true only when the
+    // source actually had BOTH layers (otherwise it's a plain scene, no split needed).
+    std::ifstream in(src, std::ios::binary);
+    if (!in) return false;
+    json doc;
+    try {
+        in >> doc;
+    } catch (...) {
+        return false;
+    }
+    if (!doc.contains("entities") || !doc["entities"].is_array()) return false;
+    const json& ents = doc["entities"];
+    const auto isDynamic = [](const json& e) {
+        return e.value("sceneLayer", std::string("static")) == "dynamic";
+    };
+    int nStatic = 0, nDynamic = 0;
+    for (const json& e : ents) (isDynamic(e) ? nDynamic : nStatic)++;
+    if (nStatic == 0 || nDynamic == 0) return false; // single-layer -> not a level
+
+    const auto buildLayer = [&](bool wantDynamic) -> json {
+        json out = doc;
+        out["kind"] = wantDynamic ? "dynamic" : "static";
+        std::unordered_map<int, int> remap; // old index -> new index in this partition
+        std::vector<int> keep;
+        for (int i = 0; i < static_cast<int>(ents.size()); ++i)
+            if (isDynamic(ents[static_cast<usize>(i)]) == wantDynamic) {
+                remap[i] = static_cast<int>(keep.size());
+                keep.push_back(i);
+            }
+        json arr = json::array();
+        for (int oldIdx : keep) {
+            json e = ents[static_cast<usize>(oldIdx)];
+            if (auto it = e.find("parent"); it != e.end() && it->is_number_integer()) {
+                const int p = it->get<int>();
+                const auto rit = remap.find(p);
+                *it = (rit != remap.end()) ? rit->second : -1; // cross-layer parent -> root
+            }
+            arr.push_back(std::move(e));
+        }
+        out["entities"] = std::move(arr);
+        return out;
+    };
+
+    std::error_code ec;
+    fs::create_directories(staticOut.parent_path(), ec);
+    const auto writeJson = [](const fs::path& p, const json& d) {
+        std::ofstream o(p, std::ios::binary | std::ios::trunc);
+        if (!o) return false;
+        o << d.dump(2);
+        return static_cast<bool>(o);
+    };
+    bool ok = writeJson(staticOut, buildLayer(false));
+    ok = writeJson(dynamicOut, buildLayer(true)) && ok;
+    return ok;
 }
 
 void SavePaintCanvases(Scene& scene, const fs::path& assetsDir,

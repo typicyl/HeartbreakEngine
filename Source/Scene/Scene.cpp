@@ -109,9 +109,15 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         item.thicknessTexture = instance.thicknessTexture;
         item.materialFlags = instance.materialFlags;
         // Art Editor surface paint: composite the canvas over the material when
-        // the entity has an enabled, GPU-resident PaintComponent.
-        if (const PaintComponent* pc = registry_.try_get<PaintComponent>(e);
-            pc && pc->enabled && pc->gpuReady && pc->colorTex.IsValid()) {
+        // the entity has an enabled, GPU-resident PaintComponent. Terrain chunks
+        // share ONE whole-terrain canvas that lives on the parent terrain entity
+        // (their UVs are terrain-wide), so inherit it.
+        const PaintComponent* pc = registry_.try_get<PaintComponent>(e);
+        if (!pc && registry_.all_of<TerrainChunk>(e)) {
+            if (const Parent* par = registry_.try_get<Parent>(e); par && registry_.valid(par->entity))
+                pc = registry_.try_get<PaintComponent>(par->entity);
+        }
+        if (pc && pc->enabled && pc->gpuReady && pc->colorTex.IsValid()) {
             item.paintColorTexture = pc->colorTex;
             item.paintHeightTexture = pc->matTex; // material+height (R metal,G rough,B height)
             item.paintOpacity = pc->opacity;

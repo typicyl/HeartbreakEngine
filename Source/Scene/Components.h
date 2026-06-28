@@ -539,7 +539,8 @@ struct TerrainComponent {
     u32 chunks = 4;          // chunks per side (chunks x chunks grid)
     u32 resolution = 24;     // quads per chunk side
     f32 chunkSize = 16.0f;   // world units per chunk side
-    f32 height = 8.0f;       // peak height amplitude
+    f32 height = 0.0f;       // procedural noise amplitude; 0 = spawn FLAT (sculpt or
+                             // raise this for hills). Was 8 (random hills on spawn).
     f32 frequency = 0.04f;   // noise frequency (smaller = broader hills)
     u32 octaves = 4;         // fractal noise octaves
     i32 seed = 1337;

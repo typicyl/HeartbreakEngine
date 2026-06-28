@@ -877,7 +877,11 @@ bool Editor::SaveStreamedScenes(Scene& scene) {
 
 void Editor::MakePaintable(Scene& scene, Renderer& renderer, entt::entity e) {
     auto& reg = scene.Registry();
-    if (!reg.valid(e) || !reg.all_of<MeshInstance>(e)) return;
+    if (!reg.valid(e)) return;
+    // A terrain holds the canvas itself (its chunks render it); everything else
+    // needs a MeshInstance of its own.
+    const bool isTerrain = reg.all_of<TerrainComponent>(e);
+    if (!reg.all_of<MeshInstance>(e) && !isTerrain) return;
     PaintComponent& pc = reg.get_or_emplace<PaintComponent>(e);
     pc.opacity = paintOpacity_;
     pc.heightScale = paintHeightScale_;
@@ -2044,7 +2048,16 @@ void Editor::UpdateArtTool(Engine& engine) {
         paintHasLast_ = false;
         return;
     }
-    PaintComponent* pc = reg.try_get<PaintComponent>(target);
+    // Terrain: the paint canvas lives on the terrain ENTITY (its chunks render it),
+    // not on the runtime-regenerated chunk under the cursor. The chunk still supplies
+    // the mesh + terrain-wide UV for the raycast; the canvas owner is its parent.
+    entt::entity paintEntity = target;
+    if (reg.all_of<TerrainChunk>(target)) {
+        if (const Parent* par = reg.try_get<Parent>(target);
+            par && reg.valid(par->entity) && reg.all_of<TerrainComponent>(par->entity))
+            paintEntity = par->entity;
+    }
+    PaintComponent* pc = reg.try_get<PaintComponent>(paintEntity);
     if (pc) {
         // Existing canvas: respect lock / hidden / layer masks.
         const bool layerMasked = paintActiveLayer_ != "All" && pc->layer != paintActiveLayer_;
@@ -2121,16 +2134,16 @@ void Editor::UpdateArtTool(Engine& engine) {
             renderer.SetOrbitEnabled(false);
         }
         if (!pc) { // every mesh paintable: make a canvas on the first dab
-            MakePaintable(scene, renderer, target);
-            pc = reg.try_get<PaintComponent>(target);
+            MakePaintable(scene, renderer, paintEntity);
+            pc = reg.try_get<PaintComponent>(paintEntity);
             if (!pc) { paintStroking_ = false; return; }
         }
         if (!paintStroking_) {
             paintStroking_ = true;
             paintHasLast_ = false;
             paintSyncTick_ = 0;
-            paintTarget_ = target;
-            selected_ = target; // painting selects the object (selection feedback)
+            paintTarget_ = paintEntity;
+            selected_ = paintEntity; // painting selects the object (selection feedback)
             // Begin recording this stroke into the database (committed on release).
             curStroke_ = paint::Stroke{};
             curStroke_.type = paint::StrokeType::Path;
@@ -3066,11 +3079,24 @@ void Editor::OpenLevel(Engine& engine, const scene::LevelPaths& level, bool addi
     navCells_.clear();
     navPath_.clear();
     if (scene::LoadLevel(scene, engine.GetRenderer(), level, nullptr, additive)) {
-        currentLevel_ = level; // the active level (new objects join it)
-        levelOpen_ = true;
-        // A non-additive load replaced the world, so there's no active scene left;
-        // an additive load keeps any active UI scene (and its save target) resident.
-        if (!additive) currentScenePath_.clear();
+        if (additive) {
+            currentLevel_ = level; // composed/streamed: keep the legacy level grouping
+            levelOpen_ = true;
+        } else {
+            // MERGED MODEL: a level is now just ONE scene. LoadLevel already set each
+            // entity's Static/Dynamic SceneLayer from the file it came from; strip the
+            // per-FILE SceneSource tags so there's no two-file grouping, and treat the
+            // world as a single scene saved to <base>.hbscene. The old .static/.dynamic
+            // files are left untouched as backups; the next Save writes the merged file.
+            std::vector<entt::entity> tagged;
+            for (const entt::entity e : reg.view<SceneSource>()) tagged.push_back(e);
+            for (const entt::entity e : tagged) reg.remove<SceneSource>(e);
+            std::filesystem::path merged = level.base;
+            merged += ".hbscene";
+            currentScenePath_ = merged;
+            currentLevel_ = {};
+            levelOpen_ = false;
+        }
     }
 }
 
@@ -4368,77 +4394,75 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
     }
     std::sort(roots.begin(), roots.end(), byId);
 
-    // Group roots by their source FILE (SceneSource). In a level every entity is
-    // tagged with its layer file, so each composed level shows as its own Static /
-    // Dynamic groups; untagged roots fall under the active scene (non-level edit).
+    // Group roots so the hierarchy is a single FLAT tree PER LEVEL: a level's Static
+    // and Dynamic layers are MERGED into one group (no manual sorting between two
+    // scenes). The per-object Static/Dynamic choice lives in the Inspector, new
+    // objects auto-classify, and Save still splits the .static/.dynamic files
+    // invisibly. Non-level scenes group by their own file as before.
     const std::string activeName =
         currentScenePath_.empty() ? std::string("Scene") : currentScenePath_.stem().string();
-    std::vector<std::pair<std::string, std::vector<entt::entity>>> groups;
-    const auto groupFor = [&](const std::string& name) -> std::vector<entt::entity>& {
+    struct Grp {
+        std::string key, label, sortKey;
+        bool isLevel = false;
+        std::filesystem::path levelBase;
+        std::vector<entt::entity> ents;
+    };
+    std::vector<Grp> groups;
+    const auto groupFor = [&](entt::entity e) -> std::vector<entt::entity>& {
+        std::string key = activeName, label = activeName, sk = "0";
+        bool isLevel = false;
+        std::filesystem::path base;
+        if (const SceneSource* ss = reg.try_get<SceneSource>(e); ss && !ss->scene.empty()) {
+            const std::filesystem::path p(ss->scene);
+            if (scene::IsLevelMember(p)) {
+                base = scene::ResolveLevel(p).base; // merge .static + .dynamic
+                key = base.string();
+                label = scene::ResolveLevel(p).Name();
+                sk = "1" + label;
+                isLevel = true;
+            } else {
+                key = ss->scene;
+                label = p.stem().string();
+                sk = "2" + label;
+            }
+        }
         for (auto& g : groups)
-            if (g.first == name) return g.second;
-        groups.push_back({name, {}});
-        return groups.back().second;
+            if (g.key == key) return g.ents;
+        groups.push_back({key, label, sk, isLevel, base, {}});
+        return groups.back().ents;
     };
-    for (const entt::entity e : roots) {
-        const SceneSource* ss = reg.try_get<SceneSource>(e);
-        groupFor(ss && !ss->scene.empty() ? ss->scene : activeName).push_back(e);
-    }
-    // A friendly label + sort key for a group's file path.
-    const auto groupLabel = [&](const std::string& key) -> std::string {
-        if (key == activeName) return activeName;
-        const std::filesystem::path p(key);
-        if (scene::IsLevelMember(p)) {
-            return scene::ResolveLevel(p).Name() +
-                   (KindFromScenePath(key) == SceneKind::Static ? "  -  Static"
-                                                                : "  -  Dynamic");
-        }
-        return p.stem().string();
-    };
-    const auto sortKey = [&](const std::string& key) -> std::string {
-        if (key == activeName) return "0";
-        const std::filesystem::path p(key);
-        if (scene::IsLevelMember(p)) {
-            return "1" + scene::ResolveLevel(p).Name() +
-                   (KindFromScenePath(key) == SceneKind::Static ? "0" : "1");
-        }
-        return "2" + p.stem().string();
-    };
+    for (const entt::entity e : roots) groupFor(e).push_back(e);
     std::sort(groups.begin(), groups.end(),
-              [&](const auto& a, const auto& b) { return sortKey(a.first) < sortKey(b.first); });
+              [](const Grp& a, const Grp& b) { return a.sortKey < b.sortKey; });
 
-    if (groups.size() <= 1 && !levelOpen_) {
+    // One group (the common single-level / single-scene case) -> a fully flat list,
+    // no header. Multiple composed levels/scenes still get collapsible headers.
+    if (groups.size() <= 1) {
         for (const entt::entity e : roots) DrawEntityNode(scene, renderer, e);
     } else {
-        for (auto& g : groups) {
-            std::string disp = groupLabel(g.first);
-            if (disp.empty()) disp = g.first;
+        for (Grp& g : groups) {
             char hdr[256];
-            std::snprintf(hdr, sizeof(hdr), "%s  (%zu)###grp_%s", disp.c_str(),
-                          g.second.size(), g.first.c_str());
+            std::snprintf(hdr, sizeof(hdr), "%s  (%zu)###grp_%s", g.label.c_str(),
+                          g.ents.size(), g.key.c_str());
             const bool open = ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen);
-            // Drop an entity onto a header to move it there. For a level layer file
-            // this retags the whole subtree into that level + layer; for a scene it
-            // re-tags the source scene (active group = untag).
+            // Drop onto a header to move an entity here. A LEVEL header keeps the
+            // entity's current Static/Dynamic layer (change it in the Inspector); a
+            // scene header re-tags the source scene (active group = untag).
             if (ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("HBE_ENTITY")) {
                     entt::entity dropped;
                     std::memcpy(&dropped, p->Data, sizeof(dropped));
                     Reparent(scene, dropped, entt::null); // becomes a root
-                    const std::filesystem::path gp(g.first);
-                    if (scene::IsLevelMember(gp)) {
-                        AssignToLevel(scene, dropped, scene::ResolveLevel(gp).base,
-                                      KindFromScenePath(g.first));
-                    } else {
-                        MoveToScene(scene, dropped,
-                                    g.first == activeName ? std::string() : g.first);
-                    }
+                    if (g.isLevel)
+                        AssignToLevel(scene, dropped, g.levelBase, EffectiveLayer(scene, dropped));
+                    else
+                        MoveToScene(scene, dropped, g.key == activeName ? std::string() : g.key);
                 }
                 ImGui::EndDragDropTarget();
             }
             if (open) {
                 ImGui::Indent(8.0f);
-                for (const entt::entity e : g.second) DrawEntityNode(scene, renderer, e);
+                for (const entt::entity e : g.ents) DrawEntityNode(scene, renderer, e);
                 ImGui::Unindent(8.0f);
             }
         }
@@ -4664,24 +4688,33 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (ImGui::Button("Add Component")) ImGui::OpenPopup("AddComponent");
     }
 
-    // --- Level layer (Static / Dynamic) ------------------------------------
-    // While a level is open, pick which layer this object (and its subtree) lives
-    // in. Static = non-moving world geometry baked into the navmesh; Dynamic =
-    // actors / physics. The choice tags the entity, so it sticks (the auto-router
-    // only assigns untagged entities) and saves into the level's .static/.dynamic
-    // file. UI lives in its own scenes, so only these two appear here.
-    if (levelOpen_) {
-        const SceneKind cur = EffectiveLayer(scene, sel);
-        int idx = (cur == SceneKind::Dynamic) ? 1 : 0; // 0 = Static, 1 = Dynamic
+    // --- Static / Dynamic (per object, any scene) --------------------------
+    // There is no separate "level" any more: every scene is one file, and each
+    // object just carries a Static/Dynamic tag (saved in the scene). Static =
+    // non-moving world geometry the navmesh bakes from; Dynamic = actors / physics
+    // / scripted. The build splits the scene by these tags. Sets the whole subtree
+    // so a building + its parts share one layer.
+    {
+        const SceneLayer* sl = reg.try_get<SceneLayer>(sel);
+        int idx = (sl && sl->kind == SceneKind::Dynamic) ? 1 : 0; // 0 = Static, 1 = Dynamic
         ImGui::SetNextItemWidth(-110.0f);
         if (ImGui::Combo("Layer", &idx, "Static\0Dynamic\0")) {
             PushUndo(scene);
-            AssignToLayer(scene, sel, idx == 1 ? SceneKind::Dynamic : SceneKind::Static);
+            const SceneKind kind = idx == 1 ? SceneKind::Dynamic : SceneKind::Static;
+            // Tag this entity + all descendants (depth-first over the Parent links).
+            std::vector<entt::entity> stack{sel};
+            while (!stack.empty()) {
+                const entt::entity cur = stack.back();
+                stack.pop_back();
+                reg.emplace_or_replace<SceneLayer>(cur, SceneLayer{kind});
+                for (const entt::entity c : reg.view<Parent>())
+                    if (reg.get<Parent>(c).entity == cur) stack.push_back(c);
+            }
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Static = world geometry (navmesh source).\n"
                               "Dynamic = actors / physics / scripted.\n"
-                              "Moves this object's subtree into that layer's file.");
+                              "Tags this object's whole subtree; saved in the scene.");
         }
     }
 
@@ -5500,11 +5533,13 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             ImGui::DragFloat("Speed Scale", &mm->speedScale, 0.01f, 0.01f, 20.0f);
             undoOnActivate();
             bool nav = mm->useNavVelocity;
-            if (ImGui::Checkbox("Use Nav Agent velocity", &nav)) {
+            if (ImGui::Checkbox("Drive from movement (Nav / Character)", &nav)) {
                 PushUndo(scene);
                 mm->useNavVelocity = nav;
             }
-            if (!mm->useNavVelocity) {
+            if (mm->useNavVelocity) {
+                ImGui::TextDisabled("Reads a NavigationAgent or CharacterController on this entity.");
+            } else {
                 ImGui::DragFloat3("Desired Velocity", glm::value_ptr(mm->desiredVelocity), 0.05f);
                 undoOnActivate();
             }
@@ -8509,20 +8544,9 @@ void Editor::DrawSceneManager(Engine& engine) {
         wantSaveSceneAs_ = true; // name it right away
     }
     ImGui::SameLine();
-    if (ImGui::Button("New Level")) {
-        wantNewLevel_ = true; // static + dynamic layer files (name it next)
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Create a level: <name>.static + <name>.dynamic scene files.\n"
-                          "Navmesh bakes the static layer only. UI (menu/HUD) are\n"
-                          "separate standalone scenes, not part of a level.");
-    }
-    ImGui::SameLine();
     if (ImGui::Button("Save")) SaveCurrent(scene);
     ImGui::SameLine();
-    ImGui::BeginDisabled(levelOpen_); // a level saves to its two files
     if (ImGui::Button("Save As...")) wantSaveSceneAs_ = true;
-    ImGui::EndDisabled();
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) RefreshScenes();
 
@@ -8545,102 +8569,67 @@ void Editor::DrawSceneManager(Engine& engine) {
     bool wantOpenLevel = false;
     bool deferredAdditive = false;
 
-    // Levels: group the .static/.dynamic/.ui members by their base name. Each
-    // row opens the whole triplet; the individual members are hidden from the
-    // standalone scene list below.
+    // Legacy levels (a .static/.dynamic pair with no merged <base>.hbscene yet) show
+    // in the SAME list as scenes. Opening one MERGES it into a single scene - save it
+    // once and it becomes a normal <base>.hbscene (the two layer files stay as
+    // backups; the build re-derives them). No separate "Levels" section any more.
     {
         std::vector<std::filesystem::path> bases;
         for (const std::filesystem::path& p : sceneList_) {
             if (!scene::IsLevelMember(p)) continue;
-            const std::filesystem::path base = scene::ResolveLevel(p).base;
+            std::filesystem::path base = scene::ResolveLevel(p).base;
+            std::filesystem::path merged = base;
+            merged += ".hbscene";
+            std::error_code ec;
+            if (std::filesystem::exists(merged, ec)) continue; // already merged -> a scene
             if (std::find(bases.begin(), bases.end(), base) == bases.end())
                 bases.push_back(base);
         }
-        if (!bases.empty()) {
-            ImGui::SeparatorText("Levels");
-            // Which level layer files are currently resident (for loaded/active marks).
-            std::set<std::string> loadedSrc;
-            for (const entt::entity e : scene.Registry().view<SceneSource>()) {
-                const std::string& s = scene.Registry().get<SceneSource>(e).scene;
-                if (!s.empty()) loadedSrc.insert(s);
+        for (usize i = 0; i < bases.size(); ++i) {
+            scene::LevelPaths lp;
+            lp.base = bases[i];
+            const std::string rel = project.RelativeAssetPath(lp.Member(SceneKind::Static));
+            const bool isStartup = !startupRel.empty() && rel == startupRel;
+            ImGui::PushID(static_cast<int>(i) + 20000);
+            if (ImGui::SmallButton(isStartup ? "[default]" : "   set   ")) {
+                project.Settings().startupScene = rel; // runtime loads it as a level
+                project.Save();
             }
-            for (usize i = 0; i < bases.size(); ++i) {
-                scene::LevelPaths lp;
-                lp.base = bases[i];
-                const bool isActive = levelOpen_ && currentLevel_.base == lp.base;
-                const bool isLoaded =
-                    loadedSrc.count(lp.Member(SceneKind::Static).string()) ||
-                    loadedSrc.count(lp.Member(SceneKind::Dynamic).string());
-                const bool isCur = isActive; // selection highlight on the active level
-                ImGui::PushID(static_cast<int>(i) + 10000);
-                std::string layers;
-                for (const SceneKind k : {SceneKind::Static, SceneKind::Dynamic}) {
-                    std::error_code ec;
-                    if (std::filesystem::exists(lp.Member(k), ec)) {
-                        if (!layers.empty()) layers += "/";
-                        layers += ToString(k);
-                    }
-                }
-                const char* mark = isActive ? "  (active)" : (isLoaded ? "  (loaded)" : "");
-                char row[512];
-                std::snprintf(row, sizeof(row), "%s  [%s]%s##lvl", lp.Name().c_str(),
-                              layers.c_str(), mark);
-                if (ImGui::Selectable(row, isCur, ImGuiSelectableFlags_AllowDoubleClick) &&
-                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    deferredLevel = lp; // double-click loads ADDITIVELY (compose)
-                    deferredAdditive = true;
+            ImGui::SameLine();
+            char row[512];
+            std::snprintf(row, sizeof(row), "%s  (level)##lvl", lp.Name().c_str());
+            if (ImGui::Selectable(row, false, ImGuiSelectableFlags_AllowDoubleClick) &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                deferredLevel = lp; // open MERGED (non-additive)
+                deferredAdditive = false;
+                wantOpenLevel = true;
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Double-click: open as ONE scene (merges the two layer\n"
+                                  "files). Save it once to finish; it then lists as a scene.");
+            }
+            if (ImGui::BeginPopupContextItem("##lvlctx")) {
+                if (ImGui::MenuItem("Open (merge to one scene)")) {
+                    deferredLevel = lp;
+                    deferredAdditive = false;
                     wantOpenLevel = true;
                 }
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Double-click: add to the world (additive).\n"
-                                      "Right-click: open by itself (replace).");
+                if (ImGui::MenuItem("Delete")) {
+                    for (const SceneKind k : {SceneKind::Static, SceneKind::Dynamic}) {
+                        std::error_code ec;
+                        std::filesystem::remove(lp.Member(k), ec);
+                    }
+                    scenesScanned_ = false;
                 }
-                if (ImGui::BeginPopupContextItem("##lvlctx")) {
-                    if (ImGui::MenuItem("Open by Itself (replace)")) {
-                        deferredLevel = lp;
-                        deferredAdditive = false;
-                        wantOpenLevel = true;
-                    }
-                    if (ImGui::MenuItem("Add Additively")) {
-                        deferredLevel = lp;
-                        deferredAdditive = true;
-                        wantOpenLevel = true;
-                    }
-                    // When several levels are composed, choose which one new
-                    // objects join (no reload). Only meaningful if it's resident.
-                    if (ImGui::MenuItem("Set Active (new objects join here)", nullptr, false,
-                                        isLoaded && !isActive)) {
-                        currentLevel_ = lp;
-                        levelOpen_ = true;
-                    }
-                    if (ImGui::MenuItem("Set static as startup scene")) {
-                        project.Settings().startupScene =
-                            project.RelativeAssetPath(lp.Member(SceneKind::Static));
-                        project.Save();
-                    }
-                    ImGui::Separator();
-                    if (ImGui::MenuItem("Delete Level")) {
-                        for (const SceneKind k : {SceneKind::Static, SceneKind::Dynamic}) {
-                            std::error_code ec;
-                            std::filesystem::remove(lp.Member(k), ec);
-                        }
-                        if (isCur) {
-                            levelOpen_ = false;
-                            currentLevel_ = {};
-                        }
-                        scenesScanned_ = false;
-                    }
-                    ImGui::EndPopup();
-                }
-                ImGui::PopID();
+                ImGui::EndPopup();
             }
-            ImGui::SeparatorText("Scenes");
+            ImGui::PopID();
         }
     }
 
     for (usize i = 0; i < sceneList_.size(); ++i) {
         const std::filesystem::path& path = sceneList_[i];
-        if (scene::IsLevelMember(path)) continue; // shown under Levels above
+        if (scene::IsLevelMember(path)) continue; // legacy layer file (backup) - hidden
         const std::string rel = project.RelativeAssetPath(path);
         const bool isStartup = !startupRel.empty() && rel == startupRel;
         const bool isCurrent = path == currentScenePath_;
@@ -8712,30 +8701,8 @@ void Editor::DrawSceneManager(Engine& engine) {
     if (wantOpenLevel) OpenLevel(engine, deferredLevel, deferredAdditive);
     else if (!deferredLoad.empty()) LoadSceneInEditor(engine, deferredLoad);
 
-    // New Level modal: names the static/dynamic/UI triplet.
-    if (wantNewLevel_ && !ImGui::IsPopupOpen("New Level")) ImGui::OpenPopup("New Level");
-    if (ImGui::BeginPopupModal("New Level", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextDisabled("Creates <name>.static + <name>.dynamic scene files.");
-        ImGui::SetNextItemWidth(240.0f);
-        const bool enter = ImGui::InputText("Name##newlevel", levelNameBuf_,
-                                            sizeof(levelNameBuf_),
-                                            ImGuiInputTextFlags_EnterReturnsTrue);
-        const std::string stem = SanitizeFileStem(levelNameBuf_);
-        const bool can = !stem.empty();
-        ImGui::BeginDisabled(!can);
-        if (ImGui::Button("Create") || (enter && can)) {
-            CreateLevel(engine, project.AssetsDir() / "Scenes" / stem); // levels live in Scenes/
-            wantNewLevel_ = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel")) {
-            wantNewLevel_ = false;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
+    // (Levels are no longer authored separately - every scene is one file, with
+    // per-object Static/Dynamic; the build splits the layers. No "New Level" modal.)
 
     // Rename popup.
     if (!renameScene_.empty() && !ImGui::IsPopupOpen("Rename Scene")) {
@@ -8991,6 +8958,26 @@ bool Editor::BuildShipping(std::string& outMessage) {
         }
     }
     extras.push_back({"__project.hbproj", Project::Active().ProjectFile()});
+
+    // Author-time scenes are ONE merged file; emit the .static/.dynamic split the
+    // runtime's level loader expects, partitioned by each object's Static/Dynamic tag.
+    // Regenerated fresh from the merged scene each build, so the pack ships current
+    // data and the runtime's two-file LoadLevel keeps working unchanged.
+    int splitCount = 0;
+    for (auto it = fs::recursive_directory_iterator(Project::Active().AssetsDir(), ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (!it->is_regular_file()) continue;
+        const fs::path p = it->path();
+        if (p.extension() != ".hbscene" || scene::IsLevelMember(p)) continue;
+        fs::path base = p;
+        base.replace_extension(); // <dir>/<name>.hbscene -> <dir>/<name>
+        fs::path st = base, dy = base;
+        st += ".static.hbscene";
+        dy += ".dynamic.hbscene";
+        if (scene::SplitSceneFile(p, st, dy)) ++splitCount;
+    }
+    if (splitCount > 0)
+        HBE_INFO("Shipping: split {} merged scene(s) into static/dynamic layers.", splitCount);
 
     std::set<std::string> refs;
     uap::WriteOptions options = PackOptionsFromSettings(refs);

@@ -374,6 +374,42 @@ std::vector<glm::vec3> GridNav::FindPath(const glm::vec3& start, const glm::vec3
         }
     }
     out.push_back(raw.back());
+
+    // --- Human-path smoothing -------------------------------------------------
+    // String-pulling gives the shortest path but with SHARP corners that hug walls
+    // and read as robotic. Round each corner into a natural curve with validated
+    // Chaikin corner-cutting: a corner is only rounded when BOTH new points and the
+    // chord between them stay on walkable ground clear of obstacles, so a rounded
+    // turn never clips a wall - tight spots (doorways) keep their sharp corner. Two
+    // passes give a smooth arc; endpoints (exact start / goal) stay pinned.
+    const auto snapWalkable = [&](glm::vec3& p, f32 refY) -> bool {
+        const std::optional<f32> g = GroundAt(p.x, p.z, refY);
+        if (!g || std::fabs(*g - refY) > params_.maxStep) return false;
+        for (const GridObstacle& o : obstacles) {
+            const f32 ddx = p.x - o.pos.x, ddz = p.z - o.pos.z;
+            const f32 r = o.radius + params_.agentRadius;
+            if (ddx * ddx + ddz * ddz < r * r) return false;
+        }
+        p.y = *g; // ride the ground
+        return true;
+    };
+    for (int iter = 0; iter < 2 && out.size() >= 3; ++iter) {
+        std::vector<glm::vec3> sm;
+        sm.reserve(out.size() * 2);
+        sm.push_back(out.front());
+        for (size_t i = 1; i + 1 < out.size(); ++i) {
+            glm::vec3 q = out[i] + (out[i - 1] - out[i]) * 0.25f; // 1/4 toward prev
+            glm::vec3 r = out[i] + (out[i + 1] - out[i]) * 0.25f; // 1/4 toward next
+            if (snapWalkable(q, out[i].y) && snapWalkable(r, out[i].y) && segWalkable(q, r)) {
+                sm.push_back(q);
+                sm.push_back(r);
+            } else {
+                sm.push_back(out[i]); // can't round here (tight) - keep the corner
+            }
+        }
+        sm.push_back(out.back());
+        out.swap(sm);
+    }
     return out;
 }
 
