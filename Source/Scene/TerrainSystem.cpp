@@ -140,6 +140,49 @@ void Update(Scene& scene, Renderer& renderer) {
     if (!renderer.SupportsScene()) return;
     auto& reg = scene.Registry();
 
+    // Hole-mask GPU uploads (independent of chunk rebuilds): expand the 1-byte mask
+    // to RGBA8 (the bindless array is RGBA) and (re)upload. The forward pass samples
+    // .r and clips where it's set; chunks reference this via the parent terrain.
+    for (const entt::entity e : reg.view<TerrainComponent>()) {
+        TerrainComponent& t = reg.get<TerrainComponent>(e);
+        if (!t.holeDirty || t.holeMask.empty()) continue;
+        const u32 n = t.GridN();
+        std::vector<u8> rgba(static_cast<usize>(n) * n * 4, 0);
+        const usize count = std::min<usize>(t.holeMask.size(), static_cast<usize>(n) * n);
+        for (usize i = 0; i < count; ++i) {
+            const u8 m = t.holeMask[i];
+            rgba[i * 4 + 0] = m; rgba[i * 4 + 1] = m; rgba[i * 4 + 2] = m; rgba[i * 4 + 3] = m;
+        }
+        rhi::TextureDesc desc;
+        desc.width = n;
+        desc.height = n;
+        desc.format = rhi::Format::R8G8B8A8_UNORM;
+        desc.mipCount = 1; // no mips: keep the hole edge crisp (binary clip)
+        desc.pixels = rgba.data();
+        desc.debugName = "TerrainHoleMask";
+        if (t.holeMaskTex.IsValid()) renderer.UpdateTexture(t.holeMaskTex, desc);
+        else t.holeMaskTex = renderer.UploadTexture(desc);
+        t.holeDirty = false;
+    }
+
+    // Splat weight-mask uploads (already RGBA8, one channel per layer).
+    for (const entt::entity e : reg.view<TerrainComponent>()) {
+        TerrainComponent& t = reg.get<TerrainComponent>(e);
+        if (!t.splatDirty || t.splatWeight.empty()) continue;
+        const u32 n = t.GridN();
+        if (t.splatWeight.size() != static_cast<usize>(n) * n * 4) { t.splatDirty = false; continue; }
+        rhi::TextureDesc desc;
+        desc.width = n;
+        desc.height = n;
+        desc.format = rhi::Format::R8G8B8A8_UNORM;
+        desc.mipCount = 1;
+        desc.pixels = t.splatWeight.data();
+        desc.debugName = "TerrainSplatWeight";
+        if (t.splatWeightTex.IsValid()) renderer.UpdateTexture(t.splatWeightTex, desc);
+        else t.splatWeightTex = renderer.UploadTexture(desc);
+        t.splatDirty = false;
+    }
+
     std::vector<entt::entity> toBuild;
     for (const entt::entity e : reg.view<TerrainComponent>()) {
         if (reg.get<TerrainComponent>(e).dirty) toBuild.push_back(e);
@@ -257,6 +300,76 @@ void Sculpt(Scene& scene, Renderer& renderer, entt::entity terrain, f32 localX,
         ComputeBounds(md, bmin, bmax);
         reg.emplace_or_replace<AABB>(ce, AABB{bmin, bmax});
     }
+}
+
+void PaintHole(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, bool erase) {
+    EnsureHeights(t);
+    const i32 gridN = static_cast<i32>(t.GridN());
+    const usize need = static_cast<usize>(gridN) * gridN;
+    if (t.holeMask.size() != need) t.holeMask.assign(need, 0); // 0 = solid
+
+    const f32 step = Step(t), total = Total(t);
+    const f32 inv = step > 0.0f ? 1.0f / step : 0.0f;
+    const f32 cx = (localX + total * 0.5f) * inv;
+    const f32 cz = (localZ + total * 0.5f) * inv;
+    const i32 r = static_cast<i32>(std::ceil(radius * inv)) + 1;
+    const i32 i0 = glm::clamp(static_cast<i32>(cx) - r, 0, gridN - 1);
+    const i32 i1 = glm::clamp(static_cast<i32>(cx) + r, 0, gridN - 1);
+    const i32 j0 = glm::clamp(static_cast<i32>(cz) - r, 0, gridN - 1);
+    const i32 j1 = glm::clamp(static_cast<i32>(cz) + r, 0, gridN - 1);
+    const f32 r2 = radius * radius;
+    const u8 value = erase ? 0 : 255; // 255 = hole (clipped), 0 = solid
+
+    for (i32 gz = j0; gz <= j1; ++gz) {
+        for (i32 gx = i0; gx <= i1; ++gx) {
+            const f32 wx = -total * 0.5f + gx * step;
+            const f32 wz = -total * 0.5f + gz * step;
+            const f32 d2 = (wx - localX) * (wx - localX) + (wz - localZ) * (wz - localZ);
+            if (d2 > r2) continue;
+            t.holeMask[static_cast<usize>(gz) * gridN + gx] = value; // hard stamp
+        }
+    }
+    t.holeDirty = true;
+}
+
+void PaintSplat(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, i32 layer) {
+    EnsureHeights(t);
+    layer = glm::clamp(layer, 0, 3);
+    const i32 gridN = static_cast<i32>(t.GridN());
+    const usize need = static_cast<usize>(gridN) * gridN * 4; // RGBA
+    if (t.splatWeight.size() != need) {
+        t.splatWeight.assign(need, 0);
+        for (usize i = 0; i < need; i += 4) t.splatWeight[i] = 255; // default = layer 0
+    }
+    const f32 step = Step(t), total = Total(t);
+    const f32 inv = step > 0.0f ? 1.0f / step : 0.0f;
+    const f32 cx = (localX + total * 0.5f) * inv;
+    const f32 cz = (localZ + total * 0.5f) * inv;
+    const i32 r = static_cast<i32>(std::ceil(radius * inv)) + 1;
+    const i32 i0 = glm::clamp(static_cast<i32>(cx) - r, 0, gridN - 1);
+    const i32 i1 = glm::clamp(static_cast<i32>(cx) + r, 0, gridN - 1);
+    const i32 j0 = glm::clamp(static_cast<i32>(cz) - r, 0, gridN - 1);
+    const i32 j1 = glm::clamp(static_cast<i32>(cz) + r, 0, gridN - 1);
+    const f32 r2 = radius * radius;
+
+    for (i32 gz = j0; gz <= j1; ++gz) {
+        for (i32 gx = i0; gx <= i1; ++gx) {
+            const f32 wx = -total * 0.5f + gx * step;
+            const f32 wz = -total * 0.5f + gz * step;
+            const f32 d2 = (wx - localX) * (wx - localX) + (wz - localZ) * (wz - localZ);
+            if (d2 > r2) continue;
+            const f32 fall = 1.0f - std::sqrt(d2 / r2);
+            const f32 w = fall * fall * (3.0f - 2.0f * fall); // smoothstep falloff
+            u8* px = &t.splatWeight[(static_cast<usize>(gz) * gridN + gx) * 4];
+            for (i32 c = 0; c < 4; ++c) {
+                if (c == layer)
+                    px[c] = static_cast<u8>(glm::max<f32>(px[c], w * 255.0f)); // grow active
+                else
+                    px[c] = static_cast<u8>(px[c] * (1.0f - w));               // fade others
+            }
+        }
+    }
+    t.splatDirty = true;
 }
 
 bool RaycastLocal(const TerrainComponent& t, const glm::vec3& localOrigin,

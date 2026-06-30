@@ -122,7 +122,14 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     float  NdotH = max(dot(N, Hv), 0.0f);
     float  VdotH = max(dot(V, Hv), 0.0f);
 
-    float3 Ft = FresnelSchlick(VdotH, F0);
+    // Roughness-aware grazing Fresnel. Standard Schlick uses F90 = 1, so even a fully
+    // rough surface flashes a bright specular rim at glancing angles / low sun (the
+    // "wet ground" streak). Real rough surfaces lose that grazing sheen (multiple
+    // scattering darkens F90), so fade F90 toward F0 with roughness: smooth surfaces
+    // keep full Fresnel, rough surfaces (e.g. terrain at max roughness) read matte.
+    float  f90s = 1.0f - roughness * roughness;
+    float3 F90  = max(f90s.xxx, F0);
+    float3 Ft   = F0 + (F90 - F0) * pow(saturate(1.0f - VdotH), 5.0f);
     float3 specular;
     if ((gMaterialFlags & HBE_MAT_CLOTH) != 0u)
     {
@@ -182,6 +189,13 @@ struct PSOutput
 
 PSOutput PSMain(VSOutput input)
 {
+    // Terrain hole mask: clip painted-transparent terrain pixels so cliff/cave models
+    // show through. The mask rides in the (terrain-unused) thickness-texture slot; we
+    // discard early, before any shading. Mesh UV == terrain-wide UV for terrain chunks.
+    if ((gMaterialFlags & HBE_MAT_TERRAIN_HOLE) != 0u && gThicknessIndex != 0u &&
+        SampleBindless(gThicknessIndex, input.uv).r > 0.5f)
+        clip(-1.0f);
+
     float3 V = normalize(gCameraPosWS - input.positionWS);
 
     // --- Eye: parallax iris -------------------------------------------------
@@ -202,25 +216,88 @@ PSOutput PSMain(VSOutput input)
     float4 albedoTex = SampleBindless(gAlbedoIndex, uv);
     float3 albedo = gBaseColorFactor.rgb * albedoTex.rgb;
 
+    // --- Terrain splat: blend up to 4 FULL MATERIALS (albedo + normal + metal/rough)
+    // by a painted weight mask. The 4 layers' textures are in the gSplat* index arrays;
+    // the weight mask is the emissive slot (terrain-wide mesh UV); layers tile by world
+    // XZ / subsurfaceRadius(=tile). Normal/rough/metal are taken from the blend below.
+    const bool splat = (gMaterialFlags & HBE_MAT_TERRAIN_SPLAT) != 0u;
+    float3 splatNTS = float3(0.0f, 0.0f, 1.0f); // blended tangent-space normal
+    float2 splatMRrm = float2(0.0f, 0.8f);      // blended (metal, rough)
+    if (splat)
+    {
+        float2 tuv = input.positionWS.xz / max(gSubsurfaceRadius, 0.01f);
+        float4 wt = (gEmissiveIndex != 0u) ? SampleBindless(gEmissiveIndex, uv)
+                                           : float4(1.0f, 0.0f, 0.0f, 0.0f);
+        float  wsum = wt.x + wt.y + wt.z + wt.w + 1e-4f;
+        float3 a = 0.0f.xxx, n = 0.0f.xxx;
+        float2 mr = 0.0f.xx;
+        [unroll] for (int Li = 0; Li < 4; ++Li)
+        {
+            float wl = wt[Li] / wsum;
+            uint ai = gSplatAlbedo[Li], ni = gSplatNormal[Li], mi = gSplatMR[Li];
+            a  += ((ai != 0u) ? SampleBindless(ai, tuv).rgb : 0.5f.xxx) * wl;
+            n  += ((ni != 0u) ? (SampleBindless(ni, tuv).xyz * 2.0f - 1.0f)
+                              : float3(0.0f, 0.0f, 1.0f)) * wl;
+            // glTF MR: blue = metallic, green = roughness. Roughness is the MR map's
+            // green (1 if the layer has no MR map) TIMES the material's roughness factor,
+            // so cranking a layer material's roughness actually mattes the terrain.
+            float lm = (mi != 0u) ? SampleBindless(mi, tuv).b : 0.0f;
+            float lr = ((mi != 0u) ? SampleBindless(mi, tuv).g : 1.0f) * gSplatRough[Li];
+            mr += float2(lm, lr) * wl;
+        }
+        albedo = gBaseColorFactor.rgb * a;
+        splatNTS = (dot(n, n) > 1e-5f) ? normalize(n) : float3(0.0f, 0.0f, 1.0f);
+        splatMRrm = mr;
+    }
+
     float metallic  = gMetallicFactor;
     float roughness = gRoughnessFactor;
-    if (gMRIndex != 0)
+    if (gMRIndex != 0 && !splat)
     {
         // glTF packing: blue = metallic, green = roughness.
         float3 mr = SampleBindless(gMRIndex, uv).rgb;
         metallic  *= mr.b;
         roughness *= mr.g;
     }
+    // Splat roughness = the blended layer-material roughness, but FLOORED by the terrain's
+    // own roughness factor (gRoughnessFactor = the terrain Roughness slider). So cranking
+    // the terrain Roughness forces the whole surface matte no matter how glossy a layer's
+    // material/MR map is - a direct "make the ground matte" override.
+    if (splat) { metallic = splatMRrm.x; roughness = max(splatMRrm.y, gRoughnessFactor); }
     metallic  = saturate(metallic);
     roughness = clamp(roughness, 0.04f, 1.0f);
     // The cornea is a smooth, wet refractive layer: force a sharp specular so
     // eyes get a crisp catchlight.
     if ((gMaterialFlags & HBE_MAT_EYE) != 0u) roughness = min(roughness, 0.06f);
 
-    float ao = (gAOIndex != 0) ? SampleBindless(gAOIndex, uv).r : 1.0f;
+    float ao = (gAOIndex != 0 && !splat) ? SampleBindless(gAOIndex, uv).r : 1.0f;
 
-    float3 N = (gNormalIndex != 0) ? ApplyNormalMap(input.normalWS, input.tangentWS, uv)
-                                   : normalize(input.normalWS);
+    float3 N;
+    if (splat)
+    {
+        // World-aligned tangent frame matching the world-XZ tiling (u = world X), so
+        // the blended layer normal maps apply correctly even though the terrain mesh
+        // has no per-vertex tangents.
+        float3 nn = normalize(input.normalWS);
+        float3 t = normalize(float3(1.0f, 0.0f, 0.0f) - nn * nn.x);
+        // b aligns with +Z (= the tiling's +V axis), matching the glTF/OpenGL green-up
+        // normal-map convention; cross(nn,t) would point -Z and invert relief along Z.
+        float3 b = cross(t, nn);
+        N = normalize(mul(splatNTS, float3x3(t, b, nn)));
+    }
+    else
+        N = (gNormalIndex != 0) ? ApplyNormalMap(input.normalWS, input.tangentWS, uv)
+                                : normalize(input.normalWS);
+
+    if (splat)
+    {
+        // Geometric specular antialiasing: the tiled layer normal maps + the heightfield
+        // make N change fast per pixel, so the specular sparkles at grazing angles
+        // ("mirror grain"). Roughen by the per-pixel normal variation so the highlight
+        // stops shimmering; this also helps when a layer's authored roughness is high.
+        float nv = saturate(length(fwidth(N)) * 1.5f);
+        roughness = clamp(max(roughness, nv), 0.04f, 1.0f);
+    }
 
     // Subsurface inputs (consumed by ShadeDirect when the subsurface flag is on):
     // screen-space curvature drives how far light wraps; a thickness map gates
@@ -440,7 +517,7 @@ PSOutput PSMain(VSOutput input)
 
     // --- Emissive (self-illumination, unaffected by lighting) --------------
     float3 emissive = gEmissiveColor * gEmissiveIntensity;
-    if (gEmissiveIndex != 0)
+    if (gEmissiveIndex != 0 && !splat) // for splat the emissive slot is the weight mask
         emissive *= SampleBindless(gEmissiveIndex, uv).rgb;
 
     float3 color = ambient + Lo + emissive;
@@ -452,10 +529,23 @@ PSOutput PSMain(VSOutput input)
         color  = LinearToSRGB(color);
     }
 
-    // Alpha-blended materials (e.g. painterly stroke decals) output straight-alpha
-    // coverage = base alpha * albedo-texture alpha; the transparent pass blends
-    // them over the lit scene. Opaque materials stay fully covered.
+    // HDR alpha doubles as the PAINTERLY MASK in the post pipeline: 1 = dynamic-layer
+    // object (exempt -> stays crisp), 0 = static (gets the painted finish). A later
+    // composite reads it to restore lit colour over the painterly result. (Legacy
+    // direct-to-LDR path has no post, so opaque stays fully covered = 1.)
     float outAlpha = 1.0f;
+    if (gOutputLinear != 0) {
+        // 2-bit painterly mask: bit0 = dynamic-exempt (restore crisp), bit1 =
+        // censored object (paint strokes onto its surface). 0=static, .33=dynamic,
+        // .67=censored static, 1=censored dynamic. Decoded by the composite + strokes.
+        uint mbits = 0u;
+        if ((gMaterialFlags & HBE_MAT_PAINTERLY_EXEMPT) != 0u) mbits |= 1u;
+        if ((gMaterialFlags & HBE_MAT_CENSORED) != 0u) mbits |= 2u;
+        outAlpha = float(mbits) / 3.0f;
+    }
+    // Alpha-blended materials (e.g. painterly stroke decals) output straight-alpha
+    // coverage = base alpha * albedo-texture alpha; the transparent pass blends them
+    // over the lit scene (this overrides the mask for those rare dynamic decals).
     if ((gMaterialFlags & HBE_MAT_TRANSPARENT) != 0u)
         outAlpha = saturate(gBaseColorFactor.a * albedoTex.a);
 

@@ -554,6 +554,31 @@ struct TerrainComponent {
     // (and re-seeded procedurally) whenever the grid resolution changes.
     std::vector<f32> heights;
 
+    // Hole mask: one byte per heightfield sample (GridN^2, same layout as `heights`).
+    // 255 = solid, 0 = hole (terrain pixels there are clipped so cliff/cave models show
+    // through; collision stays). The hole brush paints this; uploaded to `holeMaskTex`
+    // and sampled (terrain-wide UV) by the forward pass. Empty = no holes.
+    std::vector<u8> holeMask;
+    rhi::TextureHandle holeMaskTex; // runtime: GPU upload of holeMask (not serialized)
+    bool holeDirty = false;         // runtime: holeMask changed -> re-upload
+
+    // Splat material painting: up to 4 tiling MATERIALS blended by a painted weight
+    // mask. `splatLayerSrc` = .hbmat material paths (serialized); the runtime resolves
+    // each into albedo/normal/MR handles. `splatWeight` is RGBA8 (GridN^2), one
+    // channel per layer (default = layer 0 everywhere); painted by the terrain brush,
+    // uploaded to `splatWeightTex`. `splatTile` = world units per texture repeat.
+    bool splatEnabled = false;
+    std::string splatLayerSrc[4];        // .hbmat material paths (serialized)
+    rhi::TextureHandle splatAlbedoTex[4]; // runtime, resolved from each layer material
+    rhi::TextureHandle splatNormalTex[4];
+    rhi::TextureHandle splatMRTex[4];
+    f32 splatRoughFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // each material's roughness factor
+    f32 splatTile = 8.0f;
+    std::vector<u8> splatWeight;         // RGBA8, GridN^2 (R..A = layer 0..3 weight)
+    rhi::TextureHandle splatWeightTex;   // runtime upload of splatWeight
+    bool splatDirty = false;             // runtime: splatWeight changed -> re-upload
+    i32 activeSplatLayer = 0;            // runtime: layer the terrain brush paints
+
     u32 GridN() const { return chunks * resolution + 1; } // samples per side
 };
 
@@ -609,6 +634,21 @@ struct IKConstraint {
 struct Rotator {
     glm::vec3 axis{0.0f, 1.0f, 0.0f};
     f32 speed = 45.0f; // degrees per second
+    bool enabled = true;
+};
+
+// Painterly "censor": attach to any entity (a person, a prop) to re-paint it with
+// the painterly brush-stroke look inside a soft world-space sphere that follows
+// the entity - a moving censor patch. Only does anything while the painterly post
+// stack + "Real brush strokes" are on; the renderer projects this sphere to screen
+// and feathers it into the painterly passes via a 3D sphere test (see
+// rhi::CensorData / CollectCensors). `offset` raises the center off the origin
+// (e.g. onto a character's torso). `strength` 1 = fully painted, 0 = no effect.
+struct CensorComponent {
+    f32 radius = 2.0f;          // sphere radius in world units
+    f32 feather = 0.5f;         // soft-edge fraction of the radius (0 = hard cut)
+    f32 strength = 1.0f;        // 0..1 how fully the object is painted over
+    glm::vec3 offset{0.0f, 1.0f, 0.0f}; // local-space center offset from the entity
     bool enabled = true;
 };
 

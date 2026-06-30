@@ -178,7 +178,7 @@ std::wstring ExecutableDir() {
     return slash == std::wstring::npos ? L"" : path.substr(0, slash + 1);
 }
 
-// Constant buffers mirror the cbuffer layouts in Shaders/Common.hlsli.
+// Constant buffers mirror the cbuffer layouts in Shaders/Common.hlsli. - TODO figure out what's causing the spike
 struct FrameCB {
     glm::mat4 viewProj;
     glm::vec3 cameraPos; f32 exposure;
@@ -211,6 +211,14 @@ struct PostCB {
     glm::vec4 params0{0.0f};
     glm::vec4 params1{0.0f};
     glm::vec4 params2{0.0f};
+    glm::vec4 params3{0.0f}; // extra pass params (brush-stroke area mask: minX,minY,maxX,maxY)
+    // World-anchored painterly censors (3D sphere test in the shader). Each:
+    // censors[i] = (worldCenter.xyz, worldRadius); strength/feather packed per
+    // component. Filled for the stroke pass + composite; 0 count elsewhere.
+    glm::vec4 censors[kMaxCensors]{};
+    glm::vec4 censorStrength{0.0f}; // per-censor strength (.x=censor0 ... .w=censor3)
+    glm::vec4 censorFeather{0.0f};  // per-censor feather fraction (.x..w)
+    glm::uvec4 censorCount{0u};     // .x = active censor count
 };
 
 struct ObjectCB {
@@ -228,6 +236,10 @@ struct ObjectCB {
     f32 paintLodBias; f32 paintTexel; u32 paintProjMode; f32 paintBoxInvM;
     glm::vec3 paintBoxCenter; f32 _padBoxC;
     glm::vec3 paintBoxScale; f32 _padBoxS;
+    // Terrain splat: 4 layers' albedo/normal/MR bindless indices (must match the
+    // gSplat* uint4 block in Common.hlsli). 0 for non-terrain draws.
+    glm::uvec4 splatAlbedo{0}; glm::uvec4 splatNormal{0}; glm::uvec4 splatMR{0};
+    glm::vec4 splatRough{1.0f}; // 4 layers' roughness factor
 };
 
 u32 BytesPerPixel(Format f) {
@@ -417,6 +429,7 @@ private:
     ComPtr<ID3D12Resource> ssgi_;               // screen-space GI composite (HDR)
     ComPtr<ID3D12Resource> volScatter_;         // volumetric fog composite (HDR)
     ComPtr<ID3D12Resource> painterly_;          // painterly stroke pass (HDR)
+    ComPtr<ID3D12Resource> painterlyComp_;      // painterly + dynamic-layer crisp composite (HDR)
     ComPtr<ID3D12Resource> adaptedLum_[2];      // auto-exposure adapted luminance (1x1, ping-pong)
     ComPtr<ID3D12DescriptorHeap> postRtvHeap_;  // hdr, ssaoRaw, ssaoBlur, ldr, bloom[N], taa[2], dof, mblur, ssr, lum[2]
     ComPtr<ID3D12DescriptorHeap> postDsvHeap_;  // hdr depth
@@ -431,6 +444,7 @@ private:
     u32 slotSsgi_ = 0;
     u32 slotVol_ = 0;
     u32 slotPainterly_ = 0;
+    u32 slotPainterlyComp_ = 0;
     u32 slotAdaptedLum_[2] = {};
     u32 slotBloom_[kBloomMaxMips] = {};
     u32 bloomW_[kBloomMaxMips] = {}, bloomH_[kBloomMaxMips] = {};
@@ -441,7 +455,7 @@ private:
     ComPtr<ID3D12PipelineState> ssaoPSO_, ssaoBlurPSO_, bloomDownPSO_, bloomUpPSO_,
                                 tonemapPSO_, fxaaPSO_, taaPSO_, dofPSO_, motionBlurPSO_,
                                 ssrPSO_, exposurePSO_, volPSO_, ssgiPSO_, painterlyPSO_,
-                                brushStrokesPSO_;
+                                brushStrokesPSO_, compositePSO_;
 
     // Temporal AA: jittered camera each frame + reprojected history accumulation.
     bool taaReady_ = false;          // TAA PSO built (optional; absent = no TAA)
@@ -1203,7 +1217,11 @@ bool D3D12Device::CreateMeshPipeline() {
     params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     params[2].DescriptorTable.NumDescriptorRanges = 1;
     params[2].DescriptorTable.pDescriptorRanges = &srvRange;
-    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // ALL (not just PIXEL): the BrushStrokes pass samples the bindless HDR in its
+    // VERTEX shader (per-stroke colour + Sobel flow). PIXEL-only made the VS reads
+    // return nothing -> strokes never rendered on D3D12 (they worked on Vulkan once its
+    // descriptor stage flags were widened to VERTEX; this is the same fix, root-sig side).
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     // Joint palettes (StructuredBuffer<float4x4> gBones, t0 space1).
     params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
     params[3].Descriptor.ShaderRegister = 0;
@@ -1229,6 +1247,8 @@ bool D3D12Device::CreateMeshPipeline() {
     samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     samplers[1].ShaderRegister = 1;
+    // ALL: the BrushStrokes VERTEX shader samples through this clamp sampler (s1).
+    samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
     rsDesc.NumParameters = 4;
@@ -1824,6 +1844,9 @@ bool D3D12Device::CreatePostPipelines() {
                          DXGI_FORMAT_UNKNOWN, ssgiPSO_); // composites in HDR
     painterlyReady_ = makePso(L"Painterly", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                               DXGI_FORMAT_UNKNOWN, painterlyPSO_); // repaints HDR
+    // Dynamic-layer composite: lerp painterly vs crisp lit colour by the HDR-alpha mask.
+    makePso(L"PainterlyComposite", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+            DXGI_FORMAT_UNKNOWN, compositePSO_);
 
     // Brush-stroke splat: instanced oriented quads, straight-alpha blended over
     // the painterly base. Custom VS (no fullscreen triangle) so it needs its own
@@ -1863,7 +1886,7 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         // base 4 + bloom + 2 TAA history + DoF + motion blur + SSR + 2 lum +
         // G-buffer + velocity + volumetric + SSGI + painterly.
-        hd.NumDescriptors = 16 + kBloomMaxMips;
+        hd.NumDescriptors = 17 + kBloomMaxMips; // +1 for the painterly composite RTV
         HR_CHECK(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&postRtvHeap_)),
                  "CreateDescriptorHeap(postRTV)");
         postRtvSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -1878,7 +1901,7 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     // Reserve the bindless slots once; resizes rewrite the same descriptors so
     // shader-visible indices stay stable.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 17 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 18 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
@@ -1886,6 +1909,7 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         slotVol_ = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
+        slotPainterlyComp_ = bindlessNextSlot_++;
         slotSsaoRaw_ = bindlessNextSlot_++;
         slotSsaoBlur_ = bindlessNextSlot_++;
         slotLdr_ = bindlessNextSlot_++;
@@ -2046,6 +2070,10 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 15 + kBloomMaxMips,
                        slotPainterly_, nullptr, painterly_))
             return false;
+        // Dynamic-layer composite target (painterly + crisp objects by the HDR mask).
+        if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 16 + kBloomMaxMips,
+                       slotPainterlyComp_, nullptr, painterlyComp_))
+            return false;
     }
     if (exposureReady_) { // 1x1 adapted-luminance ping-pong (auto-exposure)
         if (!makeColor(1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, 9 + kBloomMaxMips,
@@ -2175,8 +2203,18 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                      sceneH_, cb);
         hdrInput = slotPainterly_;
 
+        // Collect world-anchored censors once (shared by the stroke pass + the
+        // composite below). The shader does a 3D sphere test, so no projection here.
+        // When "Real brush strokes" is OFF, censors are the ONLY thing that paints
+        // strokes - onto any geometry inside the sphere (static or dynamic).
+        glm::vec4 censorArr[kMaxCensors];
+        glm::vec4 censorStrength;
+        glm::vec4 censorFeather;
+        const u32 nCensor = CollectCensors(view, censorArr, censorStrength, censorFeather);
+
         // --- Real brush strokes: splat instanced oriented quads over the base --
-        if (ps.painterlyStrokes && brushStrokesReady_) {
+        // Runs when global strokes are on OR any censor is active (censor-only mode).
+        if ((ps.painterlyStrokes || nCensor > 0) && brushStrokesReady_) {
             auto toRT = TransitionBarrier(painterly_.Get(),
                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2193,6 +2231,24 @@ void D3D12Device::RunPostStack(const SceneView& view) {
 
             const f32 density = std::max(ps.painterlyStrokeDensity, 0.1f);
             const f32 baseLen = std::max(ps.painterlyRadius * 6.0f * ps.painterlyStrokeLength, 6.0f);
+            // Stop-motion "boil": fold a TIME-QUANTIZED step into the per-stroke seed
+            // so the strokes repaint in discrete jumps at painterlyStrokeBoil fps and
+            // hold in between (instead of recomputing every frame). Wrapped to a small
+            // range so the growing time can't blow up Hash21 (precision -> stripes).
+            const f32 boilPhase =
+                (ps.painterlyStrokeBoil > 0.01f)
+                    ? std::fmod(std::floor(view.timeSeconds * ps.painterlyStrokeBoil), 256.0f)
+                    : 0.0f;
+            // Global stroke coverage box: full screen (or the user's censor-box
+            // rect) when "Real brush strokes" is on; an EMPTY box when it's off, so
+            // strokes paint ONLY inside the censor spheres (gated in the PS below).
+            const glm::vec4 strokeRect =
+                !ps.painterlyStrokes
+                    ? glm::vec4{2.0f, 2.0f, -1.0f, -1.0f} // empty: censor-only
+                    : ps.painterlyStrokeMask
+                          ? glm::vec4{ps.painterlyStrokeMaskMinX, ps.painterlyStrokeMaskMinY,
+                                     ps.painterlyStrokeMaskMaxX, ps.painterlyStrokeMaskMaxY}
+                          : glm::vec4{0.0f, 0.0f, 1.0f, 1.0f};
             const auto drawLayer = [&](f32 lenPx, f32 widthFrac, f32 spacingFac, f32 seed) {
                 const f32 spacing = std::max(3.0f, lenPx * spacingFac / density);
                 const u32 cols = std::max(1u, static_cast<u32>(std::ceil(sceneW_ / spacing)));
@@ -2200,14 +2256,25 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                 PostCB cb2;
                 cb2.input0 = paintColorSrc;
                 cb2.input1 = slotGbuffer_;
-                cb2.input2 = slotDepth_;
+                cb2.input2 = slotDepth_; // depth: world anchoring + the 3D censor test
+                cb2.input3 = slotHdr_;   // forward HDR alpha = the per-pixel censored flag
                 cb2.outTexel = sceneTexel;
                 cb2.inTexel = sceneTexel;
-                cb2.params0 = {lenPx, widthFrac, 0.35f, ps.painterlyStrength};
+                // sizeJit sign flags the VS to SCREEN-ANCHOR the strokes (hold their
+                // screen positions, don't glide with the camera) when boil is on; the
+                // magnitude (0.35) is the size jitter either way.
+                cb2.params0 = {lenPx, widthFrac,
+                               (ps.painterlyStrokeBoil > 0.01f) ? -0.35f : 0.35f,
+                               ps.painterlyStrength};
                 cb2.params1 = {ps.painterlyStrokeSharp, ps.painterlyEdge, 0.30f,
                                std::max(ps.painterlyStrokeDetail * 2.0f, 0.25f)};
                 cb2.params2 = {static_cast<f32>(cols), static_cast<f32>(rows),
                                ps.painterlyStrokeFlow, seed};
+                cb2.params3 = strokeRect;
+                for (u32 ci = 0; ci < kMaxCensors; ++ci) cb2.censors[ci] = censorArr[ci];
+                cb2.censorStrength = censorStrength;
+                cb2.censorFeather = censorFeather;
+                cb2.censorCount = glm::uvec4(nCensor, 0u, 0u, 0u);
                 D3D12_GPU_VIRTUAL_ADDRESS addr = 0;
                 if (void* dst = AllocConstants(sizeof(PostCB), addr)) {
                     std::memcpy(dst, &cb2, sizeof(cb2));
@@ -2215,13 +2282,34 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                 }
                 cmdList_->DrawInstanced(6, cols * rows, 0, 0);
             };
-            drawLayer(baseLen * 1.8f, 0.55f, 0.62f, 11.0f); // coarse block-in (sparser)
-            drawLayer(baseLen, 0.42f, 0.46f, 37.0f);        // finer detail strokes
+            drawLayer(baseLen * 1.8f, 0.55f, 0.62f, 11.0f + boilPhase); // coarse block-in
+            drawLayer(baseLen, 0.42f, 0.46f, 37.0f + boilPhase);        // finer detail
 
             auto toSRV = TransitionBarrier(painterly_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             cmdList_->ResourceBarrier(1, &toSRV);
         }
+
+        // Dynamic-layer composite: restore crisp lit colour over the painterly where the
+        // forward HDR alpha mask = 1 (player / NPCs / interactables), so dynamic objects
+        // stand out against the painted static world. paintColorSrc = pre-painterly lit
+        // HDR (fog/GI integrated); slotHdr_ = untouched forward HDR carrying the mask.
+        PostCB comp;
+        comp.input0 = slotPainterly_; // painted static world
+        comp.input1 = paintColorSrc;  // crisp lit colour for dynamic objects
+        comp.input2 = slotHdr_;       // forward HDR: alpha = mask
+        comp.input3 = slotDepth_;     // depth for the 3D censor test
+        comp.outTexel = sceneTexel;
+        comp.inTexel = sceneTexel;
+        // World-anchored censors (collected above): feed the feathered sphere so
+        // dynamic objects inside a censor keep the painted look (CensorComponent).
+        for (u32 ci = 0; ci < kMaxCensors; ++ci) comp.censors[ci] = censorArr[ci];
+        comp.censorStrength = censorStrength;
+        comp.censorFeather = censorFeather;
+        comp.censorCount = glm::uvec4(nCensor, 0u, 0u, 0u);
+        DrawPostPass(compositePSO_.Get(), painterlyComp_.Get(), rtvAt(16 + kBloomMaxMips),
+                     sceneW_, sceneH_, comp);
+        hdrInput = slotPainterlyComp_;
     }
 
     // --- SSAO + blur (half res) --------------------------------------------
@@ -2765,6 +2853,14 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
             ocb.paintBoxInvM = it.paintBoxInvM;
             ocb.paintBoxCenter = it.paintBoxCenter;
             ocb.paintBoxScale = it.paintBoxScale;
+            ocb.splatAlbedo = {it.splatAlbedo[0].index, it.splatAlbedo[1].index,
+                               it.splatAlbedo[2].index, it.splatAlbedo[3].index};
+            ocb.splatNormal = {it.splatNormal[0].index, it.splatNormal[1].index,
+                               it.splatNormal[2].index, it.splatNormal[3].index};
+            ocb.splatMR     = {it.splatMR[0].index, it.splatMR[1].index,
+                               it.splatMR[2].index, it.splatMR[3].index};
+            ocb.splatRough  = {it.splatRough[0], it.splatRough[1],
+                               it.splatRough[2], it.splatRough[3]};
             if (it.bones && it.boneCount > 0) {
                 // Reuse the palette the shadow pass uploaded this frame.
                 u32 offset = (shadowPassRun_ && i < shadowBoneOffsets_.size())

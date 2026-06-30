@@ -249,7 +249,7 @@ float4 PSMain(VSOutput input) : SV_Target
     float3 sky = SkyRadiance(dir, sunDir, gWeather.x, gWeather.y, gWeather.z, gWeather.w);
 
     if (gOutputLinear != 0)
-        return float4(sky, 1.0f); // HDR pipeline: exposure/tonemap in post
+        return float4(sky, 0.0f); // HDR pipeline: alpha = painterly mask, 0 = paint the sky (it's background)
 
     float3 color = sky * gExposure;
     color = TonemapACES(color);

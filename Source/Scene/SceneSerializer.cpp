@@ -213,6 +213,7 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const TerrainComponent>()) add(e);
     for (const entt::entity e : reg.view<const MotionMatching>()) add(e);
     for (const entt::entity e : reg.view<const Rotator>()) add(e);
+    for (const entt::entity e : reg.view<const CensorComponent>()) add(e);
     for (const entt::entity e : reg.view<const IKConstraint>()) add(e);
     for (const entt::entity e : reg.view<const UIElement>()) add(e);
     for (const entt::entity e : reg.view<const UICanvas>()) add(e);
@@ -230,6 +231,7 @@ json BuildSceneJson(const Scene& scene,
     if (kind != SceneKind::Full) root["kind"] = ToString(kind);
     root["ambientIntensity"] = scene.Environment().ambientIntensity;
     root["exposure"] = scene.Environment().exposure;
+    root["shadowDistance"] = scene.Environment().shadowDistance;
     root["post"] = PostToJson(scene.Environment().post);
     if (!scene.Environment().giSource.empty())
         root["giSource"] = scene.Environment().giSource;
@@ -375,6 +377,18 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
             // Persist sculpted heights so edits survive save/load (omitted for
             // purely procedural terrain, which regenerates from the params).
             if (!tr->heights.empty()) je["terrain"]["heights"] = tr->heights;
+            // Persist the painted hole mask (cliff/cave cutouts) when present.
+            if (!tr->holeMask.empty()) je["terrain"]["holeMask"] = tr->holeMask;
+            // Persist splat material layers (texture paths) + tile + painted weights.
+            if (tr->splatEnabled || !tr->splatWeight.empty()) {
+                json sp;
+                sp["enabled"] = tr->splatEnabled;
+                sp["tile"] = tr->splatTile;
+                sp["layers"] = {tr->splatLayerSrc[0], tr->splatLayerSrc[1],
+                                tr->splatLayerSrc[2], tr->splatLayerSrc[3]};
+                if (!tr->splatWeight.empty()) sp["weight"] = tr->splatWeight;
+                je["terrain"]["splat"] = sp;
+            }
         }
         if (const MotionMatching* mm = reg.try_get<MotionMatching>(e)) {
             je["motionMatching"] = {{"sourceAsset", mm->sourceAsset},
@@ -387,6 +401,13 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
             je["rotator"] = {{"axis", ToJson(ro->axis)},
                              {"speed", ro->speed},
                              {"enabled", ro->enabled}};
+        }
+        if (const CensorComponent* ce = reg.try_get<CensorComponent>(e)) {
+            je["censor"] = {{"radius", ce->radius},
+                            {"feather", ce->feather},
+                            {"strength", ce->strength},
+                            {"offset", ToJson(ce->offset)},
+                            {"enabled", ce->enabled}};
         }
         if (const CharacterController* cc = reg.try_get<CharacterController>(e)) {
             je["character"] = {{"radius", cc->radius},
@@ -578,6 +599,7 @@ void ParseSceneJson(const json& root, SceneData& out) {
     out.ambientIntensity = root.value("ambientIntensity", 1.0f);
     out.giSource = root.value("giSource", std::string());
     out.exposure = root.value("exposure", 1.0f);
+    out.shadowDistance = root.value("shadowDistance", 150.0f);
     if (const auto it = root.find("post"); it != root.end() && it->is_object()) {
         PostFromJson(*it, out.post); // out.post starts at defaults (effects on)
     }
@@ -713,6 +735,21 @@ void ParseSceneJson(const json& root, SceneData& out) {
             if (const auto hit = it->find("heights"); hit != it->end() && hit->is_array()) {
                 tr.heights = hit->get<std::vector<f32>>(); // sculpted heightmap
             }
+            if (const auto mit = it->find("holeMask"); mit != it->end() && mit->is_array()) {
+                tr.holeMask = mit->get<std::vector<u8>>(); // painted cliff/cave holes
+                tr.holeDirty = !tr.holeMask.empty();       // re-upload on load
+            }
+            if (const auto sit = it->find("splat"); sit != it->end()) {
+                tr.splatEnabled = sit->value("enabled", false);
+                tr.splatTile = sit->value("tile", tr.splatTile);
+                if (const auto lit = sit->find("layers"); lit != sit->end() && lit->is_array())
+                    for (int i = 0; i < 4 && i < static_cast<int>(lit->size()); ++i)
+                        tr.splatLayerSrc[i] = (*lit)[i].get<std::string>();
+                if (const auto wit = sit->find("weight"); wit != sit->end() && wit->is_array()) {
+                    tr.splatWeight = wit->get<std::vector<u8>>();
+                    tr.splatDirty = !tr.splatWeight.empty(); // re-upload on load
+                }
+            }
             tr.dirty = true; // rebuild chunks from the loaded params/heights
         }
         if (auto it = je.find("paint"); it != je.end() && it->is_object()) {
@@ -743,6 +780,15 @@ void ParseSceneJson(const json& root, SceneData& out) {
             ro.axis = Vec3(it->value("axis", json()), ro.axis);
             ro.speed = it->value("speed", ro.speed);
             ro.enabled = it->value("enabled", ro.enabled);
+        }
+        if (auto it = je.find("censor"); it != je.end()) {
+            d.hasCensor = true;
+            CensorComponent& ce = d.censor;
+            ce.radius = it->value("radius", ce.radius);
+            ce.feather = it->value("feather", ce.feather);
+            ce.strength = it->value("strength", ce.strength);
+            ce.offset = Vec3(it->value("offset", json()), ce.offset);
+            ce.enabled = it->value("enabled", ce.enabled);
         }
         if (auto it = je.find("character"); it != je.end()) {
             d.hasCharacter = true;
@@ -1240,6 +1286,13 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         }
         out.models.emplace(rel, std::move(*model));
     }
+
+    // Terrain splat layers are MATERIALS: stage each (loads it + its textures) so
+    // Instantiate can resolve the layer's albedo on load.
+    for (const EntityData& d : data.entities) {
+        if (!d.hasTerrain) continue;
+        for (const std::string& mat : d.terrain.splatLayerSrc) stageMaterial(mat);
+    }
 }
 
 void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
@@ -1250,6 +1303,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         reg.clear();
         scene.Environment().ambientIntensity = data.ambientIntensity;
         scene.Environment().exposure = data.exposure;
+        scene.Environment().shadowDistance = data.shadowDistance;
         scene.Environment().post = data.post;
         // Load the cached GI volume (.hbgi) so baked GI lights the scene without a
         // re-bake (falls back to no volume if the cache is missing).
@@ -1418,9 +1472,24 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                 paint::Sync(renderer, placed); // upload canvas + mips
             }
         }
-        if (d.hasTerrain) reg.emplace<TerrainComponent>(e, d.terrain);
+        if (d.hasTerrain) {
+            reg.emplace<TerrainComponent>(e, d.terrain);
+            // Resolve each splat layer's albedo/normal/MR from its (staged) material.
+            TerrainComponent& tc = reg.get<TerrainComponent>(e);
+            for (int li = 0; li < 4; ++li) {
+                if (tc.splatLayerSrc[li].empty()) continue;
+                if (auto mit = staged.materials.find(tc.splatLayerSrc[li]);
+                    mit != staged.materials.end()) {
+                    tc.splatAlbedoTex[li] = loadTexture(mit->second.albedoTex);
+                    tc.splatNormalTex[li] = loadTexture(mit->second.normalTex);
+                    tc.splatMRTex[li] = loadTexture(mit->second.mrTex);
+                    tc.splatRoughFactor[li] = mit->second.roughness;
+                }
+            }
+        }
         if (d.hasMotionMatching) reg.emplace<MotionMatching>(e, d.motionMatching);
         if (d.hasRotator) reg.emplace<Rotator>(e, d.rotator);
+        if (d.hasCensor) reg.emplace<CensorComponent>(e, d.censor);
         if (d.hasCharacter) reg.emplace<CharacterController>(e, d.character);
         if (d.hasIK) reg.emplace<IKConstraint>(e, d.ik);
         if (d.hasUI) {

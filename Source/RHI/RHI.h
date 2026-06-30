@@ -159,6 +159,20 @@ inline constexpr u32 kMaxProbes = 64;
 // Number of cascaded-shadow-map slices (rendered into a 2x2 atlas).
 inline constexpr u32 kMaxShadowCascades = 4;
 
+// One world-anchored painterly "censor": a soft sphere that re-applies the
+// painted (brush-stroke) look over whatever dynamic object falls inside it - a
+// moving person, etc. CPU-side only: the backend projects center+radius to
+// screen each frame and feeds the painterly composite pass (never uploaded raw).
+struct CensorData {
+    glm::vec3 center{0.0f};    // world-space anchor (entity world pos + offset)
+    f32       radius = 2.0f;   // world-space radius of the censor sphere
+    f32       feather = 0.5f;  // soft-edge fraction of the radius (0 = hard cut)
+    f32       strength = 1.0f; // 0 = no effect, 1 = fully painted inside
+};
+
+// Upper bound on simultaneous censors (sized into the composite constant buffer).
+inline constexpr u32 kMaxCensors = 4;
+
 // Post-process stack configuration (HDR pipeline). All effects run inside the
 // backend after the scene pass; a backend without post support ignores this.
 struct PostSettings {
@@ -253,6 +267,18 @@ struct PostSettings {
     f32 painterlyStrokeLength = 1.0f;  // stroke length multiplier
     f32 painterlyStrokeDensity = 1.0f; // how densely strokes are packed (higher = more)
     f32 painterlyStrokeSharp = 0.65f;  // stroke definition: 0 = soft/blended, 1 = crisp/opaque
+    // Stop-motion "boil": the strokes repaint in discrete steps at this rate (frames/
+    // sec) instead of recomputing every rendered frame - the hand-painted/stop-motion
+    // look. Lower = slower/choppier; 0 = smooth/continuous (off). Drives a quantized
+    // time step folded into the per-stroke seed (CPU-side).
+    f32 painterlyStrokeBoil = 8.0f;
+    // Optional area mask: confine the real brush strokes to a screen-space rect
+    // (a "censor box"). Outside the rect only the Kuwahara base shows through.
+    u32 painterlyStrokeMask = 0;       // 0 = strokes everywhere, 1 = only inside the rect
+    f32 painterlyStrokeMaskMinX = 0.30f; // rect in normalized screen UV (0..1)
+    f32 painterlyStrokeMaskMinY = 0.30f;
+    f32 painterlyStrokeMaskMaxX = 0.70f;
+    f32 painterlyStrokeMaskMaxY = 0.70f;
     // Removed: the automatic 3D surface-stroke painterly renderer (left as an
     // always-off field so old scene files with this key still load). Hand painting
     // (Art Editor) is the painterly path now.
@@ -299,6 +325,12 @@ struct SceneView {
     u32 probeCount = 0;
     ProbeData probes[kMaxProbes];
 
+    // World-anchored painterly censors (CensorComponent): each re-paints a
+    // dynamic object inside a soft sphere. CPU-side; the backend projects these
+    // tests them in 3D and feeds the painterly passes (CollectCensors below).
+    u32 censorCount = 0;
+    CensorData censors[kMaxCensors];
+
     // Baked SH-L1 irradiance volume (the diffuse-GI upgrade). giShIndex 0 = none.
     glm::vec3  giOrigin{0.0f};
     glm::vec3  giInvSpacing{0.0f};
@@ -325,6 +357,32 @@ struct SceneView {
     PostSettings post;
 };
 
+// Collect the frame's active world-anchored censors for the painterly passes. The
+// shader does a TRUE 3D sphere test (reconstructs each pixel's world position from
+// depth and measures distance to the censor center), so there is NO screen
+// projection here - that makes the censor immune to camera angle (the old
+// project-to-screen-circle approach degenerated at some orientations) and lets it
+// affect ANY geometry inside the sphere, static or dynamic. Fills
+// outCensors[i] = (worldCenter.xyz, worldRadius) and packs per-censor strength /
+// feather into the matching component of outStrength / outFeather (.x..w).
+inline u32 CollectCensors(const SceneView& view, glm::vec4 outCensors[kMaxCensors],
+                          glm::vec4& outStrength, glm::vec4& outFeather) {
+    outStrength = glm::vec4(0.0f);
+    outFeather = glm::vec4(0.0f);
+    u32 n = 0;
+    for (u32 i = 0; i < view.censorCount && n < kMaxCensors; ++i) {
+        const CensorData& c = view.censors[i];
+        if (c.strength <= 0.0f || c.radius <= 0.0f) continue;
+        outCensors[n] = glm::vec4(c.center, c.radius);
+        outStrength[static_cast<int>(n)] = glm::clamp(c.strength, 0.0f, 1.0f);
+        // Clamp feather away from 0 so inner radius stays < outer (no smoothstep
+        // divide-by-zero in the shader); 0.01 reads as an effectively hard edge.
+        outFeather[static_cast<int>(n)] = glm::clamp(c.feather, 0.01f, 1.0f);
+        ++n;
+    }
+    return n;
+}
+
 // Material feature flags (packed into DrawItem::materialFlags).
 enum MaterialFlags : u32 {
     MaterialFlag_None       = 0,
@@ -339,6 +397,23 @@ enum MaterialFlags : u32 {
     // as a real in-focus surface instead of inheriting the far-background depth and
     // blurring where it floats off a surface. Use together with Transparent.
     MaterialFlag_DepthWrite = 1u << 6,
+    // Dynamic-layer object (player / NPC / interactable): exempt from the painterly
+    // finish so it reads crisp against the painted static world. The forward pass
+    // writes this into HDR alpha (the painterly mask); a composite restores the
+    // object's lit colour over the painterly result. Lighting/shadows/GI/fog stay on.
+    MaterialFlag_PainterlyExempt = 1u << 7,
+    // Terrain hole mask: the thickness-texture slot (unused by terrain) carries a
+    // single-channel hole mask; the forward pass clips (discards) pixels where it is
+    // set, cutting visual holes in the terrain so cliff/cave models show through.
+    MaterialFlag_TerrainHole = 1u << 8,
+    // Terrain splat: blend up to 4 tiling material textures by a painted weight mask.
+    // The 4 layer albedos ride in the (terrain-unused) albedo/normal/mr/ao slots and
+    // the weight mask in the emissive slot; subsurfaceRadius carries the tile scale.
+    MaterialFlag_TerrainSplat = 1u << 9,
+    // Painterly censor target: the entity carries a CensorComponent, so the
+    // painterly passes paint brush strokes onto ITS surface (and keep the painted
+    // look on it) - confining the censor to the object, not the volume around it.
+    MaterialFlag_Censored = 1u << 10,
 };
 
 // One mesh instance to draw with a metallic-roughness material.
@@ -377,6 +452,14 @@ struct DrawItem {
     glm::vec3  paintBoxCenter{0.0f};    // local AABB center
     glm::vec3  paintBoxScale{1.0f};     // object world scale
     f32        paintBoxInvM = 1.0f;     // 1 / max(extent*scale) (uniform density)
+
+    // Terrain splat: 4 layers' material textures (albedo / normal / metal-rough),
+    // blended by the weight mask (emissiveTexture) at the terrain-wide UV and tiled
+    // by world XZ / subsurfaceRadius. Only used when MaterialFlag_TerrainSplat is set.
+    TextureHandle splatAlbedo[4];
+    TextureHandle splatNormal[4];
+    TextureHandle splatMR[4];
+    f32           splatRough[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // per-layer roughness factor
 
     // 3D painterly: when true, the surface-stroke renderer paints this item (set
     // for STATIC, non-skinned world geometry; characters/dynamics shade normally).

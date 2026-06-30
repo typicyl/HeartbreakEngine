@@ -74,8 +74,9 @@ float4 PSMain(FSOutput input) : SV_Target
         const float sigma = dens;
 
         // Sun in-scatter, shadowed by the CSM. The godRays boost emphasizes the
-        // shafts cast through gaps (the shadowed sun term) only.
-        const float sunVis = ShadowFactor(pos, 1.0f);
+        // shafts cast through gaps (the shadowed sun term) only. 1-tap shadow per
+        // step (not 9-tap PCF) - dithered accumulation makes them look the same.
+        const float sunVis = ShadowFactorCheap(pos);
         float3 scat = gLightColor * (gLightIntensity * sunInt * sunVis * sunPhase * godRays);
         // Isotropic sky/ambient in-scatter.
         scat += ambient * gLightColor;
@@ -103,6 +104,7 @@ float4 PSMain(FSOutput input) : SV_Target
         const float stepTrans = exp(-sigma * stepLen);
         inscatter += transmittance * (scat * fogTint) * sigma * stepLen; // fog colour tint
         transmittance *= stepTrans;
+        if (transmittance < 0.004f) break; // fully fogged - remaining steps add nothing
     }
 
     return float4(scene * transmittance + inscatter, 1.0f);

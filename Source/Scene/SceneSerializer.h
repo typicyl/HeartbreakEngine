@@ -88,6 +88,8 @@ struct EntityData {
     MotionMatching motionMatching;
     bool hasRotator = false;
     Rotator rotator;
+    bool hasCensor = false;
+    CensorComponent censor;
     bool hasCharacter = false;
     CharacterController character;
     bool hasIK = false;
@@ -132,6 +134,7 @@ struct SceneData {
     std::vector<EntityData> entities;
     f32 ambientIntensity = 1.0f;
     f32 exposure = 1.0f;
+    f32 shadowDistance = 150.0f;
     std::string giSource; // cached .hbgi GI volume (rel to Assets)
     rhi::PostSettings post; // HDR post-process stack (defaults = effects on)
     // Level layer this file represents (header "kind"). Full = standalone scene.

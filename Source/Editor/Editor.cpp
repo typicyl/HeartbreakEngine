@@ -778,14 +778,24 @@ void Editor::UpdateTerrainTool(Engine& engine) {
             terrainStroking_ = true;
             terrainFlatten_ = terrain::SampleHeight(*t, localHit.x, localHit.z);
         }
-        const auto brush = static_cast<terrain::Brush>(terrainBrush_);
-        const f32 dt = engine.DeltaTime();
-        const f32 amount =
-            (brush == terrain::Brush::Raise || brush == terrain::Brush::Lower)
-                ? terrainStrength_ * dt
-                : glm::clamp(terrainStrength_ * dt * 0.5f, 0.0f, 1.0f);
-        terrain::Sculpt(scene, renderer, selected_, localHit.x, localHit.z,
-                        terrainRadius_, amount, brush, terrainFlatten_);
+        // Brushes 0-3 sculpt the heightfield; 4 = Hole (cut), 5 = Hole fill,
+        // 6 = Paint material (the active splat layer). The mask brushes don't edit
+        // height, so they call PaintHole/PaintSplat instead of Sculpt.
+        if (terrainBrush_ == 6) {
+            terrain::PaintSplat(*t, localHit.x, localHit.z, terrainRadius_, t->activeSplatLayer);
+        } else if (terrainBrush_ >= 4) {
+            terrain::PaintHole(*t, localHit.x, localHit.z, terrainRadius_,
+                               /*erase=*/terrainBrush_ == 5);
+        } else {
+            const auto brush = static_cast<terrain::Brush>(terrainBrush_);
+            const f32 dt = engine.DeltaTime();
+            const f32 amount =
+                (brush == terrain::Brush::Raise || brush == terrain::Brush::Lower)
+                    ? terrainStrength_ * dt
+                    : glm::clamp(terrainStrength_ * dt * 0.5f, 0.0f, 1.0f);
+            terrain::Sculpt(scene, renderer, selected_, localHit.x, localHit.z,
+                            terrainRadius_, amount, brush, terrainFlatten_);
+        }
         terrainConsumedClick_ = true; // don't also pick an entity
     } else {
         terrainStroking_ = false;
@@ -2388,6 +2398,10 @@ void Editor::DrawProjectSettings(Engine& engine) {
         ImGui::DragFloat("Sun Light Intensity", &env.sunLightIntensity, 0.05f, 0.0f, 50.0f);
         ImGui::DragFloat("Ambient (IBL)", &env.ambientIntensity, 0.01f, 0.0f, 4.0f);
         ImGui::DragFloat("Exposure", &env.exposure, 0.01f, 0.05f, 16.0f);
+        // Shadow distance edits the LIVE scene environment (immediate feedback). Bigger
+        // = sun shadows reach further across large terrains; smaller = crisper near.
+        ImGui::DragFloat("Shadow Distance", &engine.GetScene().Environment().shadowDistance,
+                         2.0f, 10.0f, 2000.0f, "%.0f");
         if (ImGui::Button("Apply to Scene")) {
             // Push lighting/exposure into the live scene environment now.
             SceneEnvironment& se = engine.GetScene().Environment();
@@ -4823,6 +4837,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             reg.emplace<Rotator>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
+        if (!reg.all_of<CensorComponent>(sel) && ImGui::MenuItem("Painterly Censor")) {
+            PushUndo(scene);
+            reg.emplace<CensorComponent>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
         if (!reg.all_of<CharacterController>(sel) && ImGui::MenuItem("Character Controller")) {
             PushUndo(scene);
             reg.emplace<CharacterController>(sel);
@@ -5493,10 +5512,73 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             ImGui::Checkbox("Sculpt Mode", &terrainSculpt_);
             if (terrainSculpt_) {
                 ImGui::TextDisabled("Drag LMB on the terrain in the Scene view.");
-                const char* brushes[] = {"Raise", "Lower", "Smooth", "Flatten"};
+                const char* brushes[] = {"Raise", "Lower", "Smooth", "Flatten",
+                                         "Hole (cut)", "Hole fill", "Paint material"};
                 ImGui::Combo("Brush", &terrainBrush_, brushes, IM_ARRAYSIZE(brushes));
                 ImGui::SliderFloat("Radius", &terrainRadius_, 0.5f, 50.0f, "%.1f");
                 ImGui::SliderFloat("Strength", &terrainStrength_, 0.1f, 30.0f, "%.1f");
+                if (terrainBrush_ == 4 || terrainBrush_ == 5)
+                    ImGui::TextDisabled("Cuts transparent holes for cliff/cave models\n"
+                                        "(collision stays). 'Hole fill' restores terrain.");
+                else if (terrainBrush_ == 6)
+                    ImGui::TextDisabled("Paints the active splat layer (set it below).");
+            }
+
+            // --- Material (splat) ------------------------------------------------
+            ImGui::SeparatorText("Material (splat)");
+            ImGui::Checkbox("Splat painting", &tr->splatEnabled);
+            if (tr->splatEnabled) {
+                ImGui::DragFloat("Tile (world units)", &tr->splatTile, 0.1f, 0.25f, 128.0f);
+                undoOnActivate();
+                int al = tr->activeSplatLayer;
+                if (ImGui::Combo("Paint layer", &al, "Layer 1\0Layer 2\0Layer 3\0Layer 4\0"))
+                    tr->activeSplatLayer = glm::clamp(al, 0, 3);
+                ImGui::TextDisabled("Set Brush = 'Paint material', pick a layer, drag on terrain.");
+                // Layers are MATERIALS (.hbmat); the blend uses each material's albedo.
+                static std::vector<std::string> splatMats;
+                static char splatFilter[64] = "";
+                if (ImGui::IsWindowAppearing() || splatMats.empty())
+                    splatMats = ListAssetsByExt(".hbmat");
+                const auto loadLayerMat = [&](int i, const std::string& matRef) {
+                    tr->splatLayerSrc[i] = matRef;
+                    tr->splatAlbedoTex[i] = {};
+                    tr->splatNormalTex[i] = {};
+                    tr->splatMRTex[i] = {};
+                    tr->splatRoughFactor[i] = 1.0f;
+                    if (matRef.empty()) return;
+                    const std::filesystem::path dir = Project::Active().AssetsDir();
+                    if (auto m = assets::LoadMaterial(dir / matRef)) {
+                        const auto load = [&](const std::string& t) {
+                            return t.empty() ? rhi::TextureHandle{}
+                                             : assets::LoadTexture(renderer, dir / t);
+                        };
+                        tr->splatAlbedoTex[i] = load(m->albedoTex);
+                        tr->splatNormalTex[i] = load(m->normalTex);
+                        tr->splatMRTex[i] = load(m->mrTex);
+                        tr->splatRoughFactor[i] = m->roughness;
+                    }
+                };
+                for (int i = 0; i < 4; ++i) {
+                    ImGui::PushID(i);
+                    const std::string cur =
+                        tr->splatLayerSrc[i].empty() ? "(none)" : tr->splatLayerSrc[i];
+                    char label[24];
+                    std::snprintf(label, sizeof(label), "Layer %d", i + 1);
+                    if (ImGui::BeginCombo(label, cur.c_str())) {
+                        if (ImGui::IsWindowAppearing()) { splatFilter[0] = '\0'; ImGui::SetKeyboardFocusHere(); }
+                        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+                        ImGui::InputTextWithHint("##sf", "Search...", splatFilter, sizeof(splatFilter));
+                        if (ImGui::Selectable("(none)", tr->splatLayerSrc[i].empty()))
+                            loadLayerMat(i, "");
+                        for (const std::string& choice : splatMats) {
+                            if (splatFilter[0] && choice.find(splatFilter) == std::string::npos) continue;
+                            if (ImGui::Selectable(choice.c_str(), choice == tr->splatLayerSrc[i]))
+                                loadLayerMat(i, choice);
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::PopID();
+                }
             }
         }
         if (s.remove) {
@@ -5568,6 +5650,32 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<Rotator>(sel);
+        }
+    }
+
+    // --- Painterly Censor (re-paint a moving object with brush strokes) -------
+    if (CensorComponent* ce = reg.try_get<CensorComponent>(sel)) {
+        const SectionState s = ComponentSection("Painterly Censor");
+        if (s.open) {
+            ImGui::DragFloat("Radius (m)", &ce->radius, 0.05f, 0.0f, 100.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Feather", &ce->feather, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Strength", &ce->strength, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            ImGui::DragFloat3("Center offset", glm::value_ptr(ce->offset), 0.05f);
+            undoOnActivate();
+            bool en = ce->enabled;
+            if (ImGui::Checkbox("Enabled##censor", &en)) { PushUndo(scene); ce->enabled = en; }
+            ImGui::TextDisabled("Paints this object with brush strokes inside a soft\n"
+                                "sphere that follows it (any object - static or dynamic).\n"
+                                "Needs the Painterly finish on; works with \"Real brush\n"
+                                "strokes\" OFF (censor-only). Offset raises the sphere onto\n"
+                                "the body; feather softens the edge; radius sizes it.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<CensorComponent>(sel);
         }
     }
 
@@ -6260,10 +6368,36 @@ void Editor::DrawPostLookControls(rhi::PostSettings& p, f32* exposure) {
         ImGui::SliderFloat("Posterize steps##paint", &p.painterlyPosterize, 0.0f, 16.0f, "%.0f");
         ImGui::Spacing();
         toggle("Real brush strokes", p.painterlyStrokes);
+        // The stroke look applies to BOTH whole-scene strokes and Painterly Censor
+        // objects, so these stay editable even with "Real brush strokes" off (the
+        // censor-only mode: scene is just the smooth filter, strokes only on
+        // censored objects). Add a "Painterly Censor" component to an entity.
+        ImGui::SliderFloat("Stroke length##paint", &p.painterlyStrokeLength, 0.3f, 3.0f, "%.2f");
+        ImGui::SliderFloat("Stroke density##paint", &p.painterlyStrokeDensity, 0.3f, 3.0f, "%.2f");
+        ImGui::SliderFloat("Stroke sharpness##paint", &p.painterlyStrokeSharp, 0.0f, 1.0f, "%.2f");
+        ImGui::SliderFloat("Stroke boil (fps)##paint", &p.painterlyStrokeBoil, 0.0f, 24.0f, "%.0f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Stop-motion: strokes repaint in discrete steps at this rate\n"
+                              "(lower = slower/choppier hand-painted look; 0 = smooth).");
+        if (!p.painterlyStrokes)
+            ImGui::TextDisabled("Real brush strokes OFF: strokes paint ONLY on objects\n"
+                                "with a Painterly Censor component (scene stays smooth).");
         if (p.painterlyStrokes) {
-            ImGui::SliderFloat("Stroke length##paint", &p.painterlyStrokeLength, 0.3f, 3.0f, "%.2f");
-            ImGui::SliderFloat("Stroke density##paint", &p.painterlyStrokeDensity, 0.3f, 3.0f, "%.2f");
-            ImGui::SliderFloat("Stroke sharpness##paint", &p.painterlyStrokeSharp, 0.0f, 1.0f, "%.2f");
+            ImGui::Spacing();
+            toggle("Limit to area (censor box)", p.painterlyStrokeMask);
+            if (p.painterlyStrokeMask) {
+                ImGui::SliderFloat("Box left##paint", &p.painterlyStrokeMaskMinX, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("Box top##paint", &p.painterlyStrokeMaskMinY, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("Box right##paint", &p.painterlyStrokeMaskMaxX, 0.0f, 1.0f, "%.2f");
+                ImGui::SliderFloat("Box bottom##paint", &p.painterlyStrokeMaskMaxY, 0.0f, 1.0f, "%.2f");
+                // Keep the rect well-formed (min stays left/above max).
+                p.painterlyStrokeMaskMaxX =
+                    std::max(p.painterlyStrokeMaskMaxX, p.painterlyStrokeMaskMinX + 0.01f);
+                p.painterlyStrokeMaskMaxY =
+                    std::max(p.painterlyStrokeMaskMaxY, p.painterlyStrokeMaskMinY + 0.01f);
+                ImGui::TextDisabled("Strokes only paint inside the box (screen space).\n"
+                                    "Outside the box only the smooth base shows.");
+            }
         }
         ImGui::TextDisabled("Edge keep = how hard strokes stop at object silhouettes.\n"
                             "Light tint bleeds coloured lights into the paint. 0 posterize = off.\n"

@@ -14,10 +14,13 @@
 //
 // Inputs : gInput0 = lit HDR colour (pre-Painterly, for crisp stroke colour)
 //          gInput1 = G-buffer (unused here; reserved)
-//          gInput2 = depth (R32F; 1 = sky) - silhouette-aware stroke shortening
+//          gInput2 = depth (R32F; 1 = sky) - silhouette shortening + 3D censor test
+//          gInput3 = forward HDR (a = 2-bit painterly mask; bit1 = censored object).
+//                    NOTE: composite uses the reverse (gInput2 = mask, gInput3 = depth).
 // Params : gPostParams0 = (stroke length px, width fraction, size jitter, amount)
 //          gPostParams1 = (colour jitter, edge keep, angle jitter, bristle detail)
 //          gPostParams2 = (grid cols, grid rows, flow strength, layer seed)
+//          gPostParams3 = area mask rect (minX, minY, maxX, maxY); full = (0,0,1,1)
 // Output : HDR, alpha-blended (SRC_ALPHA, INV_SRC_ALPHA) onto the painterly base.
 //
 // NOTE: this pass has its OWN instanced VSMain, so it can't include
@@ -36,6 +39,14 @@ cbuffer PostConstants : register(b1)
     float4 gPostParams0;
     float4 gPostParams1;
     float4 gPostParams2;
+    float4 gPostParams3; // area mask (minX, minY, maxX, maxY in screen UV; full = no mask)
+    // World-anchored censors (3D sphere test). Per censor: gCensors[i] =
+    // (worldCenter.xyz, worldRadius); strength/feather packed per .x..w. Layout
+    // kept byte-identical to PostCommon.hlsli / PostUBO (shared b1 cbuffer).
+    float4 gCensors[4];
+    float4 gCensorStrength;
+    float4 gCensorFeather;
+    uint4  gCensorCount;
 };
 [[vk::binding(2, 0)]] SamplerState gClampSampler : register(s1, space0);
 
@@ -61,6 +72,12 @@ float VN(float2 p) {
 float3 FetchHDR(uint tex, float2 uv) {
     return max(gTextures[NonUniformResourceIndex(tex)].SampleLevel(gClampSampler, uv, 0.0f).rgb, 0.0f);
 }
+// Unproject a screen UV + depth back to a world position (for world-anchored strokes).
+float3 WorldFromDepth(float2 uv, float depth) {
+    float2 ndc = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    float4 w = mul(gInvViewProj, float4(ndc, depth, 1.0f));
+    return w.xyz / w.w;
+}
 
 struct VSOut {
     float4 pos : SV_Position;
@@ -72,7 +89,10 @@ struct VSOut {
 VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const float lenPx = gPostParams0.x;
     const float widthFrac = gPostParams0.y;
-    const float sizeJit = gPostParams0.z;
+    // sizeJit magnitude = size jitter; a NEGATIVE sign means "boil on" -> SCREEN-ANCHOR
+    // the strokes (hold their screen positions so they don't glide with the camera).
+    const float sizeJit = abs(gPostParams0.z);
+    const bool screenAnchor = gPostParams0.z < 0.0f;
     const float edgeKeep = gPostParams1.y;
     const float angleJit = gPostParams1.z;
     const float cols = max(gPostParams2.x, 1.0f);
@@ -86,13 +106,66 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const float cx = (float)(iid % ci);
     const float cy = (float)(iid / ci);
     const float2 cell = float2(res.x / cols, res.y / rows);
-    // Jitter the seed within its cell so the grid never shows through.
-    const float2 jit = float2(Hash21(float2(iid + 0.5f, seed)),
-                              Hash21(float2(seed * 1.7f, iid + 0.5f))) - 0.5f;
-    const float2 centerPx = (float2(cx, cy) + 0.5f) * cell + jit * cell * 0.95f;
+
+    // WORLD-ANCHORED placement: the strokes are seeded on a SCREEN grid (one instance per
+    // cell), but each instance reconstructs the surface point under its cell from depth,
+    // snaps it to a distance-scaled WORLD grid, and reprojects to screen. So a stroke
+    // STAYS ON THE SURFACE as the camera moves (no screen-space "shower-door" swimming),
+    // and its per-stroke randoms key off the WORLD cell, so the marks are also temporally
+    // stable. The world cell size = the world extent of one screen cell at that depth, so
+    // on-screen stroke density stays uniform (no gaps at grazing angles). Sky pixels (no
+    // surface) fall back to the old screen-anchored grid. STOP-MOTION ("boil on" =
+    // screenAnchor): we also use the screen-grid path for ALL pixels so the strokes
+    // sit at fixed screen positions and HOLD between boil ticks (their jitter is keyed
+    // off the time-quantized seed), instead of reprojecting/gliding every frame as the
+    // camera moves. The Kuwahara base still renders live, so the world doesn't lag.
+    const float2 sampPx = (float2(cx, cy) + 0.5f) * cell;
+    const float2 sampUv = sampPx * gOutTexel;
+    const float depth = SamplePost(gInput2, sampUv).r;
+
+    float2 hk;
+    float2 centerPx;
+    if (depth < 1.0f && !screenAnchor) {
+        const float3 P  = WorldFromDepth(sampUv, depth);
+        const float3 Px = WorldFromDepth(sampUv + float2(d.x, 0.0f), depth);
+        const float cellW = max(length(Px - P) * cell.x, 0.01f); // world size of one cell
+        // If this cell's surface point is inside a censor sphere, anchor the grid to
+        // the OBJECT: snap relative to the censor center (which rides with the entity)
+        // so the strokes stick to the moving surface instead of crawling across it in
+        // world space. Outside any censor -> cOrigin stays 0 = world-anchored (as before).
+        float3 cOrigin = float3(0.0f, 0.0f, 0.0f);
+        [unroll] for (uint ci = 0u; ci < 4u; ++ci) {
+            if (ci >= gCensorCount.x) break;
+            if (distance(P, gCensors[ci].xyz) < gCensors[ci].w) { cOrigin = gCensors[ci].xyz; break; }
+        }
+        const float3 wc = round((P - cOrigin) / cellW);          // object-rel (or world) cell
+        hk = wc.xz + wc.y * 0.7f + seed * float2(1.7f, 2.3f);    // stable seed (rides w/ object)
+        const float2 jw = float2(Hash21(hk), Hash21(hk + 11.3f)) - 0.5f;
+        const float3 anchor = (wc + float3(jw.x, 0.0f, jw.y) * 0.9f) * cellW + cOrigin;
+        const float4 clip = mul(gViewProj, float4(anchor, 1.0f));
+        centerPx = (clip.w > 1e-4f)
+            ? float2(clip.x / clip.w * 0.5f + 0.5f, 0.5f - clip.y / clip.w * 0.5f) * res
+            : float2(-1e5f, -1e5f); // behind the camera -> offscreen (quad is culled)
+    } else {
+        // Sky: no surface to anchor to - keep the screen grid + a stable per-cell jitter.
+        hk = float2(cx + 1.0f, cy + 1.0f) + seed * float2(1.7f, 2.3f);
+        const float2 jit = float2(Hash21(hk), Hash21(hk + 11.3f)) - 0.5f;
+        centerPx = sampPx + jit * cell * 0.95f;
+    }
     const float2 uv = centerPx * gOutTexel;
 
-    const float3 c = FetchHDR(gInput0, uv);
+    // Average the stroke colour over a small area at the stroke scale (a 5-tap cross)
+    // rather than a single point. A fixed-position stroke that point-samples the scene
+    // flickers frame-to-frame because the scene under it changes fast - specular
+    // sparkle + the per-frame TAA sub-pixel jitter. Averaging makes each mark's colour
+    // temporally stable, so the strokes stop the "fast flicker".
+    const float2 cs = max(lenPx, 4.0f) * 0.25f * d;
+    float3 c = FetchHDR(gInput0, uv)
+             + FetchHDR(gInput0, uv + float2(cs.x, 0.0f))
+             + FetchHDR(gInput0, uv - float2(cs.x, 0.0f))
+             + FetchHDR(gInput0, uv + float2(0.0f, cs.y))
+             + FetchHDR(gInput0, uv - float2(0.0f, cs.y));
+    c *= 0.2f;
 
     // --- flow orientation: Sobel on luma at stroke scale -> structure tensor --
     const float es = max(lenPx * 0.18f, 1.5f);
@@ -108,15 +181,15 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     // Strokes run ALONG the edge (perp to gradient). In flat regions the gradient
     // is meaningless, so blend toward a random angle (scatter) by flow strength.
     const float edgeAng = phi + 1.5707963f;
-    const float randAng = (Hash21(float2(iid + 3.0f, seed)) * 2.0f - 1.0f) * kPI;
+    const float randAng = (Hash21(hk + 3.7f) * 2.0f - 1.0f) * kPI;
     const float oriented = saturate(gmag * flowStr * 6.0f);
     float ang = lerp(randAng, edgeAng, oriented);
-    ang += (Hash21(float2(seed * 2.3f, iid + 7.0f)) - 0.5f) * angleJit * 1.4f;
+    ang += (Hash21(hk + 7.1f) - 0.5f) * angleJit * 1.4f;
     const float2 dir = float2(cos(ang), sin(ang));
     const float2 perp = float2(-dir.y, dir.x);
 
     // size with per-stroke jitter
-    const float r1 = Hash21(float2(iid * 0.7f + 1.0f, seed * 2.1f));
+    const float r1 = Hash21(hk + 23.9f);
     float len = lenPx * (1.0f + (r1 - 0.5f) * 2.0f * sizeJit);
     const float wid = len * widthFrac;
 
@@ -142,11 +215,39 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     o.pos = float4(clip, 0.0f, 1.0f);
     o.luv = cr + 0.5f;
     o.col = c;
-    o.rnd = float2(Hash21(float2(iid + 11.0f, seed * 3.3f)), r1);
+    o.rnd = float2(Hash21(hk + 41.3f), r1);
     return o;
 }
 
 float4 PSMain(VSOut i) : SV_Target {
+    const float2 px = i.pos.xy;            // pixel coords (SV_Position)
+    const float2 suv = px * gOutTexel;     // normalized screen UV
+    // Stroke coverage = the global area box OR a world-anchored censor sphere.
+    // The box is full-screen when "Real brush strokes" is on (or the user's censor-
+    // box rect), and EMPTY when it's off -> then only censors paint. The censor is a
+    // 3D sphere test (reconstruct world pos from depth) GATED by the per-pixel
+    // censored flag (forward HDR alpha bit, gInput3), so strokes land ONLY on the
+    // censored object's surface - not the floor/walls inside the sphere.
+    float boxCov = (suv.x >= gPostParams3.x && suv.x <= gPostParams3.z &&
+                    suv.y >= gPostParams3.y && suv.y <= gPostParams3.w) ? 1.0f : 0.0f;
+    float censorCov = 0.0f;
+    if (gCensorCount.x > 0u) {
+        const float depth = SamplePost(gInput2, suv).r;             // R32F, 1 = sky
+        const float censored = step(1.5f, SamplePost(gInput3, suv).a * 3.0f); // bit1
+        if (depth < 1.0f && censored > 0.5f) {
+            const float3 wp = WorldFromDepth(suv, depth);
+            [unroll] for (uint ci = 0u; ci < 4u; ++ci) {
+                if (ci >= gCensorCount.x) break;
+                const float3 center = gCensors[ci].xyz;
+                const float  radius = gCensors[ci].w;
+                const float  inner = radius * (1.0f - gCensorFeather[ci]);
+                const float  d = distance(wp, center);
+                censorCov = max(censorCov, (1.0f - smoothstep(inner, radius, d)) * gCensorStrength[ci]);
+            }
+        }
+    }
+    const float cover = max(boxCov, censorCov);
+    if (cover <= 0.003f) discard;
     const float amount = gPostParams0.w;
     const float sharp = saturate(gPostParams1.x); // 0 = soft/blended, 1 = crisp/opaque
     const float bristle = saturate(gPostParams1.w);
@@ -180,5 +281,6 @@ float4 PSMain(VSOut i) : SV_Target {
 
     // Crisp strokes are also more opaque, so they sit on top rather than blend.
     const float op = lerp(0.70f, 1.0f, sharp);
-    return float4(max(col, 0.0f), saturate(a) * amount * op);
+    // Fold in the coverage so the censor edge feathers (and the empty box culls).
+    return float4(max(col, 0.0f), saturate(a) * amount * op * cover);
 }

@@ -108,6 +108,51 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         item.subsurfaceRadius = instance.subsurfaceRadius;
         item.thicknessTexture = instance.thicknessTexture;
         item.materialFlags = instance.materialFlags;
+        // Dynamic-layer objects (player / NPCs / interactables) are exempt from the
+        // painterly finish so they stand out crisp against the painted static world.
+        // Tag them here; the forward pass writes the flag into HDR alpha and a post
+        // composite restores their lit colour over the painterly result (they keep
+        // full lighting/shadows/GI/fog - only the painted stylisation is skipped).
+        if (const SceneLayer* sl = registry_.try_get<SceneLayer>(e);
+            sl && sl->kind == SceneKind::Dynamic)
+            item.materialFlags |= rhi::MaterialFlag_PainterlyExempt;
+        // Painterly censor target: an entity carrying a CensorComponent gets the
+        // painted brush-stroke look on ITS OWN surface (static or dynamic). The
+        // forward pass writes this into HDR alpha so the censor passes confine the
+        // sphere to the object's pixels (not the floor/walls inside the sphere).
+        if (const CensorComponent* cc = registry_.try_get<CensorComponent>(e);
+            cc && cc->enabled && cc->strength > 0.0f && cc->radius > 0.0f)
+            item.materialFlags |= rhi::MaterialFlag_Censored;
+        // Terrain chunk: inherit the parent terrain's painted masks. The hole mask
+        // (thickness slot + TerrainHole flag) clips pixels so cliff/cave models show
+        // through. Splat blends 4 tiling layer albedos (overloaded into the albedo/
+        // normal/mr/ao slots) by the weight mask (emissive slot); subsurfaceRadius
+        // carries the tile scale. Both coexist.
+        if (registry_.all_of<TerrainChunk>(e)) {
+            if (const Parent* par = registry_.try_get<Parent>(e);
+                par && registry_.valid(par->entity)) {
+                if (const TerrainComponent* tc = registry_.try_get<TerrainComponent>(par->entity)) {
+                    // Live terrain roughness (the inspector slider takes effect without a
+                    // chunk rebuild; also the splat roughness floor reads this).
+                    item.roughness = tc->roughness;
+                    if (tc->holeMaskTex.IsValid() && !tc->holeMask.empty()) {
+                        item.thicknessTexture = tc->holeMaskTex;
+                        item.materialFlags |= rhi::MaterialFlag_TerrainHole;
+                    }
+                    if (tc->splatEnabled && tc->splatWeightTex.IsValid()) {
+                        for (int li = 0; li < 4; ++li) {
+                            item.splatAlbedo[li] = tc->splatAlbedoTex[li];
+                            item.splatNormal[li] = tc->splatNormalTex[li];
+                            item.splatMR[li]     = tc->splatMRTex[li];
+                            item.splatRough[li]  = tc->splatRoughFactor[li];
+                        }
+                        item.emissiveTexture = tc->splatWeightTex; // weight mask
+                        item.subsurfaceRadius = tc->splatTile;     // overload: tile scale
+                        item.materialFlags |= rhi::MaterialFlag_TerrainSplat;
+                    }
+                }
+            }
+        }
         // Art Editor surface paint: composite the canvas over the material when
         // the entity has an enabled, GPU-resident PaintComponent. Terrain chunks
         // share ONE whole-terrain canvas that lives on the parent terrain entity
@@ -341,6 +386,22 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         out._pad0 = rl.twoSided ? 1.0f : 0.0f;
     }
 
+    // World-anchored painterly censors: every entity with a CensorComponent. The
+    // backend tests these spheres in 3D and feathers them into the painterly
+    // passes so geometry inside keeps the painted look (CollectCensors).
+    v.censorCount = 0;
+    for (const entt::entity e : registry_.view<const Transform, const CensorComponent>()) {
+        if (v.censorCount >= rhi::kMaxCensors) break;
+        const auto& cc = registry_.get<const CensorComponent>(e);
+        if (!cc.enabled || cc.strength <= 0.0f || cc.radius <= 0.0f) continue;
+        const glm::mat4 world = WorldMatrix(e);
+        rhi::CensorData& out = v.censors[v.censorCount++];
+        out.center = glm::vec3(world * glm::vec4(cc.offset, 1.0f)); // local offset -> world
+        out.radius = cc.radius;
+        out.feather = cc.feather;
+        out.strength = cc.strength;
+    }
+
     // Cascaded directional shadows: split the camera frustum near -> far and
     // fit one texel-snapped orthographic light frustum per slice. The world
     // bounds of everything that can cast/receive (Transform + AABB entities)
@@ -382,8 +443,16 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
 
         // Practical split scheme (log/uniform blend) out to the shadow range.
         const f32 camNear = camera.NearPlane();
+        // Shadow draw distance is driven by the camera, NOT the full scene radius.
+        // A large terrain inflates sceneRadius, which would otherwise stretch every
+        // cascade to span the whole world and collapse the NEAR cascade's shadow-map
+        // resolution (blocky umbra + wide blobby penumbra on character-scale shadows).
+        // Cap it so the near cascades stay tight; geometry past this casts no shadow,
+        // which is imperceptible at distance. Small scenes keep their tight fit.
+        const f32 maxShadow = glm::clamp(env_.shadowDistance, 10.0f, 5000.0f);
         const f32 shadowFar =
-            glm::clamp(sceneRadius * 2.5f, camNear + 1.0f, camera.FarPlane());
+            glm::clamp(sceneRadius * 2.5f, camNear + 1.0f,
+                       glm::min(camera.FarPlane(), maxShadow));
         const f32 lambda = 0.75f;
         f32 splits[rhi::kMaxShadowCascades + 1];
         splits[0] = camNear;

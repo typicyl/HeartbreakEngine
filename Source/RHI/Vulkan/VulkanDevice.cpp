@@ -31,6 +31,7 @@
 #include <glm/glm.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -157,6 +158,14 @@ struct PostUBO {
     glm::vec4 params0{0.0f};
     glm::vec4 params1{0.0f};
     glm::vec4 params2{0.0f};
+    glm::vec4 params3{0.0f}; // extra pass params (brush-stroke area mask: minX,minY,maxX,maxY)
+    // World-anchored painterly censors (3D sphere test in the shader). Each:
+    // censors[i] = (worldCenter.xyz, worldRadius); strength/feather packed per
+    // component. Filled for the stroke pass + composite; 0 count elsewhere.
+    glm::vec4 censors[kMaxCensors]{};
+    glm::vec4 censorStrength{0.0f}; // per-censor strength (.x=censor0 ... .w=censor3)
+    glm::vec4 censorFeather{0.0f};  // per-censor feather fraction (.x..w)
+    glm::uvec4 censorCount{0u};     // .x = active censor count
 };
 
 // One offscreen color target of the post chain (image + view + framebuffer).
@@ -183,6 +192,10 @@ struct ObjectUBO {
     f32 paintLodBias; f32 paintTexel; u32 paintProjMode; f32 paintBoxInvM;
     glm::vec3 paintBoxCenter; f32 _padBoxC;
     glm::vec3 paintBoxScale; f32 _padBoxS;
+    // Terrain splat: 4 layers' albedo/normal/MR bindless indices (must match the
+    // gSplat* uint4 block in Common.hlsli). 0 for non-terrain draws.
+    glm::uvec4 splatAlbedo{0}; glm::uvec4 splatNormal{0}; glm::uvec4 splatMR{0};
+    glm::vec4 splatRough{1.0f}; // 4 layers' roughness factor
 };
 
 struct GpuTextureVk {
@@ -423,6 +436,22 @@ private:
                       const PostUBO& cb);
     u32  AllocPostConstants(const PostUBO& cb); // returns dynamic offset
 
+    // --- GPU pass profiler (timestamp queries) ------------------------------
+    // Writes a GPU timestamp at the current point in the command buffer and
+    // labels it; consecutive marks' delta = that pass's GPU time. Results are
+    // read back a few frames later (when the slot's fence is signalled) and
+    // logged every ~2s so the per-pass cost is visible without an external tool.
+    void GpuMark(const char* name);
+    static constexpr u32 kMaxGpuMarks = 40;
+    VkQueryPool gpuPool_[kMaxFramesInFlight]{};
+    const char* gpuNames_[kMaxFramesInFlight][kMaxGpuMarks]{};
+    u32  gpuCount_ = 0;                       // marks written into the current frame
+    u32  gpuCountSlot_[kMaxFramesInFlight]{}; // marks pending in each slot
+    bool gpuValid_[kMaxFramesInFlight]{};
+    f64  gpuPeriodNs_ = 0.0;                  // ns per timestamp tick (0 = unsupported)
+    u32  gpuFrameCounter_ = 0;
+    bool gpuProfile_ = false;
+
     bool postPipelinesReady_ = false; // render passes + pipelines + shaders
     bool postReady_ = false;          // targets sized and usable this frame
     u32  sceneW_ = 0, sceneH_ = 0;    // size the post targets were built for
@@ -447,7 +476,9 @@ private:
     PostTargetVk motionBlur_;    // motion blur result (LDR)
     PostTargetVk ssr_;           // screen-space reflections (HDR)
     PostTargetVk ssgi_;          // screen-space GI composite (HDR)
-    PostTargetVk painterly_;     // painterly oil-on-canvas repaint (HDR)
+    PostTargetVk painterly_;     // painterly oil-on-canvas repaint (HDR, full-res)
+    PostTargetVk painterlyHalf_; // Kuwahara underpainting at HALF-res (upscaled to painterly_)
+    PostTargetVk painterlyComp_; // painterly + dynamic-layer crisp objects composited back
     PostTargetVk vol_;           // volumetric fog composite (HDR)
     PostTargetVk adaptedLum_[2]; // auto-exposure adapted luminance (1x1, ping-pong)
     u32 bloomCount_ = 0;
@@ -460,6 +491,8 @@ private:
     u32 slotSsr_ = 0;
     u32 slotSsgi_ = 0;
     u32 slotPainterly_ = 0;
+    u32 slotPainterlyHalf_ = 0;
+    u32 slotPainterlyComp_ = 0;
     u32 slotVol_ = 0;
     u32 slotAdaptedLum_[2] = {};
     u32 slotBloom_[kBloomMaxMips] = {};
@@ -471,7 +504,8 @@ private:
                motionBlurPipe_ = VK_NULL_HANDLE, ssrPipe_ = VK_NULL_HANDLE,
                exposurePipe_ = VK_NULL_HANDLE, volPipe_ = VK_NULL_HANDLE,
                ssgiPipe_ = VK_NULL_HANDLE, painterlyPipe_ = VK_NULL_HANDLE,
-               brushStrokesPipe_ = VK_NULL_HANDLE;
+               brushStrokesPipe_ = VK_NULL_HANDLE, copyPipe_ = VK_NULL_HANDLE,
+               compositePipe_ = VK_NULL_HANDLE;
 
     // Temporal AA: jittered camera + reprojected history accumulation (mirrors D3D12).
     bool taaReady_ = false;
@@ -962,6 +996,23 @@ bool VulkanDevice::CreateSyncAndCommands() {
         VK_CHECK(vkCreateSemaphore(device_, &sem, nullptr, &imageAvailable_[i]), "vkCreateSemaphore");
         VK_CHECK(vkCreateFence(device_, &fen, nullptr, &inFlight_[i]), "vkCreateFence");
     }
+
+    // GPU pass profiler: one timestamp query pool per frame in flight. Disabled
+    // gracefully if the device/queue can't timestamp (period 0). Graphics queues
+    // on desktop GPUs always support it.
+    gpuPeriodNs_ = static_cast<f64>(deviceProps_.limits.timestampPeriod);
+    if (gpuPeriodNs_ > 0.0) {
+        VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = kMaxGpuMarks;
+        gpuProfile_ = true;
+        for (u32 i = 0; i < framesInFlight_; ++i) {
+            if (vkCreateQueryPool(device_, &qpci, nullptr, &gpuPool_[i]) != VK_SUCCESS) {
+                gpuProfile_ = false;
+                break;
+            }
+        }
+    }
     renderFinished_.resize(images_.size(), VK_NULL_HANDLE);
     for (auto& s : renderFinished_) {
         VK_CHECK(vkCreateSemaphore(device_, &sem, nullptr, &s), "vkCreateSemaphore");
@@ -1000,7 +1051,9 @@ bool VulkanDevice::CreateDescriptorResources() {
     bindings[2].binding = 2;
     bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
     bindings[2].descriptorCount = 1;
-    bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // VERTEX too: the BrushStrokes pass samples the HDR in its vertex shader (stroke
+    // colour + Sobel flow orientation); a fragment-only sampler is invalid from the VS.
+    bindings[2].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     bindings[2].pImmutableSamplers = &clampSampler_;
     bindings[3].binding = 3;
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1198,7 +1251,9 @@ bool VulkanDevice::CreateBindlessResources() {
     binds[1].binding = 1;
     binds[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     binds[1].descriptorCount = kMaxBindlessTextures;
-    binds[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // VERTEX too: the BrushStrokes pass samples the bindless HDR texture in its
+    // vertex shader (per-stroke colour + flow); fragment-only would be invalid there.
+    binds[1].stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorBindingFlags flags[2] = {
         0,
@@ -2349,6 +2404,10 @@ bool VulkanDevice::CreatePostPipelines() {
     // Brush-stroke splat: alpha-over, drawn into the painterly target with LOAD so
     // strokes accumulate over the Kuwahara base (same render pass bloom-up uses).
     brushStrokesReady_ = makePipe(L"BrushStrokes", postPass16Load_, 2, brushStrokesPipe_);
+    // Passthrough/bilinear upscale (half-res Kuwahara -> full-res painterly_).
+    ok = ok && makePipe(L"Copy", postPass16_, false, copyPipe_);
+    // Dynamic-layer composite: lerp painterly vs crisp lit colour by the HDR-alpha mask.
+    ok = ok && makePipe(L"PainterlyComposite", postPass16_, false, compositePipe_);
     return ok;
 }
 
@@ -2431,6 +2490,8 @@ void VulkanDevice::DestroyPostTargets() {
     destroy(ssr_);
     destroy(ssgi_);
     destroy(painterly_);
+    destroy(painterlyHalf_);
+    destroy(painterlyComp_);
     destroy(vol_);
     destroy(adaptedLum_[0]);
     destroy(adaptedLum_[1]);
@@ -2456,6 +2517,8 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
         slotVol_ = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
+        slotPainterlyHalf_ = bindlessNextSlot_++;
+        slotPainterlyComp_ = bindlessNextSlot_++;
         slotSsaoRaw_ = bindlessNextSlot_++;
         slotSsaoBlur_ = bindlessNextSlot_++;
         slotLdr_ = bindlessNextSlot_++;
@@ -2634,6 +2697,15 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
         if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_,
                               slotPainterly_, painterly_))
             return false;
+        // Half-res Kuwahara underpainting (upscaled to painterly_ before the strokes).
+        const u32 hw = (width + 1u) / 2u, hh = (height + 1u) / 2u;
+        if (!CreatePostTarget(hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_,
+                              slotPainterlyHalf_, painterlyHalf_))
+            return false;
+        // Full-res target for the dynamic-layer composite (painterly + crisp objects).
+        if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_,
+                              slotPainterlyComp_, painterlyComp_))
+            return false;
     }
     if (exposureReady_) { // 1x1 adapted-luminance ping-pong (auto-exposure)
         if (!CreatePostTarget(1, 1, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_,
@@ -2650,6 +2722,14 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
     HBE_INFO("[Vulkan] HDR post targets ready ({}x{}, {} bloom mips).", width, height,
              bloomCount_);
     return true;
+}
+
+void VulkanDevice::GpuMark(const char* name) {
+    if (!gpuProfile_ || !frameActive_ || gpuCount_ >= kMaxGpuMarks) return;
+    vkCmdWriteTimestamp(commandBuffers_[frameIndex_], VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        gpuPool_[frameIndex_], gpuCount_);
+    gpuNames_[frameIndex_][gpuCount_] = name;
+    ++gpuCount_;
 }
 
 u32 VulkanDevice::AllocPostConstants(const PostUBO& cb) {
@@ -2698,6 +2778,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
     // The bindless set stays bound from the scene pass; rebind defensively.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
                             &bindlessSet_, 0, nullptr);
+    GpuMark("scene"); // delta shadow->here = the HDR forward pass (geo+sky+transparent+particles)
 
     // --- Screen-space reflections (HDR; composited before bloom/tonemap) ----
     u32 hdrInput = slotHdr_; // what bloom + tonemap read (SSR output when on)
@@ -2712,6 +2793,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         DrawPostPass(ssrPipe_, postPass16_, ssr_, cb);
         hdrInput = slotSsr_;
     }
+    GpuMark("ssr");
 
     // --- Screen-space GI: one indirect diffuse bounce (composited into HDR) ---
     if (view.post.ssgiEnabled && ssgiReady_) {
@@ -2725,6 +2807,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         DrawPostPass(ssgiPipe_, postPass16_, ssgi_, cb);
         hdrInput = slotSsgi_;
     }
+    GpuMark("ssgi");
 
     // --- Volumetric fog + light scattering (composited into HDR before bloom) -
     if (view.post.fogEnabled && volReady_) {
@@ -2740,6 +2823,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         DrawPostPass(volPipe_, postPass16_, vol_, cb);
         hdrInput = slotVol_;
     }
+    GpuMark("fog");
 
     // --- Painterly: repaint the lit HDR as edge-aware brush strokes ----------
     const u32 paintColorSrc = hdrInput; // pre-painterly lit HDR (crisp stroke colour)
@@ -2755,18 +2839,54 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         cb.params1 = {ps.painterlyLightTint, ps.painterlyWarmCool, ps.painterlyCanvasScale,
                       ps.painterlyCanvasStrength};
         cb.params2 = {ps.painterlyStrokeDetail, ps.painterlyPosterize, 0.0f, 0.0f};
-        DrawPostPass(painterlyPipe_, postPass16_, painterly_, cb);
+        // Kuwahara at HALF res: outTexel = half (output positions), inTexel stays full
+        // (the filter samples gInput0 with gInTexel, so its radius stays in full-res
+        // pixels -> half the output pixels, ~4x cheaper, near-lossless once upscaled).
+        const glm::vec2 halfTexel(1.0f / painterlyHalf_.width, 1.0f / painterlyHalf_.height);
+        cb.outTexel = halfTexel;
+        cb.inTexel = sceneTexel;
+        DrawPostPass(painterlyPipe_, postPass16_, painterlyHalf_, cb);
+        // Bilinear-upscale the smooth underpainting back to full-res painterly_ (the
+        // strokes + downstream composite over it at full res).
+        PostUBO up;
+        up.input0 = slotPainterlyHalf_;
+        up.outTexel = sceneTexel;
+        up.inTexel = halfTexel;
+        DrawPostPass(copyPipe_, postPass16_, painterly_, up);
         hdrInput = slotPainterly_;
+        GpuMark("kuwahara"); // delta fog->here = half-res Kuwahara + the upscale
+
+        // Collect world-anchored censors once (shared by the stroke pass + the
+        // composite below). The shader does a 3D sphere test, so no projection here.
+        // When "Real brush strokes" is OFF, censors are the ONLY thing that paints
+        // strokes - onto any geometry inside the sphere (static or dynamic).
+        glm::vec4 censorArr[kMaxCensors];
+        glm::vec4 censorStrength;
+        glm::vec4 censorFeather;
+        const u32 nCensor = CollectCensors(view, censorArr, censorStrength, censorFeather);
 
         // --- Real brush strokes: splat instanced oriented quads over the base --
-        if (ps.painterlyStrokes && brushStrokesReady_) {
+        // Runs when global strokes are on OR any censor is active (censor-only mode).
+        if ((ps.painterlyStrokes || nCensor > 0) && brushStrokesReady_) {
             VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
             rp.renderPass = postPass16Load_; // LOAD: keep the Kuwahara underpainting
             rp.framebuffer = painterly_.framebuffer;
             rp.renderArea.extent = {painterly_.width, painterly_.height};
             vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-            VkViewport vp{0.0f, 0.0f, static_cast<f32>(painterly_.width),
-                          static_cast<f32>(painterly_.height), 0.0f, 1.0f};
+            // Negative-height viewport (VK_KHR_maintenance1): unlike the fullscreen
+            // post passes (which derive UVs from SV_Position and are Y-symmetric),
+            // this pass BUILDS its own clip-space quads with the D3D12 Y convention
+            // (clip.y = -clip.y in BrushStrokes.hlsl), just like the main scene pass.
+            // Flip Y here so the strokes land right-side up over the Kuwahara base;
+            // without it every stroke renders vertically mirrored from where it
+            // sampled its colour and smears mismatched paint across the screen.
+            VkViewport vp{};
+            vp.x = 0.0f;
+            vp.y = static_cast<f32>(painterly_.height);
+            vp.width = static_cast<f32>(painterly_.width);
+            vp.height = -static_cast<f32>(painterly_.height);
+            vp.minDepth = 0.0f;
+            vp.maxDepth = 1.0f;
             VkRect2D sc{{0, 0}, {painterly_.width, painterly_.height}};
             vkCmdSetViewport(cmd, 0, 1, &vp);
             vkCmdSetScissor(cmd, 0, 1, &sc);
@@ -2776,6 +2896,24 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
             const float density = std::max(ps.painterlyStrokeDensity, 0.1f);
             const float baseLen =
                 std::max(ps.painterlyRadius * 6.0f * ps.painterlyStrokeLength, 6.0f);
+            // Stop-motion "boil": fold a TIME-QUANTIZED step into the per-stroke seed
+            // so the strokes repaint in discrete jumps at painterlyStrokeBoil fps and
+            // hold in between (instead of recomputing every frame). Wrapped to a small
+            // range so the growing time can't blow up Hash21 (precision -> stripes).
+            const float boilPhase =
+                (ps.painterlyStrokeBoil > 0.01f)
+                    ? std::fmod(std::floor(view.timeSeconds * ps.painterlyStrokeBoil), 256.0f)
+                    : 0.0f;
+            // Global stroke coverage box: full screen (or the user's censor-box
+            // rect) when "Real brush strokes" is on; an EMPTY box when it's off, so
+            // strokes paint ONLY inside the censor spheres (gated in the PS below).
+            const glm::vec4 strokeRect =
+                !ps.painterlyStrokes
+                    ? glm::vec4{2.0f, 2.0f, -1.0f, -1.0f} // empty: censor-only
+                    : ps.painterlyStrokeMask
+                          ? glm::vec4{ps.painterlyStrokeMaskMinX, ps.painterlyStrokeMaskMinY,
+                                     ps.painterlyStrokeMaskMaxX, ps.painterlyStrokeMaskMaxY}
+                          : glm::vec4{0.0f, 0.0f, 1.0f, 1.0f};
             const auto drawLayer = [&](float lenPx, float widthFrac, float spacingFac, float seed) {
                 const float spacing = std::max(3.0f, lenPx * spacingFac / density);
                 const u32 cols = std::max(1u, static_cast<u32>(std::ceil(sceneW_ / spacing)));
@@ -2783,23 +2921,57 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
                 PostUBO sb;
                 sb.input0 = paintColorSrc;
                 sb.input1 = slotGbuffer_;
-                sb.input2 = slotDepth_;
+                sb.input2 = slotDepth_; // depth: world anchoring + the 3D censor test
+                sb.input3 = slotHdr_;   // forward HDR alpha = the per-pixel censored flag
                 sb.outTexel = sceneTexel;
                 sb.inTexel = sceneTexel;
-                sb.params0 = {lenPx, widthFrac, 0.35f, ps.painterlyStrength};
+                // sizeJit sign flags the VS to SCREEN-ANCHOR the strokes (hold their
+                // screen positions, don't glide with the camera) when boil is on; the
+                // magnitude (0.35) is the size jitter either way.
+                sb.params0 = {lenPx, widthFrac,
+                              (ps.painterlyStrokeBoil > 0.01f) ? -0.35f : 0.35f,
+                              ps.painterlyStrength};
                 sb.params1 = {ps.painterlyStrokeSharp, ps.painterlyEdge, 0.30f,
                               std::max(ps.painterlyStrokeDetail * 2.0f, 0.25f)};
                 sb.params2 = {static_cast<f32>(cols), static_cast<f32>(rows),
                               ps.painterlyStrokeFlow, seed};
+                sb.params3 = strokeRect;
+                for (u32 ci = 0; ci < kMaxCensors; ++ci) sb.censors[ci] = censorArr[ci];
+                sb.censorStrength = censorStrength;
+                sb.censorFeather = censorFeather;
+                sb.censorCount = glm::uvec4(nCensor, 0u, 0u, 0u);
                 const u32 dynOffset = AllocPostConstants(sb);
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                                         &postSets_[frameIndex_], 1, &dynOffset);
                 vkCmdDraw(cmd, 6, cols * rows, 0, 0);
             };
-            drawLayer(baseLen * 1.8f, 0.55f, 0.62f, 11.0f); // coarse block-in (sparser)
-            drawLayer(baseLen, 0.42f, 0.46f, 37.0f);        // finer detail strokes
+            drawLayer(baseLen * 1.8f, 0.55f, 0.62f, 11.0f + boilPhase); // coarse block-in
+            drawLayer(baseLen, 0.42f, 0.46f, 37.0f + boilPhase);        // finer detail
             vkCmdEndRenderPass(cmd);
         }
+        GpuMark("strokes"); // delta kuwahara->here = the brush-stroke splat (both layers)
+
+        // Dynamic-layer composite: restore crisp lit colour over the painterly where
+        // the forward HDR alpha mask = 1 (player / NPCs / interactables), so dynamic
+        // objects stand out against the painted static world. paintColorSrc = the
+        // pre-painterly lit HDR (integrated, fog/GI on); slotHdr_ = the untouched
+        // forward HDR whose alpha carries the per-pixel mask.
+        PostUBO comp;
+        comp.input0 = slotPainterly_; // painted static world
+        comp.input1 = paintColorSrc;  // crisp lit colour for dynamic objects
+        comp.input2 = slotHdr_;       // forward HDR: alpha = mask
+        comp.input3 = slotDepth_;     // depth for the 3D censor test
+        comp.outTexel = sceneTexel;
+        comp.inTexel = sceneTexel;
+        // World-anchored censors (collected above): feed the feathered sphere so
+        // dynamic objects inside a censor keep the painted look (CensorComponent).
+        for (u32 ci = 0; ci < kMaxCensors; ++ci) comp.censors[ci] = censorArr[ci];
+        comp.censorStrength = censorStrength;
+        comp.censorFeather = censorFeather;
+        comp.censorCount = glm::uvec4(nCensor, 0u, 0u, 0u);
+        DrawPostPass(compositePipe_, postPass16_, painterlyComp_, comp);
+        hdrInput = slotPainterlyComp_;
+        GpuMark("composite");
     }
 
     // --- SSAO + blur (half res) --------------------------------------------
@@ -2821,6 +2993,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         DrawPostPass(ssaoBlurPipe_, postPass8_, ssaoBlur_, blur);
         aoSlot = slotSsaoBlur_;
     }
+    GpuMark("ssao");
 
     // --- Bloom pyramid -------------------------------------------------------
     f32 bloomMix = 0.0f;
@@ -2848,6 +3021,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         }
         bloomMix = ps.bloomIntensity;
     }
+    GpuMark("bloom");
 
     // --- Auto-exposure: average luminance + temporal adaptation (1x1) --------
     u32 lumSlot = 0; // 0 = off; tonemap then uses manual exposure only
@@ -2865,6 +3039,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         adaptIndex_ = prev;
         adaptValid_ = true;
     }
+    GpuMark("exposure");
 
     // --- Tonemap composite -> LDR -------------------------------------------
     {
@@ -2883,6 +3058,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         cb.params2 = {0.0f, 0.0f, 0.0f, 0.0f}; // tonemap's built-in smear off
         DrawPostPass(tonemapPipe_, postPass8_, ldr_, cb);
     }
+    GpuMark("tonemap");
 
     // --- TAA resolve -> history ---------------------------------------------
     // Reproject last frame's accumulation into this frame and blend a small
@@ -2905,6 +3081,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         taaHistoryIndex_ = prev; // next frame writes the other target
         taaHistoryValid_ = true;
     }
+    GpuMark("taa");
 
     // --- Depth of field -> dof_ ---------------------------------------------
     if (view.post.dofEnabled && dofReady_) {
@@ -2917,6 +3094,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         DrawPostPass(dofPipe_, postPass8_, dof_, cb);
         finalInput = slotDof_;
     }
+    GpuMark("dof");
 
     // --- Motion blur -> motionBlur_ -----------------------------------------
     if (view.post.motionBlurEnabled && motionBlurReady_) {
@@ -2929,6 +3107,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         DrawPostPass(motionBlurPipe_, postPass8_, motionBlur_, cb);
         finalInput = slotMotionBlur_;
     }
+    GpuMark("mblur");
 
     // --- FXAA -> final target (viewport texture or swapchain) ---------------
     // Begins the final pass and leaves it ACTIVE: the UI overlay (and, in
@@ -2977,6 +3156,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
                                 &postSets_[frameIndex_], 1, &dynOffset);
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
+    GpuMark("fxaa"); // FXAA into the final target (render pass left open for UI/ImGui)
 }
 
 void VulkanDevice::DrawShadowPass(const SceneView& view, const DrawItem* items, u32 count) {
@@ -3251,6 +3431,31 @@ void VulkanDevice::BeginFrame() {
 
     vkWaitForFences(device_, 1, &inFlight_[frameIndex_], VK_TRUE, UINT64_MAX);
 
+    // GPU profiler: this slot's fence just signalled, so its timestamps (recorded
+    // framesInFlight_ frames ago) are now readable. Log a per-pass breakdown ~every
+    // 2s. Read BEFORE the pool is reset below.
+    if (gpuProfile_ && gpuValid_[frameIndex_] && gpuCountSlot_[frameIndex_] >= 2) {
+        const u32 n = gpuCountSlot_[frameIndex_];
+        u64 ticks[kMaxGpuMarks]{};
+        if (vkGetQueryPoolResults(device_, gpuPool_[frameIndex_], 0, n, sizeof(ticks), ticks,
+                                  sizeof(u64), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            if (++gpuFrameCounter_ >= 180) { // ~2s at 90 FPS
+                gpuFrameCounter_ = 0;
+                const f64 toMs = gpuPeriodNs_ * 1e-6;
+                char buf[640];
+                int off = std::snprintf(buf, sizeof(buf), "[Vulkan GPU] total %.2f ms |",
+                                        static_cast<f64>(ticks[n - 1] - ticks[0]) * toMs);
+                for (u32 i = 1; i < n && off > 0 && off < static_cast<int>(sizeof(buf)) - 24; ++i) {
+                    const f64 ms = static_cast<f64>(ticks[i] - ticks[i - 1]) * toMs;
+                    off += std::snprintf(buf + off, sizeof(buf) - off, " %s %.2f",
+                                         gpuNames_[frameIndex_][i] ? gpuNames_[frameIndex_][i] : "?",
+                                         ms);
+                }
+                HBE_INFO("{}", buf);
+            }
+        }
+    }
+
     VkResult acq = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
                                          imageAvailable_[frameIndex_], VK_NULL_HANDLE, &imageIndex_);
     if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
@@ -3269,10 +3474,19 @@ void VulkanDevice::BeginFrame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(commandBuffers_[frameIndex_], &bi);
     frameActive_ = true;
+
+    // GPU profiler: reset this slot's timestamp pool (must be on a recording cmd
+    // buffer) and mark the frame start.
+    if (gpuProfile_) {
+        vkCmdResetQueryPool(commandBuffers_[frameIndex_], gpuPool_[frameIndex_], 0, kMaxGpuMarks);
+        gpuCount_ = 0;
+        GpuMark("start");
+    }
 }
 
 void VulkanDevice::ClearBackBuffer(f32 r, f32 g, f32 b, f32 a) {
     if (!frameActive_) return;
+    GpuMark("shadow"); // delta start->here = the cascaded shadow pass (runs before clear)
     clearColor_ = {{r, g, b, a}};
 
     // HDR pass clears 4 attachments (colour + G-buffer + velocity + depth); the
@@ -3446,6 +3660,14 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         ocb.paintBoxInvM = it.paintBoxInvM;
         ocb.paintBoxCenter = it.paintBoxCenter;
         ocb.paintBoxScale = it.paintBoxScale;
+        ocb.splatAlbedo = {it.splatAlbedo[0].index, it.splatAlbedo[1].index,
+                           it.splatAlbedo[2].index, it.splatAlbedo[3].index};
+        ocb.splatNormal = {it.splatNormal[0].index, it.splatNormal[1].index,
+                           it.splatNormal[2].index, it.splatNormal[3].index};
+        ocb.splatMR     = {it.splatMR[0].index, it.splatMR[1].index,
+                           it.splatMR[2].index, it.splatMR[3].index};
+        ocb.splatRough  = {it.splatRough[0], it.splatRough[1],
+                           it.splatRough[2], it.splatRough[3]};
         if (it.bones && it.boneCount > 0) {
             // The shadow pass shares this object UBO (same dynamic offset and
             // double-write trick), so the palette uploaded here serves both.
@@ -3591,6 +3813,13 @@ void VulkanDevice::EndFrame() {
     if (renderPassActive_) {
         vkCmdEndRenderPass(cmd);
         renderPassActive_ = false;
+    }
+    // GPU profiler: final mark (UI overlay + ImGui, drawn since FXAA) and hand this
+    // slot's timestamps off to be read back when its fence next signals.
+    if (gpuProfile_) {
+        GpuMark("ui");
+        gpuCountSlot_[frameIndex_] = gpuCount_;
+        gpuValid_[frameIndex_] = true;
     }
     vkEndCommandBuffer(cmd);
 
@@ -4255,6 +4484,8 @@ VulkanDevice::~VulkanDevice() {
     if (ssgiPipe_) vkDestroyPipeline(device_, ssgiPipe_, nullptr);
     if (painterlyPipe_) vkDestroyPipeline(device_, painterlyPipe_, nullptr);
     if (brushStrokesPipe_) vkDestroyPipeline(device_, brushStrokesPipe_, nullptr);
+    if (copyPipe_) vkDestroyPipeline(device_, copyPipe_, nullptr);
+    if (compositePipe_) vkDestroyPipeline(device_, compositePipe_, nullptr);
     if (hdrRenderPass_) vkDestroyRenderPass(device_, hdrRenderPass_, nullptr);
     if (previewRenderPass_) vkDestroyRenderPass(device_, previewRenderPass_, nullptr);
     if (postPass16_) vkDestroyRenderPass(device_, postPass16_, nullptr);
@@ -4302,6 +4533,7 @@ VulkanDevice::~VulkanDevice() {
     for (u32 i = 0; i < framesInFlight_; ++i) {
         if (imageAvailable_[i]) vkDestroySemaphore(device_, imageAvailable_[i], nullptr);
         if (inFlight_[i]) vkDestroyFence(device_, inFlight_[i], nullptr);
+        if (gpuPool_[i]) vkDestroyQueryPool(device_, gpuPool_[i], nullptr);
     }
     if (commandPool_) vkDestroyCommandPool(device_, commandPool_, nullptr);
 

@@ -49,6 +49,12 @@ inline nlohmann::json PostToJson(const rhi::PostSettings& p) {
         {"painterlyStrokeLength", p.painterlyStrokeLength},
         {"painterlyStrokeDensity", p.painterlyStrokeDensity},
         {"painterlyStrokeSharp", p.painterlyStrokeSharp},
+        {"painterlyStrokeBoil", p.painterlyStrokeBoil},
+        {"painterlyStrokeMask", p.painterlyStrokeMask},
+        {"painterlyStrokeMaskMinX", p.painterlyStrokeMaskMinX},
+        {"painterlyStrokeMaskMinY", p.painterlyStrokeMaskMinY},
+        {"painterlyStrokeMaskMaxX", p.painterlyStrokeMaskMaxX},
+        {"painterlyStrokeMaskMaxY", p.painterlyStrokeMaskMaxY},
         {"painterly3D", p.painterly3D},
     };
 }
@@ -111,6 +117,12 @@ inline void PostFromJson(const nlohmann::json& j, rhi::PostSettings& p) {
     p.painterlyStrokeLength = j.value("painterlyStrokeLength", p.painterlyStrokeLength);
     p.painterlyStrokeDensity = j.value("painterlyStrokeDensity", p.painterlyStrokeDensity);
     p.painterlyStrokeSharp = j.value("painterlyStrokeSharp", p.painterlyStrokeSharp);
+    p.painterlyStrokeBoil = j.value("painterlyStrokeBoil", p.painterlyStrokeBoil);
+    p.painterlyStrokeMask = j.value("painterlyStrokeMask", p.painterlyStrokeMask);
+    p.painterlyStrokeMaskMinX = j.value("painterlyStrokeMaskMinX", p.painterlyStrokeMaskMinX);
+    p.painterlyStrokeMaskMinY = j.value("painterlyStrokeMaskMinY", p.painterlyStrokeMaskMinY);
+    p.painterlyStrokeMaskMaxX = j.value("painterlyStrokeMaskMaxX", p.painterlyStrokeMaskMaxX);
+    p.painterlyStrokeMaskMaxY = j.value("painterlyStrokeMaskMaxY", p.painterlyStrokeMaskMaxY);
     p.painterly3D = j.value("painterly3D", p.painterly3D);
 }
 

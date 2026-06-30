@@ -53,7 +53,8 @@ float4 PSMain(FSOutput input) : SV_Target
     const float3 Bt = cross(N, T);
     const float rnd = Hash(input.positionCS.xy);
     const float rndAngle = rnd * 6.2831853f;
-    const int STEPS = 12;
+    const int STEPS = 8; // march resolution per ray; 8 vs 12 = ~33% fewer taps,
+                         // diffuse GI is forgiving of the coarser hit search
     const float3 bias = N * 0.02f; // lift the ray off the surface
 
     float3 indirect = 0.0f.xxx;

@@ -47,5 +47,15 @@ void Sculpt(Scene& scene, Renderer& renderer, entt::entity terrain, f32 localX,
 bool RaycastLocal(const TerrainComponent& t, const glm::vec3& localOrigin,
                   const glm::vec3& localDir, glm::vec3& outHit);
 
+// Paints (or erases) the hole mask around terrain-local (x,z) with a falloff brush.
+// `erase` restores solid terrain; otherwise carves a hole (clipped in the shader so
+// cliff/cave models show through). Flags holeDirty so Update re-uploads holeMaskTex.
+void PaintHole(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, bool erase);
+
+// Paints splat layer `layer` (0..3) into the weight mask around terrain-local (x,z):
+// the layer's channel rises with the brush falloff and the others fade, so that layer
+// takes over there. Flags splatDirty so Update re-uploads splatWeightTex.
+void PaintSplat(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, i32 layer);
+
 } // namespace terrain
 } // namespace hbe

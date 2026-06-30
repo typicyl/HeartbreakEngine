@@ -126,6 +126,14 @@ cbuffer ObjectConstants : register(b1)
     float    _padBoxC;
     float3   gPaintBoxScale;   // object world scale
     float    _padBoxS;
+    // Terrain splat: 4 layers' albedo / normal / metal-rough bindless indices (the
+    // weight mask is the emissive slot, the tile scale is gSubsurfaceRadius). Only
+    // read when HBE_MAT_TERRAIN_SPLAT is set; 0 for every non-terrain draw.
+    uint4    gSplatAlbedo;
+    uint4    gSplatNormal;
+    uint4    gSplatMR;
+    float4   gSplatRough;   // 4 layers' roughness FACTOR (multiplies the MR map's green,
+                            // or IS the roughness when a layer has no MR map)
 };
 
 // Per-frame joint palettes (every skinned draw appends its global*inverseBind
@@ -141,6 +149,10 @@ cbuffer ObjectConstants : register(b1)
 #define HBE_MAT_HAIR        8u
 #define HBE_MAT_TRANSPARENT 16u
 #define HBE_MAT_NOSHADOW    32u
+#define HBE_MAT_PAINTERLY_EXEMPT 128u // dynamic-layer object: write the painterly mask
+#define HBE_MAT_TERRAIN_HOLE 256u     // clip terrain pixels where the hole mask (thickness slot) is set
+#define HBE_MAT_TERRAIN_SPLAT 512u    // blend 4 tiling layer albedos (albedo/normal/mr/ao slots) by the emissive-slot weight mask
+#define HBE_MAT_CENSORED 1024u        // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
 
 // ---------------------------------------------------------------------------
 // Bindless texture table.
@@ -328,6 +340,34 @@ float ShadowFactor(float3 positionWS, float NdotL)
             }
         }
         return lit / 9.0f;
+    }
+    return 1.0f;
+}
+
+// Cheap 1-tap directional shadow (no 3x3 PCF). Per-step PCF inside a ray-march
+// (volumetric fog god-rays) is hugely wasteful - 9 taps x N steps per pixel - and a
+// single comparison reads nearly identical once the march is dithered + accumulated.
+float ShadowFactorCheap(float3 positionWS)
+{
+    if (gShadowMapIndex == 0 || gCascadeCount == 0)
+        return 1.0f;
+    [unroll]
+    for (uint c = 0; c < HBE_MAX_SHADOW_CASCADES; ++c)
+    {
+        if (c >= gCascadeCount)
+            return 1.0f;
+        float4 lp = mul(gCascadeViewProj[c], float4(positionWS, 1.0f));
+        float3 ndc = lp.xyz / lp.w;
+        float2 uv = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+        const float margin = 0.01f;
+        if (uv.x < margin || uv.x > 1.0f - margin ||
+            uv.y < margin || uv.y > 1.0f - margin ||
+            ndc.z <= 0.0f || ndc.z >= 1.0f)
+            continue;
+        const float bias = 0.0015f * (1.0f + c * 0.5f);
+        const float2 tile = float2(c & 1, c >> 1) * 0.5f;
+        const float occluder = SampleBindlessLod(gShadowMapIndex, tile + uv * 0.5f, 0.0f).r;
+        return (ndc.z - bias <= occluder) ? 1.0f : 0.0f;
     }
     return 1.0f;
 }

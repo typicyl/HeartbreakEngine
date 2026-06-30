@@ -20,6 +20,11 @@ struct SceneEnvironment {
     DirectionalLightComponent sun;
     f32 ambientIntensity = 0.04f;
     f32 exposure = 1.0f;
+    // Cascaded-shadow draw distance (world units). The cascades are fit to the camera
+    // out to this range; beyond it geometry casts/receives no sun shadow. Bigger =
+    // shadows reach further (large terrains) but the near cascades get coarser. Capped
+    // by sceneRadius*2.5 and the camera far plane in Scene::MakeView.
+    f32 shadowDistance = 150.0f;
 
     // Day/night cycle. The sky is rendered analytically from the sun direction
     // (real-time atmosphere), so moving the sun moves the whole sky + lighting.
