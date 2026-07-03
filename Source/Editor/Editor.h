@@ -2,6 +2,8 @@
 #pragma once
 
 #include "Assets/AudioEvent.h"
+#include "Assets/CutsceneAsset.h"
+#include "Assets/DialogueAsset.h"
 #include "Assets/MaterialAsset.h"
 #include "Assets/UAF.h"
 #include "Core/Types.h"
@@ -149,6 +151,8 @@ private:
         bool isSchematic = false;
         bool isPrefab = false;
         bool isFont = false;
+        bool isDialogue = false;
+        bool isCutscene = false;
         u64  thumbId = 0;       // ImGui texture id (textures only; 0 = icon)
         bool thumbTried = false;
     };
@@ -322,6 +326,7 @@ private:
     std::vector<std::string> viewerInfo_;
     int  viewedAudioKind_ = 0;          // edited audio tag (uaf::AudioKind) in the viewer
     char viewedAudioCaption_[256] = {}; // edited voiceline caption
+    char viewedAudioSpeaker_[96] = {};  // edited voiceline speaker/character name
     std::unordered_map<std::string, u64> previewCache_; // path -> large preview
     MaterialAsset editedMat_;           // working copy of a viewed .hbmat
     bool editedMatValid_ = false;
@@ -358,10 +363,21 @@ private:
     // Creates Assets/<dir>/NewAudioEvent[N].hbevent and returns its path.
     std::filesystem::path CreateAudioEventAsset(const std::filesystem::path& dir,
                                                 const std::string& name = {});
+    std::filesystem::path CreateDialogueAsset(const std::filesystem::path& dir,
+                                              const std::string& name = {});
     bool mixerSynced_ = false;          // buses pushed to AudioSystem this project
     AudioEvent editedEvent_;            // working copy of a viewed .hbevent
     bool editedEventValid_ = false;
     bool editedEventDirty_ = false;
+    DialogueAsset editedDialogue_;      // working copy of a viewed .hbdialogue
+    bool editedDialogueValid_ = false;
+    bool editedDialogueDirty_ = false;
+    CutsceneAsset editedCutscene_;      // working copy of a viewed .hbcutscene
+    bool editedCutsceneValid_ = false;
+    bool editedCutsceneDirty_ = false;
+    f32 cutsceneEditTime_ = 0.0f;       // editor playhead for "add key at time"
+    std::filesystem::path CreateCutsceneAsset(const std::filesystem::path& dir,
+                                              const std::string& name = {});
     u32  lastPostedVoice_ = 0;          // editor Play test voice (stoppable)
 
     // -- Scene manager --------------------------------------------------------------

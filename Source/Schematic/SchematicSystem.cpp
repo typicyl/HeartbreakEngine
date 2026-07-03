@@ -68,6 +68,17 @@ const Graph* GetGraph(const std::string& asset) {
     return &ins->second;
 }
 
+// One UI interaction this frame (a clicked button / a changed widget), collected
+// once from the UIElements and fired into every schematic as a UI event.
+struct UIEventRec {
+    std::string action; // the widget's UIElement.action id
+    bool clicked = false;
+    bool changed = false;
+    f32 value = 0.0f;
+    bool toggled = false;
+    f32 selected = 0.0f;
+};
+
 // Evaluates + executes one graph for one entity for one frame.
 class VM {
 public:
@@ -81,6 +92,22 @@ public:
             if (n.type == evt) { Follow(n.id, 0, 0); break; }
     }
 
+    // UI events fire EVERY matching event node (unlike RunEvent's first-only): a
+    // graph can listen to many widgets. A node fires when its Action filter (input
+    // pin 0 literal/wire) is empty or equals the event's action id.
+    void RunEventUI(NodeType evt, const UIEventRec& rec) {
+        evtAction_ = rec.action;
+        evtValue_ = rec.value;
+        evtToggled_ = rec.toggled;
+        evtSelected_ = rec.selected;
+        for (const Node& n : g_.nodes) {
+            if (n.type != evt) continue;
+            dataCache_.clear(); // per firing: the event outputs feed fresh values
+            const std::string filter = EvalInput(n.id, 0, 0).s;
+            if (filter.empty() || filter == rec.action) Follow(n.id, 0, 0);
+        }
+    }
+
 private:
     const Graph& g_;
     Scene& scene_;
@@ -89,6 +116,11 @@ private:
     f32 dt_;
     SchematicComponent& inst_;
     std::unordered_map<u64, Value> dataCache_;
+    // Payload of the UI event currently firing (RunEventUI).
+    std::string evtAction_;
+    f32 evtValue_ = 0.0f;
+    bool evtToggled_ = false;
+    f32 evtSelected_ = 0.0f;
 
     entt::entity Resolve(const Value& v) const {
         if (v.type == PinType::Entity && v.entity != 0xFFFFFFFFu)
@@ -157,6 +189,27 @@ private:
                 entt::entity e = Resolve(EvalInput(n.id, 0, d));
                 const Transform* t = scene_.Registry().try_get<Transform>(e);
                 return Value::Vec3(t ? t->position : glm::vec3(0.0f));
+            }
+            case NodeType::EventUIClicked: // Action data output (valid while firing)
+                return Value::Str(evtAction_);
+            case NodeType::EventUIChanged: // Value / Toggled / Selected outputs
+                return outPin == 1   ? Value::Float(evtValue_)
+                       : outPin == 2 ? Value::Bool(evtToggled_)
+                                     : Value::Float(evtSelected_);
+            case NodeType::GetUIValue: { // live widget state, addressed by action id
+                const std::string name = EvalInput(n.id, 0, d).s;
+                Value out = Value::Float(0.0f);
+                bool found = false;
+                if (!name.empty()) {
+                    scene_.Registry().view<UIElement>().each([&](const UIElement& el) {
+                        if (found || el.action != name) return; // first match wins
+                        found = true;
+                        out = outPin == 0   ? Value::Float(el.value)
+                              : outPin == 1 ? Value::Bool(el.toggled)
+                                            : Value::Float(static_cast<f32>(el.selected));
+                    });
+                }
+                return out;
             }
             default: return {};
         }
@@ -239,6 +292,89 @@ private:
                 game::PlayStinger(EvalInput(n.id, 1, 0).s);
                 Follow(n.id, 0, depth);
                 break;
+            case NodeType::PlayVoiceline:
+                game::PlayVoiceline(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::PlayDialogue:
+                game::PlayDialogue(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::PlayCutscene:
+                game::PlayCutscene(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
+            // Panel ops are deferred (the engine owns the UIManager); element setters
+            // write the registry directly (SetPosition precedent) - schematics run
+            // before BuildVertices, so the change shows the same frame.
+            case NodeType::UIShowPanel:
+                game::QueueUICommand({game::UICommand::Op::Show, EvalInput(n.id, 1, 0).s});
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::UIPushPanel:
+                game::QueueUICommand({game::UICommand::Op::Push, EvalInput(n.id, 1, 0).s});
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::UIPopPanel:
+                game::QueueUICommand({game::UICommand::Op::Pop, {}});
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::UISetText: {
+                const std::string name = EvalInput(n.id, 1, 0).s;
+                const std::string text = EvalInput(n.id, 2, 0).s;
+                if (!name.empty())
+                    scene_.Registry().view<UIElement>().each([&](UIElement& el) {
+                        if (el.action == name) el.text = text; // template: tokens still apply
+                    });
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::UISetVisible: {
+                const std::string name = EvalInput(n.id, 1, 0).s;
+                const bool vis = InB(n.id, 2, 0);
+                if (!name.empty())
+                    scene_.Registry().view<UIElement>().each([&](UIElement& el) {
+                        if (el.action == name) el.visible = vis; // hides its subtree too
+                    });
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::UISetValue: {
+                // Type-aware: one node drives slider (value), toggle (>0.5), selector
+                // (index). Does NOT raise `changed` - no event feedback loop.
+                const std::string name = EvalInput(n.id, 1, 0).s;
+                const f32 v = InF(n.id, 2, 0);
+                if (!name.empty())
+                    scene_.Registry().view<UIElement>().each([&](UIElement& el) {
+                        if (el.action != name) return;
+                        el.value = glm::clamp(v, 0.0f, 1.0f);
+                        el.toggled = v > 0.5f;
+                        if (!el.options.empty())
+                            el.selected = glm::clamp(static_cast<int>(v), 0,
+                                                     static_cast<int>(el.options.size()) - 1);
+                    });
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::UIPlayAnim: {
+                // Restart Manual-trigger animators on matching elements (mirrors the
+                // UIManager's OnShow restart).
+                const std::string name = EvalInput(n.id, 1, 0).s;
+                if (!name.empty()) {
+                    auto& reg = scene_.Registry();
+                    reg.view<UIElement, UIAnimator>().each(
+                        [&](UIElement& el, UIAnimator& an) {
+                            if (el.action != name ||
+                                an.trigger != UIAnimator::Trigger::Manual)
+                                return;
+                            an.time = 0.0f;
+                            an.playing = true;
+                            an.captured = false; // re-capture the base offset
+                        });
+                }
+                Follow(n.id, 0, depth);
+                break;
+            }
             default:
                 Follow(n.id, 0, depth);
                 break;
@@ -251,6 +387,23 @@ private:
 void Update(Scene& scene, Input& input, f32 dt, bool playing) {
     if (!playing) return;
     auto& reg = scene.Registry();
+
+    // UI interactions this frame (flags were set by ui::UpdateInteraction, which
+    // runs earlier in the frame): collected ONCE, then fired into every schematic
+    // below as On UI Clicked / On UI Changed events.
+    std::vector<UIEventRec> uiEvents;
+    reg.view<UIElement>().each([&](const UIElement& el) {
+        if (el.action.empty() || (!el.clicked && !el.changed)) return;
+        UIEventRec rec;
+        rec.action = el.action;
+        rec.clicked = el.clicked;
+        rec.changed = el.changed;
+        rec.value = el.value;
+        rec.toggled = el.toggled;
+        rec.selected = static_cast<f32>(el.selected);
+        uiEvents.push_back(std::move(rec));
+    });
+
     for (const entt::entity e : reg.view<SchematicComponent>()) {
         SchematicComponent& sc = reg.get<SchematicComponent>(e);
         for (auto& [id, t] : sc.timers)
@@ -264,6 +417,15 @@ void Update(Scene& scene, Input& input, f32 dt, bool playing) {
                 fn(ctx, NodeType::EventStart);
             }
             fn(ctx, NodeType::EventUpdate);
+            for (const UIEventRec& rec : uiEvents) { // UI events, payload in ctx
+                ctx.eventAction = &rec.action;
+                ctx.eventValue = rec.value;
+                ctx.eventToggled = rec.toggled;
+                ctx.eventSelected = rec.selected;
+                if (rec.clicked) fn(ctx, NodeType::EventUIClicked);
+                if (rec.changed) fn(ctx, NodeType::EventUIChanged);
+            }
+            ctx.eventAction = nullptr;
             continue;
         }
 
@@ -276,6 +438,10 @@ void Update(Scene& scene, Input& input, f32 dt, bool playing) {
             vm.RunEvent(NodeType::EventStart);
         }
         vm.RunEvent(NodeType::EventUpdate);
+        for (const UIEventRec& rec : uiEvents) {
+            if (rec.clicked) vm.RunEventUI(NodeType::EventUIClicked, rec);
+            if (rec.changed) vm.RunEventUI(NodeType::EventUIChanged, rec);
+        }
     }
 }
 

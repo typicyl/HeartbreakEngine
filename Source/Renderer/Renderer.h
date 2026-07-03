@@ -6,6 +6,7 @@
 #include "RHI/RHI.h"
 
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace hbe {
@@ -19,8 +20,10 @@ public:
     Renderer();
     ~Renderer();
 
-    // Creates the RHI device for `api` and binds it to `window`.
-    bool Initialize(const Window& window, rhi::GraphicsAPI api, bool enableValidation);
+    // Creates the RHI device for `api` and binds it to `window`. `vsync` false =
+    // uncapped present (tearing/MAILBOX), for perf measurement + player choice.
+    bool Initialize(const Window& window, rhi::GraphicsAPI api, bool enableValidation,
+                    bool vsync = true);
 
     // Uploads a CPU mesh to the GPU; returns a handle used by MeshInstance.
     rhi::MeshHandle UploadMesh(const MeshData& mesh);
@@ -49,6 +52,19 @@ public:
     // drawn over the scene inside RenderScene. Cleared by the caller each
     // frame (an empty set draws nothing).
     void SetUIOverlay(const std::vector<rhi::UIVertex>& vertices) { uiVertices_ = &vertices; }
+
+    // -- World-space ("physical") UI: canvas -> texture -> lit quad -----------
+    // Creates a per-canvas UI render target (invalid handle when unsupported).
+    rhi::TextureHandle CreateUITarget(u32 width, u32 height);
+    // One world-canvas draw for this frame: `verts` rendered into `target`
+    // before the scene pass samples it. Pointers must stay valid through
+    // RenderScene (the Engine owns the batch vectors). One frame only.
+    struct WorldUIDraw {
+        rhi::TextureHandle target;
+        const rhi::UIVertex* verts = nullptr;
+        u32 count = 0;
+    };
+    void SetWorldUI(const std::vector<WorldUIDraw>& draws) { worldUIDraws_ = &draws; }
 
     // Particle billboards for this frame (world-space; alpha + additive lists).
     // Drawn inside RenderScene's HDR pass; cleared after one frame.
@@ -85,6 +101,24 @@ public:
     // ImGui texture id for an uploaded texture (editor thumbnails; 0 = none).
     u64  TextureUIId(rhi::TextureHandle handle);
 
+    // Player brightness (Settings menu): a multiplier composed onto the view's
+    // exposure at render time - the authored scene/volume exposure is never
+    // modified. 1.0 = neutral. Sticky until changed (not per-frame).
+    void SetUserExposureScale(f32 scale) { userExposureScale_ = scale; }
+
+    // -- Frustum culling ------------------------------------------------------
+    // Per-frame draw statistics (filled by RenderScene).
+    struct FrameStats {
+        u32 total = 0;  // draw items collected from the scene
+        u32 drawn = 0;  // submitted to the main pass after frustum culling
+        u32 culled = 0; // rejected (off-screen); shadows still see the full list
+        u32 instancedDraws = 0;  // instanced run heads this frame
+        u32 totalInstances = 0;  // items covered by those runs
+    };
+    const FrameStats& Stats() const { return stats_; }
+    // Kill-switch (--nocull) for A/B comparison; culling is on by default.
+    void SetCullingEnabled(bool enabled) { cullingEnabled_ = enabled; }
+
     void SetOrbitEnabled(bool enabled) { orbitEnabled_ = enabled; }
     bool IsOrbitEnabled() const { return orbitEnabled_; }
 
@@ -103,12 +137,24 @@ private:
     Camera camera_;
     std::vector<rhi::DrawItem> drawItems_; // reused each frame
     const std::vector<rhi::UIVertex>* uiVertices_ = nullptr; // set per frame
+    const std::vector<WorldUIDraw>* worldUIDraws_ = nullptr; // set per frame
     const rhi::ParticleVertex* particleAlpha_ = nullptr;     // set per frame
     const rhi::ParticleVertex* particleAdd_ = nullptr;
     u32 particleAlphaCount_ = 0, particleAddCount_ = 0;
     rhi::SceneView previewView_;                  // editor asset preview
     std::vector<rhi::DrawItem> previewItems_;     // (consumed each frame)
     bool previewPending_ = false;
+    f32 userExposureScale_ = 1.0f; // player brightness (view-level, sticky)
+    // Local-space bounds per MeshHandle id, cached at Upload/UpdateMesh - the
+    // frustum cull's data source (missing entry = never culled). Renderer is the
+    // only upload path, so coverage is universal.
+    struct MeshBounds {
+        glm::vec3 center{0.0f};
+        glm::vec3 extent{0.0f}; // half-size
+    };
+    std::unordered_map<u32, MeshBounds> meshBounds_;
+    FrameStats stats_;
+    bool cullingEnabled_ = true;
     bool orbitEnabled_ = true;
     glm::vec2 viewportSize_{0.0f};      // last SetViewportSize request
     glm::vec2 windowSize_{1280, 720};   // swapchain size (Initialize/Resize)

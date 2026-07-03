@@ -21,19 +21,37 @@ float3 WorldFromDepth(float2 uv, float depth)
 }
 
 // Henyey-Greenstein phase function (g > 0 = forward scattering).
+// The forward peak scales as 1/(1-g)^2 and EXPLODES as g -> 1 (g=0.76 peaks ~2.4,
+// g=0.95 ~62, g=0.99 ~1580). That runaway multiplier amplifies the fog march's
+// necessarily-coarse per-step sun-shadow into glaring blocky "cubes" - which is why
+// cranking anisotropy makes them appear. Clamp g for numerical safety AND cap the
+// peak so a strong forward-scatter look stays bounded and artifact-free.
 float PhaseHG(float cosT, float g)
 {
+    g = clamp(g, -0.9f, 0.9f);
     float g2 = g * g;
     float denom = 1.0f + g2 - 2.0f * g * cosT;
-    return (1.0f - g2) / (4.0f * HBE_FOG_PI * max(pow(max(denom, 1e-4f), 1.5f), 1e-4f));
+    float p = (1.0f - g2) / (4.0f * HBE_FOG_PI * max(pow(max(denom, 1e-4f), 1.5f), 1e-4f));
+    return min(p, 8.0f); // bound the forward peak (~strong but stable)
 }
 
-float Hash(float2 p) { return frac(sin(dot(p, float2(12.9898f, 78.233f))) * 43758.5453f); }
+// Interleaved Gradient Noise (Jimenez): evenly-distributed per-pixel offset with
+// far better spectral properties than a sine hash (no structured blocks), and
+// ANIMATED by the frame index in gPostParams3.x - each frame shifts the pattern
+// so TAA integrates the march into smooth fog. params3.x is 0 when TAA is off
+// (static IGN; no crawling noise).
+float IGN(float2 p)
+{
+    return frac(52.9829189f * frac(0.06711056f * p.x + 0.00583715f * p.y));
+}
 
+// Outputs the fog contribution ONLY, packed as (rgb = inscatter, a = transmittance),
+// NOT scene*transmittance+inscatter. Rendered at reduced resolution; ApplyHalfRes
+// composites it over the full-res HDR (out = scene * a + rgb) so the sharp scene never
+// gets downsampled - only the smooth fog does.
 float4 PSMain(FSOutput input) : SV_Target
 {
     const float2 uv = input.positionCS.xy * gOutTexel;
-    const float3 scene = SamplePost(gInput0, uv).rgb;
 
     const float density = gPostParams0.x;
     const float heightFalloff = gPostParams0.y;
@@ -55,7 +73,7 @@ float4 PSMain(FSOutput input) : SV_Target
     const float3 rd = (endLen > 1e-4f) ? toEnd / endLen : float3(0.0f, 0.0f, 1.0f);
 
     const float stepLen = dist / steps;
-    const float dither = Hash(input.positionCS.xy);
+    const float dither = IGN(input.positionCS.xy + 5.588238f * gPostParams3.x);
     const float3 L = normalize(gLightDirWS); // direction TO the sun
     const float sunPhase = PhaseHG(dot(rd, L), g);
 
@@ -107,5 +125,5 @@ float4 PSMain(FSOutput input) : SV_Target
         if (transmittance < 0.004f) break; // fully fogged - remaining steps add nothing
     }
 
-    return float4(scene * transmittance + inscatter, 1.0f);
+    return float4(inscatter, transmittance); // composited over the scene by ApplyHalfRes
 }

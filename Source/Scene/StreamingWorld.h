@@ -79,6 +79,11 @@ public:
     };
     Stats GetStats() const;
 
+    // True when every cell within its loadRadius of `focus` is fully resident AND
+    // no load is in flight - i.e. revealing the world at `focus` now would show no
+    // cell pop-in. Used to hold a loading screen until the neighbourhood streamed in.
+    bool IsSettled(const glm::vec3& focus) const;
+
 private:
     // Worker job state, published to the main thread via `state` (acquire/release).
     enum class State : int { Unloaded, Loading, Ready, Failed, Loaded };

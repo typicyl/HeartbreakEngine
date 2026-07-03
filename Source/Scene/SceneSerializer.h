@@ -98,6 +98,16 @@ struct EntityData {
     UIElement uiElement;
     bool hasUICanvas = false;
     UICanvas uiCanvas;
+    bool hasUIAnimator = false;
+    UIAnimator uiAnimator;
+    bool hasUIPanel = false;
+    UIPanel uiPanel;
+    bool hasUILayoutGroup = false;
+    UILayoutGroup uiLayoutGroup;
+    bool hasUICanvasGroup = false;
+    UICanvasGroup uiCanvasGroup;
+    bool hasWorldText = false;
+    WorldText worldText;
     bool hasAnim = false;
     AnimationTrack anim;
     bool hasAnimator = false;

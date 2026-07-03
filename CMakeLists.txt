@@ -12,6 +12,7 @@
 set(HBE_CORE_SOURCES
     "Source/Core/Log.cpp"
     "Source/Core/JobSystem.cpp"
+    "Source/Core/UserSettings.cpp"
     "Source/Core/Window_Win32.cpp"
     "Source/Core/Input_Win32.cpp")
 
@@ -25,6 +26,8 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/MaterialAsset.cpp"
     "Source/Assets/AudioEvent.cpp"
     "Source/Assets/MusicGraph.cpp"
+    "Source/Assets/DialogueAsset.cpp"
+    "Source/Assets/CutsceneAsset.cpp"
     "Source/Assets/AssetLoader.cpp")
 
 set(HBE_SCENE_SOURCES
@@ -62,6 +65,10 @@ set(HBE_SCHEMATIC_SOURCES
 
 set(HBE_UI_SOURCES
     "Source/UI/UISystem.cpp"
+    "Source/UI/UIAnimation.cpp"
+    "Source/UI/UIManager.cpp"
+    "Source/UI/UIWorld.cpp"
+    "Source/UI/UIFocus.cpp"
     "Source/UI/FontAtlas.cpp")
 
 set(HBE_RHI_SOURCES
@@ -229,6 +236,10 @@ if(HBE_GAME_PROJECT)
 else()
     set(HBE_RUNTIME_BAKED "${HBE_SCHEMATIC_STUB}")
 endif()
+
+# NOTE: the MSVC runtime is linked STATICALLY (/MT - see the top-level CMakeLists), so
+# the executables need no msvcp140/vcruntime140/concrt140 DLLs and nothing is staged
+# next to them. A shipped build is just the exe + the .uap packs.
 
 # ---------------------------------------------------------------------------
 # Executables

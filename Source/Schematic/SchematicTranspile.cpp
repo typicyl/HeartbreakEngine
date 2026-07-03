@@ -112,6 +112,22 @@ struct Gen {
             case NodeType::GetPosition:  return "([&]() -> Value { entt::entity _e = BakedEnt(" + IN(0) +
                                                 ", ctx.self); const Transform* _t = ctx.scene.Registry().try_get<Transform>(_e); "
                                                 "return Value::Vec3(_t ? _t->position : glm::vec3(0.0f)); }())";
+            case NodeType::EventUIClicked: // Action payload (valid while the event fires)
+                return "(ctx.eventAction ? Value::Str(*ctx.eventAction) : Value::Str(\"\"))";
+            case NodeType::EventUIChanged:
+                return outPin == 1   ? "Value::Float(ctx.eventValue)"
+                       : outPin == 2 ? "Value::Bool(ctx.eventToggled)"
+                                     : "Value::Float(ctx.eventSelected)";
+            case NodeType::GetUIValue: {
+                const char* expr = outPin == 0   ? "Value::Float(_el.value)"
+                                   : outPin == 1 ? "Value::Bool(_el.toggled)"
+                                                 : "Value::Float(static_cast<f32>(_el.selected))";
+                return "([&]() -> Value { Value _o = Value::Float(0.0f); bool _f = false; "
+                       "const std::string _n = (" + IN(0) + ").s; if (!_n.empty()) "
+                       "ctx.scene.Registry().view<UIElement>().each([&](const UIElement& _el) { "
+                       "if (_f || _el.action != _n) return; _f = true; _o = " + std::string(expr) +
+                       "; }); return _o; }())";
+            }
             default: return "Value{}";
         }
     }
@@ -196,8 +212,65 @@ struct Gen {
                 out += "        game::PlayStinger((" + IN(1) + ").s);\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
+            case NodeType::PlayVoiceline:
+                out += "        game::PlayVoiceline((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::PlayDialogue:
+                out += "        game::PlayDialogue((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::PlayCutscene:
+                out += "        game::PlayCutscene((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UIShowPanel:
+                out += "        game::QueueUICommand({game::UICommand::Op::Show, (" + IN(1) +
+                       ").s});\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UIPushPanel:
+                out += "        game::QueueUICommand({game::UICommand::Op::Push, (" + IN(1) +
+                       ").s});\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UIPopPanel:
+                out += "        game::QueueUICommand({game::UICommand::Op::Pop, std::string()});\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UISetText:
+                out += "        { const std::string _n = (" + IN(1) + ").s; const std::string _tx = (" +
+                       IN(2) + ").s; if (!_n.empty()) ctx.scene.Registry().view<UIElement>().each("
+                       "[&](UIElement& _el) { if (_el.action == _n) _el.text = _tx; }); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UISetVisible:
+                out += "        { const std::string _n = (" + IN(1) + ").s; const bool _v = BakedB(" +
+                       IN(2) + "); if (!_n.empty()) ctx.scene.Registry().view<UIElement>().each("
+                       "[&](UIElement& _el) { if (_el.action == _n) _el.visible = _v; }); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UISetValue:
+                out += "        { const std::string _n = (" + IN(1) + ").s; const f32 _v = BakedF(" +
+                       IN(2) + "); if (!_n.empty()) ctx.scene.Registry().view<UIElement>().each("
+                       "[&](UIElement& _el) { if (_el.action != _n) return; "
+                       "_el.value = glm::clamp(_v, 0.0f, 1.0f); _el.toggled = _v > 0.5f; "
+                       "if (!_el.options.empty()) _el.selected = glm::clamp(static_cast<int>(_v), 0, "
+                       "static_cast<int>(_el.options.size()) - 1); }); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::UIPlayAnim:
+                out += "        { const std::string _n = (" + IN(1) + ").s; if (!_n.empty()) "
+                       "ctx.scene.Registry().view<UIElement, UIAnimator>().each("
+                       "[&](UIElement& _el, UIAnimator& _an) { "
+                       "if (_el.action != _n || _an.trigger != UIAnimator::Trigger::Manual) return; "
+                       "_an.time = 0.0f; _an.playing = true; _an.captured = false; }); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
             case NodeType::EventStart:
             case NodeType::EventUpdate:
+            case NodeType::EventUIClicked:
+            case NodeType::EventUIChanged:
             default:
                 EmitExec(out, node, 0, stack, depth);
                 break;
@@ -218,6 +291,26 @@ std::string TranspileGraph(const Graph& g, const std::string& fnName) {
     for (const Node& n : g.nodes)
         if (n.type == NodeType::EventUpdate) { gen.EmitExec(updateBody, n.id, 0, stack, 0); break; }
 
+    // UI events: EVERY matching event node fires (a graph can listen to many
+    // widgets), each gated on its Action filter against the event payload.
+    const auto uiBody = [&](NodeType evt) {
+        std::string body;
+        for (const Node& n : g.nodes) {
+            if (n.type != evt) continue;
+            stack.clear();
+            std::string chain;
+            gen.EmitExec(chain, n.id, 0, stack, 0);
+            const std::string filter = gen.EmitInput(n.id, 0, 0);
+            body += "        { const std::string _flt = (" + filter +
+                    ").s; if (ctx.eventAction && (_flt.empty() || *ctx.eventAction == _flt)) {\n";
+            body += chain;
+            body += "        } }\n";
+        }
+        return body;
+    };
+    const std::string clickedBody = uiBody(NodeType::EventUIClicked);
+    const std::string changedBody = uiBody(NodeType::EventUIChanged);
+
     std::string s;
     s += "static void " + fnName + "(CompiledContext& ctx, NodeType evt) {\n";
     s += "    (void)ctx;\n";
@@ -228,6 +321,14 @@ std::string TranspileGraph(const Graph& g, const std::string& fnName) {
     s += "    }\n";
     s += "    case NodeType::EventUpdate: {\n";
     s += updateBody;
+    s += "        break;\n";
+    s += "    }\n";
+    s += "    case NodeType::EventUIClicked: {\n";
+    s += clickedBody;
+    s += "        break;\n";
+    s += "    }\n";
+    s += "    case NodeType::EventUIChanged: {\n";
+    s += changedBody;
     s += "        break;\n";
     s += "    }\n";
     s += "    default: break;\n";

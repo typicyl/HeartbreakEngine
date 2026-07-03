@@ -9,14 +9,15 @@
 // mask comes from the untouched forward HDR (gInput2.a), so the static/dynamic edge is
 // pixel-crisp regardless of the half-res Kuwahara.
 //
-// Inputs : gInput0 = painterly result (rgb), gInput1 = pre-painterly lit HDR (rgb),
-//          gInput2 = forward HDR (a = painterly mask), gInput3 = scene depth (R32F)
+// Inputs : gInput0 = painterly result (rgb, Kuwahara + brush strokes), gInput1 =
+//          pre-painterly lit HDR (rgb), gInput2 = forward HDR (a = painterly mask),
+//          gInput3 = scene depth (R32F)
 #include "PostCommon.hlsli"
 
 float4 PSMain(FSOutput input) : SV_Target
 {
     const float2 uv = input.positionCS.xy * gOutTexel;
-    const float3 paint = SamplePost(gInput0, uv).rgb; // painted (static world)
+    const float3 paint = SamplePost(gInput0, uv).rgb; // painted (Kuwahara + strokes)
     const float3 lit   = SamplePost(gInput1, uv).rgb; // crisp lit colour (dynamic objects)
     const float2 mb = DecodeMaskBits(SamplePost(gInput2, uv).a); // .x=exempt .y=censored
     float        mask = mb.x;                          // 1 = restore crisp, 0 = keep paint

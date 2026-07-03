@@ -1,5 +1,7 @@
 // Engine/Engine.cpp
 #include "Engine/Engine.h"
+#include "Assets/CutsceneAsset.h"
+#include "Assets/DialogueAsset.h"
 #include "Assets/VFS.h"
 #include "Audio/AudioSystem.h"
 #include "Core/Input.h"
@@ -21,13 +23,17 @@
 #include "Scene/StreamingWorld.h"
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
+#include "UI/UIFocus.h"
 #include "UI/UISystem.h"
+#include "UI/UIAnimation.h"
+#include "UI/UIWorld.h"
 #include "Renderer/Renderer.h"
 #include "RHI/RHIFactory.h"
 #include "Scene/Scene.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +56,81 @@
 namespace hbe {
 
 namespace {
+#if defined(_WIN32)
+// Last-resort SEH handler. An access violation during init (e.g. a graphics driver /
+// device-creation fault on another machine) would otherwise terminate the process
+// SILENTLY, leaving only the pre-crash log - exactly the "it logged 'starting' and
+// quit" report. Log the code + address, flush every sink (incl. the on-disk log),
+// then let the OS finish. Turns a silent death into an actionable crash line.
+LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
+    const EXCEPTION_RECORD* rec = ep ? ep->ExceptionRecord : nullptr;
+    const u32 code = rec ? rec->ExceptionCode : 0u;
+    const void* addr = rec ? rec->ExceptionAddress : nullptr;
+
+    // Resolve the faulting *instruction* to the module (DLL/exe) it lives in. This is
+    // what turns "0x7FFB.. in some DLL" into an actual name - e.g. our own exe (a real
+    // bug), a GPU driver (nvwgf2umx/atidxx), or kernel32 (a null handle we handed it).
+    char modName[MAX_PATH] = "<unknown module>";
+    uintptr_t modOffset = 0;
+    if (addr) {
+        HMODULE mod = nullptr;
+        if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 reinterpret_cast<LPCSTR>(addr), &mod) &&
+            mod) {
+            char full[MAX_PATH] = {};
+            if (::GetModuleFileNameA(mod, full, MAX_PATH) > 0) {
+                const char* leaf = std::strrchr(full, '\\');
+                std::snprintf(modName, sizeof(modName), "%s", leaf ? leaf + 1 : full);
+            }
+            modOffset = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod);
+        }
+    }
+
+    // For an access violation, ExceptionInformation says read vs write and the exact
+    // address touched. A tiny address = a NULL/near-null deref (our own bad pointer,
+    // NOT a graphics driver) - which points the finger squarely at engine code.
+    if (code == 0xC0000005u /*EXCEPTION_ACCESS_VIOLATION*/ && rec && rec->NumberParameters >= 2) {
+        const unsigned long long rw = rec->ExceptionInformation[0]; // 0 read,1 write,8 DEP
+        const unsigned long long bad = rec->ExceptionInformation[1];
+        const char* op = rw == 1 ? "write to" : (rw == 8 ? "execute at" : "read from");
+        HBE_ERROR("FATAL: access violation in {}+0x{:X} - tried to {} 0x{:016X}{}",
+                  modName, modOffset, op, bad,
+                  bad < 0x10000ull ? " (NULL/near-null pointer - an engine bug, not the GPU)."
+                                   : " - engine terminating.");
+    } else {
+        HBE_ERROR("FATAL: unhandled exception 0x{:08X} in {}+0x{:X} at 0x{:016X} - terminating.",
+                  code, modName, modOffset, reinterpret_cast<uintptr_t>(addr));
+    }
+    HBE_ERROR("Send the <exe>.log file next to the executable. If this is graphics-side, try "
+              "--d3d12 / --vulkan / --opengl and update the GPU driver.");
+    FlushLog();
+    return EXCEPTION_EXECUTE_HANDLER; // stop searching; the process ends
+}
+#endif
+
+// Applies a graphics-quality preset (0 High, 1 Medium, 2 Low) by DEGRADING the
+// authored post stack: it only ever disables passes, never enables anything the
+// author turned off, and never touches look values (bloom/intensities/exposure).
+// High = exactly as authored. Painterly is the art style, not a perf knob -
+// untouched. Re-applied every frame AFTER the project stamp + volumes so it wins
+// for the frame without ever editing the authored data.
+void ApplyGraphicsPreset(rhi::PostSettings& p, int preset) {
+    if (preset <= 0) return; // High: the authored look, exactly
+    // Medium: drop the heaviest passes.
+    p.ssgiEnabled = 0;
+    p.motionBlurEnabled = 0;
+    if (preset >= 2) { // Low: minimal post; TAA falls back to cheap FXAA
+        p.ssrEnabled = 0;
+        p.dofEnabled = 0;
+        p.ssaoEnabled = 0;
+        if (p.taaEnabled) {
+            p.taaEnabled = 0;
+            p.fxaaEnabled = 1;
+        }
+    }
+}
+
 // Maps a build-settings backend string to the RHI enum.
 rhi::GraphicsAPI ApiFromString(const std::string& s) {
     if (s == "vulkan" || s == "vk") return rhi::GraphicsAPI::Vulkan;
@@ -129,6 +210,14 @@ void Engine::Quit() {
 }
 
 int Engine::Run(const EngineConfig& configIn) {
+#if defined(_WIN32)
+    // Install first so a crash ANYWHERE in boot gets logged before the process dies.
+    ::SetUnhandledExceptionFilter(&CrashHandler);
+#endif
+    // Build stamp = the first line ALWAYS printed. If a deployed copy doesn't show the
+    // date/time of the build you just made, that machine is running a STALE exe (the
+    // usual cause of "I fixed it but it still crashes the same way").
+    HBE_INFO("Heartbreak Engine build " __DATE__ " " __TIME__);
     EngineConfig config = configIn;
 
     // Open the project BEFORE the window exists so its BuildSettings can shape
@@ -217,6 +306,7 @@ int Engine::Run(const EngineConfig& configIn) {
             if (!config.widthExplicit && build.width > 0) config.width = build.width;
             if (!config.heightExplicit && build.height > 0) config.height = build.height;
             if (!config.fullscreenExplicit) config.fullscreen = build.fullscreen;
+            if (!config.vsyncExplicit) config.vsync = build.vsync;
             if (!config.apiExplicit) config.api = ApiFromString(build.backend);
         }
     }
@@ -226,7 +316,9 @@ int Engine::Run(const EngineConfig& configIn) {
 
     // Worker threads + fibers come up first: subsystems below parallelize onto
     // them (animation, scene streaming, culling).
+    HBE_INFO("Boot: initializing job system...");
     jobs::Initialize();
+    HBE_INFO("Boot: job system ready.");
 
     // Navigation smoke test: a headless (no window/GPU) check of the real-time
     // grid A* pathfinder routing around static + dynamic obstacles.
@@ -332,11 +424,13 @@ int Engine::Run(const EngineConfig& configIn) {
     wd.posX = config.posX;
     wd.posY = config.posY;
     wd.fullscreen = config.fullscreen;
+    HBE_INFO("Boot: creating window ({}x{})...", config.width, config.height);
     Window window(wd);
     if (!window.GetNativeHandle().hwnd) {
         HBE_ERROR("Failed to create window.");
         return 1;
     }
+    HBE_INFO("Boot: window created.");
 
     Renderer renderer;
     bool rendererReady = false;
@@ -349,7 +443,9 @@ int Engine::Run(const EngineConfig& configIn) {
             HBE_INFO("Editor: OpenGL has no editor UI yet; skipping it for the editor.");
             continue;
         }
-        if (renderer.Initialize(window, api, config.enableValidation)) {
+        HBE_INFO("Boot: initializing {} backend...", rhi::ToString(api));
+        if (config.noCull) renderer.SetCullingEnabled(false);
+        if (renderer.Initialize(window, api, config.enableValidation, config.vsync)) {
             config.api = api;
             rendererReady = true;
             break;
@@ -429,22 +525,49 @@ int Engine::Run(const EngineConfig& configIn) {
     scene::SetupEnvironment(scene, renderer);
     if (studioSplash) PresentBootSplash(0.5f); // refresh: IBL done, log advanced
 
-    // Build the scene (skipped when the studio splash already owns the world): the
-    // project's main menu when set, else startup scene / model / default world. In
-    // the studio-splash case the menu loads later, after the splash (FlowAfterBoot).
-    if (!onInit_ && !sceneBuilt && Project::HasActive() &&
-        !Project::Active().Settings().mainMenuScene.empty()) {
-        const std::filesystem::path menu =
-            Project::Active().AssetsDir() / Project::Active().Settings().mainMenuScene;
-        if (vfs::Exists(menu) && scene::LoadScene(scene, renderer, menu)) {
+    // Persistent UI scene: load ALL screens (UIPanel subtrees) ONCE and keep them
+    // resident across gameplay scene swaps (tag Persistent so the gameplay Replace
+    // spares them). The UIManager shows/hides panels. This is THE game-UI path;
+    // without it the runtime boots straight into the startup scene below.
+    if (!onInit_ && Project::HasActive() && !Project::Active().Settings().uiScene.empty()) {
+        const std::filesystem::path uip =
+            Project::Active().AssetsDir() / Project::Active().Settings().uiScene;
+        scene::SceneData uiData;
+        if (vfs::Exists(uip) && scene::ParseSceneFile(uip, uiData)) {
+            scene::StagedAssets uiStaged;
+            scene::StageAssets(uiData, Project::Active().AssetsDir(), uiStaged);
+            std::vector<entt::entity> uiEnts;
+            scene::Instantiate(scene, renderer, uiData, uiStaged, scene::LoadMode::Additive,
+                               &uiEnts, "__ui");
+            for (const entt::entity e : uiEnts) scene.Registry().emplace<Persistent>(e);
+            uiManager_.Init(scene);
+            uiManagerMode_ = true;
             flowActive_ = true;
-            gameState_ = GameState::MainMenu;
-            sceneBuilt = true;
+            sceneBuilt = true; // UI-only overlay; the gameplay world loads on Play
+            if (!studioSplash) { // no splash: go straight to the initial (menu) panel
+                uiManager_.ShowInitial(scene);
+                gameState_ = GameState::MainMenu;
+            }
+            HBE_INFO("Boot: persistent UI scene '{}' loaded ({} entities).",
+                     Project::Active().Settings().uiScene, static_cast<u32>(uiEnts.size()));
         } else {
-            HBE_WARN("Main-menu scene '{}' failed to load; falling back to startup.",
-                     Project::Active().Settings().mainMenuScene);
+            HBE_WARN("UI scene '{}' failed to load.", Project::Active().Settings().uiScene);
         }
     }
+
+    // Per-user settings (volume/graphics/brightness/captions): load + apply. Graphics +
+    // brightness are re-applied every frame (see the loop); volume + captions are set once.
+    if (Project::HasActive()) {
+        const std::string& gn = Project::Active().Settings().build.gameName;
+        userSettingsDir_ = UserSettings::ResolveDir(
+            gn.empty() ? Project::Active().Settings().name : gn);
+        userSettings_.Load(userSettingsDir_); // keeps defaults if absent
+        audio.SetBusVolume("Master", userSettings_.masterVolume);
+        audio.SetCaptionsEnabled(userSettings_.captionsEnabled);
+    }
+
+    // Build the scene (skipped when the studio splash or UI scene already owns the
+    // world): startup scene / model / default world.
     if (!sceneBuilt && Project::HasActive() && !Project::Active().Settings().startupScene.empty()) {
         const std::filesystem::path startup =
             Project::Active().AssetsDir() / Project::Active().Settings().startupScene;
@@ -472,7 +595,7 @@ int Engine::Run(const EngineConfig& configIn) {
         scene::BuildDefaultScene(scene);
     }
     if (config.stressCount > 0) {
-        scene::SpawnStress(scene, renderer, config.stressCount);
+        scene::SpawnStress(scene, renderer, config.stressCount, config.stressShared);
     }
 
     if (config.forceDof) scene.Environment().post.dofEnabled = 1;
@@ -528,6 +651,116 @@ int Engine::Run(const EngineConfig& configIn) {
     // NavigationAgents path on GridNav (the real-time A*), which auto-builds from
     // static geometry each frame (see the agent update below) - no startup bake.
 
+    // World-space UI smoke test (--uiworldtest): a lit page floating in the scene
+    // with a label + slider, exercising canvas->texture->quad on both backends.
+    if (config.uiWorldTest) {
+        auto& reg = scene.Registry();
+        const entt::entity canvasE = scene.CreateEntity("UIWorldTest");
+        Transform tf;
+        tf.position = {0.0f, 2.0f, 0.0f};
+        // Stand the page up: local XZ faces +Y by default; pitch it 90 degrees so
+        // it faces the orbiting demo camera instead of the sky.
+        tf.rotation = glm::angleAxis(glm::radians(90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+        reg.emplace<Transform>(canvasE, tf);
+        UICanvas canvas;
+        canvas.worldSpace = true;
+        canvas.refWidth = 512.0f;
+        canvas.refHeight = 512.0f;
+        canvas.worldWidth = 2.0f;
+        canvas.emissive = 0.15f; // slight glow so it reads in the demo scene
+        reg.emplace<UICanvas>(canvasE, canvas);
+        const auto child = [&](UIElement el, glm::vec2 offset, glm::vec2 size,
+                               entt::entity parent = entt::null) {
+            const entt::entity e = scene.CreateEntity("UIWorldTestEl");
+            el.offset = offset;
+            el.size = size;
+            reg.emplace<UIElement>(e, std::move(el));
+            reg.emplace<Parent>(e, Parent{parent == entt::null ? canvasE : parent});
+            return e;
+        };
+        UIElement panel;
+        panel.type = UIElement::Type::Panel;
+        panel.color = {0.93f, 0.90f, 0.82f, 1.0f}; // paper
+        panel.anchorMin = {0.0f, 0.0f};
+        panel.anchorMax = {1.0f, 1.0f};
+        child(panel, {0.0f, 0.0f}, {0.0f, 0.0f});
+        UIElement label;
+        label.type = UIElement::Type::Label;
+        label.text = "WORLD UI";
+        label.textSize = 64.0f;
+        label.color = {0.12f, 0.10f, 0.08f, 1.0f};
+        label.anchorMin = {0.5f, 0.25f};
+        label.anchorMax = {0.5f, 0.25f};
+        child(label, {0.0f, 0.0f}, {480.0f, 90.0f});
+        UIElement slider;
+        slider.type = UIElement::Type::Slider;
+        slider.action = "uitest:slider";
+        slider.color = {0.35f, 0.30f, 0.25f, 1.0f};
+        slider.fillColor = {0.80f, 0.35f, 0.20f, 1.0f};
+        slider.anchorMin = {0.5f, 0.45f};
+        slider.anchorMax = {0.5f, 0.45f};
+        child(slider, {0.0f, 0.0f}, {400.0f, 60.0f});
+
+        // ScrollView (U3 smoke): tall content clipped to the page's lower third,
+        // wheel-scrollable when the pointer ray hits it.
+        UIElement sv;
+        sv.type = UIElement::Type::ScrollView;
+        sv.color = {0.85f, 0.80f, 0.70f, 1.0f};
+        sv.fillColor = {0.80f, 0.35f, 0.20f, 1.0f};
+        sv.anchorMin = {0.5f, 0.78f};
+        sv.anchorMax = {0.5f, 0.78f};
+        const entt::entity svE = child(sv, {0.0f, 0.0f}, {420.0f, 170.0f});
+
+        // TextInput (U4 smoke): click it (ray pointer) and type; Enter commits.
+        UIElement ti;
+        ti.type = UIElement::Type::TextInput;
+        ti.placeholder = "type here...";
+        ti.textSize = 30.0f;
+        ti.color = {0.20f, 0.18f, 0.15f, 1.0f};
+        ti.fillColor = {0.80f, 0.35f, 0.20f, 1.0f};
+        ti.anchorMin = {0.5f, 0.58f};
+        ti.anchorMax = {0.5f, 0.58f};
+        child(ti, {0.0f, 0.0f}, {400.0f, 52.0f});
+
+        for (int i = 0; i < 8; ++i) {
+            UIElement line;
+            line.type = UIElement::Type::Label;
+            line.text = "scroll line " + std::to_string(i + 1);
+            line.textSize = 34.0f;
+            line.color = {0.15f, 0.12f, 0.10f, 1.0f};
+            line.anchorMin = {0.5f, 0.0f}; // top-anchored content flows downward
+            line.anchorMax = {0.5f, 0.0f};
+            child(line, {0.0f, 30.0f + 55.0f * static_cast<f32>(i)}, {380.0f, 48.0f},
+                  svE);
+        }
+
+        // Plain 3D text objects beside the page: one oriented, one billboard.
+        {
+            const entt::entity t1 = scene.CreateEntity("WorldTextTest");
+            Transform t1f;
+            t1f.position = {-2.5f, 2.0f, 0.0f};
+            reg.emplace<Transform>(t1, t1f);
+            WorldText wt1;
+            wt1.text = "3D TEXT\nownz";
+            wt1.size = 0.4f;
+            wt1.color = {1.0f, 0.85f, 0.3f, 1.0f};
+            reg.emplace<WorldText>(t1, wt1);
+
+            const entt::entity t2 = scene.CreateEntity("WorldTextBillboard");
+            Transform t2f;
+            t2f.position = {2.5f, 2.0f, 0.0f};
+            reg.emplace<Transform>(t2, t2f);
+            WorldText wt2;
+            wt2.text = "billboard";
+            wt2.size = 0.3f;
+            wt2.color = {0.5f, 0.9f, 1.0f, 1.0f};
+            wt2.billboard = true;
+            reg.emplace<WorldText>(t2, wt2);
+        }
+        HBE_INFO("UIWorldTest: spawned a world-space canvas (512x512, 2m wide) + "
+                 "two WorldText objects.");
+    }
+
     // Route OS resize events into the renderer.
     window.SetResizeCallback([&renderer](u32 w, u32 h) { renderer.Resize(w, h); });
 
@@ -539,6 +772,8 @@ int Engine::Run(const EngineConfig& configIn) {
     auto fpsLast = last;
     u32 fpsFrames = 0;
     std::vector<rhi::UIVertex> uiVertices; // reused each frame
+    std::vector<ui::WorldUIBatch> worldUIBatches;      // world-canvas triangles (reused)
+    std::vector<Renderer::WorldUIDraw> worldUIDraws;   // -> renderer, one frame each
     std::vector<rhi::ParticleVertex> particleAlpha, particleAdd; // reused each frame
     glm::vec3 streamFocus(0.0f);           // last streaming focus (for stats log)
     f32 worldTestT = 0.0f;                 // smoke-test focus-sweep clock
@@ -576,10 +811,15 @@ int Engine::Run(const EngineConfig& configIn) {
                 // Average AND worst-case: an average alone hides stutter. "worst" is
                 // the single slowest frame in the window; "jank" counts frames under
                 // 45 FPS - both > 0 with a smooth average means uneven pacing.
+                const Renderer::FrameStats& rs = renderer.Stats();
+                const ui::UIFrameStats& us = uiCtx_.stats;
                 HBE_INFO("Perf: {:.1f} FPS avg ({:.2f} ms) | worst {:.1f} ms | {} jank "
-                         "frame(s) <45 FPS",
+                         "frame(s) <45 FPS | draws {}/{} ({} culled, {} runs x{} inst) | "
+                         "UI {} el {} verts {} txt {} maps",
                          fpsFrames / elapsed, 1000.0f * elapsed / fpsFrames,
-                         1000.0f * winMaxDt, winJank);
+                         1000.0f * winMaxDt, winJank, rs.drawn, rs.total, rs.culled,
+                         rs.instancedDraws, rs.totalInstances, us.elements, us.verts,
+                         us.textLayouts, us.mapRebuilds);
                 winMaxDt = 0.0f;
                 winJank = 0;
                 if (streamingWorld.Active()) {
@@ -646,13 +886,42 @@ int Engine::Run(const EngineConfig& configIn) {
                 pointerNorm = {input.MouseX() / window.Width(),
                                input.MouseY() / window.Height()};
             }
-            ui::UpdateInteraction(scene, input, pointerNorm, uiTarget, uiConfig);
+            // World-space ("physical") UI is point-and-click: ray-pick the pages
+            // only while the cursor is FREE. A locked (recentered) cursor would be
+            // a de-facto crosshair, which is not the interaction model.
+            ui::PointerState pointers;
+            if (!IsCursorLocked())
+                ui::ComputeWorldPointers(scene, renderer.GetCamera(), pointerNorm, pointers,
+                                         uiCtx_);
+            // Cached interaction: hit-tests last frame's layout + clears flags on
+            // the touched list only (no full registry scans).
+            ui::UpdateInteraction(scene, input, pointerNorm, &pointers, uiCtx_);
+            // Keyboard/gamepad navigation + TextInput editing: moves the focus
+            // ring, activates widgets via the same clicked/changed flags the
+            // mouse sets, edits text buffers. Suspended while the editor owns
+            // the keyboard (ImGui feeds SetUIKeyboardCaptured).
+            const bool wasEditing = ui::WantsTextInput(uiCtx_);
+            if (!uiKeyboardExternal_) ui::UpdateNavigation(scene, input, uiCtx_, dt);
+            // While a text field is being edited, mute the normal keyboard
+            // queries so gameplay / dev-menu / schematic key reads stay quiet
+            // (the editing code uses the raw variants). Latch capture through
+            // the frame the session ENDS too (wasEditing): the Enter/Escape that
+            // committed/cancelled must not also trigger an Enter/Escape-bound
+            // schematic or gameplay action the same frame. The edge is gone by
+            // the next frame, so capture releases naturally.
+            input.SetTextCapture(!uiKeyboardExternal_ &&
+                                 (wasEditing || ui::WantsTextInput(uiCtx_)));
+            PlayUISounds(); // hover/click one-shots (edge-detected)
         }
 
         // High-level game flow: reads the fresh button-click state above to drive
         // menu -> loading -> gameplay transitions (runtime only; opt-in via the
         // project's main-menu scene). Cursor lock is applied here too.
         if (flowActive_) UpdateGameFlow(dt);
+        if (!onInit_) {             // runtime only (not the editor preview)
+            ApplyChangedSettings(); // live-apply any Settings widget the user just changed
+            UpdateCaptions(dt);     // drain audio captions -> drive the caption element
+        }
 
         // Visual-script "Schematics" tick while the simulation runs (the editor's
         // play mode gates physics; the runtime always plays). On Start / On Update.
@@ -720,8 +989,61 @@ int Engine::Run(const EngineConfig& configIn) {
                 while (game::ConsumeMusicParameter(pn, pv)) audio.SetMusicParameter(pn, pv);
                 std::string sa;
                 while (game::ConsumeStinger(sa)) audio.PostStinger(mAssets / sa, "Music");
+                // One-shot voicelines from schematics: play the clip; PlayUAF
+                // surfaces its baked "Speaker: caption" into the caption stack.
+                std::string va;
+                while (game::ConsumeVoiceline(va)) audio.PlayUAF(mAssets / va);
+                // Start a requested dialogue (a .hbdialogue conversation).
+                std::string dlg;
+                if (game::ConsumeDialogue(dlg)) {
+                    if (auto d = assets::LoadDialogue(mAssets / dlg)) {
+                        dialogue_ = std::move(*d);
+                        dialogueLine_ = 0;   // fire line 0 on the next UpdateDialogue
+                        dialogueTimer_ = 0.0f;
+                    }
+                }
+                UpdateDialogue(dt); // step the active conversation over time
+                // Start a requested cutscene (a .hbcutscene): take over the
+                // camera; UpdateCutscene evaluates its tracks each frame. Set
+                // camera BEFORE the camera-apply block below sees the disable.
+                std::string cs;
+                if (game::ConsumeCutscene(cs)) {
+                    if (auto c = assets::LoadCutscene(mAssets / cs)) {
+                        const bool takesCamera = !c->camera.empty();
+                        cutscene_ = std::move(*c);
+                        cutsceneTime_ = 0.0f;
+                        // Only take over the camera for a cutscene that actually
+                        // has a camera track (empty track = "leave the camera
+                        // alone"), and capture the restore-state ONLY when we
+                        // don't already own the camera. Otherwise a chained/
+                        // re-triggered cutscene would clobber the original state
+                        // with the already-disabled value and strand the camera.
+                        if (takesCamera && !cutsceneCamOwned_) {
+                            cutsceneRestoreCam_ = gameCameraEnabled_;
+                            SetGameCameraEnabled(false); // engine owns the camera now
+                            cutsceneCamOwned_ = true;
+                        }
+                    }
+                }
+                UpdateCutscene(dt); // evaluate camera/anim/dialogue tracks
             }
             audio.UpdateMusic(dt);
+        }
+        // Drain deferred UI panel commands queued by schematic UI nodes (the engine
+        // owns the UIManager). Ordered FIFO: a Push then Pop the same frame nets out.
+        if (uiManagerMode_) {
+            game::UICommand uc;
+            while (game::ConsumeUICommand(uc)) {
+                switch (uc.op) {
+                    case game::UICommand::Op::Show: uiManager_.Show(scene, uc.panel); break;
+                    case game::UICommand::Op::Push: uiManager_.Push(scene, uc.panel); break;
+                    case game::UICommand::Op::Pop:  uiManager_.Pop(scene); break;
+                }
+                // Keep parity with the built-in "settings" action: seed the widgets
+                // whenever a schematic brings the Settings panel up.
+                if (uc.op != game::UICommand::Op::Pop && uc.panel == "Settings")
+                    SeedSettingsWidgets();
+            }
         }
         renderer.Update(dt);
         // The active game camera (zone-selected or primary) overrides the
@@ -763,17 +1085,38 @@ int Engine::Run(const EngineConfig& configIn) {
             const glm::vec3 pUp = glm::normalize(glm::cross(pRight, fwd));
             particle::BuildVertices(scene, renderer, assetsDir, pRight, pUp, particleAlpha,
                                     particleAdd);
+            // 3D text objects (WorldText) ride the same depth-tested quad batch.
+            ui::AppendWorldText(scene, renderer, assetsDir, pRight, pUp, particleAlpha);
             renderer.SetParticles(particleAlpha, particleAdd);
         }
 
+        // Advance UI animation clips (writes UIElement transform/color/frame fields)
+        // BEFORE building the UI geometry so this frame reflects the animated pose.
+        ui::UpdateAnimations(scene, dt, assetsDir);
+
+        // World-space ("physical") UI upkeep: per-canvas render targets + the lit
+        // page quads that display them. Runs in the editor too (live preview).
+        ui::UpdateWorldSurfaces(scene, renderer);
+
         // In-game UI built AFTER scripts so text/visibility edits show this
-        // frame; drawn over the scene inside RenderScene.
+        // frame; drawn over the scene inside RenderScene. World canvases route
+        // into per-canvas texture batches instead of the screen overlay.
         ui::BuildVertices(scene, renderer,
                           Project::HasActive() ? Project::Active().AssetsDir()
                                                : std::filesystem::path(),
-                          uiTarget, uiConfig, uiVertices);
-        BuildDevOverlay(uiVertices); // dev stats panel on top (when toggled on)
+                          uiTarget, uiConfig, uiVertices, &worldUIBatches, uiCtx_);
+        BuildFadeCurtain(uiVertices); // loading fade-to/from-black over the world + UI
+        BuildDevOverlay(uiVertices);  // dev stats panel on top (when toggled on)
         renderer.SetUIOverlay(uiVertices);
+        worldUIDraws.clear();
+        for (const ui::WorldUIBatch& b : worldUIBatches) {
+            // Empty batches still submit: DrawUIToTexture clears the target, so a
+            // fresh (or just-hidden) canvas page shows transparent, never garbage.
+            if (b.target.IsValid())
+                worldUIDraws.push_back(
+                    {b.target, b.verts.data(), static_cast<u32>(b.verts.size())});
+        }
+        renderer.SetWorldUI(worldUIDraws); // rendered to texture before the scene pass
         renderer.BeginUI();          // no-op in a runtime build
         if (onFrame_) onFrame_(*this); // editor builds its UI
 
@@ -789,6 +1132,16 @@ int Engine::Run(const EngineConfig& configIn) {
             p.ssaoEnabled = q.ssaoEnabled;
             p.ssaoRadius = q.ssaoRadius;
             p.ssaoIntensity = q.ssaoIntensity;
+        }
+        // Player quality/brightness (the shipped game's Settings menu) - RUNTIME
+        // ONLY: the editor always shows the authored look. The preset only
+        // DEGRADES the authored post (High = untouched); brightness is a +/-1
+        // photographic-stop multiplier applied at the VIEW level, never written
+        // into the scene/volume exposure (which stays author-driven).
+        if (!onInit_) {
+            ApplyGraphicsPreset(scene.Environment().post, userSettings_.graphicsPreset);
+            renderer.SetUserExposureScale(
+                std::exp2(userSettings_.brightness * 2.0f - 1.0f)); // 0.5x..2x, 0.5=neutral
         }
         // --time / --daynight overrides survive level reloads (re-applied here,
         // after any SetupEnvironment reset).
@@ -807,6 +1160,7 @@ int Engine::Run(const EngineConfig& configIn) {
         renderer.RenderScene(scene, dt);
     }
 
+    if (settingsDirty_) { userSettings_.Save(userSettingsDir_); settingsDirty_ = false; }
     streamingWorld.UnloadAll(scene); // drain in-flight loads, destroy entities
     streamingWorld_ = nullptr;
     gridNav_ = nullptr;
@@ -903,9 +1257,16 @@ bool Engine::LoadGame(const std::string& slot) {
     scene::StageAssets(data, Project::Active().AssetsDir(), staged);
     scene::Instantiate(*scene_, *renderer_, data, staged, scene::LoadMode::Replace);
     game::DeserializeState(j.value("game", std::string()));
-    if (flowActive_) { // resume gameplay (skip menus)
-        gameState_ = GameState::Playing;
-        SetCursorLocked(true);
+    // Resume gameplay through the normal reveal so physics is un-paused, the cursor
+    // locks, and any loading overlay is dropped - loading a save (e.g. dev F9) DURING
+    // the loading screen would otherwise land in Playing with the sim still frozen.
+    // (The Replace above already cleared the registry; EnterPlaying's overlay-destroy
+    // is a valid()-guarded no-op here.) Clear the fade curtain first so a save loaded
+    // mid-transition reveals instantly instead of easing in from a leftover fade.
+    if (flowActive_) {
+        fadeAlpha_ = 0.0f;
+        loadPhase_ = LoadPhase::Begin;
+        EnterPlaying();
     }
     HBE_INFO("LoadGame: restored '{}'.", path.string());
     return true;
@@ -927,26 +1288,95 @@ std::string PollClickedAction(Scene& scene) {
     });
     return action;
 }
-// Drive every ProgressBar's fill (the loading bar) to `f` in [0,1].
-void SetProgressFill(Scene& scene, f32 f) {
-    scene.Registry().view<UIElement>().each([&](UIElement& el) {
-        if (el.type == UIElement::Type::ProgressBar) el.fill = f;
+// True when `only` is null (apply to all) or `e` is one of the listed entities. Used
+// to confine the loading-bar drivers to the loading overlay so they don't touch the
+// gameplay HUD's own ProgressBars (health/ammo bars) that share the registry.
+bool InSet(entt::entity e, const std::vector<entt::entity>* only) {
+    return !only || std::find(only->begin(), only->end(), e) != only->end();
+}
+
+// Fade the loading bar/wheel by setting its alpha to `a` in [0,1] so the "wheel" can
+// ease in after the loading screen itself has appeared. Scoped to `only` when given.
+void SetWheelAlpha(Scene& scene, f32 a, const std::vector<entt::entity>* only = nullptr) {
+    scene.Registry().view<UIElement>().each([&](entt::entity e, UIElement& el) {
+        if (el.type == UIElement::Type::ProgressBar && InSet(e, only)) {
+            el.color.a = a;
+            el.fillColor.a = a;
+        }
     });
+}
+
+// Drive the loading bar's fill to `f` in [0,1]. Scoped to `only` when given (else all
+// ProgressBars - used by the boot splash, which has no gameplay HUD in the scene).
+void SetProgressFill(Scene& scene, f32 f, const std::vector<entt::entity>* only = nullptr) {
+    scene.Registry().view<UIElement>().each([&](entt::entity e, UIElement& el) {
+        if (el.type == UIElement::Type::ProgressBar && InSet(e, only)) el.fill = f;
+    });
+}
+
+// All entities inside the named UIPanel subtree (root included). Scopes the loading
+// bar/wheel drivers to the "Loading" panel so gameplay HUD ProgressBars are untouched.
+void CollectPanelSubtree(Scene& scene, const std::string& panel,
+                         std::vector<entt::entity>& out) {
+    auto& reg = scene.Registry();
+    entt::entity root = entt::null;
+    for (const entt::entity e : reg.view<UIPanel>()) {
+        if (reg.get<UIPanel>(e).name == panel) { root = e; break; }
+    }
+    if (root == entt::null) return;
+    for (const entt::entity e : reg.storage<entt::entity>()) {
+        entt::entity cur = e;
+        for (int depth = 0; cur != entt::null && depth < 64; ++depth) {
+            if (cur == root) { out.push_back(e); break; }
+            const Parent* p = reg.try_get<Parent>(cur);
+            cur = (p && reg.valid(p->entity)) ? p->entity : entt::null;
+        }
+    }
 }
 } // namespace
 
-// Loading duration in seconds: the bar sweeps over this, then the (synchronous)
-// gameplay load happens. A real async stream would key the bar off load progress.
+// MINIMUM loading-screen dwell in seconds: the bar sweeps over this, but the screen
+// also stays up until the world has actually materialized (terrain built + streamed
+// cells resident) so nothing pops in after it clears.
 static constexpr f32 kLoadDuration = 1.25f;
+// Safety cap: reveal even if the world never reports "settled" (a broken cell, a
+// stuck terrain build), so a content bug can't hang on the loading screen forever.
+static constexpr f32 kMaxLoadDuration = 30.0f;
+// Loading-transition fade durations (seconds).
+static constexpr f32 kFadeInDur = 0.4f;      // black curtain lifts: loading screen appears
+static constexpr f32 kWheelFadeDur = 0.35f;  // loading wheel eases in
+static constexpr f32 kFadeOutDur = 0.4f;     // curtain drops to black before gameplay
+static constexpr f32 kGameFadeInDur = 0.5f;  // gameplay eases in from black once revealed
 // Studio/boot splash dwell in the loop AFTER the pre-loop warmup (IBL + loads
 // already ran behind the splash); just long enough to read the final status.
 static constexpr f32 kBootDuration = 1.0f;
 
 void Engine::FlowMainMenu() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
-    const std::filesystem::path menu =
-        Project::Active().AssetsDir() / Project::Active().Settings().mainMenuScene;
-    if (vfs::Exists(menu)) scene::LoadScene(*scene_, *renderer_, menu); // Replace
+    if (!uiManagerMode_) return; // no menu concept without a UI scene
+    // Unload the gameplay world (destroy non-Persistent entities) but keep the
+    // resident UI, then show the initial (menu) panel. No scene swap.
+    auto& reg = scene_->Registry();
+    std::vector<entt::entity> kill;
+    for (const entt::entity e : reg.storage<entt::entity>())
+        if (!reg.all_of<Persistent>(e)) kill.push_back(e);
+    for (const entt::entity e : kill)
+        if (reg.valid(e)) reg.destroy(e);
+    if (currentLevel_ && currentLevel_->Loaded()) currentLevel_->Unload(*scene_);
+    loadingPanelEntities_.clear();
+    // Leaving gameplay: stop any in-progress dialogue and clear its captions so
+    // they don't linger/resume over the menu.
+    dialogueLine_ = -1;
+    dialogueTimer_ = 0.0f;
+    dialogue_.lines.clear();
+    captions_.clear();
+    // Stop any in-progress cutscene and restore the camera before the menu.
+    if (cutsceneCamOwned_) SetGameCameraEnabled(cutsceneRestoreCam_);
+    cutsceneCamOwned_ = false;
+    cutsceneTime_ = -1.0f;
+    if (physics_) physics_->SetRunning(true);
+    fadeAlpha_ = 0.0f; // clear any leftover fade curtain from an interrupted load
+    uiManager_.ShowInitial(*scene_);
     SetCursorLocked(false);
     gameState_ = GameState::MainMenu;
     loadTimer_ = 0.0f;
@@ -954,27 +1384,47 @@ void Engine::FlowMainMenu() {
 
 void Engine::FlowPlay() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
-    const std::string& loadingScene = Project::Active().Settings().loadingScene;
-    if (!loadingScene.empty()) {
-        const std::filesystem::path loading = Project::Active().AssetsDir() / loadingScene;
-        if (vfs::Exists(loading) && scene::LoadScene(*scene_, *renderer_, loading)) {
-            SetProgressFill(*scene_, 0.0f);
-            SetCursorLocked(false);
-            loadTimer_ = 0.0f;
-            gameState_ = GameState::Loading;
-            return;
-        }
+
+    // The "Loading" UIPanel (in the persistent UI scene) is the loading screen.
+    const bool hasLoading = uiManagerMode_ && uiManager_.Has(*scene_, "Loading");
+    if (hasLoading) {
+        // Snap to black THIS frame; the heavy world load + loading-overlay stand-up
+        // happen NEXT frame in the Begin phase, hidden behind the curtain, which then
+        // lifts to fade the loading screen in. Gameplay sim stays frozen until reveal.
+        fadeAlpha_ = 1.0f;
+        wheelAlpha_ = 0.0f;
+        loadPhase_ = LoadPhase::Begin;
+        if (physics_) physics_->SetRunning(false);
+        SetCursorLocked(false);
+        loadTimer_ = 0.0f;
+        gameState_ = GameState::Loading;
+        return;
     }
-    EnterPlaying(); // no loading screen: jump straight into gameplay
+    // No loading screen configured: load + play immediately (no fade).
+    LoadGameplayWorld();
+    EnterPlaying();
 }
 
-void Engine::EnterPlaying() {
+void Engine::LoadGameplayWorld() {
     if (!scene_ || !renderer_ || !Project::HasActive()) return;
     game::Reset(); // a fresh run: clear objectives + reached checkpoints
+    // Stop any dialogue/captions left over from a prior run (the runner state
+    // is an Engine member, so it survives the scene Replace below).
+    dialogueLine_ = -1;
+    dialogueTimer_ = 0.0f;
+    dialogue_.lines.clear();
+    captions_.clear();
+    // Stop any in-progress cutscene and hand the camera back (else it stays
+    // disabled into the new run).
+    if (cutsceneCamOwned_) SetGameCameraEnabled(cutsceneRestoreCam_);
+    cutsceneCamOwned_ = false;
+    cutsceneTime_ = -1.0f;
     const std::filesystem::path assets = Project::Active().AssetsDir();
     const ProjectSettings& s = Project::Active().Settings();
 
-    // Gameplay scene/level REPLACES the loading screen (clears the registry).
+    // Gameplay scene/level REPLACES the current world (clears the registry). This
+    // runs BEFORE the loading screen goes down so terrain chunks and streamed cells
+    // build/settle behind the loading overlay instead of popping in afterwards.
     bool loaded = false;
     if (!s.startupScene.empty()) {
         const std::filesystem::path gp = assets / s.startupScene;
@@ -989,16 +1439,21 @@ void Engine::EnterPlaying() {
     }
     if (!loaded) HBE_WARN("Game flow: startup scene '{}' failed to load.", s.startupScene);
 
-    // HUD overlays the gameplay world (additive, kept resident while playing).
-    if (!s.hudScene.empty()) {
-        const std::filesystem::path hud = assets / s.hudScene;
-        if (vfs::Exists(hud))
-            scene::LoadScene(*scene_, *renderer_, hud, scene::LoadMode::Additive);
-    }
-
+    // The HUD is a resident UIPanel in the persistent UI scene (shown on reveal in
+    // EnterPlaying) - no per-scene HUD load.
     // No nav step: GridNav rebuilds from the loaded gameplay geometry each frame.
+}
 
-    SetCursorLocked(true); // mouse-look while playing
+void Engine::EnterPlaying() {
+    if (!scene_ || !renderer_) return;
+    // Reveal the fully-streamed world and hand control to the player. The world was
+    // already instantiated by LoadGameplayWorld(); Show("HUD") below hides the Loading
+    // panel (its entities are persistent - never destroy them, just deactivate).
+    loadingPanelEntities_.clear();
+
+    SetCursorLocked(true);                    // mouse-look while playing
+    if (physics_) physics_->SetRunning(true); // gameplay simulation begins now
+    if (uiManagerMode_) uiManager_.Show(*scene_, "HUD"); // reveal HUD panel, hide menus
     loadTimer_ = 0.0f;
     gameState_ = GameState::Playing;
 }
@@ -1010,14 +1465,16 @@ void Engine::FlowReload() {
 }
 
 void Engine::FlowAfterBoot() {
-    // Studio splash finished: go to the main menu when the project has one, else
-    // straight into gameplay (FlowPlay shows the game loading screen if set).
+    // Studio splash finished: show the initial (menu) panel when a UI scene is
+    // loaded, else boot straight into gameplay (the empty-uiScene fallback).
     // --play (playOnBoot_) forces gameplay directly, skipping the menu.
-    if (!playOnBoot_ && Project::HasActive() &&
-        !Project::Active().Settings().mainMenuScene.empty())
-        FlowMainMenu();
-    else
+    if (playOnBoot_) {
         FlowPlay();
+    } else if (uiManagerMode_) {
+        FlowMainMenu();
+    } else {
+        FlowPlay();
+    }
 }
 
 void Engine::SubstituteUITokens(f32 progress) {
@@ -1076,6 +1533,9 @@ void Engine::PresentBootSplash(f32 progress) {
     static std::vector<rhi::UIVertex> verts; // reused across the few boot frames
     const std::filesystem::path assets =
         Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    // Prime animators at t=0 so splash elements with OnShow clips render the
+    // authored first keyframe (not their un-animated base pose).
+    ui::UpdateAnimations(*scene_, 0.0f, assets);
     ui::BuildVertices(*scene_, *renderer_, assets, renderer_->RenderTargetSize(),
                       uiConfig, verts);
     renderer_->SetUIOverlay(verts);
@@ -1107,16 +1567,18 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
     std::string obj = game::CurrentObjectiveText();
     if (obj.empty()) obj = "(none)";
 
+    const Renderer::FrameStats& rs = renderer_->Stats();
     char buf[512];
     std::snprintf(buf, sizeof(buf),
                   "== DEV MENU ==  (Ctrl+` to close)\n"
                   "FPS %.0f   |   %.2f ms\n"
+                  "Draws: %u/%u (%u culled)\n"
                   "State: %s    Level: %s\n"
                   "Player: %.1f, %.1f, %.1f    Objects: %d\n"
                   "Objective: %s\n"
                   "[F5] Save   [F9] Load   [F2] Restart   [F3] Menu",
-                  fps, dt_ * 1000.0f, st, level.c_str(), ppos.x, ppos.y, ppos.z, objects,
-                  obj.c_str());
+                  fps, dt_ * 1000.0f, rs.drawn, rs.total, rs.culled, st, level.c_str(),
+                  ppos.x, ppos.y, ppos.z, objects, obj.c_str());
     const std::string block = buf;
 
     // --- Emit quads (NDC) ---
@@ -1149,6 +1611,272 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
                 0.95f, 0.97f, 1.0f, 1.0f, ft, q.u0, q.v0, q.u1, q.v1);
 }
 
+void Engine::BuildFadeCurtain(std::vector<rhi::UIVertex>& out) {
+    if (fadeAlpha_ <= 0.001f) return;
+    const f32 a = glm::clamp(fadeAlpha_, 0.0f, 1.0f);
+    // Full-screen black quad in NDC (tex 0 = the 1x1 white texture), drawn over the
+    // whole frame. Same winding/UV convention as BuildDevOverlay's addRect.
+    const rhi::UIVertex v00{-1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, a, 0};
+    const rhi::UIVertex v10{1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, a, 0};
+    const rhi::UIVertex v11{1.0f, -1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f, a, 0};
+    const rhi::UIVertex v01{-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, a, 0};
+    out.push_back(v00); out.push_back(v10); out.push_back(v11);
+    out.push_back(v00); out.push_back(v11); out.push_back(v01);
+}
+
+void Engine::SeedSettingsWidgets() {
+    if (!scene_) return; // fill the Settings widgets from the persisted user options
+    scene_->Registry().view<UIElement>().each([&](UIElement& el) {
+        if (el.action == "setting:volume") el.value = userSettings_.masterVolume;
+        else if (el.action == "setting:brightness") el.value = userSettings_.brightness;
+        else if (el.action == "setting:graphics") el.selected = userSettings_.graphicsPreset;
+        else if (el.action == "setting:captions") el.toggled = userSettings_.captionsEnabled;
+    });
+}
+
+void Engine::ApplyChangedSettings() {
+    if (!scene_) return; // apply any "setting:*" widget the user changed this frame
+    scene_->Registry().view<UIElement>().each([&](UIElement& el) {
+        if (!el.changed || el.action.rfind("setting:", 0) != 0) return;
+        if (el.action == "setting:volume") {
+            userSettings_.masterVolume = el.value;
+            if (audio_) audio_->SetBusVolume("Master", el.value);
+        } else if (el.action == "setting:brightness") {
+            userSettings_.brightness = el.value; // applied to exposure each frame
+        } else if (el.action == "setting:graphics") {
+            userSettings_.graphicsPreset = el.selected; // applied to post each frame
+        } else if (el.action == "setting:captions") {
+            userSettings_.captionsEnabled = el.toggled;
+            if (audio_) audio_->SetCaptionsEnabled(el.toggled);
+        } else {
+            return;
+        }
+        settingsDirty_ = true; // flushed to disk on Back / quit
+    });
+}
+
+void Engine::PushCaption(const std::string& text, f32 seconds) {
+    if (text.empty()) return;
+    // Auto-derive a readable dwell from length when unspecified (~200 wpm).
+    const f32 dwell = seconds > 0.0f
+                          ? seconds
+                          : glm::clamp(1.8f + 0.05f * static_cast<f32>(text.size()),
+                                       2.5f, 9.0f);
+    captions_.push_back({text, dwell});
+    // Cap the visible stack so it never overflows the caption Label rect; the
+    // oldest line drops early if too many pile up at once.
+    constexpr usize kMaxCaptions = 4;
+    if (captions_.size() > kMaxCaptions)
+        captions_.erase(captions_.begin(), captions_.end() - kMaxCaptions);
+}
+
+void Engine::UpdateCaptions(f32 dt) {
+    if (!scene_) return;
+    // Drain the audio system's queue (AudioSource voicelines only enqueue when
+    // captions are enabled, so that path already respects the accessibility
+    // toggle; the dialogue runner pushes directly via PushCaption).
+    if (audio_) {
+        std::string cap;
+        while (audio_->PopCaption(cap)) PushCaption(cap, 0.0f);
+    }
+    // Age out expired lines (each on its own timer).
+    for (ActiveCaption& c : captions_) c.timer -= dt;
+    captions_.erase(std::remove_if(captions_.begin(), captions_.end(),
+                                   [](const ActiveCaption& c) { return c.timer <= 0.0f; }),
+                    captions_.end());
+    // Build the multi-line block (oldest at top, newest at bottom) and drive the
+    // dedicated caption element (a Label with action "caption").
+    std::string block;
+    f32 longest = 0.0f;
+    for (const ActiveCaption& c : captions_) {
+        if (!block.empty()) block += '\n';
+        block += c.text;
+        longest = glm::max(longest, c.timer); // the last line to expire
+    }
+    const bool show = !captions_.empty();
+    scene_->Registry().view<UIElement>().each([&](UIElement& el) {
+        if (el.action != "caption") return;
+        el.visible = show;
+        if (show) {
+            el.runtimeText = block;
+            // Fade the whole block out over the final 0.5s of the LONGEST-lived
+            // remaining line (keying on the newest line could fade the block
+            // while an older line is still fully valid).
+            el.color.a = longest > 0.5f ? 1.0f : glm::max(longest / 0.5f, 0.0f);
+        }
+    });
+}
+
+void Engine::PlayUISounds() {
+    if (!scene_ || !audio_) return;
+    // Runtime only: the editor drives the Game view as a pure preview, so
+    // authoring (mousing over the preview) must not emit the game's UI SFX.
+    // Mirrors the !onInit_ gate on ApplyChangedSettings/UpdateCaptions.
+    if (onInit_) return;
+    const std::filesystem::path assets =
+        Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    if (assets.empty()) return;
+    // Hover SFX only when the pointer actually moved this frame: `hovered` is a
+    // level state re-asserted every frame, so a menu opening under a resting
+    // cursor would otherwise blip. (Clicks are real events - always play.)
+    const bool moved =
+        input_ && (input_->MouseDeltaX() != 0.0f || input_->MouseDeltaY() != 0.0f);
+    // One cheap per-frame scan; maintains the hover edge for every widget so a
+    // hover-out resets it.
+    scene_->Registry().view<UIElement>().each([&](UIElement& el) {
+        if (el.clicked && !el.clickSound.empty()) audio_->PlayUAF(assets / el.clickSound);
+        if (moved && el.hovered && !el.prevHovered && !el.hoverSound.empty())
+            audio_->PlayUAF(assets / el.hoverSound);
+        el.prevHovered = el.hovered;
+    });
+}
+
+void Engine::UpdateDialogue(f32 dt) {
+    if (dialogueLine_ < 0) return; // nothing running
+    const std::filesystem::path assets =
+        Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    dialogueTimer_ -= dt;
+    // Advance through every line whose hold has elapsed (normally one per frame;
+    // the loop also cleanly finishes a run where the last hold already lapsed).
+    while (dialogueLine_ >= 0 && dialogueTimer_ <= 0.0f) {
+        if (dialogueLine_ >= static_cast<int>(dialogue_.lines.size())) {
+            dialogueLine_ = -1; // conversation finished
+            break;
+        }
+        const DialogueLine& line = dialogue_.lines[dialogueLine_];
+        const bool hasText = !line.text.empty();
+        // The line's own text wins; if it's empty we let the clip's baked
+        // caption show instead (caption=!hasText below). Respect the player's
+        // captions toggle, matching every other caption path.
+        if (hasText && userSettings_.captionsEnabled)
+            PushCaption(line.speaker.empty() ? line.text
+                                             : line.speaker + ": " + line.text,
+                        0.0f);
+        if (!line.clip.empty() && audio_ && !assets.empty())
+            audio_->PlayUAF(assets / line.clip, {}, /*caption=*/!hasText);
+        // Hold: authored value, else a readable auto-dwell from the line length.
+        f32 hold = line.hold;
+        if (hold <= 0.0f) {
+            const usize len = hasText ? line.text.size() : line.speaker.size() + 8;
+            hold = glm::clamp(1.8f + 0.05f * static_cast<f32>(len), 2.5f, 9.0f);
+        }
+        dialogueTimer_ += glm::max(hold, 0.25f); // >0 so the loop can't spin
+        ++dialogueLine_;
+    }
+}
+
+namespace {
+// Cutscenes reference entities by Name (stable across scene loads, unlike entt
+// ids). Linear scan - cutscene tracks are few, evaluated once per frame.
+entt::entity FindEntityByName(Scene& scene, const std::string& name) {
+    if (name.empty()) return entt::null;
+    auto& reg = scene.Registry();
+    for (const entt::entity e : reg.view<Name>())
+        if (reg.get<Name>(e).value == name) return e;
+    return entt::null;
+}
+} // namespace
+
+void Engine::UpdateCutscene(f32 dt) {
+    if (cutsceneTime_ < 0.0f || !scene_ || !renderer_) return;
+    auto& reg = scene_->Registry();
+    const f32 prev = cutsceneTime_;
+    cutsceneTime_ += dt;
+    const f32 t = cutsceneTime_;
+
+    // --- Camera track: interpolate eye/aim/fov, honoring hard cuts. -----------
+    if (!cutscene_.camera.empty()) {
+        const auto& ks = cutscene_.camera;
+        glm::vec3 pos = ks.front().position, aim = ks.front().aim;
+        f32 fov = ks.front().fov;
+        if (t >= ks.back().time) {
+            pos = ks.back().position; aim = ks.back().aim; fov = ks.back().fov;
+        } else if (t > ks.front().time) {
+            usize i = 0;
+            while (i + 1 < ks.size() && ks[i + 1].time <= t) ++i; // last key <= t
+            const CutsceneCameraKey& a = ks[i];
+            const CutsceneCameraKey& b = ks[i + 1];
+            if (b.cut) { // hold a's pose until the cut instant (b.time)
+                pos = a.position; aim = a.aim; fov = a.fov;
+            } else {
+                const f32 span = glm::max(b.time - a.time, 1e-4f);
+                const f32 u = glm::clamp((t - a.time) / span, 0.0f, 1.0f);
+                pos = glm::mix(a.position, b.position, u);
+                aim = glm::mix(a.aim, b.aim, u);
+                fov = glm::mix(a.fov, b.fov, u);
+            }
+        }
+        Camera& cam = renderer_->GetCamera();
+        cam.SetFovY(fov);
+        cam.LookAt(pos, aim, glm::vec3(0.0f, 1.0f, 0.0f));
+    }
+
+    // --- Animation tracks: transform keyframes + skeletal-clip triggers. ------
+    for (const CutsceneAnimTrack& tr : cutscene_.animTracks) {
+        const entt::entity e = FindEntityByName(*scene_, tr.target);
+        if (e == entt::null) continue;
+        if (!tr.keys.empty()) {
+            if (Transform* xf = reg.try_get<Transform>(e)) {
+                const auto& ks = tr.keys;
+                if (t <= ks.front().time) {
+                    xf->position = ks.front().position;
+                    xf->rotation = ks.front().rotation;
+                    xf->scale = ks.front().scale;
+                } else if (t >= ks.back().time) {
+                    xf->position = ks.back().position;
+                    xf->rotation = ks.back().rotation;
+                    xf->scale = ks.back().scale;
+                } else {
+                    usize i = 0;
+                    while (i + 1 < ks.size() && ks[i + 1].time <= t) ++i;
+                    const CutsceneTransformKey& a = ks[i];
+                    const CutsceneTransformKey& b = ks[i + 1];
+                    const f32 span = glm::max(b.time - a.time, 1e-4f);
+                    const f32 u = glm::clamp((t - a.time) / span, 0.0f, 1.0f);
+                    xf->position = glm::mix(a.position, b.position, u);
+                    xf->rotation = glm::slerp(a.rotation, b.rotation, u);
+                    xf->scale = glm::mix(a.scale, b.scale, u);
+                }
+            }
+        }
+        // Clip triggers crossed this frame [prev, t): restart the target's clip.
+        if (Animator* an = reg.try_get<Animator>(e)) {
+            for (const CutsceneClipMarker& m : tr.clips) {
+                if (m.time >= prev && m.time < t) {
+                    an->clip = m.clip;
+                    an->time = 0.0f;
+                    an->playing = true;
+                }
+            }
+        }
+    }
+
+    // --- Dialogue markers crossed this frame. ---------------------------------
+    for (const CutsceneDialogueMarker& m : cutscene_.dialogue) {
+        if (m.time >= prev && m.time < t) {
+            if (!m.dialogue.empty()) game::PlayDialogue(m.dialogue);
+            else if (!m.voiceline.empty()) game::PlayVoiceline(m.voiceline);
+        }
+    }
+
+    // End: restore the game camera (rising edge snaps it back next apply).
+    if (t >= cutscene_.duration) {
+        cutsceneTime_ = -1.0f;
+        if (cutsceneCamOwned_) {
+            SetGameCameraEnabled(cutsceneRestoreCam_);
+            cutsceneCamOwned_ = false;
+        }
+    }
+}
+
+void Engine::ClearCutscene() {
+    if (cutsceneCamOwned_) {
+        SetGameCameraEnabled(cutsceneRestoreCam_);
+        cutsceneCamOwned_ = false;
+    }
+    cutsceneTime_ = -1.0f;
+}
+
 void Engine::UpdateGameFlow(f32 dt) {
     if (!flowActive_ || !scene_) return;
     switch (gameState_) {
@@ -1164,25 +1892,109 @@ void Engine::UpdateGameFlow(f32 dt) {
         const std::string act = PollClickedAction(*scene_);
         if (act == "play")
             FlowPlay();
-        else if (act == "quit")
+        else if (act == "settings" && uiManager_.Has(*scene_, "Settings")) {
+            uiManager_.Push(*scene_, "Settings"); // overlay Settings; "back" pops it
+            SeedSettingsWidgets();
+        } else if (act == "back") {
+            uiManager_.Pop(*scene_);
+            if (settingsDirty_) { userSettings_.Save(userSettingsDir_); settingsDirty_ = false; }
+        } else if (act == "quit")
             Quit();
         break;
     }
     case GameState::Loading: {
-        loadTimer_ += dt;
-        const f32 p = glm::clamp(loadTimer_ / kLoadDuration, 0.0f, 1.0f);
-        SetProgressFill(*scene_, p);
-        SubstituteUITokens(p); // {progress} on the game loading screen
-        if (loadTimer_ >= kLoadDuration) EnterPlaying();
+        switch (loadPhase_) {
+        case LoadPhase::Begin: {
+            // First Loading frame - the screen is already black (set in FlowPlay). Do
+            // the heavy world load behind the curtain, then show the resident Loading
+            // panel and start fading the loading screen in.
+            LoadGameplayWorld();
+            bool shown = false;
+            if (uiManagerMode_ && uiManager_.Has(*scene_, "Loading")) {
+                uiManager_.Show(*scene_, "Loading");
+                // Scope the progress/wheel drivers to the panel's subtree so gameplay
+                // HUD bars are never clobbered (the panel entities are persistent -
+                // Show("HUD") on reveal hides them, nothing is destroyed).
+                loadingPanelEntities_.clear();
+                CollectPanelSubtree(*scene_, "Loading", loadingPanelEntities_);
+                SetProgressFill(*scene_, 0.0f, &loadingPanelEntities_);
+                SetWheelAlpha(*scene_, 0.0f, &loadingPanelEntities_); // hidden until it eases in
+                shown = true;
+            }
+            loadTimer_ = 0.0f;
+            loadPhase_ = shown ? LoadPhase::FadeIn : LoadPhase::FadeOut;
+            break;
+        }
+        case LoadPhase::FadeIn: {
+            // Lift the black curtain so the loading screen appears (wheel still hidden).
+            fadeAlpha_ = glm::max(fadeAlpha_ - dt / kFadeInDur, 0.0f);
+            if (fadeAlpha_ <= 0.0f) { loadTimer_ = 0.0f; loadPhase_ = LoadPhase::Wheel; }
+            break;
+        }
+        case LoadPhase::Wheel: {
+            loadTimer_ += dt;
+            // Ease the wheel in while the world streams behind the visible screen.
+            wheelAlpha_ = glm::min(wheelAlpha_ + dt / kWheelFadeDur, 1.0f);
+            SetWheelAlpha(*scene_, wheelAlpha_, &loadingPanelEntities_);
+
+            // Hold until the world has materialized: terrain chunks built AND streamed
+            // cells resident around the spawn (cam::Update parks the camera there while
+            // the sim is frozen). Then nothing pops in when we reveal.
+            const glm::vec3 focus =
+                renderer_ ? renderer_->GetCamera().Position() : glm::vec3(0.0f);
+            const bool terrainReady = terrain::IsSettled(*scene_);
+            const bool streamReady = !(streamingWorld_ && streamingWorld_->Active()) ||
+                                     streamingWorld_->IsSettled(focus);
+            const bool ready = terrainReady && streamReady;
+
+            const f32 p = (ready && loadTimer_ >= kLoadDuration)
+                              ? 1.0f
+                              : glm::clamp(loadTimer_ / kLoadDuration, 0.0f, 0.9f);
+            SetProgressFill(*scene_, p, &loadingPanelEntities_);
+            SubstituteUITokens(p); // {progress} on the game loading screen
+
+            const bool timedOut = loadTimer_ >= kMaxLoadDuration;
+            if ((ready && loadTimer_ >= kLoadDuration) || timedOut) {
+                if (timedOut && !ready)
+                    HBE_WARN("Loading: revealing after {:.0f}s cap (terrain={}, stream={}) - "
+                             "something never settled.",
+                             kMaxLoadDuration, terrainReady, streamReady);
+                loadPhase_ = LoadPhase::FadeOut;
+            }
+            break;
+        }
+        case LoadPhase::FadeOut: {
+            // Fade to black, then reveal the fully-resident world behind the curtain.
+            fadeAlpha_ = glm::min(fadeAlpha_ + dt / kFadeOutDur, 1.0f);
+            if (fadeAlpha_ >= 1.0f) EnterPlaying();
+            break;
+        }
+        }
         break;
     }
     case GameState::Playing: {
+        // Ease gameplay in from the fade-to-black the loading transition left behind.
+        if (fadeAlpha_ > 0.0f)
+            fadeAlpha_ = glm::max(fadeAlpha_ - dt / kGameFadeInDur, 0.0f);
+        // Free-cursor policy: any menu panel over the HUD (Settings/Pause - pushed
+        // by a button OR a schematic UI node) frees the cursor for point-and-click
+        // (including world-space pages); back on the HUD relocks mouse-look.
+        // Reconciled per frame so every panel-change path is covered.
+        const bool menuOpen =
+            uiManagerMode_ && !uiManager_.Empty() && uiManager_.Top() != "HUD";
+        if (IsCursorLocked() == menuOpen) SetCursorLocked(!menuOpen);
         const std::string act = PollClickedAction(*scene_);
         if (act == "menu")
             FlowMainMenu();
         else if (act == "restart")
             FlowReload();
-        else if (act == "quit")
+        else if (act == "settings" && uiManager_.Has(*scene_, "Settings")) {
+            uiManager_.Push(*scene_, "Settings"); // pause-menu style overlay; "back" pops
+            SeedSettingsWidgets();
+        } else if (act == "back") {
+            uiManager_.Pop(*scene_);
+            if (settingsDirty_) { userSettings_.Save(userSettingsDir_); settingsDirty_ = false; }
+        } else if (act == "quit")
             Quit();
         break;
     }
@@ -1224,6 +2036,14 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
         } else if (arg == "--windowed") {
             config.fullscreen = false;
             config.fullscreenExplicit = true;
+        } else if (arg == "--vsync") {
+            config.vsync = true;
+            config.vsyncExplicit = true;
+        } else if (arg == "--novsync") {
+            config.vsync = false; // uncapped present (perf measurement / player choice)
+            config.vsyncExplicit = true;
+        } else if (arg == "--nocull") {
+            config.noCull = true; // frustum-culling kill switch (A/B)
         } else if (arg == "--model" && i + 1 < argc) {
             config.modelPath = argv[++i];
         } else if (arg == "--project" && i + 1 < argc) {
@@ -1239,6 +2059,9 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.posY = std::stoi(argv[++i]);
         } else if (arg == "--stress" && i + 1 < argc) {
             config.stressCount = static_cast<u32>(std::stoul(argv[++i]));
+        } else if (arg == "--stress-shared" && i + 1 < argc) {
+            config.stressCount = static_cast<u32>(std::stoul(argv[++i]));
+            config.stressShared = true; // one shared mesh (sort/instancing rig)
         } else if (arg == "--world" && i + 1 < argc) {
             config.worldPath = argv[++i];
         } else if (arg == "--worldtest") {
@@ -1255,6 +2078,8 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.navTest = true;
         } else if (arg == "--play") {
             config.playOnBoot = true;
+        } else if (arg == "--uiworldtest") {
+            config.uiWorldTest = true; // world-space UI smoke test (lit page)
         } else if (arg == "--time" && i + 1 < argc) {
             config.forceTimeOfDay = std::stof(argv[++i]); // scrub the day/night sky
         } else if (arg == "--daynight" && i + 1 < argc) {

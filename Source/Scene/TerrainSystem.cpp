@@ -399,5 +399,14 @@ bool RaycastLocal(const TerrainComponent& t, const glm::vec3& localOrigin,
     return false;
 }
 
+bool IsSettled(Scene& scene) {
+    auto view = scene.Registry().view<TerrainComponent>();
+    for (const entt::entity e : view) {
+        const TerrainComponent& t = view.get<TerrainComponent>(e);
+        if (t.dirty || t.holeDirty || t.splatDirty) return false;
+    }
+    return true;
+}
+
 } // namespace terrain
 } // namespace hbe

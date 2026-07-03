@@ -161,6 +161,51 @@ void FontAtlas::Measure(const std::string& text, f32 sizePx, f32& outWidth,
     Layout(text, sizePx, scratch, outWidth, outHeight);
 }
 
+void FontAtlas::LayoutWrapped(const std::string& text, f32 sizePx, f32 wrapWidth,
+                              std::vector<GlyphQuad>& out, f32& outWidth,
+                              f32& outHeight) const {
+    if (wrapWidth <= 0.0f || text.empty()) {
+        Layout(text, sizePx, out, outWidth, outHeight);
+        return;
+    }
+    // Assemble a wrapped string (spaces collapsed to one; existing '\n' kept),
+    // then reuse Layout's newline handling. Word widths come from Measure.
+    f32 spaceW = 0.0f, dummy = 0.0f;
+    Measure(" ", sizePx, spaceW, dummy);
+    std::string wrapped;
+    wrapped.reserve(text.size() + 16);
+    f32 lineW = 0.0f;
+    bool firstOnLine = true;
+    usize i = 0;
+    while (i < text.size()) {
+        if (text[i] == '\n') {
+            wrapped += '\n';
+            lineW = 0.0f;
+            firstOnLine = true;
+            ++i;
+            continue;
+        }
+        if (text[i] == ' ') { ++i; continue; } // run of spaces -> single break point
+        usize j = i;
+        while (j < text.size() && text[j] != ' ' && text[j] != '\n') ++j;
+        const std::string word = text.substr(i, j - i);
+        f32 wordW = 0.0f;
+        Measure(word, sizePx, wordW, dummy);
+        if (!firstOnLine && lineW + spaceW + wordW > wrapWidth) {
+            wrapped += '\n';   // wrap before this word
+            wrapped += word;
+            lineW = wordW;
+        } else {
+            if (!firstOnLine) { wrapped += ' '; lineW += spaceW; }
+            wrapped += word;
+            lineW += wordW;
+        }
+        firstOnLine = false;
+        i = j;
+    }
+    Layout(wrapped, sizePx, out, outWidth, outHeight);
+}
+
 // --- Font library -------------------------------------------------------------
 
 namespace {

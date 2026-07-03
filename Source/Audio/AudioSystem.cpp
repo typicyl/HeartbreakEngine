@@ -13,6 +13,7 @@
 #include <miniaudio.h>
 
 #include <algorithm>
+#include <deque>
 #include <list>
 #include <random>
 #include <string>
@@ -117,6 +118,14 @@ struct AudioSystem::Impl {
     std::string musicState;     // current state ("" = stopped)
     f32 musicFade = 2.0f;       // active crossfade seconds
     bool musicHasGraph = false;
+
+    // Closed captions: pending texts enqueued when a captioned sound starts.
+    bool captionsEnabled = false;
+    std::deque<std::string> captions;
+
+    // Decoded-PCM cache for PlayUAF one-shots (path -> Audio). Cleared when an
+    // asset is re-imported / edited so stale PCM or captions aren't served.
+    std::unordered_map<std::string, uaf::Audio> uafCache;
 
     void DestroyMusic() {
         for (MusicLayerVoice& m : musicLayers) {
@@ -340,6 +349,17 @@ f32 AudioSystem::BusVolume(const std::string& bus) const {
     return it != impl_->buses.end() ? it->second.volume : 1.0f;
 }
 
+void AudioSystem::SetCaptionsEnabled(bool on) {
+    if (impl_) impl_->captionsEnabled = on;
+}
+
+bool AudioSystem::PopCaption(std::string& out) {
+    if (!impl_ || impl_->captions.empty()) return false;
+    out = std::move(impl_->captions.front());
+    impl_->captions.pop_front();
+    return true;
+}
+
 void AudioSystem::SetBusMuted(const std::string& bus, bool muted) {
     if (!IsAvailable()) return;
     if (auto it = impl_->buses.find(bus); it != impl_->buses.end()) {
@@ -426,14 +446,37 @@ bool AudioSystem::PlayPCM(const void* pcm, usize bytes, u32 channels, u32 sample
                              1.0f, 1.0f, false, nullptr, 1.0f, 30.0f) != nullptr;
 }
 
-bool AudioSystem::PlayUAF(const std::filesystem::path& uafPath, const std::string& bus) {
-    const std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
-    if (!audio) {
-        HBE_WARN("Audio: failed to read '{}'.", uafPath.string());
-        return false;
+bool AudioSystem::PlayUAF(const std::filesystem::path& uafPath, const std::string& bus,
+                          bool caption) {
+    // Decoded-PCM cache: UI one-shots (hover/click) can fire several times a
+    // second as the cursor sweeps a menu; without this each edge re-reads and
+    // re-decodes the whole .uaf on the main thread (a frame hitch). Keyed by
+    // path; cleared by ClearUAFCache on re-import/edit so stale PCM/captions
+    // aren't served. Main-thread only (frame loop / editor).
+    if (!impl_) return false;
+    const std::string key = uafPath.string();
+    auto it = impl_->uafCache.find(key);
+    if (it == impl_->uafCache.end()) {
+        std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
+        if (!audio) {
+            HBE_WARN("Audio: failed to read '{}'.", uafPath.string());
+            return false;
+        }
+        it = impl_->uafCache.emplace(key, std::move(*audio)).first;
     }
-    return PlayPCM(audio->pcm.data(), audio->pcm.size(), audio->channels,
-                   audio->sampleRate, audio->bitsPerSample, bus);
+    const uaf::Audio& a = it->second;
+    // Surface a baked caption ("Speaker: text") so a voiceline played this way
+    // (e.g. a schematic PlayVoiceline) captions just like a scene AudioSource.
+    // UI/SFX clips have empty captions, so this is a no-op for them.
+    if (caption && impl_ && impl_->captionsEnabled && !a.caption.empty())
+        impl_->captions.push_back(a.speaker.empty() ? a.caption
+                                                    : a.speaker + ": " + a.caption);
+    return PlayPCM(a.pcm.data(), a.pcm.size(), a.channels, a.sampleRate,
+                   a.bitsPerSample, bus);
+}
+
+void AudioSystem::ClearUAFCache() {
+    if (impl_) impl_->uafCache.clear();
 }
 
 void AudioSystem::SetMusicGraph(const MusicGraph& graph,
@@ -596,6 +639,13 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
         if (it == impl_->spatial.end()) {
             const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / src.asset);
             if (!audio) continue;
+
+            // Closed caption: surface the asset's caption when this voice starts,
+            // prefixed with the speaker name when set ("Speaker: caption").
+            if (impl_->captionsEnabled && !audio->caption.empty())
+                impl_->captions.push_back(audio->speaker.empty()
+                                              ? audio->caption
+                                              : audio->speaker + ": " + audio->caption);
 
             ma_format format;
             switch (audio->bitsPerSample) {

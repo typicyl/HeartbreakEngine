@@ -253,4 +253,19 @@ StreamingWorld::Stats StreamingWorld::GetStats() const {
     return st;
 }
 
+bool StreamingWorld::IsSettled(const glm::vec3& focus) const {
+    for (const std::unique_ptr<Cell>& up : cells_) {
+        const State s = static_cast<State>(up->state.load(std::memory_order_acquire));
+        // A load in flight (or finished-but-not-yet-instantiated) is never settled.
+        if (s == State::Loading || s == State::Ready) return false;
+        // An in-range cell that hasn't started loading will pop in once revealed.
+        // (State::Failed is left as-is: a broken cell won't appear, so waiting on it
+        // would hang the loading screen forever.)
+        if (s == State::Unloaded &&
+            glm::distance(focus, up->desc.center) <= up->desc.loadRadius)
+            return false;
+    }
+    return true;
+}
+
 } // namespace hbe

@@ -284,7 +284,16 @@ void Scheduler() {
 void WorkerMain(u32 index) {
     t_isWorker = true;
     t_worker = index;
+    // A worker's own thread becomes its scheduler fiber. If this fails (returns null),
+    // running the scheduler would SwitchToFiber(null) and crash with 0xC0000005 - so
+    // bail out of this worker instead. (Turns a silent AV into a logged, survivable
+    // degradation.)
     t_scheduler = ConvertThreadToFiber(nullptr);
+    if (!t_scheduler) {
+        HBE_ERROR("JobSystem: worker {} ConvertThreadToFiber failed (GetLastError={}); "
+                  "this worker is idle.", index, ::GetLastError());
+        return;
+    }
     Scheduler();
     ConvertFiberToThread();
 }
@@ -333,12 +342,24 @@ void Initialize(u32 workerCount) {
     }
     g->workerCount = workerCount;
 
+    HBE_INFO("JobSystem: creating {} fibers ({} KB stacks)...", kFiberCount,
+             kFiberStackSize / 1024);
     g->allFibers.reserve(kFiberCount);
     g->freeFibers.reserve(kFiberCount);
     for (u32 i = 0; i < kFiberCount; ++i) {
+        void* handle = CreateFiber(kFiberStackSize, &FiberProc, nullptr);
+        if (!handle) {
+            // Out of address space / a sandboxed environment can refuse CreateFiber.
+            // A null handle would AV the moment a worker SwitchToFibers to it, so stop
+            // here and run with whatever was created (0 = the caller can't use jobs).
+            HBE_ERROR("JobSystem: CreateFiber failed at {}/{} (GetLastError={}). Continuing "
+                      "with {} fibers.", i, kFiberCount, ::GetLastError(),
+                      static_cast<u32>(g->allFibers.size()));
+            break;
+        }
         Fiber* f = new Fiber();
         f->index = i;
-        f->handle = CreateFiber(kFiberStackSize, &FiberProc, nullptr);
+        f->handle = handle;
         g->allFibers.push_back(f);
         g->freeFibers.push_back(f);
     }
@@ -348,7 +369,7 @@ void Initialize(u32 workerCount) {
     for (u32 i = 0; i < workerCount; ++i) g->workers.emplace_back(WorkerMain, i);
 
     HBE_INFO("JobSystem: {} workers, {} fibers ({} KB stacks).", workerCount,
-             kFiberCount, kFiberStackSize / 1024);
+             static_cast<u32>(g->allFibers.size()), kFiberStackSize / 1024);
 
     if (SelfTest()) {
         HBE_INFO("JobSystem: self-test passed.");

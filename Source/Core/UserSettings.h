@@ -1,0 +1,29 @@
+// Core/UserSettings.h - per-user, per-game options that persist across runs.
+//
+// Distinct from .hbsave game saves and the project file: these are the player's own
+// preferences (volume / graphics / brightness / captions), stored in the OS user data
+// dir so they survive reinstalls of the game folder. Loaded on boot, saved on change.
+#pragma once
+
+#include "Core/Types.h"
+
+#include <filesystem>
+#include <string>
+
+namespace hbe {
+
+struct UserSettings {
+    f32 masterVolume = 1.0f;      // [0,1] -> AudioSystem Master bus
+    int graphicsPreset = 0;       // 0 High (as authored), 1 Medium, 2 Low (degrade-only)
+    f32 brightness = 0.5f;        // [0,1] -> +/-1-stop VIEW exposure multiplier (0.5 = neutral)
+    bool captionsEnabled = false; // closed captions on/off
+
+    bool Save(const std::filesystem::path& dir) const; // <dir>/usersettings.json
+    bool Load(const std::filesystem::path& dir);        // false if absent/invalid
+
+    // Per-user settings directory for `gameName` (Windows: %LOCALAPPDATA%/<gameName>,
+    // falling back to the working dir). Sanitizes the name for use as a folder.
+    static std::filesystem::path ResolveDir(const std::string& gameName);
+};
+
+} // namespace hbe

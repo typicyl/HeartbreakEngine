@@ -25,6 +25,13 @@ bool g_musicStatePending = false;
 std::string g_musicState;
 std::vector<std::pair<std::string, f32>> g_musicParams;
 std::vector<std::string> g_stingers;
+std::vector<std::string> g_voicelines; // one-shot voiceline clips (rel. Assets)
+std::string g_dialogue;                // latest requested `.hbdialogue` (rel. Assets)
+bool g_dialoguePending = false;
+std::string g_cutscene;                // latest requested `.hbcutscene` (rel. Assets)
+bool g_cutscenePending = false;
+// Deferred UI panel commands (drained by the engine, in order).
+std::vector<UICommand> g_uiCommands;
 } // namespace
 
 void SetMusicState(const std::string& state) {
@@ -53,6 +60,41 @@ bool ConsumeStinger(std::string& outAsset) {
     if (g_stingers.empty()) return false;
     outAsset = g_stingers.front();
     g_stingers.erase(g_stingers.begin());
+    return true;
+}
+void PlayVoiceline(const std::string& asset) { g_voicelines.push_back(asset); }
+bool ConsumeVoiceline(std::string& outAsset) {
+    if (g_voicelines.empty()) return false;
+    outAsset = g_voicelines.front();
+    g_voicelines.erase(g_voicelines.begin());
+    return true;
+}
+void PlayDialogue(const std::string& asset) {
+    g_dialogue = asset;
+    g_dialoguePending = true;
+}
+bool ConsumeDialogue(std::string& outAsset) {
+    if (!g_dialoguePending) return false;
+    g_dialoguePending = false;
+    outAsset = g_dialogue;
+    return true;
+}
+void PlayCutscene(const std::string& asset) {
+    g_cutscene = asset;
+    g_cutscenePending = true;
+}
+bool ConsumeCutscene(std::string& outAsset) {
+    if (!g_cutscenePending) return false;
+    g_cutscenePending = false;
+    outAsset = g_cutscene;
+    return true;
+}
+
+void QueueUICommand(UICommand cmd) { g_uiCommands.push_back(std::move(cmd)); }
+bool ConsumeUICommand(UICommand& out) {
+    if (g_uiCommands.empty()) return false;
+    out = std::move(g_uiCommands.front());
+    g_uiCommands.erase(g_uiCommands.begin());
     return true;
 }
 

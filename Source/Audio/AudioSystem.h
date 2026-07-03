@@ -50,6 +50,12 @@ public:
     void SetBusMuted(const std::string& bus, bool muted);
     bool BusMuted(const std::string& bus) const;
 
+    // Closed captions: when enabled, starting playback of an audio asset that carries
+    // a caption enqueues its text; the engine drains it (PopCaption) to an on-screen
+    // caption element. No-op / nothing enqueued when disabled.
+    void SetCaptionsEnabled(bool on);
+    bool PopCaption(std::string& out); // FIFO; returns false when the queue is empty
+
     // Active playback device description for boot/diagnostics UI (device name +
     // sample rate, e.g. "Speakers (Realtek) - 48000 Hz"). "No audio device" when
     // playback is unavailable.
@@ -71,8 +77,14 @@ public:
     bool PlayPCM(const void* pcm, usize bytes, u32 channels, u32 sampleRate,
                  u32 bitsPerSample, const std::string& bus = {});
 
-    // Convenience: loads a .uaf Audio asset and plays it.
-    bool PlayUAF(const std::filesystem::path& uafPath, const std::string& bus = {});
+    // Convenience: loads a .uaf Audio asset and plays it. `caption` surfaces the
+    // clip's baked "Speaker: caption" into the caption queue (when captions are
+    // enabled) - pass false when the caller shows its own text (dialogue lines).
+    bool PlayUAF(const std::filesystem::path& uafPath, const std::string& bus = {},
+                 bool caption = true);
+    // Drops PlayUAF's decoded-PCM cache (call after a .uaf is re-imported or its
+    // tags edited, so the next play reflects the new PCM / caption / speaker).
+    void ClearUAFCache();
 
     // -- Adaptive music director -------------------------------------------------
     // Interactive music: a graph of STATES (each a set of synced looping LAYERS)

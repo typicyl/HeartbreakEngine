@@ -134,6 +134,16 @@ std::optional<Texture> ReadTexture(const std::filesystem::path& path) {
     return t;
 }
 
+bool PeekTextureSize(const std::filesystem::path& path, u32& width, u32& height) {
+    std::vector<u8> bytes = LoadAssetFile(path);
+    if (bytes.empty()) return false;
+    BinaryReader r(bytes);
+    if (ReadHeader(r) != AssetType::Texture) return false;
+    r.Pod(width);
+    r.Pod(height); // width/height are the first fields after the header
+    return r.Ok();
+}
+
 // --- Mesh ------------------------------------------------------------------
 namespace {
 
@@ -302,6 +312,7 @@ bool WriteAudio(const std::filesystem::path& path, const Audio& audio, u64 guid)
     w.Pod(audio.bitsPerSample);
     w.Pod(static_cast<u32>(audio.kind)); // v6
     w.Str(audio.caption);                // v6
+    w.Str(audio.speaker);                // v7
     w.Vec(audio.pcm);
     if (!w.SaveToFile(path)) {
         HBE_ERROR("UAF: failed to write audio '{}'.", path.string());
@@ -349,6 +360,7 @@ std::optional<Audio> ReadAudio(const std::filesystem::path& path) {
         a.kind = static_cast<AudioKind>(kind > 3 ? 0 : kind);
         r.Str(a.caption);
     }
+    if (version >= 7) r.Str(a.speaker); // caption speaker name
     r.Vec(a.pcm);
     if (!r.Ok()) return std::nullopt;
     return a;

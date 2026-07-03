@@ -6,15 +6,93 @@
 #include "RHI/RHIFactory.h"
 #include "Scene/Scene.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
 namespace hbe {
 
+namespace {
+
+// Gribb-Hartmann frustum planes from a view-projection matrix, for the RH
+// ZERO-TO-ONE clip space this engine uses (GLM_FORCE_DEPTH_ZERO_TO_ONE):
+// left/right/bottom/top = row3 +/- row(i); near = row2 ALONE (z >= 0), far =
+// row3 - row2. Planes point INWARD (positive half-space = inside).
+struct Frustum {
+    glm::vec4 planes[6];
+
+    explicit Frustum(const glm::mat4& vp) {
+        // glm is column-major: "row i" of the matrix = vec4(m[0][i], m[1][i], ...).
+        const auto row = [&](int i) {
+            return glm::vec4(vp[0][i], vp[1][i], vp[2][i], vp[3][i]);
+        };
+        const glm::vec4 r0 = row(0), r1 = row(1), r2 = row(2), r3 = row(3);
+        planes[0] = r3 + r0; // left
+        planes[1] = r3 - r0; // right
+        planes[2] = r3 + r1; // bottom
+        planes[3] = r3 - r1; // top
+        planes[4] = r2;      // near (zero-to-one depth: z' >= 0)
+        planes[5] = r3 - r2; // far
+    }
+
+    // Conservative world-AABB test (center + half-extent): outside ANY plane =
+    // culled; intersecting/inside = visible.
+    bool Intersects(const glm::vec3& c, const glm::vec3& e) const {
+        for (const glm::vec4& p : planes) {
+            const glm::vec3 n(p);
+            const f32 r = e.x * std::abs(n.x) + e.y * std::abs(n.y) + e.z * std::abs(n.z);
+            if (glm::dot(n, c) + p.w + r < 0.0f) return false;
+        }
+        return true;
+    }
+};
+
+// Local center/extent -> world center/extent under an affine transform:
+// world extent_i = sum_j |M[j][i]| * localExtent_j (no 8-corner loop).
+void WorldAabb(const glm::mat4& m, const glm::vec3& localC, const glm::vec3& localE,
+               glm::vec3& outC, glm::vec3& outE) {
+    outC = glm::vec3(m * glm::vec4(localC, 1.0f));
+    const glm::vec3 x = glm::vec3(m[0]) * localE.x;
+    const glm::vec3 y = glm::vec3(m[1]) * localE.y;
+    const glm::vec3 z = glm::vec3(m[2]) * localE.z;
+    outE = glm::abs(x) + glm::abs(y) + glm::abs(z);
+}
+
+// True when an item is SAFE to fold into an instanced run: opaque, unskinned,
+// unpainted, non-splat "simple" materials only (everything per-instance except
+// the transforms must be identical - the run head's ObjectCB serves the group).
+bool Instanceable(const rhi::DrawItem& it) {
+    return it.boneCount == 0 && !it.paintColorTexture.IsValid() &&
+           !(it.materialFlags &
+             (rhi::MaterialFlag_Transparent | rhi::MaterialFlag_TerrainSplat));
+}
+
+// Material-key equality for run grouping: everything the ObjectCB carries
+// besides the per-instance transforms.
+bool SameMaterial(const rhi::DrawItem& a, const rhi::DrawItem& b) {
+    return a.mesh.id == b.mesh.id && a.materialFlags == b.materialFlags &&
+           a.baseColor == b.baseColor && a.metallic == b.metallic &&
+           a.roughness == b.roughness &&
+           a.albedoTexture.index == b.albedoTexture.index &&
+           a.normalTexture.index == b.normalTexture.index &&
+           a.mrTexture.index == b.mrTexture.index &&
+           a.aoTexture.index == b.aoTexture.index &&
+           a.emissiveTexture.index == b.emissiveTexture.index &&
+           a.thicknessTexture.index == b.thicknessTexture.index &&
+           a.emissiveColor == b.emissiveColor &&
+           a.emissiveIntensity == b.emissiveIntensity &&
+           a.subsurfaceColor == b.subsurfaceColor &&
+           a.subsurfaceRadius == b.subsurfaceRadius &&
+           a.surfaceStrokes == b.surfaceStrokes;
+}
+
+} // namespace
+
 Renderer::Renderer() = default;
 Renderer::~Renderer() { Shutdown(); }
 
-bool Renderer::Initialize(const Window& window, rhi::GraphicsAPI api, bool enableValidation) {
+bool Renderer::Initialize(const Window& window, rhi::GraphicsAPI api, bool enableValidation,
+                          bool vsync) {
     const NativeWindowHandle native = window.GetNativeHandle();
 
     rhi::RenderDeviceDesc desc;
@@ -26,6 +104,7 @@ bool Renderer::Initialize(const Window& window, rhi::GraphicsAPI api, bool enabl
     desc.backBufferCount = 3;
     desc.backBufferFormat = rhi::Format::R8G8B8A8_UNORM;
     desc.enableValidation = enableValidation;
+    desc.vsync = vsync;
 
     device_ = rhi::CreateRenderDevice(desc);
     if (!device_) {
@@ -47,15 +126,31 @@ bool Renderer::Initialize(const Window& window, rhi::GraphicsAPI api, bool enabl
 }
 
 rhi::MeshHandle Renderer::UploadMesh(const MeshData& mesh) {
-    return device_ ? device_->CreateMesh(mesh) : rhi::MeshHandle{};
+    const rhi::MeshHandle handle = device_ ? device_->CreateMesh(mesh) : rhi::MeshHandle{};
+    if (handle.IsValid()) {
+        glm::vec3 bmin, bmax;
+        ComputeBounds(mesh, bmin, bmax);
+        meshBounds_[handle.id] = {(bmin + bmax) * 0.5f, (bmax - bmin) * 0.5f};
+    }
+    return handle;
 }
 
 void Renderer::UpdateMesh(rhi::MeshHandle handle, const MeshData& mesh) {
-    if (device_) device_->UpdateMesh(handle, mesh);
+    if (!device_) return;
+    device_->UpdateMesh(handle, mesh);
+    if (handle.IsValid()) { // geometry changed (sculpting) -> refresh the cull bounds
+        glm::vec3 bmin, bmax;
+        ComputeBounds(mesh, bmin, bmax);
+        meshBounds_[handle.id] = {(bmin + bmax) * 0.5f, (bmax - bmin) * 0.5f};
+    }
 }
 
 rhi::TextureHandle Renderer::UploadTexture(const rhi::TextureDesc& desc) {
     return device_ ? device_->CreateTexture(desc) : rhi::TextureHandle{};
+}
+
+rhi::TextureHandle Renderer::CreateUITarget(u32 width, u32 height) {
+    return device_ ? device_->CreateUITarget(width, height) : rhi::TextureHandle{};
 }
 
 void Renderer::UpdateTexture(rhi::TextureHandle handle, const rhi::TextureDesc& desc) {
@@ -100,7 +195,20 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
                                       static_cast<u32>(previewItems_.size()));
         }
 
+        // World-space UI canvases render into their textures FIRST so the scene
+        // pass below samples this frame's page content (shadow-map precedent).
+        // count == 0 still submits: the backend clears the target (a fresh or
+        // just-hidden page shows transparent, never stale/garbage content).
+        if (worldUIDraws_) {
+            for (const WorldUIDraw& d : *worldUIDraws_) {
+                if (d.target.IsValid())
+                    device_->DrawUIToTexture(d.target, d.verts, d.count);
+            }
+            worldUIDraws_ = nullptr; // one frame only
+        }
+
         rhi::SceneView view = scene.MakeView(camera_);
+        view.exposure *= userExposureScale_; // player brightness (view-level only)
         view.deltaTime = dt; // for temporal post effects (auto-exposure)
         static f32 s_skyTime = 0.0f; // accumulated time for sky animation
         s_skyTime += dt;
@@ -108,15 +216,90 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         drawItems_.clear();
         scene.CollectDrawItems(drawItems_);
         const u32 itemCount = static_cast<u32>(drawItems_.size());
+
+        // --- Frustum culling: reorder drawItems_ IN PLACE to a visible-first
+        // prefix. INVARIANT: the shadow pass gets the FULL list (off-screen
+        // casters still shadow) and the main pass gets only the prefix; both
+        // backends couple shadow->scene per-item state BY INDEX (D3D12
+        // shadowObjAddrs_[i], Vulkan's shared object-UBO arena), which stays
+        // valid because indices < visibleCount are identical for both passes.
+        // All reordering happens strictly BEFORE DrawShadowPass. Skinned items
+        // (boneCount > 0) are never culled (bind-pose bounds would lie).
+        u32 visibleCount = itemCount;
+        if (cullingEnabled_ && itemCount > 0) {
+            const Frustum frustum(view.viewProj);
+            const auto visible = [&](const rhi::DrawItem& it) {
+                if (it.boneCount > 0) return true; // skinned: bounds unreliable
+                const auto bit = meshBounds_.find(it.mesh.id);
+                if (bit == meshBounds_.end()) return true; // unknown: never cull
+                glm::vec3 c, e;
+                WorldAabb(it.transform, bit->second.center, bit->second.extent, c, e);
+                return frustum.Intersects(c, e);
+            };
+            const auto mid = std::stable_partition(drawItems_.begin(), drawItems_.end(),
+                                                   visible);
+            visibleCount = static_cast<u32>(std::distance(drawItems_.begin(), mid));
+        }
+        stats_.total = itemCount;
+        stats_.drawn = visibleCount;
+        stats_.culled = itemCount - visibleCount;
+
+        // Sort the VISIBLE prefix for submission coherence: opaque first (matches
+        // the backends' two-pass split), grouped by mesh (enables the IA-rebind
+        // skip + instancing runs), then front-to-back within a mesh (early-Z).
+        // The backends' own transparent back-to-front sort still runs after this.
+        if (visibleCount > 1) {
+            const glm::vec3 camPos = view.cameraPos;
+            std::sort(drawItems_.begin(), drawItems_.begin() + visibleCount,
+                      [&](const rhi::DrawItem& a, const rhi::DrawItem& b) {
+                          const bool ta = (a.materialFlags & rhi::MaterialFlag_Transparent) != 0;
+                          const bool tb = (b.materialFlags & rhi::MaterialFlag_Transparent) != 0;
+                          if (ta != tb) return !ta; // opaque before transparent
+                          if (a.mesh.id != b.mesh.id) return a.mesh.id < b.mesh.id;
+                          const glm::vec3 va = glm::vec3(a.transform[3]) - camPos;
+                          const glm::vec3 vb = glm::vec3(b.transform[3]) - camPos;
+                          return glm::dot(va, va) < glm::dot(vb, vb); // front-to-back
+                      });
+        }
+
+        // Run-builder: fold consecutive identical-material items in the sorted
+        // VISIBLE prefix into instanced runs (head.instanceRun = N, followers 0;
+        // singles stay 1). Runs never cross the cull boundary - the unsorted
+        // culled tail (shadow-only) stays single draws. Both passes consume the
+        // same markers, so the shadow<->scene coupling stays per-run consistent.
+        stats_.instancedDraws = 0;
+        stats_.totalInstances = 0;
+        for (u32 i = 0; i < visibleCount;) {
+            drawItems_[i].instanceRun = 1;
+            if (!Instanceable(drawItems_[i])) {
+                ++i;
+                continue;
+            }
+            u32 runEnd = i + 1;
+            while (runEnd < visibleCount && Instanceable(drawItems_[runEnd]) &&
+                   SameMaterial(drawItems_[i], drawItems_[runEnd]))
+                ++runEnd;
+            const u32 runLen = runEnd - i;
+            if (runLen > 1) {
+                drawItems_[i].instanceRun = runLen;
+                for (u32 j = i + 1; j < runEnd; ++j) drawItems_[j].instanceRun = 0;
+                ++stats_.instancedDraws;
+                stats_.totalInstances += runLen;
+            }
+            i = runEnd;
+        }
+        for (u32 i = visibleCount; i < itemCount; ++i) drawItems_[i].instanceRun = 1;
+
         // Particle billboards for this frame (drawn inside DrawScene's HDR pass).
         device_->SetParticles(particleAlpha_, particleAlphaCount_, particleAdd_,
                               particleAddCount_);
         particleAlpha_ = particleAdd_ = nullptr; // one frame only
         particleAlphaCount_ = particleAddCount_ = 0;
-        // Shadow map first: it must record before the main pass begins.
+        // Shadow map first: it must record before the main pass begins. FULL list
+        // (see the culling invariant above); the main pass draws the prefix only.
         device_->DrawShadowPass(view, drawItems_.data(), itemCount);
         device_->ClearBackBuffer(0.018f, 0.018f, 0.022f, 1.0f);
-        device_->DrawScene(view, drawItems_.data(), itemCount);
+        device_->DrawScene(view, drawItems_.data(), visibleCount);
         if (uiVertices_ && !uiVertices_->empty()) {
             device_->DrawUIOverlay(uiVertices_->data(),
                                    static_cast<u32>(uiVertices_->size()));

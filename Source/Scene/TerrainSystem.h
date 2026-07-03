@@ -26,6 +26,11 @@ namespace terrain {
 // nothing is dirty.
 void Update(Scene& scene, Renderer& renderer);
 
+// True when no TerrainComponent still needs a (re)build - every chunk mesh (and
+// hole/splat upload) is current. Lets a loading screen wait until terrain has
+// fully materialized instead of watching chunks pop in after the screen clears.
+bool IsSettled(Scene& scene);
+
 // Ensures the heightmap is sized for the (clamped) params, seeding it
 // procedurally (fbm noise) when it is empty or the resolution changed.
 void EnsureHeights(TerrainComponent& t);

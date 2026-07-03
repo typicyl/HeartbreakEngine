@@ -28,10 +28,10 @@ json WriteVec3(const glm::vec3& v) { return json::array({v.x, v.y, v.z}); }
 void ParseSettings(const json& j, ProjectSettings& s) {
     s.name = j.value("name", "Untitled");
     s.startupScene = j.value("startupScene", "");
-    s.mainMenuScene = j.value("mainMenuScene", "");
-    s.hudScene = j.value("hudScene", "");
-    s.loadingScene = j.value("loadingScene", "");
+    // Legacy keys (mainMenuScene/hudScene/loadingScene) are silently ignored:
+    // those screens are UIPanels inside uiScene now.
     s.studioLoadingScene = j.value("studioLoadingScene", "");
+    s.uiScene = j.value("uiScene", "");
     s.musicGraph = j.value("musicGraph", "");
     s.musicStartState = j.value("musicStartState", "");
     s.audioBuses.clear();
@@ -55,6 +55,7 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         b.width = it->value("width", 1280u);
         b.height = it->value("height", 720u);
         b.fullscreen = it->value("fullscreen", true);
+        b.vsync = it->value("vsync", true);
         b.packAssets = it->value("packAssets", true);
         b.compressAssets = it->value("compressAssets", true);
         b.onlyReferenced = it->value("onlyReferenced", false);
@@ -188,10 +189,8 @@ bool Project::Save() const {
     json j;
     j["name"] = settings_.name;
     j["startupScene"] = settings_.startupScene;
-    j["mainMenuScene"] = settings_.mainMenuScene;
-    j["hudScene"] = settings_.hudScene;
-    j["loadingScene"] = settings_.loadingScene;
     j["studioLoadingScene"] = settings_.studioLoadingScene;
+    j["uiScene"] = settings_.uiScene;
     j["musicGraph"] = settings_.musicGraph;
     j["musicStartState"] = settings_.musicStartState;
     j["engine"] = "HeartbreakEngine";
@@ -204,6 +203,7 @@ bool Project::Save() const {
                   {"width", b.width},
                   {"height", b.height},
                   {"fullscreen", b.fullscreen},
+                  {"vsync", b.vsync},
                   {"packAssets", b.packAssets},
                   {"compressAssets", b.compressAssets},
                   {"onlyReferenced", b.onlyReferenced},

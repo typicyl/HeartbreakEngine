@@ -133,6 +133,18 @@ void Window::FeedInput(u32 msg, u64 wparam, i64 lparam) {
         case WM_KEYUP: case WM_SYSKEYUP:
             input_->OnKeyVK(static_cast<u32>(wparam), false);
             break;
+        case WM_CHAR:
+            // Translated text input (TranslateMessage in PumpMessages emits
+            // these). Only printable ASCII 32..126 is accepted, matching the
+            // font atlas's baked range (FontAtlas bakes ASCII 32..126 and lays
+            // text out byte-wise): admitting higher code points would store
+            // characters that render as nothing and freeze the caret. Controls
+            // (<32) and DEL (127) arrive as WM_KEYDOWN edits instead. Widen this
+            // (and the atlas + a UTF-8-aware Layout) when extended glyphs land.
+            if (wparam >= 32 && wparam < 127) {
+                input_->OnChar(static_cast<u32>(wparam));
+            }
+            break;
         case WM_LBUTTONDOWN: button(MouseButton::Left, true);    break;
         case WM_LBUTTONUP:   button(MouseButton::Left, false);   break;
         case WM_RBUTTONDOWN: button(MouseButton::Right, true);   break;

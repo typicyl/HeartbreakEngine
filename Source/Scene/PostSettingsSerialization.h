@@ -94,10 +94,11 @@ inline void PostFromJson(const nlohmann::json& j, rhi::PostSettings& p) {
     p.fogSunIntensity = j.value("fogSunIntensity", p.fogSunIntensity);
     p.fogMaxDistance = j.value("fogMaxDistance", p.fogMaxDistance);
     p.fogAmbient = j.value("fogAmbient", p.fogAmbient);
-    p.fogStepCount = j.value("fogStepCount", p.fogStepCount);
+    p.fogStepCount = glm::clamp(j.value("fogStepCount", p.fogStepCount), 8u, 64u);
     if (auto it = j.find("fogColor"); it != j.end() && it->is_array() && it->size() == 3)
         p.fogColor = {(*it)[0].get<f32>(), (*it)[1].get<f32>(), (*it)[2].get<f32>()};
     p.fogGodRays = j.value("fogGodRays", p.fogGodRays);
+    p.fogAnisotropy = glm::clamp(p.fogAnisotropy, -0.9f, 0.9f); // HG peak explodes past ±0.9
     p.ssgiEnabled = j.value("ssgi", p.ssgiEnabled);
     p.ssgiIntensity = j.value("ssgiIntensity", p.ssgiIntensity);
     p.ssgiRadius = j.value("ssgiRadius", p.ssgiRadius);

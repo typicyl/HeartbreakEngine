@@ -85,6 +85,32 @@ std::array<NodeDesc, static_cast<usize>(NodeType::Count)> BuildCatalog() {
                                   {EXEC, {"Name", P::String}, {"Value", P::Float}}, {EXEC}});
     set(NodeType::PlayStinger, {"Play Stinger", "Music",
                                 {EXEC, {"Asset", P::String}}, {EXEC}});
+    // UI: widgets are addressed by their UIElement `action` id, panels by UIPanel name.
+    set(NodeType::EventUIClicked, {"On UI Clicked", "UI", {{"Action", P::String}},
+                                   {EXEC, {"Action", P::String}}});
+    set(NodeType::EventUIChanged, {"On UI Changed", "UI", {{"Action", P::String}},
+                                   {EXEC, {"Value", P::Float}, {"Toggled", P::Bool},
+                                    {"Selected", P::Float}}});
+    set(NodeType::GetUIValue, {"Get UI Value", "UI", {{"Action", P::String}},
+                               {{"Value", P::Float}, {"Toggled", P::Bool},
+                                {"Selected", P::Float}}});
+    set(NodeType::UIShowPanel, {"UI Show Panel", "UI", {EXEC, {"Panel", P::String}}, {EXEC}});
+    set(NodeType::UIPushPanel, {"UI Push Panel", "UI", {EXEC, {"Panel", P::String}}, {EXEC}});
+    set(NodeType::UIPopPanel,  {"UI Pop Panel", "UI", {EXEC}, {EXEC}});
+    set(NodeType::UISetText, {"UI Set Text", "UI",
+                              {EXEC, {"Action", P::String}, {"Text", P::String}}, {EXEC}});
+    set(NodeType::UISetVisible, {"UI Set Visible", "UI",
+                                 {EXEC, {"Action", P::String}, {"Visible", P::Bool}}, {EXEC}});
+    set(NodeType::UISetValue, {"UI Set Value", "UI",
+                               {EXEC, {"Action", P::String}, {"Value", P::Float}}, {EXEC}});
+    set(NodeType::UIPlayAnim, {"UI Play Animation", "UI",
+                               {EXEC, {"Action", P::String}}, {EXEC}});
+    set(NodeType::PlayVoiceline, {"Play Voiceline", "Audio",
+                                  {EXEC, {"Asset", P::String}}, {EXEC}});
+    set(NodeType::PlayDialogue, {"Play Dialogue", "Audio",
+                                 {EXEC, {"Asset", P::String}}, {EXEC}});
+    set(NodeType::PlayCutscene, {"Play Cutscene", "Cinematic",
+                                 {EXEC, {"Asset", P::String}}, {EXEC}});
     return c;
 }
 } // namespace
@@ -111,6 +137,18 @@ Value DefaultLiteral(NodeType t, u32 inPin, PinType pt) {
     if (t == NodeType::SetMusicParam && inPin == 1) return Value::Str("intensity");
     if (t == NodeType::SetMusicParam && inPin == 2) return Value::Float(1.0f);
     if (t == NodeType::PlayStinger && inPin == 1) return Value::Str("Music/stinger.uaf");
+    if (t == NodeType::EventUIClicked && inPin == 0) return Value::Str("play");
+    if (t == NodeType::EventUIChanged && inPin == 0) return Value::Str("setting:volume");
+    if (t == NodeType::GetUIValue && inPin == 0) return Value::Str("setting:volume");
+    if (t == NodeType::UIShowPanel && inPin == 1) return Value::Str("MainMenu");
+    if (t == NodeType::UIPushPanel && inPin == 1) return Value::Str("Settings");
+    if (t == NodeType::UISetText && inPin == 1) return Value::Str("title");
+    if (t == NodeType::UISetText && inPin == 2) return Value::Str("Hello");
+    if (t == NodeType::UISetVisible && inPin == 2) return Value::Bool(true);
+    if (t == NodeType::UISetValue && inPin == 2) return Value::Float(1.0f);
+    if (t == NodeType::PlayVoiceline && inPin == 1) return Value::Str("Voice/line.uaf");
+    if (t == NodeType::PlayDialogue && inPin == 1) return Value::Str("Dialogue/scene.hbdialogue");
+    if (t == NodeType::PlayCutscene && inPin == 1) return Value::Str("Cutscenes/intro.hbcutscene");
     switch (pt) {
         case PinType::Bool:   return Value::Bool(false);
         case PinType::Vec3:   return Value::Vec3({0.0f, 0.0f, 0.0f});

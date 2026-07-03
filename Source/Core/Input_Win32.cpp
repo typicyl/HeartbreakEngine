@@ -65,14 +65,46 @@ void NormalizeStick(i16 rawX, i16 rawY, i32 deadzone, f32& outX, f32& outY) {
 void Input::NewFrame() {
     std::memcpy(prevKeys_, keys_, sizeof(keys_));
     std::memcpy(prevMouse_, mouse_, sizeof(mouse_));
+    std::memset(pressedEdge_, 0, sizeof(pressedEdge_));
     mouseDeltaX_ = mouseDeltaY_ = 0.0f;
     wheel_ = 0.0f;
+    textEventCount_ = 0;
     PollGamepads();
+}
+
+void Input::PushEditKey(Key k) {
+    TextEditEvent::Kind kind;
+    switch (k) {
+        case Key::Backspace: kind = TextEditEvent::Backspace; break;
+        case Key::Delete:    kind = TextEditEvent::Delete; break;
+        case Key::Left:      kind = TextEditEvent::CaretLeft; break;
+        case Key::Right:     kind = TextEditEvent::CaretRight; break;
+        case Key::Home:      kind = TextEditEvent::CaretHome; break;
+        case Key::End:       kind = TextEditEvent::CaretEnd; break;
+        default: return; // not an editing key
+    }
+    if (textEventCount_ < kMaxTextEvents)
+        textEvents_[textEventCount_++] = TextEditEvent{kind, 0};
 }
 
 void Input::OnKeyVK(u32 nativeKey, bool down) {
     const Key k = TranslateVK(nativeKey);
-    if (k != Key::Unknown) keys_[Index(k)] = down;
+    if (k == Key::Unknown) return;
+    if (down) {
+        // Down-transition = a fresh press edge (survives a same-frame release).
+        if (!keys_[Index(k)]) pressedEdge_[Index(k)] = true;
+        // Editing keys feed the ordered text-event stream, one per WM_KEYDOWN -
+        // so OS auto-repeat yields repeated edits and message order relative to
+        // WM_CHAR insertions is preserved. Cleared each frame; only drained by
+        // an active text-field edit session.
+        PushEditKey(k);
+    }
+    keys_[Index(k)] = down;
+}
+
+void Input::OnChar(u32 codepoint) {
+    if (textEventCount_ < kMaxTextEvents)
+        textEvents_[textEventCount_++] = TextEditEvent{TextEditEvent::InsertChar, codepoint};
 }
 
 void Input::OnMouseButton(MouseButton b, bool down) {
@@ -105,6 +137,8 @@ void Input::OnMouseWheel(f32 delta) {
 void Input::OnFocusLost() {
     std::memset(keys_, 0, sizeof(keys_));
     std::memset(mouse_, 0, sizeof(mouse_));
+    std::memset(pressedEdge_, 0, sizeof(pressedEdge_));
+    textEventCount_ = 0;
     hasMousePos_ = false;
 }
 

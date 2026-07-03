@@ -30,14 +30,17 @@ float2 ProjectUV(float3 worldPos, out float clipW)
 
 float Hash(float2 p) { return frac(sin(dot(p, float2(12.9898f, 78.233f))) * 43758.5453f); }
 
+// Outputs the indirect-GI term ONLY (rgb = bounce, a = 1), NOT scene+GI. The GI is
+// rendered at reduced resolution and composited over the full-res HDR by ApplyHalfRes
+// (out = scene * a + rgb = scene + GI). a = 1 everywhere so the composite leaves the
+// scene untouched where there is no GI.
 float4 PSMain(FSOutput input) : SV_Target
 {
     const float2 uv = input.positionCS.xy * gOutTexel;
-    const float3 hdr = SamplePost(gInput0, uv).rgb;
-    if (gPostParams0.w < 0.5f) return float4(hdr, 1.0f); // disabled
+    if (gPostParams0.w < 0.5f) return float4(0.0f, 0.0f, 0.0f, 1.0f); // disabled -> no GI
 
     const float depth = SamplePost(gInput2, uv).r;
-    if (depth >= 1.0f) return float4(hdr, 1.0f); // sky receives no GI
+    if (depth >= 1.0f) return float4(0.0f, 0.0f, 0.0f, 1.0f); // sky receives no GI
 
     const float intensity = gPostParams0.x;
     const float radius = gPostParams0.y;
@@ -96,6 +99,7 @@ float4 PSMain(FSOutput input) : SV_Target
     }
     indirect /= K;
 
-    // Add one diffuse bounce; metals take no diffuse GI.
-    return float4(hdr + indirect * (intensity * (1.0f - metal)), 1.0f);
+    // One diffuse bounce; metals take no diffuse GI. GI-only (a=1); ApplyHalfRes adds
+    // it over the full-res HDR (scene + GI).
+    return float4(indirect * (intensity * (1.0f - metal)), 1.0f);
 }

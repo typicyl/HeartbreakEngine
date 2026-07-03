@@ -6,8 +6,15 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "Assets/CutsceneAsset.h" // active cutscene the player evaluates
+#include "Assets/DialogueAsset.h" // active dialogue the runner steps through
 #include "Navigation/GridNav.h" // real-time A* pathfinder (agents path on this)
 #include "RHI/RHI.h"
+#include "Core/UserSettings.h" // per-user volume/graphics/brightness/captions
+#include "UI/UIManager.h" // persistent-UI-scene panel manager (game flow drives it)
+#include "UI/UISystem.h"  // ui::UIContext (cached layout/interaction state)
+
+#include <entt/entt.hpp> // entt::entity (loading-overlay entity tracking)
 
 #include <filesystem>
 #include <functional>
@@ -37,6 +44,11 @@ struct EngineConfig {
     // runtime defaults this from the project's BuildSettings; --windowed /
     // --fullscreen override on the command line.
     bool fullscreen = false;
+    // Present with vsync (default). --novsync uncaps the frame rate (tearing
+    // allowed) so real GPU headroom is measurable.
+    bool vsync = true;
+    // --nocull disables frustum culling (A/B comparison / debugging).
+    bool noCull = false;
 
     // True when the corresponding option was given explicitly on the command
     // line; explicit options beat the project's BuildSettings in the runtime.
@@ -44,6 +56,7 @@ struct EngineConfig {
     bool heightExplicit = false;
     bool apiExplicit = false;
     bool fullscreenExplicit = false;
+    bool vsyncExplicit = false;
 
     // Optional model file (glTF/GLB/OBJ/FBX) to load as the scene. When empty,
     // the built-in PBR sphere-grid demo scene is used. UTF-8 path.
@@ -63,6 +76,9 @@ struct EngineConfig {
 
     // Spawns this many extra meshes for draw-call stress testing (0 = off).
     u32 stressCount = 0;
+    // --stress-shared: the stress meshes share ONE mesh (identical-mesh runs -
+    // the measurement rig for draw sorting / IA-rebind skipping / instancing).
+    bool stressShared = false;
 
     // Optional streaming-world manifest (.hbworld JSON) for distance-based world
     // partition streaming. UTF-8 path.
@@ -81,6 +97,10 @@ struct EngineConfig {
     // Navigation smoke test: route the grid A* pathfinder around a static + a
     // dynamic obstacle and walk an agent to the goal, then exit.
     bool navTest = false;
+
+    // World-space UI smoke test: spawns a worldSpace UICanvas (a lit page with a
+    // label + widgets) in the scene, exercising the canvas->texture->quad path.
+    bool uiWorldTest = false;
 
     // Boot straight into the gameplay level, skipping the studio splash + main
     // menu (--play). Useful for testing the scene/render path without the UI.
@@ -138,11 +158,17 @@ public:
     void SetCursorLocked(bool locked);
     bool IsCursorLocked() const;
 
-    // High-level game flow (runtime): boots to the project's main-menu scene,
-    // shows the loading scene + progress while the gameplay scene/level loads,
-    // then overlays the HUD. Driven by UIElement button `action`s.
+    // High-level game flow (runtime): boots to the persistent UI scene's initial
+    // (menu) panel, shows the "Loading" panel + progress while the gameplay
+    // scene/level loads, then reveals the "HUD" panel. Driven by UIElement button
+    // `action`s. No UI scene = boot straight into the startup scene.
     enum class GameState { None, Booting, MainMenu, Loading, Playing };
     GameState State() const { return gameState_; }
+
+    // Sub-phases of GameState::Loading, driving the fade sequence: go black on Play ->
+    // load the world behind the curtain -> fade the loading screen in -> ease the wheel
+    // in while it streams -> fade to black -> reveal (gameplay eases in from black).
+    enum class LoadPhase { Begin, FadeIn, Wheel, FadeOut };
     void FlowPlay();      // menu -> loading -> gameplay (+HUD), lock cursor
     void FlowMainMenu();  // back to the main menu, unlock cursor
     void FlowReload();    // respawn/restart: game loading screen -> reload gameplay
@@ -168,6 +194,12 @@ public:
     void SetGameCameraEnabled(bool enabled) { gameCameraEnabled_ = enabled; }
     bool IsGameCameraEnabled() const { return gameCameraEnabled_; }
 
+    // Abort any in-progress cutscene and hand the camera back to its owner.
+    // The editor calls this when entering/leaving play mode so a cutscene that
+    // was mid-flight when the user hit Stop cannot silently resume on the next
+    // Play (which would hijack the viewport camera with no schematic trigger).
+    void ClearCutscene();
+
     // In-game UI pointer in NORMALIZED game-image coordinates (0..1; negative
     // = no pointer). The editor feeds this from the Game panel's image rect;
     // the runtime derives it from the OS cursor over the window.
@@ -176,6 +208,18 @@ public:
         uiPointerV_ = v;
         uiPointerExternal_ = true; // an editor is feeding the pointer
     }
+
+    // Editor keyboard gate (mirror of the external pointer): while captured,
+    // in-game UI keyboard/gamepad navigation and TextInput editing are
+    // suspended so ImGui typing and editor shortcuts never leak into the game
+    // UI. The editor sets this every frame; the standalone runtime leaves it
+    // false.
+    void SetUIKeyboardCaptured(bool on) { uiKeyboardExternal_ = on; }
+
+    // Push a subtitle/caption line onto the on-screen stack (used by the dialogue
+    // runner and game code). Pre-format the speaker in (e.g. "Nara: Hello");
+    // `seconds` <= 0 auto-derives a readable duration from the text length.
+    void PushCaption(const std::string& text, f32 seconds = 0.0f);
 
 private:
     Hook onInit_;
@@ -187,6 +231,37 @@ private:
     PhysicsWorld* physics_ = nullptr;
     AudioSystem*  audio_ = nullptr;
     StreamingWorld* streamingWorld_ = nullptr;
+    ui::UIManager uiManager_;       // persistent-UI-scene panel manager (when uiScene set)
+    ui::UIContext uiCtx_;           // cached UI layout/interaction/text state
+    bool uiManagerMode_ = false;    // true once a project uiScene is loaded + managed
+    UserSettings userSettings_;              // per-user options (volume/graphics/brightness/captions)
+    std::filesystem::path userSettingsDir_;  // where usersettings.json lives
+    bool settingsDirty_ = false;             // pending user-settings save (flushed on Back/quit)
+    // Closed captions / subtitles: a STACK of active lines, each expiring on its
+    // own timer. Newest is appended last, so the "caption" Label (bottom-anchored)
+    // grows upward as lines arrive and drops them as they expire.
+    struct ActiveCaption {
+        std::string text;   // already formatted ("Speaker: line")
+        f32 timer = 0.0f;   // seconds remaining
+    };
+    std::vector<ActiveCaption> captions_;
+    // Active dialogue (a .hbdialogue run by a schematic): the runner steps
+    // through lines over time, pushing each caption + playing each clip.
+    DialogueAsset dialogue_;
+    int dialogueLine_ = -1;      // -1 = no dialogue running; else the next line index
+    f32 dialogueTimer_ = 0.0f;   // seconds until the next line advances
+    // Active cutscene (a .hbcutscene run by a schematic): the player takes over
+    // the camera and evaluates the tracks each frame until the duration elapses.
+    CutsceneAsset cutscene_;
+    f32 cutsceneTime_ = -1.0f;      // -1 = no cutscene; else seconds along the timeline
+    bool cutsceneRestoreCam_ = true; // gameCameraEnabled_ to restore when it ends
+    bool cutsceneCamOwned_ = false;  // true while a cutscene has taken over the camera
+    void SeedSettingsWidgets();  // fill "setting:*" widgets from userSettings_ (on Settings shown)
+    void ApplyChangedSettings(); // read changed "setting:*" widgets -> apply live + mark dirty
+    void UpdateCaptions(f32 dt); // drain audio captions -> drive the "caption" UI element
+    void UpdateDialogue(f32 dt); // advance the active .hbdialogue line-by-line
+    void UpdateCutscene(f32 dt); // evaluate the active .hbcutscene camera/anim/dialogue tracks
+    void PlayUISounds();         // play UIElement hover/click sounds (edge-detected)
     nav::GridNav* gridNav_ = nullptr;
     scene::Level* currentLevel_ = nullptr;
     f32       dt_ = 0.0f;
@@ -200,8 +275,17 @@ private:
     f32       forceClouds_ = -1.0f;    // --clouds: force cloud coverage each frame
     GameState gameState_ = GameState::None;
     f32       loadTimer_ = 0.0f;
+    LoadPhase loadPhase_ = LoadPhase::Begin; // fade sub-phase within GameState::Loading
+    f32       fadeAlpha_ = 0.0f;  // full-screen black curtain: 0 clear .. 1 opaque black
+    f32       wheelAlpha_ = 0.0f; // loading wheel/progress fade-in factor (0..1)
+    // Entities of the "Loading" UIPanel subtree (resident in the persistent UI
+    // scene), collected when the panel is shown so the progress/wheel drivers only
+    // touch the loading screen (never gameplay HUD bars). Cleared on reveal - the
+    // panel entities themselves are persistent and are merely deactivated.
+    std::vector<entt::entity> loadingPanelEntities_;
     void UpdateGameFlow(f32 dt); // per-frame; polls UI button actions + progress
-    void EnterPlaying();         // loads gameplay scene/level + HUD, locks cursor
+    void LoadGameplayWorld();    // instantiate startup level/scene + HUD (no state flip)
+    void EnterPlaying();         // reveal: remove loading overlay, resume sim, lock cursor
     void FlowAfterBoot();        // studio splash done -> main menu (or gameplay)
     // Fills UIElement::runtimeText for {backend}/{gpu}/{audio}/{version}/{progress}/
     // {log} tokens (studio/loading screens). `progress` is 0..1.
@@ -212,11 +296,14 @@ private:
     // Developer overlay (shipped builds when BuildSettings.devMenu): appends an
     // immediate stats panel + hotkey list to the UI overlay. Toggled by Ctrl+`.
     void BuildDevOverlay(std::vector<rhi::UIVertex>& out);
+    // Full-screen black fade curtain (loading transitions); appends a quad at fadeAlpha_.
+    void BuildFadeCurtain(std::vector<rhi::UIVertex>& out);
     bool      devMenuOpen_ = false;
     bool      gameCameraEnabled_ = true;
     f32       uiPointerU_ = -1.0f;
     f32       uiPointerV_ = -1.0f;
     bool      uiPointerExternal_ = false;
+    bool      uiKeyboardExternal_ = false; // editor owns the keyboard (ImGui)
 };
 
 // Parses common command-line options into an EngineConfig:

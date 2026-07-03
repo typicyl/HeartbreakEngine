@@ -75,12 +75,12 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float levels = gPostParams2.y;
 
     const float3 orig = FetchHDR(gInput0, uv);
-    // Silhouette edge-stopping only matters when edgeKeep > 0; at edgeKeep == 0 the
-    // per-tap depth weight is multiplied out (lerp t=0), so skip the centre + per-tap
-    // depth samples and their exp() entirely. edgeKeep is a uniform, so this branch is
-    // coherent across the whole pass (free) and the output is identical.
-    const bool useEdge = edgeKeep > 0.001f;
-    const float dc = useEdge ? SamplePost(gInput2, uv).r : 0.0f; // centre depth
+    // Silhouette edge-stopping is ALWAYS on: without it the Kuwahara pulls flat
+    // bright-sky taps into ridge pixels (the sky's near-zero variance wins the
+    // inverse-variance blend) and paints a bright RIM along silhouettes. edgeKeep
+    // now only scales HOW strict the depth stop is, never disables it.
+    const bool useEdge = true;
+    const float dc = SamplePost(gInput2, uv).r; // centre depth
 
     // Stroke length scale in pixels (the slider reads 1..7; paint wants real size).
     const float px = size * 3.0f;
@@ -116,7 +116,9 @@ float4 PSMain(FSOutput input) : SV_Target {
     float nSum[8], n2Sum[8], wSum[8];
     [unroll] for (int s = 0; s < 8; ++s) { cSum[s] = 0; nSum[s] = 0; n2Sum[s] = 0; wSum[s] = 0; }
     const float kSector = 8.0f / 6.2831853f;
-    const float depthEdge = 700.0f * (0.15f + edgeKeep); // higher = stricter silhouettes
+    // Strong baseline even at edgeKeep 0 (a hill silhouette against sky needs it);
+    // edgeKeep raises it further for stricter lost-and-found edges.
+    const float depthEdge = 700.0f * (0.35f + 0.65f * edgeKeep);
 
     // 9x9 grid (~64 disc taps). The Kuwahara output is smooth, so dropping from an
     // 11x11 grid is nearly invisible but ~1/3 cheaper. Each tap also samples ONE
@@ -140,13 +142,14 @@ float4 PSMain(FSOutput input) : SV_Target {
             const float3 c = FetchHDR(gInput0, suv);
 
             // Don't pull colour across a silhouette: weight by depth proximity to
-            // the centre pixel (lost & found edges). Only when edgeKeep > 0 - else the
-            // sample + exp are skipped (see useEdge above). Depth alone catches object
-            // boundaries; the old per-tap normal sample was dropped for cost.
+            // the centre pixel (lost & found edges). NO edgeKeep floor here - the old
+            // lerp(1, w, edgeKeep) left every cross-silhouette tap a 1-edgeKeep weight
+            // floor, which let the flat bright sky win the variance blend at ridge
+            // pixels (the rim bug). Depth alone catches object boundaries.
             float wEdge = 1.0f;
             if (useEdge) {
                 const float ds = SamplePost(gInput2, suv).r;
-                wEdge = lerp(1.0f, exp(-depthEdge * abs(ds - dc)), edgeKeep);
+                wEdge = exp(-depthEdge * abs(ds - dc));
             }
             const float w = exp(-2.0f * r2) * wEdge + 1e-5f;
             const float nl = NLuma(c);
@@ -208,8 +211,9 @@ float4 PSMain(FSOutput input) : SV_Target {
         // Centre both to [-0.5,0.5]; sharpen the broad term so marks have edges.
         const float marks = (broad - 0.5f) * 1.3f + (bristle - 0.5f) * 0.5f;
         // Modulate value AND a touch of the existing chroma so strokes feel laid
-        // down, not just dimmed. *1.6 makes them read at the default detail level.
-        col *= 1.0f + marks * strokeDetail * 1.6f;
+        // down, not just dimmed. *1.6 makes them read at the default detail level;
+        // clamped so marks can never over-amplify already-bright edge pixels.
+        col *= 1.0f + clamp(marks * strokeDetail * 1.6f, -0.35f, 0.35f);
     }
     if (canvasStr > 0.0f) {
         // Soft value-noise tooth (no raw sin grid -> no Nyquist moiré).

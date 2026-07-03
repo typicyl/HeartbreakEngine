@@ -54,12 +54,26 @@ float4x4 SkinMatrix(uint base, uint4 j, float4 w)
            gBones[base + j.w] * w.w;
 }
 
-VSOutput VSMain(VSInput input)
+VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 {
     float3 posOS = input.positionOS;
     float3 nrmOS = input.normalOS;
     float3 tanOS = input.tangentOS.xyz;
     float3 prevPosOS = input.positionOS; // skinned with the previous palette
+
+    // GPU instancing: instanced runs replace the object CB's transforms with
+    // this instance's slice of gInstances (3 matrices per instance). Single
+    // draws have gInstanced == 0 and read the CB exactly as before.
+    float4x4 model = gModel;
+    float4x4 normalMat = gNormalMatrix;
+    float4x4 prevModel = gPrevModel;
+    if (gInstanced != 0u)
+    {
+        const uint base = (gInstanceBase + instanceId) * 3u;
+        model = gInstances[base + 0u];
+        normalMat = gInstances[base + 1u];
+        prevModel = gInstances[base + 2u];
+    }
 
     // Skeletal skinning: blend the joint palette (bind -> animated model
     // space), then the entity transform places the result in the world. Joint
@@ -86,14 +100,14 @@ VSOutput VSMain(VSInput input)
     }
 
     VSOutput o;
-    float4 posWS = mul(gModel, float4(posOS, 1.0f));
+    float4 posWS = mul(model, float4(posOS, 1.0f));
     o.positionWS = posWS.xyz;
     o.positionCS = mul(gViewProj, posWS);
-    o.normalWS   = normalize(mul((float3x3)gNormalMatrix, nrmOS));
-    o.tangentWS  = float4(normalize(mul((float3x3)gModel, tanOS)), input.tangentOS.w);
+    o.normalWS   = normalize(mul((float3x3)normalMat, nrmOS));
+    o.tangentWS  = float4(normalize(mul((float3x3)model, tanOS)), input.tangentOS.w);
     o.uv         = input.uv;
     o.curClip    = o.positionCS;
-    o.prevClip   = mul(gPrevViewProj, mul(gPrevModel, float4(prevPosOS, 1.0f)));
+    o.prevClip   = mul(gPrevViewProj, mul(prevModel, float4(prevPosOS, 1.0f)));
     o.positionOS = posOS; // object space (post-skin) for box paint projection
     o.normalOS   = nrmOS;
     return o;

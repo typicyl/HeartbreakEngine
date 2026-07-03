@@ -67,6 +67,21 @@ enum class NodeType : u16 {
     SetMusicState,                           // exec in + State(string) -> exec
     SetMusicParam,                           // exec in + Name(string) + Value(float) -> exec
     PlayStinger,                             // exec in + Asset(string) -> exec
+    // --- UI (widgets addressed by UIElement.action; panels by UIPanel.name) ---
+    EventUIClicked,  // Action(string filter; ""=any) -> exec + Action(string)
+    EventUIChanged,  // Action(string filter) -> exec + Value + Toggled + Selected
+    GetUIValue,      // Action(string) -> Value(float) + Toggled(bool) + Selected(float) (pure)
+    UIShowPanel,     // exec in + Panel(string) -> exec (clear stack, show only it)
+    UIPushPanel,     // exec in + Panel(string) -> exec (overlay; Pop returns)
+    UIPopPanel,      // exec in -> exec (back)
+    UISetText,       // exec in + Action(string) + Text(string) -> exec
+    UISetVisible,    // exec in + Action(string) + Visible(bool) -> exec
+    UISetValue,      // exec in + Action(string) + Value(float) -> exec (slider/toggle/selector)
+    UIPlayAnim,      // exec in + Action(string) -> exec (restarts Manual UIAnimators)
+    // --- Voicelines / dialogue (append-only: node types are serialized) -------
+    PlayVoiceline,   // exec in + Asset(string .uaf) -> exec (one-shot line + caption)
+    PlayDialogue,    // exec in + Asset(string .hbdialogue) -> exec (runs a conversation)
+    PlayCutscene,    // exec in + Asset(string .hbcutscene) -> exec (runs a cinematic)
     Count
 };
 

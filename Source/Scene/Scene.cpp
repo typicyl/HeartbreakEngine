@@ -19,6 +19,24 @@
 
 namespace hbe {
 
+Scene::Scene() {
+    // UI structure signals: constructing/destroying/replacing a hierarchy-shaping
+    // component invalidates the UI layout's cached parent->children map (the
+    // version is compared by ui::UIContext). Direct FIELD writes don't fire
+    // signals - those sites (panel.active flips, in-place reparents) call
+    // BumpUIVersion() explicitly. NOTE: connections capture `this`; Scene must
+    // not be moved/copied (registry_ is move-only, and no call site moves Scene).
+    registry_.on_construct<Parent>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_destroy<Parent>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_update<Parent>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_construct<UIElement>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_destroy<UIElement>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_construct<UICanvas>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_destroy<UICanvas>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_construct<UIPanel>().connect<&Scene::OnUIStructural>(*this);
+    registry_.on_destroy<UIPanel>().connect<&Scene::OnUIStructural>(*this);
+}
+
 entt::entity Scene::CreateEntity(const std::string& name) {
     const entt::entity e = registry_.create();
     if (!name.empty()) {
@@ -566,23 +584,28 @@ void BuildDefaultScene(Scene& scene) {
     HBE_INFO("Scene: built default scene ({} entities).", scene.EntityCount());
 }
 
-void SpawnStress(Scene& scene, Renderer& renderer, u32 count) {
+void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh) {
     if (!renderer.SupportsScene() || count == 0) return;
 
-    // Each instance gets its OWN higher-poly mesh, so this exercises unique
-    // vertex data / bandwidth (like a real heavy scene), not a single cached mesh.
+    // Default: each instance gets its OWN higher-poly mesh, exercising unique
+    // vertex data / bandwidth (like a real heavy scene). `sharedMesh` spawns N
+    // instances of ONE mesh instead - the measurement rig for draw sorting /
+    // IA-rebind skipping / GPU instancing (identical-mesh runs).
     MeshData proto = mesh::GenerateSphere(0.4f, 48, 24); // ~1200 verts each
     glm::vec3 pMin, pMax;
     ComputeBounds(proto, pMin, pMax);
+    const rhi::MeshHandle shared = sharedMesh ? renderer.UploadMesh(proto) : rhi::MeshHandle{};
+    if (sharedMesh && !shared.IsValid()) return;
     const u32 side = static_cast<u32>(std::ceil(std::cbrt(static_cast<f64>(count))));
     usize totalVerts = 0;
     u32 spawned = 0;
     for (u32 z = 0; z < side && spawned < count; ++z) {
         for (u32 y = 0; y < side && spawned < count; ++y) {
             for (u32 x = 0; x < side && spawned < count; ++x, ++spawned) {
-                const rhi::MeshHandle handle = renderer.UploadMesh(proto);
+                const rhi::MeshHandle handle =
+                    sharedMesh ? shared : renderer.UploadMesh(proto);
                 if (!handle.IsValid()) continue;
-                totalVerts += proto.vertices.size();
+                if (!sharedMesh || spawned == 0) totalVerts += proto.vertices.size();
                 const entt::entity e = scene.CreateEntity("Stress");
                 Transform t;
                 t.position = {static_cast<f32>(x) * 1.2f - side * 0.6f,
@@ -592,8 +615,13 @@ void SpawnStress(Scene& scene, Renderer& renderer, u32 count) {
                 MeshInstance mi;
                 mi.mesh = handle;
                 mi.baseColor = {0.8f, 0.8f, 0.85f, 1.0f};
-                mi.metallic = (x & 1u) ? 1.0f : 0.0f;
-                mi.roughness = glm::clamp(0.1f + 0.8f * (static_cast<f32>(y) / side), 0.05f, 1.0f);
+                // Shared mode = ONE material too (varied materials would split the
+                // instancing runs, defeating the measurement rig).
+                mi.metallic = sharedMesh ? 0.0f : ((x & 1u) ? 1.0f : 0.0f);
+                mi.roughness = sharedMesh
+                                   ? 0.5f
+                                   : glm::clamp(0.1f + 0.8f * (static_cast<f32>(y) / side),
+                                                0.05f, 1.0f);
                 scene.Registry().emplace<MeshInstance>(e, mi);
                 scene.Registry().emplace<AABB>(e, AABB{pMin, pMax});
             }

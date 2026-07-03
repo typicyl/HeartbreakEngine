@@ -21,7 +21,7 @@ namespace hbe::uaf {
 inline constexpr char kMagic[4] = {'U', 'A', 'F', '1'};
 // v2: material texture refs; v3: emissive; v4: per-submesh .hbmat asset ref;
 // v5: skinned vertices (72B) + optional rig (skeleton + animation clips)
-inline constexpr u32 kVersion = 6; // v6: Audio gains kind + caption
+inline constexpr u32 kVersion = 7; // v7: Audio gains a caption speaker name
 
 enum class AssetType : u32 {
     Unknown = 0,
@@ -52,6 +52,7 @@ struct Audio {
     u32 bitsPerSample = 16;
     AudioKind kind = AudioKind::Sfx; // SFX / Music / Ambience / Voiceline
     std::string caption;             // accessibility caption (voicelines)
+    std::string speaker;             // v7: character name; shown as "Speaker: caption"
     std::vector<u8> pcm; // interleaved PCM samples
 };
 
@@ -63,6 +64,9 @@ AssetType PeekType(const std::filesystem::path& path);
 
 bool WriteTexture(const std::filesystem::path& path, const Texture& tex, u64 guid = 0);
 std::optional<Texture> ReadTexture(const std::filesystem::path& path);
+// Reads ONLY a texture's width/height (skips the pixel payload). VFS-aware
+// (works inside packed assets), so 9-slice borders resolve in shipped builds.
+bool PeekTextureSize(const std::filesystem::path& path, u32& width, u32& height);
 
 // `rig` (skeleton + clips) is optional; pass nullptr (or an invalid rig) for
 // static meshes.

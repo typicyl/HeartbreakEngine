@@ -12,6 +12,7 @@
 #include "Scene/PaintSystem.h"
 #include "Scene/PostSettingsSerialization.h"
 #include "Scene/Scene.h"
+#include "UI/UISystem.h" // PreloadUIAssets (eager UI font/texture load)
 
 #include <nlohmann/json.hpp>
 
@@ -188,8 +189,10 @@ json BuildSceneJson(const Scene& scene,
     std::unordered_map<u32, int> indexOf;
     const auto add = [&](entt::entity e) {
         // Terrain chunks are runtime-generated from a TerrainComponent; never
-        // serialize them (they're rebuilt on load).
+        // serialize them (they're rebuilt on load). Same for world-UI surface
+        // quads (rebuilt from their UICanvas by ui::UpdateWorldSurfaces).
         if (reg.try_get<TerrainChunk>(e)) return;
+        if (reg.try_get<UISurface>(e)) return;
         if (include && !include(e)) return; // not part of the scene being saved
         const u32 key = static_cast<u32>(e);
         if (indexOf.find(key) == indexOf.end()) {
@@ -455,14 +458,79 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                         {"radial", el->radial},
                         {"fullscreen", el->fullscreen},
                         {"action", el->action},
-                        {"font", el->font}};
+                        {"font", el->font},
+                        {"rotation", el->rotation},
+                        {"scale", json::array({el->scale.x, el->scale.y})},
+                        {"value", el->value},
+                        {"toggled", el->toggled},
+                        {"selected", el->selected},
+                        {"options", el->options},
+                        {"frames", el->frames},
+                        {"contentSize", json::array({el->contentSize.x, el->contentSize.y})},
+                        {"scrollPos", json::array({el->scrollPos.x, el->scrollPos.y})},
+                        {"scrollSpeed", el->scrollSpeed},
+                        {"scrollVertical", el->scrollVertical},
+                        {"scrollHorizontal", el->scrollHorizontal},
+                        {"autoScroll", el->autoScroll},
+                        {"autoScrollLoop", el->autoScrollLoop},
+                        {"placeholder", el->placeholder},
+                        {"maxLength", el->maxLength},
+                        {"hoverColor", ToJson(el->hoverColor)},
+                        {"pressedColor", ToJson(el->pressedColor)},
+                        {"disabledColor", ToJson(el->disabledColor)},
+                        {"enabled", el->enabled},
+                        {"hoverSound", el->hoverSound},
+                        {"clickSound", el->clickSound},
+                        {"trackTexture", el->trackTexture},
+                        {"fillTexture", el->fillTexture},
+                        {"handleTexture", el->handleTexture},
+                        {"handleSize", el->handleSize},
+                        {"onTexture", el->onTexture},
+                        {"offTexture", el->offTexture},
+                        {"hoverTexture", el->hoverTexture},
+                        {"pressedTexture", el->pressedTexture},
+                        {"disabledTexture", el->disabledTexture},
+                        {"cellTexture", el->cellTexture},
+                        {"slice", ToJson(el->slice)},
+                        {"wrap", el->wrap}};
         }
         if (const UICanvas* canvas = reg.try_get<UICanvas>(e)) {
             je["uiCanvas"] = {{"scaleMode", canvas->scaleMode},
                               {"refWidth", canvas->refWidth},
                               {"refHeight", canvas->refHeight},
                               {"sortOrder", canvas->sortOrder},
-                              {"visible", canvas->visible}};
+                              {"visible", canvas->visible},
+                              {"worldSpace", canvas->worldSpace},
+                              {"worldWidth", canvas->worldWidth},
+                              {"emissive", canvas->emissive},
+                              {"rtWidth", canvas->rtWidth},
+                              {"rtHeight", canvas->rtHeight}};
+        }
+        if (const UIAnimator* an = reg.try_get<UIAnimator>(e)) {
+            je["uiAnimator"] = {{"clip", an->clip}, {"trigger", static_cast<int>(an->trigger)}};
+        }
+        if (const UIPanel* p = reg.try_get<UIPanel>(e)) {
+            je["uiPanel"] = {{"name", p->name}, {"startVisible", p->startVisible}};
+        }
+        if (const UILayoutGroup* lg = reg.try_get<UILayoutGroup>(e)) {
+            je["uiLayoutGroup"] = {{"kind", static_cast<int>(lg->kind)},
+                                   {"spacing", lg->spacing},
+                                   {"cellSize", json::array({lg->cellSize.x, lg->cellSize.y})},
+                                   {"padding", ToJson(lg->padding)},
+                                   {"columns", lg->columns},
+                                   {"fitContent", lg->fitContent}};
+        }
+        if (const UICanvasGroup* cg = reg.try_get<UICanvasGroup>(e)) {
+            je["uiCanvasGroup"] = {{"opacity", cg->opacity},
+                                   {"interactable", cg->interactable}};
+        }
+        if (const WorldText* wt = reg.try_get<WorldText>(e)) {
+            je["worldText"] = {{"text", wt->text},
+                               {"size", wt->size},
+                               {"color", json::array({wt->color.r, wt->color.g,
+                                                      wt->color.b, wt->color.a})},
+                               {"font", wt->font},
+                               {"billboard", wt->billboard}};
         }
         if (const ParticleEmitter* pe = reg.try_get<ParticleEmitter>(e)) {
             je["particles"] = {
@@ -570,6 +638,7 @@ json BuildSubtreeJson(const Scene& scene, entt::entity root) {
         const entt::entity e = stack.back();
         stack.pop_back();
         if (reg.try_get<TerrainChunk>(e)) continue; // runtime-generated chunks
+        if (reg.try_get<UISurface>(e)) continue;    // runtime world-UI quads
         const u32 key = static_cast<u32>(e);
         if (indexOf.count(key)) continue;
         indexOf[key] = static_cast<int>(order.size());
@@ -825,7 +894,7 @@ void ParseSceneJson(const json& root, SceneData& out) {
         if (auto it = je.find("ui"); it != je.end()) {
             d.hasUI = true;
             const int type = it->value("type", 1);
-            d.uiElement.type = static_cast<UIElement::Type>(glm::clamp(type, 0, 4));
+            d.uiElement.type = static_cast<UIElement::Type>(glm::clamp(type, 0, 9));
             d.uiElement.text = it->value("text", "");
             const auto vec2Of = [&](const char* key, glm::vec2 def) {
                 const json arr = it->value(key, json::array());
@@ -865,6 +934,84 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.uiElement.fullscreen = it->value("fullscreen", false);
             d.uiElement.action = it->value("action", "");
             d.uiElement.font = it->value("font", "");
+            d.uiElement.rotation = it->value("rotation", 0.0f);
+            d.uiElement.scale = vec2Of("scale", {1.0f, 1.0f});
+            d.uiElement.value = it->value("value", 0.5f);
+            d.uiElement.toggled = it->value("toggled", false);
+            d.uiElement.selected = it->value("selected", 0);
+            d.uiElement.options = it->value("options", std::vector<std::string>{});
+            d.uiElement.frames = it->value("frames", std::vector<std::string>{});
+            d.uiElement.contentSize = glm::max(vec2Of("contentSize", {0.0f, 0.0f}),
+                                               glm::vec2(0.0f));
+            d.uiElement.scrollPos = vec2Of("scrollPos", {0.0f, 0.0f});
+            d.uiElement.scrollSpeed =
+                glm::clamp(it->value("scrollSpeed", 40.0f), 1.0f, 4000.0f);
+            d.uiElement.scrollVertical = it->value("scrollVertical", true);
+            d.uiElement.scrollHorizontal = it->value("scrollHorizontal", false);
+            d.uiElement.autoScroll =
+                glm::clamp(it->value("autoScroll", 0.0f), -4000.0f, 4000.0f);
+            d.uiElement.autoScrollLoop = it->value("autoScrollLoop", false);
+            d.uiElement.placeholder = it->value("placeholder", "");
+            d.uiElement.maxLength = glm::clamp(it->value("maxLength", 64), 1, 4096);
+            d.uiElement.hoverColor = Vec4(it->value("hoverColor", json()), glm::vec4(0.0f));
+            d.uiElement.pressedColor =
+                Vec4(it->value("pressedColor", json()), glm::vec4(0.0f));
+            d.uiElement.disabledColor =
+                Vec4(it->value("disabledColor", json()), glm::vec4(0.0f));
+            d.uiElement.enabled = it->value("enabled", true);
+            d.uiElement.hoverSound = it->value("hoverSound", "");
+            d.uiElement.clickSound = it->value("clickSound", "");
+            d.uiElement.trackTexture = it->value("trackTexture", "");
+            d.uiElement.fillTexture = it->value("fillTexture", "");
+            d.uiElement.handleTexture = it->value("handleTexture", "");
+            d.uiElement.handleSize = glm::max(it->value("handleSize", 0.0f), 0.0f);
+            d.uiElement.onTexture = it->value("onTexture", "");
+            d.uiElement.offTexture = it->value("offTexture", "");
+            d.uiElement.hoverTexture = it->value("hoverTexture", "");
+            d.uiElement.pressedTexture = it->value("pressedTexture", "");
+            d.uiElement.disabledTexture = it->value("disabledTexture", "");
+            d.uiElement.cellTexture = it->value("cellTexture", "");
+            d.uiElement.slice = glm::max(Vec4(it->value("slice", json()), glm::vec4(0.0f)),
+                                         glm::vec4(0.0f));
+            d.uiElement.wrap = it->value("wrap", false);
+        }
+        if (auto it = je.find("uiAnimator"); it != je.end()) {
+            d.hasUIAnimator = true;
+            d.uiAnimator.clip = it->value("clip", "");
+            d.uiAnimator.trigger = static_cast<UIAnimator::Trigger>(
+                glm::clamp(it->value("trigger", 1), 0, 5));
+        }
+        if (auto it = je.find("uiPanel"); it != je.end()) {
+            d.hasUIPanel = true;
+            d.uiPanel.name = it->value("name", "");
+            d.uiPanel.startVisible = it->value("startVisible", false);
+        }
+        if (auto it = je.find("uiLayoutGroup"); it != je.end()) {
+            d.hasUILayoutGroup = true;
+            UILayoutGroup& lg = d.uiLayoutGroup;
+            lg.kind = static_cast<UILayoutGroup::Kind>(
+                glm::clamp(it->value("kind", 0), 0, 2));
+            lg.spacing = it->value("spacing", 8.0f);
+            if (const json cs = it->value("cellSize", json());
+                cs.is_array() && cs.size() >= 2) {
+                lg.cellSize = {cs[0].get<f32>(), cs[1].get<f32>()};
+            }
+            lg.padding = Vec4(it->value("padding", json()), glm::vec4(0.0f));
+            lg.columns = glm::max(it->value("columns", 1), 1);
+            lg.fitContent = it->value("fitContent", false);
+        }
+        if (auto it = je.find("uiCanvasGroup"); it != je.end()) {
+            d.hasUICanvasGroup = true;
+            d.uiCanvasGroup.opacity = glm::clamp(it->value("opacity", 1.0f), 0.0f, 1.0f);
+            d.uiCanvasGroup.interactable = it->value("interactable", true);
+        }
+        if (auto it = je.find("worldText"); it != je.end()) {
+            d.hasWorldText = true;
+            d.worldText.text = it->value("text", "Text");
+            d.worldText.size = glm::clamp(it->value("size", 0.25f), 0.001f, 100.0f);
+            d.worldText.color = Vec4(it->value("color", json()), glm::vec4(1.0f));
+            d.worldText.font = it->value("font", "");
+            d.worldText.billboard = it->value("billboard", false);
         }
         if (auto it = je.find("uiCanvas"); it != je.end()) {
             d.hasUICanvas = true;
@@ -873,6 +1020,13 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.uiCanvas.refHeight = it->value("refHeight", 1080.0f);
             d.uiCanvas.sortOrder = it->value("sortOrder", 0);
             d.uiCanvas.visible = it->value("visible", true);
+            d.uiCanvas.worldSpace = it->value("worldSpace", false);
+            d.uiCanvas.worldWidth = glm::clamp(it->value("worldWidth", 1.0f), 0.01f, 1000.0f);
+            d.uiCanvas.emissive = glm::clamp(it->value("emissive", 0.0f), 0.0f, 10.0f);
+            const u32 rw = it->value("rtWidth", 0u);
+            const u32 rh = it->value("rtHeight", 0u);
+            d.uiCanvas.rtWidth = rw ? glm::clamp(rw, 64u, 4096u) : 0u;  // 0 = ref size
+            d.uiCanvas.rtHeight = rh ? glm::clamp(rh, 64u, 4096u) : 0u;
         }
         if (auto it = je.find("audio"); it != je.end()) {
             d.hasAudio = true;
@@ -1300,7 +1454,17 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                  std::vector<entt::entity>* createdOut, const std::string& sceneTag) {
     auto& reg = scene.Registry();
     if (mode == LoadMode::Replace) {
-        reg.clear();
+        // Destroy everything EXCEPT entities tagged Persistent (the resident UI layer),
+        // so a persistent UI scene survives gameplay scene swaps. With no Persistent
+        // entities present this is equivalent to reg.clear() (the common case). Collect
+        // first, then destroy - can't mutate the registry mid-iteration.
+        {
+            std::vector<entt::entity> kill;
+            for (const entt::entity e : reg.storage<entt::entity>())
+                if (!reg.all_of<Persistent>(e)) kill.push_back(e);
+            for (const entt::entity e : kill)
+                if (reg.valid(e)) reg.destroy(e);
+        }
         scene.Environment().ambientIntensity = data.ambientIntensity;
         scene.Environment().exposure = data.exposure;
         scene.Environment().shadowDistance = data.shadowDistance;
@@ -1499,6 +1663,11 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             reg.emplace<UIElement>(e, el);
         }
         if (d.hasUICanvas) reg.emplace<UICanvas>(e, d.uiCanvas);
+        if (d.hasUIAnimator) reg.emplace<UIAnimator>(e, d.uiAnimator);
+        if (d.hasUIPanel) reg.emplace<UIPanel>(e, d.uiPanel);
+        if (d.hasUILayoutGroup) reg.emplace<UILayoutGroup>(e, d.uiLayoutGroup);
+        if (d.hasUICanvasGroup) reg.emplace<UICanvasGroup>(e, d.uiCanvasGroup);
+        if (d.hasWorldText) reg.emplace<WorldText>(e, d.worldText);
         if (d.hasAnim) reg.emplace<AnimationTrack>(e, d.anim);
         if (d.hasAnimator) {
             Animator an = d.animator;
@@ -1547,6 +1716,20 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         createdOut->reserve(created.size());
         for (const entt::entity e : created)
             if (e != entt::null) createdOut->push_back(e);
+    }
+
+    // Eager UI asset preload: bake fonts + load every UI texture NOW (scene
+    // load) instead of lazily on first draw - kills the blank-text/white-quad
+    // first frame and the disk-I/O hitch inside the frame loop.
+    bool anyUI = false;
+    for (const EntityData& d : data.entities) {
+        if (d.hasUI || d.hasWorldText) {
+            anyUI = true;
+            break;
+        }
+    }
+    if (anyUI && Project::HasActive()) {
+        ui::PreloadUIAssets(scene, renderer, Project::Active().AssetsDir());
     }
 
     HBE_INFO("Scene: instantiated {} entities ({}).", data.entities.size(),

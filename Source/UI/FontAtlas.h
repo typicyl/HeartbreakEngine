@@ -42,6 +42,14 @@ public:
     void Measure(const std::string& text, f32 sizePx, f32& outWidth,
                  f32& outHeight) const;
 
+    // Word-wrapped layout: greedily breaks on spaces so no line exceeds
+    // `wrapWidth` canvas px (existing '\n' still forces a break; a single word
+    // wider than the limit overflows its own line). Delegates to Layout on the
+    // assembled multi-line string. wrapWidth <= 0 behaves like Layout.
+    void LayoutWrapped(const std::string& text, f32 sizePx, f32 wrapWidth,
+                       std::vector<GlyphQuad>& out, f32& outWidth,
+                       f32& outHeight) const;
+
 private:
     u32 textureIndex_ = 0;
     bool failed_ = false;

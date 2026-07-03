@@ -40,6 +40,19 @@ public:
     }
 
     glm::mat4 ViewProjection() const { return Projection() * View(); }
+    glm::mat4 InverseViewProjection() const { return glm::inverse(ViewProjection()); }
+
+    // Unprojects a pointer in normalized target coords (0..1, y-down - the
+    // engine's UI pointer convention) into a world-space picking ray. Uses the
+    // RH zero-to-one projection (near plane at NDC z=0).
+    void ScreenRay(glm::vec2 pointerNorm, glm::vec3& origin, glm::vec3& dir) const {
+        const glm::vec2 ndc(pointerNorm.x * 2.0f - 1.0f, 1.0f - pointerNorm.y * 2.0f);
+        const glm::mat4 inv = InverseViewProjection();
+        glm::vec4 pNear = inv * glm::vec4(ndc, 0.0f, 1.0f);
+        glm::vec4 pFar = inv * glm::vec4(ndc, 1.0f, 1.0f);
+        origin = glm::vec3(pNear) / pNear.w;
+        dir = glm::normalize(glm::vec3(pFar) / pFar.w - origin);
+    }
 
     glm::vec3 Position() const { return position_; }
     glm::vec3 Forward() const { return glm::normalize(target_ - position_); }

@@ -80,6 +80,10 @@ struct RenderDeviceDesc {
 
     // Enable the API's validation/debug layer (slow; debug builds only).
     bool enableValidation = false;
+
+    // Present with vsync (default). false = uncapped: D3D12 Present(0) with
+    // tearing when supported; Vulkan MAILBOX (else IMMEDIATE, else FIFO).
+    bool vsync = true;
 };
 
 // ---------------------------------------------------------------------------
@@ -229,7 +233,7 @@ struct PostSettings {
     f32 fogSunIntensity = 1.0f;    // multiplier on the sun's in-scatter
     f32 fogMaxDistance = 200.0f;   // ray-march far clamp (world units)
     f32 fogAmbient = 0.02f;        // isotropic sky in-scatter
-    u32 fogStepCount = 24;         // ray-march samples
+    u32 fogStepCount = 32;         // ray-march samples (fewer = along-ray banding)
     // Tint applied to ALL fog in-scatter (the fog's own colour; 1,1,1 = neutral).
     glm::vec3 fogColor{1.0f, 1.0f, 1.0f};
     // God-ray boost: extra multiplier on the SHADOWED sun in-scatter only, so
@@ -480,18 +484,34 @@ struct DrawItem {
     // Both must stay valid through DrawScene; the backend copies them.
     glm::mat4 prevTransform{1.0f};
     const glm::mat4* prevBones = nullptr;
+
+    // GPU instancing (CPU-side, filled by the Renderer's run-builder over the
+    // SORTED item array): 1 = a normal single draw; N > 1 = the HEAD of an
+    // N-instance run of identical-material items (the next N-1 items are its
+    // followers); 0 = consumed by a preceding run head (both the shadow and
+    // scene passes must skip it). Same markers drive BOTH passes, so the
+    // per-index shadow<->scene coupling becomes per-run and stays consistent.
+    u32 instanceRun = 1;
 };
 
 // One vertex of the in-game UI overlay. Positions are in NDC (the UI system
 // applies canvas scaling on the CPU); `texIndex` selects a bindless texture
 // (0 = the 1x1 white default, i.e. a solid quad). Straight-alpha blending,
-// triangle list.
+// triangle list. The clip rect (also NDC, min..max) discards fragments
+// outside it in the pixel shader - ScrollViews clip their content with it.
+// The default sentinel (-2..2) covers all of NDC = no clipping, so plain
+// aggregate-initialized vertices behave exactly as before.
 struct UIVertex {
     f32 x = 0, y = 0;          // NDC
     f32 u = 0, v = 0;          // texture coordinates
     f32 r = 1, g = 1, b = 1, a = 1;
     u32 texIndex = 0;          // bindless texture (0 = white)
+    f32 clipX0 = -2.0f, clipY0 = -2.0f; // NDC clip rect min (sentinel = open)
+    f32 clipX1 = 2.0f, clipY1 = 2.0f;   // NDC clip rect max
 };
+static_assert(sizeof(UIVertex) == 52,
+              "UIVertex layout is mirrored in both backends' input layouts "
+              "(D3D12 uiLayout / Vulkan uiAttrs) and UI.hlsl - keep in sync");
 
 // One camera-facing particle billboard vertex, in WORLD space (the VS transforms
 // by the frame's viewProj). texIndex 0 = a procedural soft round dot.
@@ -574,6 +594,20 @@ public:
     // canvas space, no depth) over the scene. Call after DrawScene, before
     // RenderUI/EndFrame. No-op when unsupported.
     virtual void DrawUIOverlay(const UIVertex*, u32 /*count*/) {}
+
+    // -- World-space ("physical") UI: a canvas rendered into a texture that a
+    //    lit mesh in the scene displays (e.g. a settings page on a notebook).
+    // Creates a render-target-capable bindless texture: written raw (UNORM) by
+    // DrawUIToTexture, sampled with sRGB decode like any albedo map. Fixed size
+    // for its lifetime. Invalid handle when unsupported (GL) or out of slots.
+    virtual TextureHandle CreateUITarget(u32 /*width*/, u32 /*height*/) { return {}; }
+    // Renders UI triangles (same NDC convention as DrawUIOverlay) into `target`
+    // (a CreateUITarget texture), clearing it to transparent black first. Must be
+    // called after BeginFrame and BEFORE DrawShadowPass/ClearBackBuffer - the
+    // scene pass samples the texture the same frame (the shadow-map write-then-
+    // sample precedent). Multiple calls per frame (one per canvas) are allowed.
+    // No-op when unsupported.
+    virtual void DrawUIToTexture(TextureHandle /*target*/, const UIVertex*, u32 /*count*/) {}
 
     // -- Editor viewport: render the scene into an offscreen target that the
     //    UI displays in a panel (Unity-style). When the backend reports a

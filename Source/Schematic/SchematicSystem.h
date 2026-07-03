@@ -41,6 +41,13 @@ struct CompiledContext {
     entt::entity self;
     f32 dt;
     SchematicComponent& inst; // per-instance vars / Delay timers / started flag
+    // UI event payload (set only while firing EventUIClicked/EventUIChanged; the
+    // fields are DEFAULTED so existing aggregate-init call sites + previously baked
+    // units stay source-compatible).
+    const std::string* eventAction = nullptr; // the widget's UIElement.action id
+    f32 eventValue = 0.0f;                    // slider value at the change
+    bool eventToggled = false;                // toggle state at the change
+    f32 eventSelected = 0.0f;                 // selector index at the change
 };
 using CompiledFn = void (*)(CompiledContext& ctx, NodeType evt);
 

@@ -68,8 +68,17 @@ struct SceneEnvironment {
 // Owns an entt::registry. Entities with Transform + MeshInstance are drawn.
 class Scene {
 public:
+    Scene(); // wires the UI structure-version signals (see BumpUIVersion)
+
     entt::registry&       Registry()       { return registry_; }
     const entt::registry& Registry() const { return registry_; }
+
+    // UI structure version: bumped whenever the UI HIERARCHY may have changed
+    // (Parent/UIElement/UICanvas/UIPanel construct/destroy via EnTT signals, plus
+    // explicit bumps at field-write sites like reparenting or panel activation).
+    // The UI layout caches its parent->children map against this counter.
+    u64  UIStructureVersion() const { return uiStructureVersion_; }
+    void BumpUIVersion() { ++uiStructureVersion_; }
 
     SceneEnvironment&       Environment()       { return env_; }
     const SceneEnvironment& Environment() const { return env_; }
@@ -104,9 +113,14 @@ public:
     rhi::SceneView MakeView(const Camera& camera) const;
 
 private:
+    // EnTT signal target: any construct/destroy/update of a hierarchy-shaping
+    // component bumps the UI structure version.
+    void OnUIStructural(entt::registry&, entt::entity) { ++uiStructureVersion_; }
+
     entt::registry   registry_;
     SceneEnvironment env_;
     bool             editorView_ = false; // editor-only EditorHidden culling
+    u64              uiStructureVersion_ = 1; // see BumpUIVersion()
 
     // Per-object motion-vector history (for TAA + motion blur). Double-buffered:
     // CollectDrawItems hands out pointers/values from the "previous" maps (kept
@@ -130,8 +144,10 @@ void BuildDefaultScene(Scene& scene);
 // Loads a model file (glTF/GLB/OBJ/FBX) as entities. Returns false on failure.
 bool LoadModel(Scene& scene, Renderer& renderer, const std::string& path);
 
-// Spawns `count` mesh instances (draw-call stress test).
-void SpawnStress(Scene& scene, Renderer& renderer, u32 count);
+// Spawns `count` mesh instances (draw-call stress test). `sharedMesh` spawns N
+// instances of ONE mesh (draw-sort/instancing measurement rig) instead of a
+// unique mesh per instance (vertex-bandwidth stress).
+void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh = false);
 
 } // namespace scene
 } // namespace hbe

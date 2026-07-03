@@ -455,6 +455,23 @@ struct UICanvas {
     f32 refHeight = 1080.0f;
     int sortOrder = 0;
     bool visible = true;
+    // --- World-space ("physical"/diegetic) canvas --------------------------------
+    // When set, this canvas renders to a texture shown on a LIT quad in the 3D
+    // scene (paper-like: shaded by scene lighting) instead of the screen overlay.
+    // The page lies in the canvas entity's local XZ plane facing +Y - rotate the
+    // entity to mount it (on a notebook, a wall...), parent it under an object to
+    // follow it. Panels, animators, tokens and the UIManager all work unchanged
+    // (same layout walk). scaleMode is ignored: the canvas is exactly ref-sized.
+    bool worldSpace = false;
+    f32 worldWidth = 1.0f;   // page width in meters; height = worldWidth*refH/refW
+    f32 emissive = 0.0f;     // 0 = pure lit paper; >0 adds self-glow (readability)
+    u32 rtWidth = 0;         // render-target resolution (0 = refWidth/refHeight)
+    u32 rtHeight = 0;
+    // Runtime only (NOT serialized): the per-canvas UI render target + the hidden
+    // lit quad entity (UISurface) that displays it.
+    rhi::TextureHandle rtTexture;
+    u32 rtTexW = 0, rtTexH = 0;      // size rtTexture was created at
+    entt::entity surface = entt::null;
 };
 
 // A screen-space UI element with a Unity-style RectTransform. Layout is
@@ -476,6 +493,11 @@ struct UIElement {
         Button = 2,      // interactive rect + caption
         Image = 3,       // textured rect (color tints)
         ProgressBar = 4, // background rect + fill (linear or radial "wheel")
+        Slider = 5,      // draggable track + handle, `value` in [0,1]
+        Toggle = 6,      // on/off, `toggled`
+        Selector = 7,    // one-of-N options (`options`/`selected`), e.g. High/Med/Low
+        ScrollView = 8,  // clips + scrolls its children (mouse wheel / autoScroll)
+        TextInput = 9,   // editable text box; `text` is the buffer
     };
     Type type = Type::Label;
     std::string text;            // Label / Button / ProgressBar caption (authoring)
@@ -488,6 +510,10 @@ struct UIElement {
     glm::vec2 pivot{0.5f, 0.5f};
     glm::vec2 offset{0.0f};       // anchored position (canvas px)
     glm::vec2 size{300.0f, 80.0f}; // pixel size / sizeDelta when stretching
+    // 2D render transform about the element's pivot (drives UI animation): scale
+    // THEN rotation. Identity (rotation 0, scale {1,1}) = plain axis-aligned rect.
+    f32 rotation = 0.0f;          // degrees, clockwise in screen space
+    glm::vec2 scale{1.0f, 1.0f};  // per-axis scale about the pivot
     glm::vec4 color{1.0f};        // text color (Label) / fill or tint otherwise
     f32 textSize = 28.0f;         // text height in canvas pixels
     std::string font;             // `.uaf` Font asset (empty = engine default)
@@ -504,6 +530,9 @@ struct UIElement {
 
     // Image / textured Panel: a texture .uaf (relative to Assets/).
     std::string texture;
+    // Sprite-frame animation: optional list of texture .uaf paths; a UIAnimator's
+    // SpriteFrame track indexes this list and swaps `texture` to the active frame.
+    std::vector<std::string> frames;
 
     // Button game-flow action, handled by the engine when the button is clicked:
     // "play" (menu -> loading -> gameplay), "menu" (back to main menu), "quit".
@@ -515,10 +544,155 @@ struct UIElement {
     glm::vec4 fillColor{0.86f, 0.27f, 0.33f, 1.0f};
     bool radial = false;
 
+    // Slider: normalized value + draggable handle. Toggle: on/off. Selector: one of
+    // `options` by `selected` index. `fillColor` = the active/handle tint for all three.
+    f32 value = 0.5f;                     // Slider position [0,1]
+    bool toggled = false;                 // Toggle state
+    std::vector<std::string> options;     // Selector choices (e.g. High/Med/Low)
+    int selected = 0;                     // Selector index into `options`
+
+    // ScrollView: children lay out inside a content rect shifted by -scrollPos
+    // and the view rect clips the whole subtree. contentSize 0 = auto (measured
+    // from the laid-out children each frame). autoScroll drifts the content at
+    // px/s (credits roll); with autoScrollLoop the content re-enters from the
+    // far side once it has fully scrolled past. `fillColor` tints the scrollbar
+    // thumb (hidden while auto-scrolling); `color` is the background (a=0 none).
+    glm::vec2 contentSize{0.0f};          // scrollable extent (0 = auto-measure)
+    glm::vec2 scrollPos{0.0f};            // current offset into the content (px)
+    f32 scrollSpeed = 40.0f;              // px per mouse-wheel notch
+    bool scrollVertical = true;           // wheel + autoScroll move Y
+    bool scrollHorizontal = false;        // ... or X (vertical wins when both)
+    f32 autoScroll = 0.0f;                // content drift px/s (0 = manual)
+    bool autoScrollLoop = false;          // wrap around (credits) vs stop at end
+    glm::vec2 contentExtent{0.0f};        // measured content size (runtime)
+    glm::vec2 viewExtent{0.0f};           // laid-out view size (runtime)
+
+    // TextInput: `text` is the edit buffer. Click (or Enter/gamepad-A while
+    // focused) starts editing; Enter commits (`changed` fires), Escape cancels.
+    // `placeholder` shows grayed while the buffer is empty and not editing.
+    std::string placeholder;
+    int maxLength = 64;                   // buffer cap (characters)
+
+    // --- Skinning (U5) -------------------------------------------------------
+    // Per-state tint for interactive widgets. Alpha 0 = "unset" sentinel: the
+    // legacy automatic multiply is used (hover 1.22x, pressed 0.72x, disabled
+    // 0.5x gray), so pre-U5 widgets are byte- and pixel-identical.
+    glm::vec4 hoverColor{0.0f};
+    glm::vec4 pressedColor{0.0f};
+    glm::vec4 disabledColor{0.0f};
+    bool enabled = true;                  // false = inert + disabled look
+    std::string hoverSound;               // `.uaf` Audio, played on hover-enter
+    std::string clickSound;               // `.uaf` Audio, played on click
+
+    // Widget-part textures (empty = flat-color legacy look), resolved through
+    // the same path->index UI texture cache as `texture`. `text`ure is the
+    // Button/Panel/Image base; these skin the sub-parts.
+    std::string trackTexture;             // Slider groove
+    std::string fillTexture;              // Slider fill / ProgressBar fill
+    std::string handleTexture;            // Slider handle
+    f32 handleSize = 0.0f;                // Slider handle px (0 = auto from height)
+    std::string onTexture;                // Toggle on
+    std::string offTexture;               // Toggle off
+    std::string hoverTexture;             // Button hover state
+    std::string pressedTexture;           // Button pressed state
+    std::string disabledTexture;          // Button/TextInput disabled state
+    std::string cellTexture;              // Selector option cell
+
+    // 9-slice border in SOURCE-texture pixels (L,T,R,B); 0 = plain stretch. The
+    // corners keep their native size, edges stretch (Unity-style sprite border).
+    glm::vec4 slice{0.0f};
+    // Word-wrap the caption to the element width (Label/Button/Panel/TextInput).
+    bool wrap = false;
+
     bool hovered = false;            // runtime state (UISystem)
     bool clicked = false;            // pressed this frame (runtime state)
+    bool changed = false;            // value changed this frame (slider/toggle/selector)
+    bool dragging = false;           // slider grabbed (persists across frames while held)
+    bool prevHovered = false;        // runtime: hover-enter edge (drives hoverSound)
     u32 textureIndexCache = 0;       // resolved bindless index (runtime)
     bool textureResolved = false;    // reset to re-resolve `texture`
+};
+
+// Plays a reusable UI animation clip (.hbuianim) on this entity's UIElement. The clip
+// drives offset/scale/rotation/color/opacity/sprite-frame over time; ui::UpdateAnimations
+// advances it each frame per `trigger`. See UI/UIAnimation.h.
+struct UIAnimator {
+    std::string clip;                 // .hbuianim path (relative to Assets/)
+    enum class Trigger : u8 {
+        Manual = 0, // started by gameplay/schematic (set playing + time=0)
+        OnShow,     // when the element becomes visible (panel shown)
+        OnHide,     // when it becomes hidden
+        Hover,      // on hover-enter
+        Click,      // on click
+        Loop,       // always looping
+    };
+    Trigger trigger = Trigger::OnShow;
+
+    // Runtime playback state (not authored).
+    f32 time = 0.0f;
+    bool playing = false;
+    bool captured = false;           // baseOffset captured for additive offset tracks
+    bool justStarted = false;        // hold the exact t=0 pose on the start frame
+    glm::vec2 baseOffset{0.0f};
+    bool prevVisible = false;        // OnShow/OnHide edge detection
+    bool prevHovered = false;        // Hover edge detection
+};
+
+// Runtime-only tag: entities carrying it SURVIVE a Replace scene load (the loader
+// destroys everything else). The engine applies it to the persistent UI scene so the
+// menus / HUD stay resident across gameplay scene swaps. NOT serialized.
+struct Persistent {};
+
+// Runtime-only tag: the auto-managed lit quad that displays a worldSpace UICanvas
+// in the 3D scene. Created/pruned by ui::UpdateWorldSurfaces each frame; NEVER
+// serialized (the scene writer skips these entities; recreated on load).
+struct UISurface {
+    entt::entity canvas = entt::null; // the UICanvas entity this quad displays
+};
+
+// 3D text as its OWN object (Unity TextMesh / Unreal TextRender style): glyph
+// quads placed directly in the world by this entity's Transform - no canvas, no
+// panels. Drawn through the world-space particle pass (unlit, alpha-blended,
+// depth-tested against the scene). Text lies in the entity's local XY plane
+// facing +Z (a standing sign), centered on the origin; `billboard` makes it
+// face the camera instead (floating label). Supports '\n'.
+struct WorldText {
+    std::string text = "Text";
+    f32 size = 0.25f;              // line height in METERS
+    glm::vec4 color{1.0f, 1.0f, 1.0f, 1.0f};
+    std::string font;              // font asset (rel. Assets; empty = system font)
+    bool billboard = false;        // always face the camera
+};
+
+// Auto-layout container (U5): positions its NON-stretch child UIElements in a
+// row / column / grid AFTER their normal RectTransform solve, so lists, menus,
+// and credits don't need hand-placed offsets. Children that stretch (anchorMin
+// != anchorMax on an axis) are left untouched. `fitContent` back-sizes the
+// owning element to wrap its children (a ContentSizeFitter).
+struct UILayoutGroup {
+    enum class Kind : u8 { Vertical = 0, Horizontal = 1, Grid = 2 };
+    Kind kind = Kind::Vertical;
+    f32 spacing = 8.0f;             // gap between children (px)
+    glm::vec2 cellSize{160.0f, 48.0f}; // Grid cell size (px)
+    glm::vec4 padding{0.0f};        // inner padding L,T,R,B (px)
+    int columns = 1;                // Grid columns (>=1)
+    bool fitContent = false;        // grow the element to fit the children
+};
+
+// Inherited opacity + interactivity for a whole subtree (U5), like Unity's
+// CanvasGroup: multiplies every descendant's alpha (menu fade-in/out from one
+// value) and can make the subtree non-interactive without hiding it.
+struct UICanvasGroup {
+    f32 opacity = 1.0f;      // 0..1, multiplies descendant alpha
+    bool interactable = true; // false = subtree ignores the pointer
+};
+
+// Marks a UI subtree root as a named "screen" the UIManager shows/hides as a unit.
+// While inactive the entire subtree is skipped by layout (not drawn, not interactive).
+struct UIPanel {
+    std::string name;           // screen id: "MainMenu" / "Settings" / "HUD" / "Pause" / ...
+    bool startVisible = false;  // active when the UI scene first loads
+    bool active = false;        // runtime: manager-controlled visibility (NOT serialized)
 };
 
 // Attaches a visual-scripting graph (a `.hbschem` "Schematic"). Runs On Start

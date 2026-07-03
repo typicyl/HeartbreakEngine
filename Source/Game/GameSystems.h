@@ -56,6 +56,35 @@ bool ConsumeMusicState(std::string& outState);
 bool ConsumeMusicParameter(std::string& outName, f32& outValue);
 bool ConsumeStinger(std::string& outAsset);
 
+// --- Voicelines (deferred one-shots) ----------------------------------------
+// Schematics play a spoken line (a `.uaf` Voiceline, rel. Assets); the engine
+// drains this each frame and plays it, surfacing its baked "Speaker: caption".
+void PlayVoiceline(const std::string& asset);
+bool ConsumeVoiceline(std::string& outAsset);
+
+// --- Dialogue (deferred; a `.hbdialogue` sequence) --------------------------
+// A schematic starts a conversation; the engine loads it and runs the lines
+// over time (each shows its caption + plays its clip). Latest request wins.
+void PlayDialogue(const std::string& asset);
+bool ConsumeDialogue(std::string& outAsset);
+
+// --- Cutscene (deferred; a `.hbcutscene` timeline) --------------------------
+// A schematic starts a cinematic; the engine takes over the camera and runs
+// the camera/animation/dialogue tracks over time. Latest request wins.
+void PlayCutscene(const std::string& asset);
+bool ConsumeCutscene(std::string& outAsset);
+
+// --- UI panel commands (deferred) --------------------------------------------
+// Schematic UI nodes drive the panel stack through these; the engine (which owns
+// the UIManager) drains the queue each frame, in order (Push then Pop matters).
+struct UICommand {
+    enum class Op : u8 { Show, Push, Pop };
+    Op op = Op::Show;
+    std::string panel; // UIPanel.name (unused for Pop)
+};
+void QueueUICommand(UICommand cmd);
+bool ConsumeUICommand(UICommand& out);
+
 // --- Run-state save/load (objectives + checkpoints) -------------------------
 // The SCENE snapshot is saved by the engine; this is just the gameplay bookkeeping.
 std::string SerializeState();

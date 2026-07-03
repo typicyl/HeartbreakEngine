@@ -86,6 +86,9 @@ struct BuildSettings {
     // the primary monitor with no chrome); width/height then size the swapchain
     // only when windowed. The editor is always windowed.
     bool fullscreen = true;
+    // Present with vsync (default). Off = uncapped frame rate (tearing allowed);
+    // --vsync/--novsync override on the command line.
+    bool vsync = true;
     // Ship cooked .uap packs only (no loose Assets/ folder in the build).
     bool packAssets = true;
     // LZMS-compress pack contents (smaller packs, slower cook).
@@ -117,16 +120,17 @@ struct AudioBusSetting {
 struct ProjectSettings {
     std::string name = "Untitled";
     std::string startupScene; // relative path under Assets (optional)
-    // Game-flow scenes (relative to Assets). The runtime boots to the main menu
-    // when set; "Play" shows the loading scene while the gameplay scene/level
-    // (startupScene) streams in, then loads the HUD. All optional.
-    std::string mainMenuScene;
-    std::string hudScene;
-    std::string loadingScene; // GAME loading (respawn/restart/Play); has a ProgressBar
     // Studio/boot splash shown once at startup while the engine warms up (backend
-    // pick, GPU/audio probe, shader warmup). Can display live info via {backend}/
-    // {gpu}/{audio}/{version}/{progress} text tokens; has a ProgressBar.
+    // pick, GPU/audio probe, shader warmup). Rendered BEFORE the UI scene exists,
+    // so it stays a standalone scene. Can display live info via {backend}/{gpu}/
+    // {audio}/{version}/{progress} text tokens; has a ProgressBar.
     std::string studioLoadingScene;
+    // THE game UI: one persistent scene holding ALL screens as UIPanel subtrees
+    // (MainMenu / Settings / HUD / Pause / Loading). Loaded once at boot, kept
+    // resident across gameplay scene swaps; the UIManager shows/hides panels.
+    // The "Loading" panel (with a ProgressBar) is driven by the engine during
+    // level loads. Empty = no menus: the runtime boots straight into startupScene.
+    std::string uiScene;
     BuildSettings build;
     // Project-wide sky/lighting (applied by scene::SetupEnvironment).
     EnvironmentSettings environment;

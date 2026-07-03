@@ -134,6 +134,12 @@ cbuffer ObjectConstants : register(b1)
     uint4    gSplatMR;
     float4   gSplatRough;   // 4 layers' roughness FACTOR (multiplies the MR map's green,
                             // or IS the roughness when a layer has no MR map)
+    // GPU instancing: when gInstanced != 0 the VS replaces gModel/gNormalMatrix/
+    // gPrevModel with gInstances[(gInstanceBase + SV_InstanceID)*3 + {0,1,2}].
+    // Zero-init (the C++ ObjectCB default) keeps every single-draw byte-compatible.
+    uint     gInstanced;
+    uint     gInstanceBase; // first instance's slot in gInstances (in instances)
+    uint2    _padInstanced;
 };
 
 // Per-frame joint palettes (every skinned draw appends its global*inverseBind
@@ -141,6 +147,12 @@ cbuffer ObjectConstants : register(b1)
 //   D3D12 : root SRV at t0, space1.
 //   Vulkan: storage buffer at set 0 binding 3.
 [[vk::binding(3, 0)]] StructuredBuffer<float4x4> gBones : register(t0, space1);
+
+// Per-frame instance transforms (3 matrices per instance: model, normalMatrix,
+// prevModel), appended per instanced run; gInstanceBase indexes the run's slice.
+//   D3D12 : root SRV at t1, space1.
+//   Vulkan: storage buffer at set 0 binding 4.
+[[vk::binding(4, 0)]] StructuredBuffer<float4x4> gInstances : register(t1, space1);
 
 // Material feature flags (must match rhi::MaterialFlags).
 #define HBE_MAT_SUBSURFACE  1u
@@ -223,26 +235,39 @@ float3 SampleGiVolume(float3 P, float3 N)
         if (tw <= 0.0f) continue;
         uint cell = uint(c.x + c.y * gGiDims.x + c.z * gGiDims.x * gGiDims.y);
         float3 cellPos = gGiOrigin + float3(c) * spacing;
-        // DDGI depth visibility: the cell stored its distance to geometry in every
-        // direction; if the surface is FARTHER than that, a wall is between them ->
-        // the cell can't light this surface, skip it (no leak).
+        // DDGI depth visibility: the cell baked its distance to geometry in every
+        // direction; if the surface sits FARTHER than that, a wall is between them,
+        // so the cell can't light this surface. Use the SOFT Chebyshev test (the
+        // reason the bake stores distance^2 in .g) rather than a hard cull: a binary
+        // continue snaps a corner probe on/off as the surface point crosses each cell
+        // boundary, and that discontinuity is exactly what makes the volume show up
+        // as world-aligned CUBES (worst in shadow, where indirect light dominates).
+        float visWeight = 1.0f;
         if (gGiDepthIndex != 0u)
         {
             float2 oct = GiOctEncode(normalize(P - cellPos));
             int ox = clamp(int(oct.x * 8.0f), 0, 7);
             int oy = clamp(int(oct.y * 8.0f), 0, 7);
-            float r = SampleBindlessLod(gGiDepthIndex,
+            float2 moments = SampleBindlessLod(gGiDepthIndex,
                                         float2((oy * 8 + ox + 0.5f) / 64.0f,
                                                (cell + 0.5f) / float(cellCount)),
-                                        0.0f).r;
-            float bias = max(spacing.x, max(spacing.y, spacing.z)) * 0.5f;
-            if (length(P - cellPos) > r + bias) continue;
+                                        0.0f).rg; // .x = mean dist, .y = mean(dist^2)
+            float bias = max(spacing.x, max(spacing.y, spacing.z)) * 0.25f;
+            float dist = length(P - cellPos) - bias;
+            if (dist > moments.x)
+            {
+                float variance = max(abs(moments.x * moments.x - moments.y), 2e-4f);
+                float d = dist - moments.x;
+                float cheb = variance / (variance + d * d); // [0,1], smooth
+                visWeight = cheb * cheb * cheb;             // sharpen (DDGI convention)
+            }
         }
         float3 toCell = cellPos - P;
         // Front-facing term: a cell behind / perpendicular to the surface (e.g.
         // across a wall or above a ceiling) contributes little.
         float vis = saturate(dot(N, normalize(toCell + N * 1e-3f)) + 0.15f);
-        float w = tw * vis * vis;
+        float w = tw * vis * vis * visWeight;
+        if (w <= 0.0f) continue;
         sum += max(GiCellIrradiance(cell, cellCount, N), 0.0f) * w;
         wsum += w;
     }
@@ -344,9 +369,13 @@ float ShadowFactor(float3 positionWS, float NdotL)
     return 1.0f;
 }
 
-// Cheap 1-tap directional shadow (no 3x3 PCF). Per-step PCF inside a ray-march
-// (volumetric fog god-rays) is hugely wasteful - 9 taps x N steps per pixel - and a
-// single comparison reads nearly identical once the march is dithered + accumulated.
+// Soft directional shadow for the volumetric-fog ray-march. A single HARD tap
+// (returning 0 or 1) makes the shadow map's texels project into the fog as blocky
+// god-ray CUBES - worst at half-res fog with a coarse step count, and the reason
+// the fog reads as cubes on shadowed surfaces. A small ROTATED 4-tap PCF turns
+// those hard texel edges into smooth gradients while staying far cheaper than the
+// surface 3x3 (4 taps, only at fog resolution). The per-position rotation keeps
+// the softened result from revealing a fixed grid.
 float ShadowFactorCheap(float3 positionWS)
 {
     if (gShadowMapIndex == 0 || gCascadeCount == 0)
@@ -365,9 +394,26 @@ float ShadowFactorCheap(float3 positionWS)
             ndc.z <= 0.0f || ndc.z >= 1.0f)
             continue;
         const float bias = 0.0015f * (1.0f + c * 0.5f);
+        const float receiver = ndc.z - bias;
         const float2 tile = float2(c & 1, c >> 1) * 0.5f;
-        const float occluder = SampleBindlessLod(gShadowMapIndex, tile + uv * 0.5f, 0.0f).r;
-        return (ndc.z - bias <= occluder) ? 1.0f : 0.0f;
+        const float2 tileMin = tile + HBE_SHADOW_ATLAS_TEXEL;
+        const float2 tileMax = tile + 0.5f - HBE_SHADOW_ATLAS_TEXEL;
+        const float2 base = tile + uv * 0.5f;
+        // Rotated 4-tap kernel (~2 texels across), angle hashed from world pos.
+        const float ang = frac(sin(dot(positionWS, float3(12.9898f, 78.233f, 37.719f)))
+                               * 43758.5453f) * 6.2831853f;
+        const float2 ox = float2(cos(ang), sin(ang)) * (HBE_SHADOW_ATLAS_TEXEL * 2.0f);
+        const float2 oy = float2(-ox.y, ox.x);
+        float lit = 0.0f;
+        lit += (receiver <= SampleBindlessLod(gShadowMapIndex,
+                    clamp(base + ox + oy, tileMin, tileMax), 0.0f).r) ? 1.0f : 0.0f;
+        lit += (receiver <= SampleBindlessLod(gShadowMapIndex,
+                    clamp(base + ox - oy, tileMin, tileMax), 0.0f).r) ? 1.0f : 0.0f;
+        lit += (receiver <= SampleBindlessLod(gShadowMapIndex,
+                    clamp(base - ox + oy, tileMin, tileMax), 0.0f).r) ? 1.0f : 0.0f;
+        lit += (receiver <= SampleBindlessLod(gShadowMapIndex,
+                    clamp(base - ox - oy, tileMin, tileMax), 0.0f).r) ? 1.0f : 0.0f;
+        return lit * 0.25f;
     }
     return 1.0f;
 }

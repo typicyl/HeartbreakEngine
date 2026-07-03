@@ -13,6 +13,10 @@ enum class LogLevel { Trace, Info, Warn, Error };
 // safe. Backs the studio/boot screen's {log} token so it reads like a boot console.
 std::string RecentLog(unsigned maxLines = 12);
 
+// Flush every log sink (stdout/stderr + the on-disk log file) right now. Call from a
+// crash handler so the last lines survive a hard termination.
+void FlushLog();
+
 namespace detail {
 // Writes an already-formatted line to the console (and the debugger on Windows).
 void LogWrite(LogLevel level, std::string_view message);

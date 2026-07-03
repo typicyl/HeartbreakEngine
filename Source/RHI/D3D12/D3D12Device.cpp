@@ -240,6 +240,9 @@ struct ObjectCB {
     // gSplat* uint4 block in Common.hlsli). 0 for non-terrain draws.
     glm::uvec4 splatAlbedo{0}; glm::uvec4 splatNormal{0}; glm::uvec4 splatMR{0};
     glm::vec4 splatRough{1.0f}; // 4 layers' roughness factor
+    // GPU instancing (matches gInstanced/gInstanceBase in Common.hlsli). Zero-init
+    // keeps every single draw byte-compatible with the pre-instancing ABI.
+    u32 instanced = 0; u32 instanceBase = 0; u32 _padInst0 = 0; u32 _padInst1 = 0;
 };
 
 u32 BytesPerPixel(Format f) {
@@ -288,6 +291,8 @@ public:
                       const ParticleVertex* additive, u32 addCount) override;
     void DrawScene(const SceneView& view, const DrawItem* items, u32 count) override;
     void DrawUIOverlay(const UIVertex* vertices, u32 count) override;
+    TextureHandle CreateUITarget(u32 width, u32 height) override;
+    void DrawUIToTexture(TextureHandle target, const UIVertex* vertices, u32 count) override;
 
 #if HBE_EDITOR
     bool SupportsUI() const override { return true; }
@@ -348,6 +353,9 @@ private:
     u32 height_ = 0;
     DXGI_FORMAT swapFormat_ = DXGI_FORMAT_R8G8B8A8_UNORM;
     HWND hwnd_ = nullptr;
+    bool vsync_ = true;            // Present interval 1 vs 0 (uncapped)
+    bool tearingSupported_ = false; // DXGI_FEATURE_PRESENT_ALLOW_TEARING
+    u32 swapchainFlags_ = 0;        // creation flags; ResizeBuffers MUST reuse them
 
     D3D12_CPU_DESCRIPTOR_HANDLE currentRtv_{};
     std::string adapterName_ = "Unknown D3D12 Adapter";
@@ -372,9 +380,30 @@ private:
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
     ComPtr<ID3D12PipelineState> uiPSO_; // uses meshRootSig_ (bindless table)
-    static constexpr u64 kUIVertexBufferSize = 1u << 20; // 1 MB/frame (~43k verts)
+    static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~40k verts @ 52 B)
     ComPtr<ID3D12Resource> uiVertexBuffers_[kMaxBackBuffers];
     u8* uiVertexCpu_[kMaxBackBuffers] = {};
+
+    // -- World-space UI (canvas -> texture -> lit quad in the scene) ----------
+    // Same UI pipeline against an R8G8B8A8 target instead of the swapchain. The
+    // targets are TYPELESS resources: UNORM RTV (raw UI shader output) + SRGB SRV
+    // (decoded like an albedo PNG when the mesh pass samples the page).
+    ComPtr<ID3D12PipelineState> uiWorldPSO_;
+    static constexpr u32 kMaxUITargets = 8;
+    ComPtr<ID3D12DescriptorHeap> uiTargetRtvHeap_; // created lazily (kMaxUITargets)
+    struct UITarget {
+        ComPtr<ID3D12Resource> tex;
+        u32 rtvIndex = 0; // slot in uiTargetRtvHeap_
+        u32 w = 0, h = 0;
+        bool inSrvState = true; // resource-state tracking (PSR <-> RTV)
+    };
+    std::unordered_map<u32, UITarget> uiTargets_; // key = bindless slot
+    // Own per-frame vertex buffers with a bump head: the overlay's buffers are
+    // memcpy'd at offset 0 per call, so sharing them would alias (the GPU reads
+    // upload heaps at execute time). Multiple canvases draw per frame.
+    ComPtr<ID3D12Resource> uiWorldVertexBuffers_[kMaxBackBuffers];
+    u8* uiWorldVertexCpu_[kMaxBackBuffers] = {};
+    u64 uiWorldVertexHead_ = 0; // reset in BeginFrame
 
     // -- Particle billboards (world-space, drawn in the HDR pass) -------------
     ComPtr<ID3D12PipelineState> particlePSO_;    // alpha blend
@@ -426,8 +455,10 @@ private:
     ComPtr<ID3D12Resource> dof_;                // depth-of-field result (LDR)
     ComPtr<ID3D12Resource> motionBlur_;         // motion blur result (LDR)
     ComPtr<ID3D12Resource> ssr_;                // screen-space reflections (HDR)
-    ComPtr<ID3D12Resource> ssgi_;               // screen-space GI composite (HDR)
-    ComPtr<ID3D12Resource> volScatter_;         // volumetric fog composite (HDR)
+    ComPtr<ID3D12Resource> ssgi_;               // screen-space GI composite (HDR, full-res)
+    ComPtr<ID3D12Resource> ssgiHalf_;           // SSGI GI-only term at reduced res (upscaled into ssgi_)
+    ComPtr<ID3D12Resource> volScatter_;         // volumetric fog composite (HDR, full-res)
+    ComPtr<ID3D12Resource> volHalf_;            // fog (inscatter+transmittance) at reduced res
     ComPtr<ID3D12Resource> painterly_;          // painterly stroke pass (HDR)
     ComPtr<ID3D12Resource> painterlyComp_;      // painterly + dynamic-layer crisp composite (HDR)
     ComPtr<ID3D12Resource> adaptedLum_[2];      // auto-exposure adapted luminance (1x1, ping-pong)
@@ -442,7 +473,9 @@ private:
     u32 slotMotionBlur_ = 0;
     u32 slotSsr_ = 0;
     u32 slotSsgi_ = 0;
+    u32 slotSsgiHalf_ = 0;
     u32 slotVol_ = 0;
+    u32 slotVolHalf_ = 0;
     u32 slotPainterly_ = 0;
     u32 slotPainterlyComp_ = 0;
     u32 slotAdaptedLum_[2] = {};
@@ -455,7 +488,7 @@ private:
     ComPtr<ID3D12PipelineState> ssaoPSO_, ssaoBlurPSO_, bloomDownPSO_, bloomUpPSO_,
                                 tonemapPSO_, fxaaPSO_, taaPSO_, dofPSO_, motionBlurPSO_,
                                 ssrPSO_, exposurePSO_, volPSO_, ssgiPSO_, painterlyPSO_,
-                                brushStrokesPSO_, compositePSO_;
+                                brushStrokesPSO_, compositePSO_, applyPSO_;
 
     // Temporal AA: jittered camera each frame + reprojected history accumulation.
     bool taaReady_ = false;          // TAA PSO built (optional; absent = no TAA)
@@ -479,6 +512,7 @@ private:
     u8*  constantCpu_[kMaxBackBuffers] = {};
     u64  constantHead_ = 0;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> shadowObjAddrs_; // scratch, per frame
+    std::vector<u32> shadowInstanceCounts_; // scratch: instances per run head (1 = single)
 
     // -- Skinning: per-frame joint-palette arena (StructuredBuffer t0,space1) -
     static constexpr u64 kBoneArenaSize = 1u << 22; // 4 MB (~500 skinned draws)
@@ -499,6 +533,29 @@ private:
         boneHead_ += bytes;
         ok = true;
         return offset;
+    }
+
+    // -- GPU instancing: per-frame instance-transform arena (t1, space1) -------
+    // 3 matrices per instance (model, normalMatrix, prevModel); each pass appends
+    // its runs independently (shadow first, then scene - no cross-pass coupling).
+    static constexpr u64 kInstanceArenaSize = 1u << 22; // 4 MB (~21k instances)
+    ComPtr<ID3D12Resource> instanceArenas_[kMaxBackBuffers];
+    u8*  instanceCpu_[kMaxBackBuffers] = {};
+    u64  instanceHead_ = 0;
+    // Reserves `count` instances; returns the base INSTANCE index for
+    // ObjectCB::instanceBase and a write pointer, or ok=false when full.
+    glm::mat4* AllocInstances(u32 count, u32& outBase, bool& ok) {
+        const u64 bytes = static_cast<u64>(count) * 3u * sizeof(glm::mat4);
+        if (instanceHead_ + bytes > kInstanceArenaSize) {
+            ok = false;
+            outBase = 0;
+            return nullptr;
+        }
+        outBase = static_cast<u32>(instanceHead_ / (3u * sizeof(glm::mat4)));
+        glm::mat4* dst = reinterpret_cast<glm::mat4*>(instanceCpu_[frameIndex_] + instanceHead_);
+        instanceHead_ += bytes;
+        ok = true;
+        return dst;
     }
 
     std::vector<GpuMesh> meshes_;
@@ -574,6 +631,7 @@ bool D3D12Device::Initialize(const RenderDeviceDesc& desc) {
     hwnd_ = static_cast<HWND>(desc.windowHandle);
     width_ = desc.width;
     height_ = desc.height;
+    vsync_ = desc.vsync;
     backBufferCount_ = (desc.backBufferCount < 2) ? 2
                       : (desc.backBufferCount > kMaxBackBuffers ? kMaxBackBuffers
                                                                 : desc.backBufferCount);
@@ -613,12 +671,34 @@ bool D3D12Device::Initialize(const RenderDeviceDesc& desc) {
         if (ad.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
         if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
                                         IID_PPV_ARGS(&device_)))) {
-            adapterName_ = WideToUtf8(ad.Description);
-            break;
+            // The engine's shaders are Shader Model 6.5 and it binds textures through a
+            // large bindless table (resource binding tier 2+). A GPU that makes an
+            // FL 11_0 device but lacks these would CREATE fine here, then CRASH later at
+            // PSO creation / the bindless heap - which on a bare machine looks like a
+            // silent quit right after boot. Verify up front and skip the adapter if it
+            // can't meet them, so the boot fallback moves on with a clear reason.
+            D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_5};
+            D3D12_FEATURE_DATA_D3D12_OPTIONS opt{};
+            const bool smOk =
+                SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) &&
+                sm.HighestShaderModel >= D3D_SHADER_MODEL_6_5;
+            const bool tierOk =
+                SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &opt, sizeof(opt))) &&
+                opt.ResourceBindingTier >= D3D12_RESOURCE_BINDING_TIER_2;
+            if (smOk && tierOk) {
+                adapterName_ = WideToUtf8(ad.Description);
+                break;
+            }
+            HBE_WARN("[D3D12] Adapter '{}' lacks required features (Shader Model 6.5: {}, "
+                     "resource binding tier >= 2: {}); skipping.",
+                     WideToUtf8(ad.Description), smOk, tierOk);
+            device_.Reset();
         }
     }
     if (!device_) {
-        HBE_ERROR("[D3D12] No Direct3D 12 capable adapter found.");
+        HBE_ERROR("[D3D12] No Direct3D 12 adapter meets the engine's requirements "
+                  "(Shader Model 6.5 + bindless resource binding tier 2). The GPU/driver "
+                  "may be too old - update the graphics driver, or use --vulkan / --opengl.");
         return false;
     }
     HBE_INFO("[D3D12] Adapter: {}", adapterName_);
@@ -627,6 +707,21 @@ bool D3D12Device::Initialize(const RenderDeviceDesc& desc) {
     qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     qd.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
     HR_CHECK(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "CreateCommandQueue");
+
+    // Tearing (uncapped present) support: required for Present(0) with
+    // ALLOW_TEARING on flip-model swapchains. Borderless-only engine -> legal.
+    {
+        ComPtr<IDXGIFactory5> f5;
+        BOOL allow = FALSE;
+        if (SUCCEEDED(factory_.As(&f5)) &&
+            SUCCEEDED(f5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow,
+                                              sizeof(allow)))) {
+            tearingSupported_ = allow == TRUE;
+        }
+        if (!vsync_ && !tearingSupported_)
+            HBE_WARN("[D3D12] vsync off requested but tearing unsupported; presents "
+                     "will still wait for vblank.");
+    }
 
     DXGI_SWAP_CHAIN_DESC1 scd{};
     scd.Width = width_;
@@ -638,6 +733,10 @@ bool D3D12Device::Initialize(const RenderDeviceDesc& desc) {
     scd.Scaling = DXGI_SCALING_STRETCH;
     scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
+    // NOTE: swapchainFlags_ must ALSO be passed to every ResizeBuffers call, or
+    // resize fails with E_INVALIDARG.
+    swapchainFlags_ = tearingSupported_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    scd.Flags = swapchainFlags_;
 
     ComPtr<IDXGISwapChain1> sc1;
     HR_CHECK(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd_, &scd, nullptr, nullptr, &sc1),
@@ -747,6 +846,8 @@ void D3D12Device::BeginFrame() {
     cmdList_->Reset(allocators_[frameIndex_].Get(), nullptr);
     constantHead_ = 0;
     boneHead_ = 0;
+    instanceHead_ = 0;
+    uiWorldVertexHead_ = 0; // world-UI canvases bump-allocate here across the frame
 
     if (!viewportReady_) {
         // Legacy direct-to-swapchain path (no editor viewport).
@@ -851,7 +952,10 @@ void D3D12Device::EndFrame() {
     ID3D12CommandList* lists[] = {cmdList_.Get()};
     queue_->ExecuteCommandLists(1, lists);
 
-    const HRESULT pr = swapchain_->Present(1, 0); // vsync on
+    // Vsync on = interval 1; off = interval 0 + ALLOW_TEARING (when supported) so
+    // presents never wait for vblank and real frame rates are measurable.
+    const HRESULT pr = swapchain_->Present(
+        vsync_ ? 1 : 0, (!vsync_ && tearingSupported_) ? DXGI_PRESENT_ALLOW_TEARING : 0);
     if (FAILED(pr)) {
         // A device removal/hang (e.g. a TDR after a bad draw) otherwise looks
         // like a freeze while the CPU loop spins at thousands of "FPS": shout
@@ -901,7 +1005,10 @@ void D3D12Device::Resize(u32 width, u32 height) {
         backBuffers_[i].Reset();
     }
 
-    HRESULT hr = swapchain_->ResizeBuffers(backBufferCount_, width, height, swapFormat_, 0);
+    // Must pass the swapchain's CREATION flags (ALLOW_TEARING) or this fails
+    // with E_INVALIDARG.
+    HRESULT hr = swapchain_->ResizeBuffers(backBufferCount_, width, height, swapFormat_,
+                                           swapchainFlags_);
     if (FAILED(hr)) {
         HBE_ERROR("[D3D12] ResizeBuffers failed (hr=0x{:08X})", static_cast<u32>(hr));
         return;
@@ -981,6 +1088,15 @@ bool D3D12Device::CreateConstantArenas() {
         void* boneMapped = nullptr;
         HR_CHECK(boneArenas_[i]->Map(0, &noRead, &boneMapped), "Map(BoneArena)");
         boneCpu_[i] = static_cast<u8*>(boneMapped);
+
+        instanceArenas_[i] = CreateUploadBuffer(device_.Get(), kInstanceArenaSize);
+        if (!instanceArenas_[i]) {
+            HBE_ERROR("[D3D12] Failed to create instance arena {}", i);
+            return false;
+        }
+        void* instMapped = nullptr;
+        HR_CHECK(instanceArenas_[i]->Map(0, &noRead, &instMapped), "Map(InstanceArena)");
+        instanceCpu_[i] = static_cast<u8*>(instMapped);
     }
     return true;
 }
@@ -1207,7 +1323,7 @@ bool D3D12Device::CreateMeshPipeline() {
     srvRange.RegisterSpace = 0;
     srvRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER params[4] = {};
+    D3D12_ROOT_PARAMETER params[5] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1227,6 +1343,11 @@ bool D3D12Device::CreateMeshPipeline() {
     params[3].Descriptor.ShaderRegister = 0;
     params[3].Descriptor.RegisterSpace = 1;
     params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    // Instance transforms (StructuredBuffer<float4x4> gInstances, t1 space1).
+    params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[4].Descriptor.ShaderRegister = 1;
+    params[4].Descriptor.RegisterSpace = 1;
+    params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
     // Static samplers: s0 = anisotropic wrap (materials), s1 = linear clamp
     // (post-process sampling; wrap would bleed opposite screen edges).
@@ -1251,7 +1372,7 @@ bool D3D12Device::CreateMeshPipeline() {
     samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 4;
+    rsDesc.NumParameters = 5;
     rsDesc.pParameters = params;
     rsDesc.NumStaticSamplers = 2;
     rsDesc.pStaticSamplers = samplers;
@@ -1542,6 +1663,8 @@ bool D3D12Device::CreateMeshPipeline() {
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                 {"TEXCOORD", 1, DXGI_FORMAT_R32_UINT, 0, 32,
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+                {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 36,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // NDC clip rect
             };
             D3D12_GRAPHICS_PIPELINE_STATE_DESC ui = pso; // inherit, then adjust
             ui.pRootSignature = meshRootSig_.Get();
@@ -1564,6 +1687,20 @@ bool D3D12Device::CreateMeshPipeline() {
             uiRt.SrcBlendAlpha = D3D12_BLEND_ONE;
             uiRt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
             ok = SUCCEEDED(device_->CreateGraphicsPipelineState(&ui, IID_PPV_ARGS(&uiPSO_)));
+
+            // World-UI variant: the SAME UI pipeline against an R8G8B8A8_UNORM
+            // canvas texture instead of the swapchain (world canvases render to
+            // texture, then a lit quad in the scene shows it). Failure here only
+            // disables world-space canvases, never the overlay.
+            if (ok) {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC uiw = ui;
+                uiw.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                if (FAILED(device_->CreateGraphicsPipelineState(
+                        &uiw, IID_PPV_ARGS(&uiWorldPSO_)))) {
+                    HBE_WARN("[D3D12] world-UI pipeline unavailable.");
+                    uiWorldPSO_.Reset();
+                }
+            }
         }
         for (u32 i = 0; ok && i < backBufferCount_; ++i) {
             uiVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kUIVertexBufferSize);
@@ -1573,6 +1710,23 @@ bool D3D12Device::CreateMeshPipeline() {
                 void* mapped = nullptr;
                 ok = SUCCEEDED(uiVertexBuffers_[i]->Map(0, &noRead, &mapped));
                 uiVertexCpu_[i] = static_cast<u8*>(mapped);
+            }
+        }
+        // World-UI vertex buffers: SEPARATE from the overlay's (which memcpy at
+        // offset 0 per call and would alias) - bump-allocated across the frame.
+        for (u32 i = 0; uiWorldPSO_ && i < backBufferCount_; ++i) {
+            uiWorldVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kUIVertexBufferSize);
+            bool wok = uiWorldVertexBuffers_[i] != nullptr;
+            if (wok) {
+                D3D12_RANGE noRead{0, 0};
+                void* mapped = nullptr;
+                wok = SUCCEEDED(uiWorldVertexBuffers_[i]->Map(0, &noRead, &mapped));
+                uiWorldVertexCpu_[i] = static_cast<u8*>(mapped);
+            }
+            if (!wok) {
+                HBE_WARN("[D3D12] world-UI vertex buffers unavailable.");
+                uiWorldPSO_.Reset();
+                break;
             }
         }
         if (!ok) {
@@ -1847,6 +2001,9 @@ bool D3D12Device::CreatePostPipelines() {
     // Dynamic-layer composite: lerp painterly vs crisp lit colour by the HDR-alpha mask.
     makePso(L"PainterlyComposite", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
             DXGI_FORMAT_UNKNOWN, compositePSO_);
+    // Reduced-res effect composite (SSGI GI / fog) upscaled back over the full-res HDR.
+    ok = ok && makePso(L"ApplyHalfRes", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+                       DXGI_FORMAT_UNKNOWN, applyPSO_);
 
     // Brush-stroke splat: instanced oriented quads, straight-alpha blended over
     // the painterly base. Custom VS (no fullscreen triangle) so it needs its own
@@ -1886,7 +2043,7 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         // base 4 + bloom + 2 TAA history + DoF + motion blur + SSR + 2 lum +
         // G-buffer + velocity + volumetric + SSGI + painterly.
-        hd.NumDescriptors = 17 + kBloomMaxMips; // +1 for the painterly composite RTV
+        hd.NumDescriptors = 19 + kBloomMaxMips; // +painterly composite +ssgiHalf +volHalf RTVs
         HR_CHECK(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&postRtvHeap_)),
                  "CreateDescriptorHeap(postRTV)");
         postRtvSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -1901,13 +2058,15 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     // Reserve the bindless slots once; resizes rewrite the same descriptors so
     // shader-visible indices stay stable.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 18 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 20 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
         slotVelocity_ = bindlessNextSlot_++;
         slotVol_ = bindlessNextSlot_++;
+        slotVolHalf_ = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
+        slotSsgiHalf_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
         slotPainterlyComp_ = bindlessNextSlot_++;
         slotSsaoRaw_ = bindlessNextSlot_++;
@@ -2060,10 +2219,25 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 13 + kBloomMaxMips,
                        slotVol_, nullptr, volScatter_))
             return false;
+        // Fog (inscatter+transmittance) at QUARTER res - fog is very low-frequency, so
+        // HALF-res (was quarter): the march's per-step sun-shadow is world-scale
+        // blocky at grazing sun angles; quarter-res made the blocks obvious.
+        // Half-res + the bilateral upscale reads smooth, and the fog march is
+        // cheap enough that 4x the pixels is still a small pass.
+        const u32 hw = (width + 1u) / 2u, hh = (height + 1u) / 2u;
+        if (!makeColor(hw, hh, DXGI_FORMAT_R16G16B16A16_FLOAT, 18 + kBloomMaxMips, slotVolHalf_,
+                       nullptr, volHalf_))
+            return false;
     }
     if (ssgiReady_) { // HDR (indirect bounce composited before bloom)
         if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 14 + kBloomMaxMips,
                        slotSsgi_, nullptr, ssgi_))
+            return false;
+        // GI-only term at QUARTER res (GI is very low-frequency + TAA-denoised, so a
+        // 1/4-res gather + bilinear upscale is near-lossless and ~16x cheaper).
+        const u32 qw = (width + 3u) / 4u, qh = (height + 3u) / 4u;
+        if (!makeColor(qw, qh, DXGI_FORMAT_R16G16B16A16_FLOAT, 17 + kBloomMaxMips, slotSsgiHalf_,
+                       nullptr, ssgiHalf_))
             return false;
     }
     if (painterlyReady_) { // HDR (brush-stroke repaint before bloom/tonemap)
@@ -2155,32 +2329,64 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         hdrInput = slotSsr_;
     }
 
-    // --- Screen-space GI: one indirect diffuse bounce (composited into HDR) ---
+    // --- Screen-space GI: gathered at REDUCED res, then upscaled + added over the
+    //     full-res HDR. The SSGI shader outputs the GI term only (a=1); ApplyHalfRes
+    //     does scene + GI. GI is low-frequency + TAA-denoised, so ~16x cheaper is
+    //     near-lossless. -------------------------------------------------------------
     if (view.post.ssgiEnabled && ssgiReady_) {
+        const u32 qw = (sceneW_ + 3u) / 4u, qh = (sceneH_ + 3u) / 4u;
+        const glm::vec2 giTexel(1.0f / qw, 1.0f / qh);
         PostCB cb;
-        cb.input0 = hdrInput;
+        cb.input0 = hdrInput;   // full-res lit HDR = the ray-march gather source
         cb.input1 = slotGbuffer_;
         cb.input2 = slotDepth_;
-        cb.outTexel = sceneTexel;
+        cb.outTexel = giTexel;  // rasterize GI at reduced res
         cb.inTexel = sceneTexel;
         cb.params0 = {ps.ssgiIntensity, ps.ssgiRadius, static_cast<f32>(ps.ssgiSamples), 1.0f};
-        DrawPostPass(ssgiPSO_.Get(), ssgi_.Get(), rtvAt(14 + kBloomMaxMips), sceneW_, sceneH_, cb);
+        DrawPostPass(ssgiPSO_.Get(), ssgiHalf_.Get(), rtvAt(17 + kBloomMaxMips), qw, qh, cb);
+        // Upscale + add: scene + GI -> full-res HDR.
+        PostCB ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotSsgiHalf_;
+        ap.outTexel = sceneTexel;
+        ap.inTexel = sceneTexel;
+        DrawPostPass(applyPSO_.Get(), ssgi_.Get(), rtvAt(14 + kBloomMaxMips), sceneW_, sceneH_, ap);
         hdrInput = slotSsgi_;
     }
 
-    // --- Volumetric fog + light scattering (composited into HDR before bloom) -
+    // --- Volumetric fog: marched at HALF res (inscatter+transmittance), then upscaled
+    //     + applied over the full-res HDR (scene*transmittance + inscatter). Fog is
+    //     smooth, so half-res is near-lossless and ~4x cheaper. ---------------------
     if (view.post.fogEnabled && volReady_) {
+        const u32 hw = (sceneW_ + 1u) / 2u, hh = (sceneH_ + 1u) / 2u; // half res (matches volHalf_)
+        const glm::vec2 fogTexel(1.0f / hw, 1.0f / hh);
         PostCB cb;
-        cb.input0 = hdrInput;
+        cb.input0 = hdrInput;   // (unused by the fog shader now; bound defensively)
         cb.input2 = slotDepth_;
-        cb.outTexel = sceneTexel;
+        cb.outTexel = fogTexel; // march fog at reduced res
         cb.inTexel = sceneTexel;
         cb.params0 = {ps.fogDensity, ps.fogHeightFalloff, ps.fogAnisotropy,
                       static_cast<f32>(ps.fogStepCount)};
         cb.params1 = {ps.fogSunIntensity, ps.fogHeight, ps.fogMaxDistance, ps.fogAmbient};
         cb.params2 = {ps.fogColor.x, ps.fogColor.y, ps.fogColor.z, ps.fogGodRays};
-        DrawPostPass(volPSO_.Get(), volScatter_.Get(), rtvAt(13 + kBloomMaxMips), sceneW_, sceneH_,
-                     cb);
+        // Animated dither frame index (TAA integrates it into smooth fog); 0 = static
+        // IGN when TAA is off, so the noise never crawls without temporal filtering.
+        cb.params3.x = ps.taaEnabled
+                           ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f)
+                           : 0.0f;
+        DrawPostPass(volPSO_.Get(), volHalf_.Get(), rtvAt(18 + kBloomMaxMips), hw, hh, cb);
+        // Upscale + apply: scene * transmittance + inscatter -> full-res HDR. Low-pass
+        // the fog buffer here (inTexel = fog's quarter-res texel, params0.x = radius) so
+        // the world-scale sun-shadow blocks smooth out instead of reading as cubes.
+        PostCB ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotVolHalf_;
+        ap.input2 = slotDepth_;     // depth for the bilateral (no silhouette bleed)
+        ap.outTexel = sceneTexel;
+        ap.inTexel = fogTexel;      // blur offsets in fog (half-res) texels
+        ap.params0 = {1.5f, 0.0f, 0.0f, 0.0f}; // fog blur radius (texels); 0 = crisp (SSGI)
+        DrawPostPass(applyPSO_.Get(), volScatter_.Get(), rtvAt(13 + kBloomMaxMips), sceneW_, sceneH_,
+                     ap);
         hdrInput = slotVol_;
     }
 
@@ -2214,6 +2420,8 @@ void D3D12Device::RunPostStack(const SceneView& view) {
 
         // --- Real brush strokes: splat instanced oriented quads over the base --
         // Runs when global strokes are on OR any censor is active (censor-only mode).
+        // Object-anchored + time-quantized "boil" (the strokes stay glued to the object
+        // and re-paint in discrete steps - see BrushStrokes.hlsl); rendered every frame.
         if ((ps.painterlyStrokes || nCensor > 0) && brushStrokesReady_) {
             auto toRT = TransitionBarrier(painterly_.Get(),
                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
@@ -2260,12 +2468,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                 cb2.input3 = slotHdr_;   // forward HDR alpha = the per-pixel censored flag
                 cb2.outTexel = sceneTexel;
                 cb2.inTexel = sceneTexel;
-                // sizeJit sign flags the VS to SCREEN-ANCHOR the strokes (hold their
-                // screen positions, don't glide with the camera) when boil is on; the
-                // magnitude (0.35) is the size jitter either way.
-                cb2.params0 = {lenPx, widthFrac,
-                               (ps.painterlyStrokeBoil > 0.01f) ? -0.35f : 0.35f,
-                               ps.painterlyStrength};
+                cb2.params0 = {lenPx, widthFrac, 0.35f, ps.painterlyStrength};
                 cb2.params1 = {ps.painterlyStrokeSharp, ps.painterlyEdge, 0.30f,
                                std::max(ps.painterlyStrokeDetail * 2.0f, 0.25f)};
                 cb2.params2 = {static_cast<f32>(cols), static_cast<f32>(rows),
@@ -2513,12 +2716,17 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
     // Skinned items upload their joint palette here too (reused by DrawScene).
     cmdList_->SetGraphicsRootShaderResourceView(
         3, boneArenas_[frameIndex_]->GetGPUVirtualAddress());
+    cmdList_->SetGraphicsRootShaderResourceView(
+        4, instanceArenas_[frameIndex_]->GetGPUVirtualAddress());
     shadowObjAddrs_.clear();
     shadowObjAddrs_.resize(count, 0);
     shadowBoneOffsets_.clear();
     shadowBoneOffsets_.resize(count, UINT32_MAX); // MAX = not uploaded
+    shadowInstanceCounts_.clear();
+    shadowInstanceCounts_.resize(count, 1);
     for (u32 i = 0; i < count; ++i) {
         const DrawItem& it = items[i];
+        if (it.instanceRun == 0) continue; // consumed by a run head (no CB = skipped)
         if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) continue;
         if (it.materialFlags & MaterialFlag_NoShadow) continue; // doesn't cast a shadow
         D3D12_GPU_VIRTUAL_ADDRESS objAddr = 0;
@@ -2533,6 +2741,25 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
                     ocb.boneOffset = offset;
                     ocb.boneCount = it.boneCount;
                     shadowBoneOffsets_[i] = offset;
+                }
+            }
+            // Instanced run head: upload the whole run's transforms once; the
+            // cascade loops then draw the group with one call each. Depth-only
+            // pass: the normal/prev matrices are never read, so skip the
+            // inverse-transpose (write model into all three slots).
+            if (it.instanceRun > 1) {
+                bool iok = false;
+                u32 base = 0;
+                if (glm::mat4* inst = AllocInstances(it.instanceRun, base, iok); iok) {
+                    for (u32 k = 0; k < it.instanceRun; ++k) {
+                        const DrawItem& run = items[i + k];
+                        inst[k * 3 + 0] = run.transform;
+                        inst[k * 3 + 1] = run.transform;
+                        inst[k * 3 + 2] = run.transform;
+                    }
+                    ocb.instanced = 1;
+                    ocb.instanceBase = base;
+                    shadowInstanceCounts_[i] = it.instanceRun;
                 }
             }
             std::memcpy(dst, &ocb, sizeof(ocb));
@@ -2562,14 +2789,18 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
             cmdList_->SetGraphicsRootConstantBufferView(0, frameAddr);
         }
 
+        u32 lastMesh = 0; // consecutive same-mesh draws skip the IA rebinds
         for (u32 i = 0; i < count; ++i) {
             const DrawItem& it = items[i];
-            if (!shadowObjAddrs_[i]) continue;
+            if (!shadowObjAddrs_[i]) continue; // no CB = NoShadow or run-consumed
             const GpuMesh& gm = meshes_[it.mesh.id - 1];
             cmdList_->SetGraphicsRootConstantBufferView(1, shadowObjAddrs_[i]);
-            cmdList_->IASetVertexBuffers(0, 1, &gm.vbv);
-            cmdList_->IASetIndexBuffer(&gm.ibv);
-            cmdList_->DrawIndexedInstanced(gm.indexCount, 1, 0, 0, 0);
+            if (it.mesh.id != lastMesh) {
+                cmdList_->IASetVertexBuffers(0, 1, &gm.vbv);
+                cmdList_->IASetIndexBuffer(&gm.ibv);
+                lastMesh = it.mesh.id;
+            }
+            cmdList_->DrawIndexedInstanced(gm.indexCount, shadowInstanceCounts_[i], 0, 0, 0);
         }
     }
 
@@ -2741,6 +2972,8 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
     cmdList_->SetGraphicsRootDescriptorTable(2, bindlessHeap_->GetGPUDescriptorHandleForHeapStart());
     cmdList_->SetGraphicsRootShaderResourceView(
         3, boneArenas_[frameIndex_]->GetGPUVirtualAddress());
+    cmdList_->SetGraphicsRootShaderResourceView(
+        4, instanceArenas_[frameIndex_]->GetGPUVirtualAddress());
 
     // Temporal AA: jitter the camera sub-pixel each frame so successive frames
     // sample different positions; the TAA resolve reprojects + accumulates them.
@@ -2816,10 +3049,12 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         cmdList_->SetGraphicsRootConstantBufferView(0, frameAddr);
     }
 
+    u32 lastSceneMesh = 0; // consecutive same-mesh draws skip the IA rebinds
     const auto drawItem = [&](u32 i) {
         const DrawItem& it = items[i];
         if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) return;
         const GpuMesh& gm = meshes_[it.mesh.id - 1];
+        u32 instances = 1; // >1 when this is an instanced run head
 
         D3D12_GPU_VIRTUAL_ADDRESS objAddr = 0;
         if (void* dst = AllocConstants(sizeof(ObjectCB), objAddr)) {
@@ -2890,18 +3125,43 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
                 if (pok) ocb.prevBoneOffset = prevOff;
             }
 
+            // Instanced run head: upload the whole run's transforms and draw the
+            // group in ONE call (followers were skipped by the loop below).
+            if (it.instanceRun > 1) {
+                bool iok = false;
+                u32 base = 0;
+                if (glm::mat4* inst = AllocInstances(it.instanceRun, base, iok); iok) {
+                    for (u32 k = 0; k < it.instanceRun; ++k) {
+                        const DrawItem& run = items[i + k];
+                        inst[k * 3 + 0] = run.transform;
+                        inst[k * 3 + 1] = glm::mat4(
+                            glm::transpose(glm::inverse(glm::mat3(run.transform))));
+                        inst[k * 3 + 2] = run.prevTransform;
+                    }
+                    ocb.instanced = 1;
+                    ocb.instanceBase = base;
+                    instances = it.instanceRun;
+                }
+            }
+
             std::memcpy(dst, &ocb, sizeof(ocb));
             cmdList_->SetGraphicsRootConstantBufferView(1, objAddr);
         }
 
-        cmdList_->IASetVertexBuffers(0, 1, &gm.vbv);
-        cmdList_->IASetIndexBuffer(&gm.ibv);
-        cmdList_->DrawIndexedInstanced(gm.indexCount, 1, 0, 0, 0);
+        if (it.mesh.id != lastSceneMesh) {
+            cmdList_->IASetVertexBuffers(0, 1, &gm.vbv);
+            cmdList_->IASetIndexBuffer(&gm.ibv);
+            lastSceneMesh = it.mesh.id;
+        }
+        cmdList_->DrawIndexedInstanced(gm.indexCount, instances, 0, 0, 0);
     };
 
-    // Opaque pass (transparent items deferred to the blended pass below).
+    // Opaque pass (transparent items deferred to the blended pass below; items
+    // consumed by an instanced run head are skipped - the head draws them).
     for (u32 i = 0; i < count; ++i)
-        if (!(items[i].materialFlags & MaterialFlag_Transparent)) drawItem(i);
+        if (items[i].instanceRun != 0 &&
+            !(items[i].materialFlags & MaterialFlag_Transparent))
+            drawItem(i);
 
     // Sky background: after opaques so the depth test rejects covered pixels.
     if (drawSky) {
@@ -2999,6 +3259,149 @@ void D3D12Device::DrawUIOverlay(const UIVertex* vertices, u32 count) {
     vbv.StrideInBytes = sizeof(UIVertex);
     cmdList_->IASetVertexBuffers(0, 1, &vbv);
     cmdList_->DrawInstanced(count, 1, 0, 0);
+}
+
+TextureHandle D3D12Device::CreateUITarget(u32 width, u32 height) {
+    if (!uiWorldPSO_ || !bindlessHeap_ || bindlessNextSlot_ >= kMaxBindlessTextures ||
+        width == 0 || height == 0)
+        return {};
+    if (uiTargets_.size() >= kMaxUITargets) {
+        HBE_WARN("[D3D12] world-UI target limit ({}) reached.", kMaxUITargets);
+        return {};
+    }
+    // RTV descriptor heap for the targets, created on first use.
+    if (!uiTargetRtvHeap_) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = kMaxUITargets;
+        if (FAILED(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&uiTargetRtvHeap_))))
+            return {};
+    }
+
+    // TYPELESS resource: UNORM RTV (the UI shader's raw display-space output) +
+    // UNORM_SRGB SRV (hardware sRGB decode when the mesh pass samples the page,
+    // exactly like an albedo PNG). Starts (and is tracked) in the SRV state.
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = width;
+    td.Height = height;
+    td.DepthOrArraySize = 1;
+    td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE clear{};
+    clear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    const D3D12_HEAP_PROPERTIES def = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    ComPtr<ID3D12Resource> tex;
+    if (FAILED(device_->CreateCommittedResource(
+            &def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            &clear, IID_PPV_ARGS(&tex))))
+        return {};
+
+    const u32 slot = bindlessNextSlot_++;
+    D3D12_CPU_DESCRIPTOR_HANDLE sh = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
+    sh.ptr += static_cast<SIZE_T>(slot) * bindlessDescSize_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(tex.Get(), &sv, sh);
+
+    const u32 rtvIndex = static_cast<u32>(uiTargets_.size());
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = uiTargetRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rh.ptr += static_cast<SIZE_T>(rtvIndex) *
+              device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device_->CreateRenderTargetView(tex.Get(), &rv, rh);
+
+    uiTargets_[slot] = UITarget{tex, rtvIndex, width, height, true};
+    slotTextures_[slot] = SlotTexture{tex.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1};
+    textures_.push_back(tex);
+    HBE_INFO("[D3D12] world-UI target {}x{} (slot {}).", width, height, slot);
+    return TextureHandle{slot};
+}
+
+void D3D12Device::DrawUIToTexture(TextureHandle target, const UIVertex* vertices, u32 count) {
+    if (!uiWorldPSO_) return;
+    const auto it = uiTargets_.find(target.index);
+    if (it == uiTargets_.end()) return;
+    UITarget& t = it->second;
+
+    // Bump-allocate this canvas's verts in the frame's world-UI buffer (several
+    // canvases share it; DrawUIOverlay's buffer is NOT reusable - offset-0 memcpy).
+    // count == 0 (or a null vertex pointer) still CLEARS the target below - a
+    // fresh/hidden page must read transparent, never uninitialized garbage.
+    if (!vertices) count = 0;
+    const u64 remaining = kUIVertexBufferSize - uiWorldVertexHead_;
+    const u32 maxVerts = static_cast<u32>(remaining / sizeof(UIVertex));
+    count = std::min(count, maxVerts - maxVerts % 3);
+    if (count > 0) {
+        std::memcpy(uiWorldVertexCpu_[frameIndex_] + uiWorldVertexHead_, vertices,
+                    count * sizeof(UIVertex));
+    }
+
+    if (t.inSrvState) {
+        auto toRt = TransitionBarrier(t.tex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+        cmdList_->ResourceBarrier(1, &toRt);
+        t.inSrvState = false;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = uiTargetRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(t.rtvIndex) *
+               device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    const f32 clear[4] = {0.0f, 0.0f, 0.0f, 0.0f}; // transparent page background
+    cmdList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    cmdList_->ClearRenderTargetView(rtv, clear, 0, nullptr);
+    D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<f32>(t.w), static_cast<f32>(t.h), 0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(t.w), static_cast<LONG>(t.h)};
+    cmdList_->RSSetViewports(1, &vp);
+    cmdList_->RSSetScissorRects(1, &scissor);
+
+    if (count > 0) {
+        cmdList_->SetGraphicsRootSignature(meshRootSig_.Get());
+        ID3D12DescriptorHeap* heaps[] = {bindlessHeap_.Get()};
+        cmdList_->SetDescriptorHeaps(1, heaps);
+        cmdList_->SetGraphicsRootDescriptorTable(
+            2, bindlessHeap_->GetGPUDescriptorHandleForHeapStart());
+        cmdList_->SetPipelineState(uiWorldPSO_.Get());
+        cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        D3D12_VERTEX_BUFFER_VIEW vbv{};
+        vbv.BufferLocation =
+            uiWorldVertexBuffers_[frameIndex_]->GetGPUVirtualAddress() + uiWorldVertexHead_;
+        vbv.SizeInBytes = count * sizeof(UIVertex);
+        vbv.StrideInBytes = sizeof(UIVertex);
+        cmdList_->IASetVertexBuffers(0, 1, &vbv);
+        cmdList_->DrawInstanced(count, 1, 0, 0);
+        uiWorldVertexHead_ += static_cast<u64>(count) * sizeof(UIVertex);
+    }
+
+    // Back to SRV: the scene pass samples the page this same frame.
+    auto toSrv = TransitionBarrier(t.tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmdList_->ResourceBarrier(1, &toSrv);
+    t.inSrvState = true;
+
+    // Restore the main targets for the direct-to-swapchain path (the editor
+    // viewport path re-binds its own targets in ClearBackBuffer).
+    if (!viewportReady_) {
+        D3D12_VIEWPORT mainVp{0.0f, 0.0f, static_cast<f32>(width_), static_cast<f32>(height_),
+                              0.0f, 1.0f};
+        D3D12_RECT mainScissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+        if (dsvHeap_) {
+            const D3D12_CPU_DESCRIPTOR_HANDLE mainDsv =
+                dsvHeap_->GetCPUDescriptorHandleForHeapStart();
+            cmdList_->OMSetRenderTargets(1, &currentRtv_, FALSE, &mainDsv);
+        } else {
+            cmdList_->OMSetRenderTargets(1, &currentRtv_, FALSE, nullptr);
+        }
+        cmdList_->RSSetViewports(1, &mainVp);
+        cmdList_->RSSetScissorRects(1, &mainScissor);
+    }
 }
 
 #if HBE_EDITOR
@@ -3373,6 +3776,8 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
     // previewing a skinned mesh).
     cmdList_->SetGraphicsRootShaderResourceView(
         3, boneArenas_[frameIndex_]->GetGPUVirtualAddress());
+    cmdList_->SetGraphicsRootShaderResourceView(
+        4, instanceArenas_[frameIndex_]->GetGPUVirtualAddress());
     cmdList_->SetPipelineState(meshPSOSingle_.Get()); // single-RT (no G-buffer)
     cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 

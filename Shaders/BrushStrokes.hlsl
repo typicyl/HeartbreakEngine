@@ -89,10 +89,7 @@ struct VSOut {
 VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const float lenPx = gPostParams0.x;
     const float widthFrac = gPostParams0.y;
-    // sizeJit magnitude = size jitter; a NEGATIVE sign means "boil on" -> SCREEN-ANCHOR
-    // the strokes (hold their screen positions so they don't glide with the camera).
-    const float sizeJit = abs(gPostParams0.z);
-    const bool screenAnchor = gPostParams0.z < 0.0f;
+    const float sizeJit = gPostParams0.z;
     const float edgeKeep = gPostParams1.y;
     const float angleJit = gPostParams1.z;
     const float cols = max(gPostParams2.x, 1.0f);
@@ -114,29 +111,43 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     // and its per-stroke randoms key off the WORLD cell, so the marks are also temporally
     // stable. The world cell size = the world extent of one screen cell at that depth, so
     // on-screen stroke density stays uniform (no gaps at grazing angles). Sky pixels (no
-    // surface) fall back to the old screen-anchored grid. STOP-MOTION ("boil on" =
-    // screenAnchor): we also use the screen-grid path for ALL pixels so the strokes
-    // sit at fixed screen positions and HOLD between boil ticks (their jitter is keyed
-    // off the time-quantized seed), instead of reprojecting/gliding every frame as the
-    // camera moves. The Kuwahara base still renders live, so the world doesn't lag.
+    // surface) fall back to the old screen-anchored grid. STOP-MOTION: strokes are
+    // GLUED + BOIL: strokes anchor to the OBJECT (object-relative world cell below), so
+    // they stay stuck to the surface and always cover it as the camera/object moves
+    // (never reveal it underneath). The stop-motion "boil" comes from the time-quantized
+    // seed (boilPhase) folded into hk -> the stroke pattern re-rolls only at the tick rate.
     const float2 sampPx = (float2(cx, cy) + 0.5f) * cell;
     const float2 sampUv = sampPx * gOutTexel;
     const float depth = SamplePost(gInput2, sampUv).r;
 
     float2 hk;
     float2 centerPx;
-    if (depth < 1.0f && !screenAnchor) {
+    bool inCensor = false; // this cell's surface is inside a censor sphere
+    if (depth < 1.0f) {
         const float3 P  = WorldFromDepth(sampUv, depth);
         const float3 Px = WorldFromDepth(sampUv + float2(d.x, 0.0f), depth);
-        const float cellW = max(length(Px - P) * cell.x, 0.01f); // world size of one cell
+        float cellW = max(length(Px - P) * cell.x, 0.01f); // world size of one screen cell
         // If this cell's surface point is inside a censor sphere, anchor the grid to
         // the OBJECT: snap relative to the censor center (which rides with the entity)
-        // so the strokes stick to the moving surface instead of crawling across it in
-        // world space. Outside any censor -> cOrigin stays 0 = world-anchored (as before).
+        // so the strokes stick to the moving surface instead of crawling across it.
         float3 cOrigin = float3(0.0f, 0.0f, 0.0f);
         [unroll] for (uint ci = 0u; ci < 4u; ++ci) {
             if (ci >= gCensorCount.x) break;
-            if (distance(P, gCensors[ci].xyz) < gCensors[ci].w) { cOrigin = gCensors[ci].xyz; break; }
+            if (distance(P, gCensors[ci].xyz) < gCensors[ci].w) {
+                cOrigin = gCensors[ci].xyz; inCensor = true; break;
+            }
+        }
+        // CONSISTENT BOIL: inside a censor, size the world grid from the CAMERA->censor
+        // distance instead of the per-pixel depth. That distance is constant while you
+        // orbit, so the grid (and every stroke) stays fixed as the camera moves -> the
+        // strokes only change at the boil rate (no "speed-up" with camera motion), yet
+        // still scale with distance on a dolly. (Per-pixel cellW foreshortens with view
+        // angle, which made the strokes re-snap every frame = the apparent speed-up.)
+        if (inCensor) {
+            // ~angular-size-per-pixel (0.0007) * the layer's screen-cell width (px) *
+            // the camera->censor distance = a world cell that holds steady on orbit and
+            // keeps each layer's density. Tune 0.0007 if the stroke spacing looks off.
+            cellW = max(distance(gCameraPosWS, cOrigin) * cell.x * 0.0007f, 0.01f);
         }
         const float3 wc = round((P - cOrigin) / cellW);          // object-rel (or world) cell
         hk = wc.xz + wc.y * 0.7f + seed * float2(1.7f, 2.3f);    // stable seed (rides w/ object)
@@ -183,7 +194,11 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     const float edgeAng = phi + 1.5707963f;
     const float randAng = (Hash21(hk + 3.7f) * 2.0f - 1.0f) * kPI;
     const float oriented = saturate(gmag * flowStr * 6.0f);
-    float ang = lerp(randAng, edgeAng, oriented);
+    // Censored strokes use a BOIL-STABLE orientation (random per object-cell, keyed off
+    // the time-quantized seed) instead of the live image-gradient angle. The live angle
+    // is recomputed every frame, so it re-orients continuously as the camera orbits =
+    // the "speed-up" the user saw; the stable angle only re-rolls at the boil rate.
+    float ang = inCensor ? randAng : lerp(randAng, edgeAng, oriented);
     ang += (Hash21(hk + 7.1f) - 0.5f) * angleJit * 1.4f;
     const float2 dir = float2(cos(ang), sin(ang));
     const float2 perp = float2(-dir.y, dir.x);

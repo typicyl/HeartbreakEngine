@@ -196,6 +196,9 @@ struct ObjectUBO {
     // gSplat* uint4 block in Common.hlsli). 0 for non-terrain draws.
     glm::uvec4 splatAlbedo{0}; glm::uvec4 splatNormal{0}; glm::uvec4 splatMR{0};
     glm::vec4 splatRough{1.0f}; // 4 layers' roughness factor
+    // GPU instancing (matches gInstanced/gInstanceBase in Common.hlsli). Zero-init
+    // keeps every single draw byte-compatible with the pre-instancing ABI.
+    u32 instanced = 0; u32 instanceBase = 0; u32 _padInst0 = 0; u32 _padInst1 = 0;
 };
 
 struct GpuTextureVk {
@@ -250,6 +253,8 @@ public:
                       const ParticleVertex* additive, u32 addCount) override;
     void DrawScene(const SceneView& view, const DrawItem* items, u32 count) override;
     void DrawUIOverlay(const UIVertex* vertices, u32 count) override;
+    TextureHandle CreateUITarget(u32 width, u32 height) override;
+    void DrawUIToTexture(TextureHandle target, const UIVertex* vertices, u32 count) override;
 
 #if HBE_EDITOR
     bool SupportsUI() const override { return true; }
@@ -354,11 +359,35 @@ private:
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
     VkPipeline uiPipeline_ = VK_NULL_HANDLE; // uses pipelineLayout_ (bindless set 1)
-    static constexpr u64 kUIVertexBufferSize = 1u << 20; // 1 MB/frame (~43k verts)
+    static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~40k verts @ 52 B)
     VkBuffer       uiVertexBuffers_[kMaxFramesInFlight]{};
     VkDeviceMemory uiVertexMemory_[kMaxFramesInFlight]{};
     u8*            uiVertexCpu_[kMaxFramesInFlight] = {};
     bool                  meshPipelineReady_ = false;
+
+    // -- World-space UI (canvas -> texture -> lit quad in the scene) ----------
+    // Same UI pipeline against a small R8G8B8A8_UNORM offscreen pass whose
+    // finalLayout hands the image to the fragment shader (the render pass does
+    // ALL layout transitions - the vpRenderPass_ precedent). Images are MUTABLE:
+    // UNORM attachment view (raw UI output) + SRGB sampled view (albedo decode).
+    VkRenderPass worldUIRenderPass_ = VK_NULL_HANDLE;
+    VkPipeline uiWorldPipeline_ = VK_NULL_HANDLE;
+    static constexpr u32 kMaxUITargets = 8;
+    struct UITargetVk {
+        VkImage img = VK_NULL_HANDLE;
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        VkImageView attachView = VK_NULL_HANDLE; // UNORM (framebuffer)
+        VkImageView sampleView = VK_NULL_HANDLE; // SRGB (bindless)
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        u32 w = 0, h = 0;
+    };
+    std::unordered_map<u32, UITargetVk> uiTargets_; // key = bindless slot
+    // Own per-frame vertex buffers with a bump head (the overlay's are memcpy'd
+    // at offset 0 per call and would alias; several canvases draw per frame).
+    VkBuffer       uiWorldVertexBuffers_[kMaxFramesInFlight]{};
+    VkDeviceMemory uiWorldVertexMemory_[kMaxFramesInFlight]{};
+    u8*            uiWorldVertexCpu_[kMaxFramesInFlight] = {};
+    u64            uiWorldVertexHead_ = 0; // reset in BeginFrame
 
     // -- Particle billboards (world-space, drawn in the HDR scene pass) -------
     VkPipeline particlePipeline_ = VK_NULL_HANDLE;    // alpha blend
@@ -395,6 +424,30 @@ private:
         const u32 offset = static_cast<u32>(boneHead_ / sizeof(glm::mat4));
         boneHead_ += bytes;
         return offset;
+    }
+
+    // -- GPU instancing: per-frame instance-transform arena (binding 4) -------
+    // 3 matrices per instance (model, normalMatrix, prevModel); each pass appends
+    // its runs independently (shadow first, then scene - no cross-pass coupling).
+    static constexpr VkDeviceSize kInstanceArenaSize = 1u << 22; // 4 MB (~21k instances)
+    VkBuffer       instanceArena_[kMaxFramesInFlight]{};
+    VkDeviceMemory instanceArenaMem_[kMaxFramesInFlight]{};
+    u8*            instanceArenaMapped_[kMaxFramesInFlight]{};
+    u64            instanceHead_ = 0; // reset each frame
+    std::vector<u32> shadowInstanceCounts_; // scratch: instances per run head
+    // Reserves `count` instances; returns a write pointer + the base INSTANCE
+    // index for ObjectUBO::instanceBase, or null when the arena is full.
+    glm::mat4* AllocInstances(u32 count, u32& outBase) {
+        const u64 bytes = static_cast<u64>(count) * 3u * sizeof(glm::mat4);
+        if (instanceHead_ + bytes > kInstanceArenaSize) {
+            outBase = 0;
+            return nullptr;
+        }
+        outBase = static_cast<u32>(instanceHead_ / (3u * sizeof(glm::mat4)));
+        glm::mat4* dst =
+            reinterpret_cast<glm::mat4*>(instanceArenaMapped_[frameIndex_] + instanceHead_);
+        instanceHead_ += bytes;
+        return dst;
     }
 
     // -- Cascaded shadow maps (depth-only pass into a 2x2 atlas) -------------
@@ -475,11 +528,13 @@ private:
     PostTargetVk dof_;           // depth-of-field result (LDR)
     PostTargetVk motionBlur_;    // motion blur result (LDR)
     PostTargetVk ssr_;           // screen-space reflections (HDR)
-    PostTargetVk ssgi_;          // screen-space GI composite (HDR)
+    PostTargetVk ssgi_;          // screen-space GI composite (HDR, full-res)
+    PostTargetVk ssgiHalf_;      // SSGI GI-only term at reduced res (upscaled into ssgi_)
     PostTargetVk painterly_;     // painterly oil-on-canvas repaint (HDR, full-res)
     PostTargetVk painterlyHalf_; // Kuwahara underpainting at HALF-res (upscaled to painterly_)
     PostTargetVk painterlyComp_; // painterly + dynamic-layer crisp objects composited back
-    PostTargetVk vol_;           // volumetric fog composite (HDR)
+    PostTargetVk vol_;           // volumetric fog composite (HDR, full-res)
+    PostTargetVk volHalf_;       // fog (inscatter+transmittance) at reduced res (upscaled into vol_)
     PostTargetVk adaptedLum_[2]; // auto-exposure adapted luminance (1x1, ping-pong)
     u32 bloomCount_ = 0;
 
@@ -490,10 +545,12 @@ private:
     u32 slotMotionBlur_ = 0;
     u32 slotSsr_ = 0;
     u32 slotSsgi_ = 0;
+    u32 slotSsgiHalf_ = 0;
     u32 slotPainterly_ = 0;
     u32 slotPainterlyHalf_ = 0;
     u32 slotPainterlyComp_ = 0;
     u32 slotVol_ = 0;
+    u32 slotVolHalf_ = 0;
     u32 slotAdaptedLum_[2] = {};
     u32 slotBloom_[kBloomMaxMips] = {};
 
@@ -505,7 +562,7 @@ private:
                exposurePipe_ = VK_NULL_HANDLE, volPipe_ = VK_NULL_HANDLE,
                ssgiPipe_ = VK_NULL_HANDLE, painterlyPipe_ = VK_NULL_HANDLE,
                brushStrokesPipe_ = VK_NULL_HANDLE, copyPipe_ = VK_NULL_HANDLE,
-               compositePipe_ = VK_NULL_HANDLE;
+               compositePipe_ = VK_NULL_HANDLE, applyPipe_ = VK_NULL_HANDLE;
 
     // Temporal AA: jittered camera + reprojected history accumulation (mirrors D3D12).
     bool taaReady_ = false;
@@ -593,6 +650,7 @@ private:
     u32  width_ = 0;
     u32  height_ = 0;
     bool validation_ = false;
+    bool vsync_ = true; // FIFO vs MAILBOX/IMMEDIATE (uncapped) present mode
     bool frameActive_ = false;
     bool renderPassActive_ = false;
     VkClearColorValue clearColor_{{0, 0, 0, 1}};
@@ -612,6 +670,7 @@ bool VulkanDevice::Initialize(const RenderDeviceDesc& desc) {
     width_ = desc.width;
     height_ = desc.height;
     validation_ = desc.enableValidation;
+    vsync_ = desc.vsync;
     desiredImageCount_ = std::clamp<u32>(desc.backBufferCount, 2, kMaxFramesInFlight);
     framesInFlight_ = desiredImageCount_;
     swapFormat_ = ToVkFormat(desc.backBufferFormat);
@@ -838,6 +897,30 @@ bool VulkanDevice::CreateSwapchain() {
     u32 imageCount = std::max(desiredImageCount_, caps.minImageCount);
     if (caps.maxImageCount > 0) imageCount = std::min(imageCount, caps.maxImageCount);
 
+    // Present mode: FIFO = vsync (always available). vsync off prefers MAILBOX
+    // (uncapped, no tearing - newest frame wins), else IMMEDIATE (uncapped,
+    // tearing), else falls back to FIFO with a warning.
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!vsync_) {
+        u32 pmCount = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &pmCount, nullptr);
+        std::vector<VkPresentModeKHR> modes(pmCount);
+        vkGetPhysicalDeviceSurfacePresentModesKHR(physical_, surface_, &pmCount,
+                                                  modes.data());
+        const auto has = [&](VkPresentModeKHR m) {
+            return std::find(modes.begin(), modes.end(), m) != modes.end();
+        };
+        if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
+            presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+            HBE_INFO("[Vulkan] vsync off: MAILBOX present.");
+        } else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+            presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            HBE_INFO("[Vulkan] vsync off: IMMEDIATE present (tearing).");
+        } else {
+            HBE_WARN("[Vulkan] vsync off requested but only FIFO available.");
+        }
+    }
+
     VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     ci.surface = surface_;
     ci.minImageCount = imageCount;
@@ -849,7 +932,7 @@ bool VulkanDevice::CreateSwapchain() {
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    ci.presentMode = presentMode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = VK_NULL_HANDLE;
 
@@ -997,11 +1080,15 @@ bool VulkanDevice::CreateSyncAndCommands() {
         VK_CHECK(vkCreateFence(device_, &fen, nullptr, &inFlight_[i]), "vkCreateFence");
     }
 
-    // GPU pass profiler: one timestamp query pool per frame in flight. Disabled
-    // gracefully if the device/queue can't timestamp (period 0). Graphics queues
-    // on desktop GPUs always support it.
+    // GPU pass profiler: one timestamp query pool per frame in flight. Gated behind
+    // the debug/validation flag - its per-pass vkCmdWriteTimestamp markers serialize the
+    // pipeline (each waits for prior work to reach BOTTOM_OF_PIPE), which measurably
+    // inflates frame time. Leaving it ALWAYS-on cost ~1-3 ms/frame in shipped Vulkan
+    // builds (enough to miss a 120 Hz vsync deadline that DX12 - which has no profiler -
+    // was hitting). Now it only runs with --validation. Disabled gracefully if the
+    // device can't timestamp (period 0).
     gpuPeriodNs_ = static_cast<f64>(deviceProps_.limits.timestampPeriod);
-    if (gpuPeriodNs_ > 0.0) {
+    if (validation_ && gpuPeriodNs_ > 0.0) {
         VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qpci.queryCount = kMaxGpuMarks;
@@ -1038,8 +1125,9 @@ bool VulkanDevice::CreateDescriptorResources() {
 
     // Per-frame UBO (binding 0) + per-draw dynamic UBO (binding 1) + the
     // immutable clamp sampler (binding 2) + the joint-palette storage buffer
-    // (binding 3, vertex skinning).
-    VkDescriptorSetLayoutBinding bindings[4]{};
+    // (binding 3, vertex skinning) + the instance-transform storage buffer
+    // (binding 4, GPU instancing).
+    VkDescriptorSetLayoutBinding bindings[5]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -1059,9 +1147,13 @@ bool VulkanDevice::CreateDescriptorResources() {
     bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[3].descriptorCount = 1;
     bindings[3].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    bindings[4].binding = 4;
+    bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[4].descriptorCount = 1;
+    bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 4;
+    lci.bindingCount = 5;
     lci.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &descriptorLayout_),
              "vkCreateDescriptorSetLayout");
@@ -1077,7 +1169,7 @@ bool VulkanDevice::CreateDescriptorResources() {
     sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;
     sizes[2].descriptorCount = framesInFlight_ * setsPerFrame;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = framesInFlight_ * setsPerFrame;
+    sizes[3].descriptorCount = framesInFlight_ * setsPerFrame * 2; // bones + instances
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = framesInFlight_ * setsPerFrame;
     pci.poolSizeCount = 4;
@@ -1115,16 +1207,27 @@ bool VulkanDevice::CreateDescriptorResources() {
         void* boneMapped = nullptr;
         vkMapMemory(device_, boneArenaMem_[i], 0, kBoneArenaSize, 0, &boneMapped);
         boneArenaMapped_[i] = static_cast<u8*>(boneMapped);
+
+        if (!CreateBuffer(kInstanceArenaSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          instanceArena_[i], instanceArenaMem_[i])) {
+            return false;
+        }
+        void* instMapped = nullptr;
+        vkMapMemory(device_, instanceArenaMem_[i], 0, kInstanceArenaSize, 0, &instMapped);
+        instanceArenaMapped_[i] = static_cast<u8*>(instMapped);
     }
 
-    // Writes bindings 0/1/3 of one set-0 clone (binding 2 is immutable). The
-    // bone arena rides along with the frame index of the frame UBO/dyn buffer.
+    // Writes bindings 0/1/3/4 of one set-0 clone (binding 2 is immutable). The
+    // bone + instance arenas ride along with the frame index of the frame UBO.
     const auto writeSet = [&](VkDescriptorSet set, VkBuffer frameBuf, VkDeviceSize frameOffset,
-                              VkBuffer dynBuf, VkDeviceSize dynRange, VkBuffer boneBuf) {
+                              VkBuffer dynBuf, VkDeviceSize dynRange, VkBuffer boneBuf,
+                              VkBuffer instBuf) {
         VkDescriptorBufferInfo frameInfo{frameBuf, frameOffset, sizeof(FrameUBO)};
         VkDescriptorBufferInfo objInfo{dynBuf, 0, dynRange};
         VkDescriptorBufferInfo boneInfo{boneBuf, 0, VK_WHOLE_SIZE};
-        VkWriteDescriptorSet writes[3]{};
+        VkDescriptorBufferInfo instInfo{instBuf, 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet writes[4]{};
         writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         writes[0].dstSet = set;
         writes[0].dstBinding = 0;
@@ -1143,7 +1246,13 @@ bool VulkanDevice::CreateDescriptorResources() {
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[2].pBufferInfo = &boneInfo;
-        vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+        writes[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[3].dstSet = set;
+        writes[3].dstBinding = 4;
+        writes[3].descriptorCount = 1;
+        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[3].pBufferInfo = &instInfo;
+        vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
     };
 
     const auto allocSets = [&](VkDescriptorSet* out, u32 n) {
@@ -1159,7 +1268,7 @@ bool VulkanDevice::CreateDescriptorResources() {
     if (!allocSets(descriptorSets_, framesInFlight_)) return false;
     for (u32 i = 0; i < framesInFlight_; ++i) {
         writeSet(descriptorSets_[i], frameUBO_[i], 0, objectArena_[i], sizeof(ObjectUBO),
-                 boneArena_[i]);
+                 boneArena_[i], instanceArena_[i]);
     }
 
     // Shadow-pass clones of set 0, one per cascade: binding 0 points at that
@@ -1181,7 +1290,7 @@ bool VulkanDevice::CreateDescriptorResources() {
         for (u32 c = 0; c < kMaxShadowCascades; ++c) {
             writeSet(shadowDescriptorSets_[i][c], shadowFrameUBO_[i],
                      shadowFrameStride_ * c, objectArena_[i], sizeof(ObjectUBO),
-                     boneArena_[i]);
+                     boneArena_[i], instanceArena_[i]);
         }
     }
 
@@ -1200,7 +1309,7 @@ bool VulkanDevice::CreateDescriptorResources() {
 
         if (!allocSets(&postSets_[i], 1)) return false;
         writeSet(postSets_[i], frameUBO_[i], 0, postArena_[i], sizeof(PostUBO),
-                 boneArena_[i]);
+                 boneArena_[i], instanceArena_[i]);
     }
 
     // Editor asset-preview clones of set 0: binding 0 = the preview's own
@@ -1217,7 +1326,7 @@ bool VulkanDevice::CreateDescriptorResources() {
                     &previewFrameUBOMapped_[i]);
         if (!allocSets(&previewSets_[i], 1)) return false;
         writeSet(previewSets_[i], previewFrameUBO_[i], 0, objectArena_[i],
-                 sizeof(ObjectUBO), boneArena_[i]);
+                 sizeof(ObjectUBO), boneArena_[i], instanceArena_[i]);
     }
     return true;
 }
@@ -1896,17 +2005,19 @@ bool VulkanDevice::CreateMeshPipeline() {
 
             VkVertexInputBindingDescription uiBinding{0, sizeof(UIVertex),
                                                       VK_VERTEX_INPUT_RATE_VERTEX};
-            VkVertexInputAttributeDescription uiAttrs[4] = {
+            VkVertexInputAttributeDescription uiAttrs[5] = {
                 {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, x)},
                 {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, u)},
                 {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(UIVertex, r)},
                 {3, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, texIndex)},
+                {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
+                 offsetof(UIVertex, clipX0)}, // NDC clip rect
             };
             VkPipelineVertexInputStateCreateInfo uiVi{
                 VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
             uiVi.vertexBindingDescriptionCount = 1;
             uiVi.pVertexBindingDescriptions = &uiBinding;
-            uiVi.vertexAttributeDescriptionCount = 4;
+            uiVi.vertexAttributeDescriptionCount = 5;
             uiVi.pVertexAttributeDescriptions = uiAttrs;
 
             VkPipelineDepthStencilStateCreateInfo uiDs{
@@ -1939,6 +2050,63 @@ bool VulkanDevice::CreateMeshPipeline() {
 
             ok = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &uiPci, nullptr,
                                            &uiPipeline_) == VK_SUCCESS;
+
+            // World-UI variant: the same UI pipeline against a small offscreen
+            // pass (canvas texture a lit quad in the scene samples). The pass's
+            // finalLayout hands the image to the fragment shader - it does ALL
+            // layout transitions (vpRenderPass_ precedent). Failure only disables
+            // world-space canvases, never the overlay.
+            if (ok && worldUIRenderPass_ == VK_NULL_HANDLE) {
+                VkAttachmentDescription color{};
+                color.format = VK_FORMAT_R8G8B8A8_UNORM;
+                color.samples = VK_SAMPLE_COUNT_1_BIT;
+                color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+                VkSubpassDescription subpass{};
+                subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+                subpass.colorAttachmentCount = 1;
+                subpass.pColorAttachments = &colorRef;
+
+                VkSubpassDependency deps[2]{};
+                deps[0].srcSubpass = VK_SUBPASS_EXTERNAL; // prior frame's sampling
+                deps[0].dstSubpass = 0;
+                deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+                deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                deps[1].srcSubpass = 0; // this frame's scene pass samples the page
+                deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+                deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+                deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+                VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+                rci.attachmentCount = 1;
+                rci.pAttachments = &color;
+                rci.subpassCount = 1;
+                rci.pSubpasses = &subpass;
+                rci.dependencyCount = 2;
+                rci.pDependencies = deps;
+                if (vkCreateRenderPass(device_, &rci, nullptr, &worldUIRenderPass_) !=
+                    VK_SUCCESS)
+                    worldUIRenderPass_ = VK_NULL_HANDLE;
+            }
+            if (ok && worldUIRenderPass_ != VK_NULL_HANDLE) {
+                VkGraphicsPipelineCreateInfo uiwPci = uiPci;
+                uiwPci.renderPass = worldUIRenderPass_;
+                if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &uiwPci, nullptr,
+                                              &uiWorldPipeline_) != VK_SUCCESS) {
+                    HBE_WARN("[Vulkan] world-UI pipeline unavailable.");
+                    uiWorldPipeline_ = VK_NULL_HANDLE;
+                }
+            }
         }
         const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -1950,6 +2118,27 @@ bool VulkanDevice::CreateMeshPipeline() {
                 ok = vkMapMemory(device_, uiVertexMemory_[i], 0, kUIVertexBufferSize, 0,
                                  &mapped) == VK_SUCCESS;
                 uiVertexCpu_[i] = static_cast<u8*>(mapped);
+            }
+        }
+        // World-UI vertex buffers: SEPARATE from the overlay's (offset-0 memcpy
+        // per call would alias) - bump-allocated across the frame per canvas.
+        if (uiWorldPipeline_ != VK_NULL_HANDLE) {
+            for (u32 i = 0; i < framesInFlight_; ++i) {
+                bool wok = CreateBuffer(kUIVertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                        hostVisible, uiWorldVertexBuffers_[i],
+                                        uiWorldVertexMemory_[i]);
+                if (wok) {
+                    void* mapped = nullptr;
+                    wok = vkMapMemory(device_, uiWorldVertexMemory_[i], 0, kUIVertexBufferSize,
+                                      0, &mapped) == VK_SUCCESS;
+                    uiWorldVertexCpu_[i] = static_cast<u8*>(mapped);
+                }
+                if (!wok) {
+                    HBE_WARN("[Vulkan] world-UI vertex buffers unavailable.");
+                    vkDestroyPipeline(device_, uiWorldPipeline_, nullptr);
+                    uiWorldPipeline_ = VK_NULL_HANDLE;
+                    break;
+                }
             }
         }
         // Particle vertex buffers (host-visible, mapped); same lifetime as UI.
@@ -2406,6 +2595,8 @@ bool VulkanDevice::CreatePostPipelines() {
     brushStrokesReady_ = makePipe(L"BrushStrokes", postPass16Load_, 2, brushStrokesPipe_);
     // Passthrough/bilinear upscale (half-res Kuwahara -> full-res painterly_).
     ok = ok && makePipe(L"Copy", postPass16_, false, copyPipe_);
+    // Reduced-res effect composite (SSGI GI / fog) upscaled back over the full-res HDR.
+    ok = ok && makePipe(L"ApplyHalfRes", postPass16_, false, applyPipe_);
     // Dynamic-layer composite: lerp painterly vs crisp lit colour by the HDR-alpha mask.
     ok = ok && makePipe(L"PainterlyComposite", postPass16_, false, compositePipe_);
     return ok;
@@ -2489,10 +2680,12 @@ void VulkanDevice::DestroyPostTargets() {
     destroy(motionBlur_);
     destroy(ssr_);
     destroy(ssgi_);
+    destroy(ssgiHalf_);
     destroy(painterly_);
     destroy(painterlyHalf_);
     destroy(painterlyComp_);
     destroy(vol_);
+    destroy(volHalf_);
     destroy(adaptedLum_[0]);
     destroy(adaptedLum_[1]);
     for (u32 i = 0; i < kBloomMaxMips; ++i) destroy(bloom_[i]);
@@ -2509,13 +2702,15 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
 
     // Reserve the bindless slots once; resizes rewrite the same descriptors.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 17 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 21 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
         slotVelocity_ = bindlessNextSlot_++;
         slotVol_ = bindlessNextSlot_++;
+        slotVolHalf_ = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
+        slotSsgiHalf_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
         slotPainterlyHalf_ = bindlessNextSlot_++;
         slotPainterlyComp_ = bindlessNextSlot_++;
@@ -2687,10 +2882,24 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
         if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_, slotVol_,
                               vol_))
             return false;
+        // Fog (inscatter+transmittance) at HALF res (was quarter): the march's
+        // per-step sun-shadow is world-scale blocky at grazing sun angles;
+        // quarter-res made the blocks obvious. Half-res + the bilateral upscale
+        // reads smooth and the fog march stays a small pass.
+        const u32 hw = (width + 1u) / 2u, hh = (height + 1u) / 2u;
+        if (!CreatePostTarget(hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_, slotVolHalf_,
+                              volHalf_))
+            return false;
     }
     if (ssgiReady_) { // HDR (indirect bounce composited before bloom)
         if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_, slotSsgi_,
                               ssgi_))
+            return false;
+        // GI-only term at QUARTER res (GI is very low-frequency + TAA-denoised, so a
+        // 1/4-res gather + bilinear upscale is near-lossless and ~16x cheaper).
+        const u32 qw = (width + 3u) / 4u, qh = (height + 3u) / 4u;
+        if (!CreatePostTarget(qw, qh, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_, slotSsgiHalf_,
+                              ssgiHalf_))
             return false;
     }
     if (painterlyReady_) { // HDR (oil-on-canvas repaint before bloom)
@@ -2795,32 +3004,62 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
     }
     GpuMark("ssr");
 
-    // --- Screen-space GI: one indirect diffuse bounce (composited into HDR) ---
+    // --- Screen-space GI: one indirect bounce, gathered at REDUCED res, then upscaled
+    //     + added over the full-res HDR. The SSGI shader outputs the GI term only (a=1),
+    //     so ApplyHalfRes does scene + GI. GI is low-frequency + TAA-denoised, so the
+    //     reduced-res gather is near-lossless and ~16x cheaper than full-res. ----------
     if (view.post.ssgiEnabled && ssgiReady_) {
+        const glm::vec2 giTexel(1.0f / ssgiHalf_.width, 1.0f / ssgiHalf_.height);
         PostUBO cb;
-        cb.input0 = hdrInput;
+        cb.input0 = hdrInput;   // full-res lit HDR = the ray-march gather source
         cb.input1 = slotGbuffer_;
         cb.input2 = slotDepth_;
-        cb.outTexel = sceneTexel;
+        cb.outTexel = giTexel;  // rasterize GI at reduced res
         cb.inTexel = sceneTexel;
         cb.params0 = {ps.ssgiIntensity, ps.ssgiRadius, static_cast<f32>(ps.ssgiSamples), 1.0f};
-        DrawPostPass(ssgiPipe_, postPass16_, ssgi_, cb);
+        DrawPostPass(ssgiPipe_, postPass16_, ssgiHalf_, cb);
+        // Upscale + add: scene + GI -> full-res HDR.
+        PostUBO ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotSsgiHalf_;
+        ap.outTexel = sceneTexel;
+        ap.inTexel = sceneTexel;
+        DrawPostPass(applyPipe_, postPass16_, ssgi_, ap);
         hdrInput = slotSsgi_;
     }
     GpuMark("ssgi");
 
-    // --- Volumetric fog + light scattering (composited into HDR before bloom) -
+    // --- Volumetric fog: marched at HALF res (outputs inscatter+transmittance), then
+    //     upscaled + applied over the full-res HDR (scene*transmittance + inscatter).
+    //     Fog is smooth, so half-res is near-lossless and ~4x cheaper. ----------------
     if (view.post.fogEnabled && volReady_) {
+        const glm::vec2 fogTexel(1.0f / volHalf_.width, 1.0f / volHalf_.height);
         PostUBO cb;
-        cb.input0 = hdrInput;
+        cb.input0 = hdrInput;   // (unused by the fog shader now; bound defensively)
         cb.input2 = slotDepth_;
-        cb.outTexel = sceneTexel;
+        cb.outTexel = fogTexel; // march fog at reduced res
         cb.inTexel = sceneTexel;
         cb.params0 = {ps.fogDensity, ps.fogHeightFalloff, ps.fogAnisotropy,
                       static_cast<f32>(ps.fogStepCount)};
         cb.params1 = {ps.fogSunIntensity, ps.fogHeight, ps.fogMaxDistance, ps.fogAmbient};
         cb.params2 = {ps.fogColor.x, ps.fogColor.y, ps.fogColor.z, ps.fogGodRays};
-        DrawPostPass(volPipe_, postPass16_, vol_, cb);
+        // Animated dither frame index (TAA integrates it into smooth fog); 0 = static
+        // IGN when TAA is off, so the noise never crawls without temporal filtering.
+        cb.params3.x = ps.taaEnabled
+                           ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f)
+                           : 0.0f;
+        DrawPostPass(volPipe_, postPass16_, volHalf_, cb);
+        // Upscale + apply: scene * transmittance + inscatter -> full-res HDR. Low-pass
+        // the fog buffer here (inTexel = fog's quarter-res texel, params0.x = radius) so
+        // the world-scale sun-shadow blocks smooth out instead of reading as cubes.
+        PostUBO ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotVolHalf_;
+        ap.input2 = slotDepth_;     // depth for the bilateral (no silhouette bleed)
+        ap.outTexel = sceneTexel;
+        ap.inTexel = fogTexel;      // blur offsets in fog (half-res) texels
+        ap.params0 = {1.5f, 0.0f, 0.0f, 0.0f}; // fog blur radius (texels); 0 = crisp (SSGI)
+        DrawPostPass(applyPipe_, postPass16_, vol_, ap);
         hdrInput = slotVol_;
     }
     GpuMark("fog");
@@ -2867,19 +3106,17 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
 
         // --- Real brush strokes: splat instanced oriented quads over the base --
         // Runs when global strokes are on OR any censor is active (censor-only mode).
+        // Object-anchored + time-quantized "boil" (the strokes stay glued to the object
+        // and re-paint in discrete steps - see BrushStrokes.hlsl); rendered every frame.
         if ((ps.painterlyStrokes || nCensor > 0) && brushStrokesReady_) {
             VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
             rp.renderPass = postPass16Load_; // LOAD: keep the Kuwahara underpainting
             rp.framebuffer = painterly_.framebuffer;
             rp.renderArea.extent = {painterly_.width, painterly_.height};
             vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-            // Negative-height viewport (VK_KHR_maintenance1): unlike the fullscreen
-            // post passes (which derive UVs from SV_Position and are Y-symmetric),
-            // this pass BUILDS its own clip-space quads with the D3D12 Y convention
-            // (clip.y = -clip.y in BrushStrokes.hlsl), just like the main scene pass.
-            // Flip Y here so the strokes land right-side up over the Kuwahara base;
-            // without it every stroke renders vertically mirrored from where it
-            // sampled its colour and smears mismatched paint across the screen.
+            // Negative-height viewport (VK_KHR_maintenance1): this pass BUILDS its own
+            // clip-space quads with the D3D12 Y convention (clip.y = -clip.y in
+            // BrushStrokes.hlsl), so flip Y here so the strokes land right-side up.
             VkViewport vp{};
             vp.x = 0.0f;
             vp.y = static_cast<f32>(painterly_.height);
@@ -2925,12 +3162,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
                 sb.input3 = slotHdr_;   // forward HDR alpha = the per-pixel censored flag
                 sb.outTexel = sceneTexel;
                 sb.inTexel = sceneTexel;
-                // sizeJit sign flags the VS to SCREEN-ANCHOR the strokes (hold their
-                // screen positions, don't glide with the camera) when boil is on; the
-                // magnitude (0.35) is the size jitter either way.
-                sb.params0 = {lenPx, widthFrac,
-                              (ps.painterlyStrokeBoil > 0.01f) ? -0.35f : 0.35f,
-                              ps.painterlyStrength};
+                sb.params0 = {lenPx, widthFrac, 0.35f, ps.painterlyStrength};
                 sb.params1 = {ps.painterlyStrokeSharp, ps.painterlyEdge, 0.30f,
                               std::max(ps.painterlyStrokeDetail * 2.0f, 0.25f)};
                 sb.params2 = {static_cast<f32>(cols), static_cast<f32>(rows),
@@ -3192,11 +3424,31 @@ void VulkanDevice::DrawShadowPass(const SceneView& view, const DrawItem* items, 
     // The UBO writes happen once; every cascade reuses the same dynamic offsets.
     const u32 maxDraws = static_cast<u32>(kObjectArenaSize / objectStride_);
     const u32 drawCount = std::min(count, maxDraws);
+    shadowInstanceCounts_.clear();
+    shadowInstanceCounts_.resize(drawCount, 1);
     for (u32 i = 0; i < drawCount; ++i) {
         const DrawItem& it = items[i];
+        if (it.instanceRun == 0) continue; // consumed by a run head (skipped below)
         if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) continue;
         ObjectUBO ocb{};
         ocb.model = it.transform;
+        // Instanced run head: upload the run's transforms once for this pass.
+        // Depth-only pass: the normal/prev matrices are never read, so skip the
+        // inverse-transpose (write model into all three slots).
+        if (it.instanceRun > 1) {
+            u32 base = 0;
+            if (glm::mat4* inst = AllocInstances(it.instanceRun, base)) {
+                for (u32 k = 0; k < it.instanceRun; ++k) {
+                    const DrawItem& run = items[i + k];
+                    inst[k * 3 + 0] = run.transform;
+                    inst[k * 3 + 1] = run.transform;
+                    inst[k * 3 + 2] = run.transform;
+                }
+                ocb.instanced = 1;
+                ocb.instanceBase = base;
+                shadowInstanceCounts_[i] = it.instanceRun;
+            }
+        }
         std::memcpy(objectArenaMapped_[frameIndex_] + i * objectStride_, &ocb, sizeof(ocb));
     }
 
@@ -3216,18 +3468,23 @@ void VulkanDevice::DrawShadowPass(const SceneView& view, const DrawItem* items, 
         vkCmdSetViewport(cmd, 0, 1, &vp);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+        u32 lastMesh = 0; // consecutive same-mesh draws skip the IA rebinds
         for (u32 i = 0; i < drawCount; ++i) {
             const DrawItem& it = items[i];
+            if (it.instanceRun == 0) continue; // drawn by its run head
             if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) continue;
             if (it.materialFlags & MaterialFlag_NoShadow) continue; // doesn't cast a shadow
             const GpuMeshVk& gm = meshes_[it.mesh.id - 1];
             const u32 dynOffset = static_cast<u32>(i * objectStride_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                                     &shadowDescriptorSets_[frameIndex_][c], 1, &dynOffset);
-            const VkDeviceSize voff = 0;
-            vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vertexBuffer, &voff);
-            vkCmdBindIndexBuffer(cmd, gm.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(cmd, gm.indexCount, 1, 0, 0, 0);
+            if (it.mesh.id != lastMesh) {
+                const VkDeviceSize voff = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vertexBuffer, &voff);
+                vkCmdBindIndexBuffer(cmd, gm.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+                lastMesh = it.mesh.id;
+            }
+            vkCmdDrawIndexed(cmd, gm.indexCount, shadowInstanceCounts_[i], 0, 0, 0);
         }
     }
 
@@ -3428,6 +3685,7 @@ void VulkanDevice::BeginFrame() {
     }
     postHead_ = 0;
     boneHead_ = 0;
+    instanceHead_ = 0;
 
     vkWaitForFences(device_, 1, &inFlight_[frameIndex_], VK_TRUE, UINT64_MAX);
 
@@ -3474,6 +3732,7 @@ void VulkanDevice::BeginFrame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(commandBuffers_[frameIndex_], &bi);
     frameActive_ = true;
+    uiWorldVertexHead_ = 0; // world-UI canvases bump-allocate here across the frame
 
     // GPU profiler: reset this slot's timestamp pool (must be on a recording cmd
     // buffer) and mark the frame start.
@@ -3625,6 +3884,7 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     const u32 maxDraws = static_cast<u32>(kObjectArenaSize / objectStride_);
     const u32 drawCount = std::min(count, maxDraws);
 
+    u32 lastSceneMesh = 0; // consecutive same-mesh draws skip the IA rebinds
     const auto drawItem = [&](u32 i) {
         const DrawItem& it = items[i];
         if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) return;
@@ -3688,21 +3948,46 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
             if (prevOff != UINT32_MAX) ocb.prevBoneOffset = prevOff;
         }
 
+        // Instanced run head: upload the whole run's transforms and draw the
+        // group in ONE call (followers were skipped by the loop below).
+        u32 instances = 1;
+        if (it.instanceRun > 1) {
+            u32 base = 0;
+            if (glm::mat4* inst = AllocInstances(it.instanceRun, base)) {
+                for (u32 k = 0; k < it.instanceRun; ++k) {
+                    const DrawItem& run = items[i + k];
+                    inst[k * 3 + 0] = run.transform;
+                    inst[k * 3 + 1] =
+                        glm::mat4(glm::transpose(glm::inverse(glm::mat3(run.transform))));
+                    inst[k * 3 + 2] = run.prevTransform;
+                }
+                ocb.instanced = 1;
+                ocb.instanceBase = base;
+                instances = it.instanceRun;
+            }
+        }
+
         const u32 dynOffset = static_cast<u32>(i * objectStride_);
         std::memcpy(objectArenaMapped_[frameIndex_] + dynOffset, &ocb, sizeof(ocb));
 
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                                 &descriptorSets_[frameIndex_], 1, &dynOffset);
 
-        const VkDeviceSize voff = 0;
-        vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vertexBuffer, &voff);
-        vkCmdBindIndexBuffer(cmd, gm.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, gm.indexCount, 1, 0, 0, 0);
+        if (it.mesh.id != lastSceneMesh) {
+            const VkDeviceSize voff = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &gm.vertexBuffer, &voff);
+            vkCmdBindIndexBuffer(cmd, gm.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+            lastSceneMesh = it.mesh.id;
+        }
+        vkCmdDrawIndexed(cmd, gm.indexCount, instances, 0, 0, 0);
     };
 
-    // Opaque pass (transparent items deferred to the blended pass below).
+    // Opaque pass (transparent items deferred to the blended pass below; items
+    // consumed by an instanced run head are skipped - the head draws them).
     for (u32 i = 0; i < drawCount; ++i)
-        if (!(items[i].materialFlags & MaterialFlag_Transparent)) drawItem(i);
+        if (items[i].instanceRun != 0 &&
+            !(items[i].materialFlags & MaterialFlag_Transparent))
+            drawItem(i);
 
     // Sky background: after opaques so the depth test rejects covered pixels.
     if (drawSky) {
@@ -3804,6 +4089,182 @@ void VulkanDevice::DrawUIOverlay(const UIVertex* vertices, u32 count) {
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &uiVertexBuffers_[frameIndex_], &offset);
     vkCmdDraw(cmd, count, 1, 0, 0);
+}
+
+TextureHandle VulkanDevice::CreateUITarget(u32 width, u32 height) {
+    if (uiWorldPipeline_ == VK_NULL_HANDLE || width == 0 || height == 0 ||
+        bindlessNextSlot_ >= kMaxBindlessTextures)
+        return {};
+    if (uiTargets_.size() >= kMaxUITargets) {
+        HBE_WARN("[Vulkan] world-UI target limit ({}) reached.", kMaxUITargets);
+        return {};
+    }
+
+    // MUTABLE image: UNORM attachment view (the UI shader's raw display-space
+    // output) + SRGB sampled view (hardware decode when the mesh pass samples the
+    // page, exactly like an albedo PNG).
+    UITargetVk t;
+    t.w = width;
+    t.h = height;
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &t.img) != VK_SUCCESS) return {};
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, t.img, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (vkAllocateMemory(device_, &mai, nullptr, &t.mem) != VK_SUCCESS) {
+        vkDestroyImage(device_, t.img, nullptr);
+        return {};
+    }
+    vkBindImageMemory(device_, t.img, t.mem, 0);
+
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = t.img;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    bool ok = vkCreateImageView(device_, &vci, nullptr, &t.attachView) == VK_SUCCESS;
+    vci.format = VK_FORMAT_R8G8B8A8_SRGB;
+    ok = ok && vkCreateImageView(device_, &vci, nullptr, &t.sampleView) == VK_SUCCESS;
+
+    if (ok) {
+        VkFramebufferCreateInfo fci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fci.renderPass = worldUIRenderPass_;
+        fci.attachmentCount = 1;
+        fci.pAttachments = &t.attachView;
+        fci.width = width;
+        fci.height = height;
+        fci.layers = 1;
+        ok = vkCreateFramebuffer(device_, &fci, nullptr, &t.fb) == VK_SUCCESS;
+    }
+    if (!ok) {
+        if (t.fb) vkDestroyFramebuffer(device_, t.fb, nullptr);
+        if (t.sampleView) vkDestroyImageView(device_, t.sampleView, nullptr);
+        if (t.attachView) vkDestroyImageView(device_, t.attachView, nullptr);
+        vkDestroyImage(device_, t.img, nullptr);
+        vkFreeMemory(device_, t.mem, nullptr);
+        return {};
+    }
+
+    // One-time transition UNDEFINED -> SHADER_READ_ONLY so sampling the page
+    // BEFORE its first DrawUIToTexture (hidden canvas) is legal.
+    {
+        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbai.commandPool = commandPool_;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        vkAllocateCommandBuffers(device_, &cbai, &cmd);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = t.img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                             1, &b);
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+        vkQueueWaitIdle(queue_);
+        vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
+    }
+
+    // Bindless slot samples the SRGB view.
+    const u32 slot = bindlessNextSlot_++;
+    VkDescriptorImageInfo ii{};
+    ii.imageView = t.sampleView;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = bindlessSet_;
+    w.dstBinding = 1;
+    w.dstArrayElement = slot;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+
+    slotViews_[slot] = t.sampleView;
+    slotImages_[slot] = t.img;
+    uiTargets_[slot] = t;
+    HBE_INFO("[Vulkan] world-UI target {}x{} (slot {}).", width, height, slot);
+    return TextureHandle{slot};
+}
+
+void VulkanDevice::DrawUIToTexture(TextureHandle target, const UIVertex* vertices, u32 count) {
+    // Same contract as DrawShadowPass: after BeginFrame, BEFORE the main render
+    // pass begins (the scene pass samples the page later this frame). count == 0
+    // still runs the render pass for its CLEAR - a fresh/hidden page must read
+    // transparent, never uninitialized garbage.
+    if (uiWorldPipeline_ == VK_NULL_HANDLE || !frameActive_ || renderPassActive_)
+        return;
+    const auto it = uiTargets_.find(target.index);
+    if (it == uiTargets_.end()) return;
+    const UITargetVk& t = it->second;
+
+    if (!vertices) count = 0;
+    const u64 remaining = kUIVertexBufferSize - uiWorldVertexHead_;
+    const u32 maxVerts = static_cast<u32>(remaining / sizeof(UIVertex));
+    count = std::min(count, maxVerts - maxVerts % 3);
+    if (count > 0) {
+        std::memcpy(uiWorldVertexCpu_[frameIndex_] + uiWorldVertexHead_, vertices,
+                    count * sizeof(UIVertex));
+    }
+
+    VkCommandBuffer cmd = commandBuffers_[frameIndex_];
+    VkClearValue clear{};
+    clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}}; // transparent page background
+    VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rp.renderPass = worldUIRenderPass_;
+    rp.framebuffer = t.fb;
+    rp.renderArea = {{0, 0}, {t.w, t.h}};
+    rp.clearValueCount = 1;
+    rp.pClearValues = &clear;
+    vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Negative-height viewport for orientation parity with D3D12 (the shared
+    // CPU-side NDC convention the overlay uses).
+    VkViewport vp{};
+    vp.x = 0.0f;
+    vp.y = static_cast<f32>(t.h);
+    vp.width = static_cast<f32>(t.w);
+    vp.height = -static_cast<f32>(t.h);
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    VkRect2D scissor{{0, 0}, {t.w, t.h}};
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    if (count > 0) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uiWorldPipeline_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+                                &bindlessSet_, 0, nullptr);
+        const VkDeviceSize offset = uiWorldVertexHead_;
+        vkCmdBindVertexBuffers(cmd, 0, 1, &uiWorldVertexBuffers_[frameIndex_], &offset);
+        vkCmdDraw(cmd, count, 1, 0, 0);
+        uiWorldVertexHead_ += static_cast<u64>(count) * sizeof(UIVertex);
+    }
+    vkCmdEndRenderPass(cmd); // finalLayout hands the image to the fragment shader
 }
 
 void VulkanDevice::EndFrame() {
@@ -4485,6 +4946,7 @@ VulkanDevice::~VulkanDevice() {
     if (painterlyPipe_) vkDestroyPipeline(device_, painterlyPipe_, nullptr);
     if (brushStrokesPipe_) vkDestroyPipeline(device_, brushStrokesPipe_, nullptr);
     if (copyPipe_) vkDestroyPipeline(device_, copyPipe_, nullptr);
+    if (applyPipe_) vkDestroyPipeline(device_, applyPipe_, nullptr);
     if (compositePipe_) vkDestroyPipeline(device_, compositePipe_, nullptr);
     if (hdrRenderPass_) vkDestroyRenderPass(device_, hdrRenderPass_, nullptr);
     if (previewRenderPass_) vkDestroyRenderPass(device_, previewRenderPass_, nullptr);
@@ -4505,11 +4967,25 @@ VulkanDevice::~VulkanDevice() {
     if (particlePipelineAdd_) vkDestroyPipeline(device_, particlePipelineAdd_, nullptr);
     if (strokeSurfacePipe_) vkDestroyPipeline(device_, strokeSurfacePipe_, nullptr);
 
+    // World-UI targets (their images/views are owned here, not by textures_).
+    for (auto& [slot, t] : uiTargets_) {
+        if (t.fb) vkDestroyFramebuffer(device_, t.fb, nullptr);
+        if (t.sampleView) vkDestroyImageView(device_, t.sampleView, nullptr);
+        if (t.attachView) vkDestroyImageView(device_, t.attachView, nullptr);
+        if (t.img) vkDestroyImage(device_, t.img, nullptr);
+        if (t.mem) vkFreeMemory(device_, t.mem, nullptr);
+    }
+    uiTargets_.clear();
+    if (uiWorldPipeline_) vkDestroyPipeline(device_, uiWorldPipeline_, nullptr);
+    if (worldUIRenderPass_) vkDestroyRenderPass(device_, worldUIRenderPass_, nullptr);
+
     for (u32 i = 0; i < framesInFlight_; ++i) {
         if (frameUBO_[i]) vkDestroyBuffer(device_, frameUBO_[i], nullptr);
         if (frameUBOMem_[i]) vkFreeMemory(device_, frameUBOMem_[i], nullptr);
         if (uiVertexBuffers_[i]) vkDestroyBuffer(device_, uiVertexBuffers_[i], nullptr);
         if (uiVertexMemory_[i]) vkFreeMemory(device_, uiVertexMemory_[i], nullptr);
+        if (uiWorldVertexBuffers_[i]) vkDestroyBuffer(device_, uiWorldVertexBuffers_[i], nullptr);
+        if (uiWorldVertexMemory_[i]) vkFreeMemory(device_, uiWorldVertexMemory_[i], nullptr);
         if (particleVertexBuffers_[i]) vkDestroyBuffer(device_, particleVertexBuffers_[i], nullptr);
         if (particleVertexMemory_[i]) vkFreeMemory(device_, particleVertexMemory_[i], nullptr);
         if (shadowFrameUBO_[i]) vkDestroyBuffer(device_, shadowFrameUBO_[i], nullptr);
@@ -4521,6 +4997,8 @@ VulkanDevice::~VulkanDevice() {
         if (previewFrameUBO_[i]) vkDestroyBuffer(device_, previewFrameUBO_[i], nullptr);
         if (previewFrameUBOMem_[i]) vkFreeMemory(device_, previewFrameUBOMem_[i], nullptr);
         if (boneArena_[i]) vkDestroyBuffer(device_, boneArena_[i], nullptr);
+        if (instanceArena_[i]) vkDestroyBuffer(device_, instanceArena_[i], nullptr);
+        if (instanceArenaMem_[i]) vkFreeMemory(device_, instanceArenaMem_[i], nullptr);
         if (boneArenaMem_[i]) vkFreeMemory(device_, boneArenaMem_[i], nullptr);
     }
     if (descriptorPool_) vkDestroyDescriptorPool(device_, descriptorPool_, nullptr);

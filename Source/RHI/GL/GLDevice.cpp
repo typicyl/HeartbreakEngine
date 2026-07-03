@@ -602,7 +602,9 @@ private:
         glGenBuffers(1, &uiVbo_);
         glBindVertexArray(uiVao_);
         glBindBuffer(GL_ARRAY_BUFFER, uiVbo_);
-        const GLsizei stride = sizeof(UIVertex); // 36 (8 floats + u32)
+        const GLsizei stride = sizeof(UIVertex); // 52 (12 floats + u32; the
+        // trailing NDC clip rect is unused here - GL's UI shader doesn't clip
+        // yet, so ScrollView content renders unclipped on this backend)
         glEnableVertexAttribArray(0); // NDC position
         glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(0));
         glEnableVertexAttribArray(1); // uv

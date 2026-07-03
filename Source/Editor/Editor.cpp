@@ -22,6 +22,7 @@
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
 #include "UI/UISystem.h"
+#include "UI/UIAnimation.h"
 #include "Project/Project.h"
 #include "Renderer/Camera.h"
 #include "Renderer/IBL.h"
@@ -320,6 +321,10 @@ void Editor::ApplyTheme() {
 
 void Editor::BuildUI(Engine& engine) {
     engine_ = &engine;
+    // The editor (and hub) own the keyboard by default: in-game UI nav /
+    // TextInput only engage when the Game view is focused (DrawGameView
+    // clears this below).
+    engine.SetUIKeyboardCaptured(true);
     if (hubMode_) {
         // Hub: nothing but the Project Manager over the demo scene.
         DrawProjectManager();
@@ -2493,6 +2498,14 @@ void Editor::RefreshAssets() {
             item.isPrefab = true;
             item.label = entry.path().stem().string();
             item.typeName = "Prefab";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbdialogue") {
+            item.isDialogue = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "Dialogue";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbcutscene") {
+            item.isCutscene = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "Cutscene";
         } else if (entry.is_regular_file() && entry.path().extension() == ".uaf") {
             const uaf::AssetType type = uaf::PeekType(entry.path()); // header only
             item.isMesh = (type == uaf::AssetType::Mesh);
@@ -2514,6 +2527,8 @@ void Editor::RefreshAssets() {
                    : it.isScene   ? -1
                    : it.isPrefab  ? 0
                    : it.isSchematic ? 0
+                   : it.isDialogue ? 0
+                   : it.isCutscene ? 0
                    : it.isMesh    ? 1
                    : it.isMaterial ? 2
                    : it.isAudioEvent ? 3
@@ -2921,6 +2936,8 @@ void Editor::DrawAssetBrowser(Engine& engine) {
             if (ImGui::MenuItem("Material")) beginCreate(1, "NewMaterial");
             if (ImGui::MenuItem("Audio Event")) beginCreate(3, "NewAudioEvent");
             if (ImGui::MenuItem("Schematic")) beginCreate(4, "NewSchematic");
+            if (ImGui::MenuItem("Dialogue")) beginCreate(6, "NewDialogue");
+            if (ImGui::MenuItem("Cutscene")) beginCreate(7, "NewCutscene");
             ImGui::EndMenu();
         }
         ImGui::Separator();
@@ -2957,6 +2974,8 @@ void Editor::DrawAssetBrowser(Engine& engine) {
         const char* label = pendingCreateKind_ == 1   ? "Material name"
                             : pendingCreateKind_ == 4 ? "Schematic name"
                             : pendingCreateKind_ == 5 ? "Prefab name"
+                            : pendingCreateKind_ == 6 ? "Dialogue name"
+                            : pendingCreateKind_ == 7 ? "Cutscene name"
                                                       : "Audio event name";
         ImGui::TextUnformatted(label);
         ImGui::SetNextItemWidth(240.0f);
@@ -2976,6 +2995,8 @@ void Editor::DrawAssetBrowser(Engine& engine) {
                     created = CreatePrefabFromSelection(engine.GetScene(), pendingCreateDir_,
                                                         newAssetNameBuf_);
                     break;
+                case 6: created = CreateDialogueAsset(pendingCreateDir_, newAssetNameBuf_); break;
+                case 7: created = CreateCutsceneAsset(pendingCreateDir_, newAssetNameBuf_); break;
                 default: break;
             }
             if (!created.empty()) {
@@ -3218,11 +3239,27 @@ void Editor::EnsureLevelMembership(Scene& scene) {
     // children, so detect UI by the whole tree: a ROOT is a "UI root" when its
     // subtree contains any UICanvas/UIElement, and every entity under such a root
     // is skipped (stays untagged -> saves as the active scene instead).
+    // EXCEPTION: a WORLD-SPACE canvas is diegetic scene content (a page on a
+    // notebook), not screen UI - it (and its elements) must stay level-membered,
+    // or parenting one under a level object would silently pull that whole
+    // subtree out of the level files.
+    const auto underWorldCanvas = [&](entt::entity e) {
+        int depth = 0;
+        for (entt::entity cur = e; cur != entt::null && depth < 64; ++depth) {
+            if (const UICanvas* c = reg.try_get<UICanvas>(cur); c && c->worldSpace)
+                return true;
+            const Parent* p = reg.try_get<Parent>(cur);
+            cur = (p && reg.valid(p->entity)) ? p->entity : entt::null;
+        }
+        return false;
+    };
     std::unordered_set<u32> uiRoots;
     for (const entt::entity e : reg.view<UICanvas>())
-        uiRoots.insert(static_cast<u32>(RootOf(scene, e)));
+        if (!reg.get<UICanvas>(e).worldSpace)
+            uiRoots.insert(static_cast<u32>(RootOf(scene, e)));
     for (const entt::entity e : reg.view<UIElement>())
-        uiRoots.insert(static_cast<u32>(RootOf(scene, e)));
+        if (!underWorldCanvas(e))
+            uiRoots.insert(static_cast<u32>(RootOf(scene, e)));
     const auto isUI = [&](entt::entity e) {
         return uiRoots.count(static_cast<u32>(RootOf(scene, e))) != 0;
     };
@@ -3510,12 +3547,14 @@ void Editor::EnterPlayMode(Engine& engine) {
         focusGameView_ = true;
     }
     playPaused_ = false;
+    engine.ClearCutscene();               // never resume a cutscene left over from a prior Stop
     engine.GetPhysics().SetRunning(true); // scripts follow physics' play state
     engine.SetGameCameraEnabled(true);    // the primary CameraComponent renders
 }
 
 void Editor::StopPlayMode(Engine& engine) {
     if (!playMode_) return;
+    engine.ClearCutscene();             // abort any in-flight cutscene so it can't resume next Play
     engine.GetPhysics().SetRunning(false);
     engine.SetGameCameraEnabled(false); // back to the editor camera
     // Resume the editor freecam from the game camera's final pose so the view
@@ -3609,6 +3648,10 @@ void Editor::DrawGameView(Engine& engine) {
         } else {
             engine.SetUIPointer(-1.0f, -1.0f);
         }
+        // Hand the keyboard to the game UI while the Game view has focus and
+        // ImGui itself isn't text-editing (BuildUI re-captures every frame).
+        if (ImGui::IsWindowFocused() && !ImGui::GetIO().WantTextInput)
+            engine.SetUIKeyboardCaptured(false);
     } else {
         ImGui::TextDisabled("(viewport target not available on this backend)");
     }
@@ -4347,6 +4390,16 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
                 } else if (type == UIElement::Type::ProgressBar) {
                     el.size = {420.0f, 36.0f};
                     el.color = {0.12f, 0.12f, 0.16f, 0.9f};
+                } else if (type == UIElement::Type::Slider) {
+                    el.size = {420.0f, 40.0f};
+                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
+                } else if (type == UIElement::Type::Toggle) {
+                    el.size = {160.0f, 56.0f};
+                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
+                } else if (type == UIElement::Type::Selector) {
+                    el.size = {420.0f, 56.0f};
+                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
+                    el.options = {"High", "Med", "Low"};
                 }
                 reg.emplace<UIElement>(e, el);
                 selected_ = e;
@@ -4363,6 +4416,25 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
                 if (UIElement* el = reg.try_get<UIElement>(selected_)) {
                     el->radial = true;
                     el->size = {220.0f, 220.0f};
+                }
+            }
+            if (ImGui::MenuItem("Slider")) makeUI("UI Slider", UIElement::Type::Slider);
+            if (ImGui::MenuItem("Toggle")) makeUI("UI Toggle", UIElement::Type::Toggle);
+            if (ImGui::MenuItem("Selector")) makeUI("UI Selector", UIElement::Type::Selector);
+            if (ImGui::MenuItem("Scroll View")) {
+                makeUI("UI Scroll View", UIElement::Type::ScrollView);
+                if (UIElement* el = reg.try_get<UIElement>(selected_)) {
+                    el->size = {600.0f, 400.0f};
+                    el->color = {0.08f, 0.08f, 0.10f, 0.85f};
+                }
+            }
+            if (ImGui::MenuItem("Text Input")) {
+                makeUI("UI Text Input", UIElement::Type::TextInput);
+                if (UIElement* el = reg.try_get<UIElement>(selected_)) {
+                    el->text.clear();
+                    el->placeholder = "Enter text...";
+                    el->size = {420.0f, 56.0f};
+                    el->color = {0.12f, 0.12f, 0.16f, 0.9f};
                 }
             }
             ImGui::EndMenu();
@@ -4859,6 +4931,27 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (!reg.all_of<UICanvas>(sel) && ImGui::MenuItem("UI Canvas")) {
             PushUndo(scene);
             reg.emplace<UICanvas>(sel);
+        }
+        if (!reg.all_of<UIAnimator>(sel) && ImGui::MenuItem("UI Animator")) {
+            PushUndo(scene);
+            reg.emplace<UIAnimator>(sel);
+        }
+        if (!reg.all_of<UIPanel>(sel) && ImGui::MenuItem("UI Panel")) {
+            PushUndo(scene);
+            reg.emplace<UIPanel>(sel);
+        }
+        if (!reg.all_of<UILayoutGroup>(sel) && ImGui::MenuItem("UI Layout Group")) {
+            PushUndo(scene);
+            reg.emplace<UILayoutGroup>(sel);
+        }
+        if (!reg.all_of<UICanvasGroup>(sel) && ImGui::MenuItem("UI Canvas Group")) {
+            PushUndo(scene);
+            reg.emplace<UICanvasGroup>(sel);
+        }
+        if (!reg.all_of<WorldText>(sel) && ImGui::MenuItem("World Text (3D)")) {
+            PushUndo(scene);
+            reg.emplace<WorldText>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
         if (!reg.all_of<Animator>(sel) && ImGui::MenuItem("Animator")) {
             PushUndo(scene);
@@ -5874,11 +5967,13 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.open) {
             int type = static_cast<int>(el->type);
             if (ImGui::Combo("Type", &type,
-                             "Panel\0Label\0Button\0Image\0Progress Bar\0")) {
+                             "Panel\0Label\0Button\0Image\0Progress Bar\0Slider\0Toggle\0"
+                             "Selector\0Scroll View\0Text Input\0")) {
                 PushUndo(scene);
                 el->type = static_cast<UIElement::Type>(type);
             }
-            if (el->type != UIElement::Type::Image) {
+            if (el->type != UIElement::Type::Image &&
+                el->type != UIElement::Type::ScrollView) {
                 char textBuf[256];
                 std::snprintf(textBuf, sizeof(textBuf), "%s", el->text.c_str());
                 if (ImGui::InputText("Text", textBuf, sizeof(textBuf))) {
@@ -5980,6 +6075,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                       4000.0f);
                     undoOnActivate();
                 }
+                // Render transform (about the pivot) - drives UI animation too.
+                ImGui::DragFloat("Rotation", &el->rotation, 0.5f);
+                undoOnActivate();
+                ImGui::DragFloat2("Scale", glm::value_ptr(el->scale), 0.01f, 0.0f, 8.0f);
+                undoOnActivate();
                 ImGui::TextDisabled("Anchors/pivot are relative to the PARENT rect\n"
                                     "(canvas, or the parent element). Tip: drag\n"
                                     "elements in the Scene viewport.");
@@ -6007,6 +6107,30 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                 });
             }
 
+            // 9-slice border (L,T,R,B source pixels; 0 = plain stretch) for the
+            // rectangular textured widgets.
+            if (el->type == UIElement::Type::Image ||
+                el->type == UIElement::Type::Panel ||
+                el->type == UIElement::Type::Button ||
+                el->type == UIElement::Type::TextInput) {
+                ImGui::DragFloat4("9-Slice (L,T,R,B)", glm::value_ptr(el->slice), 0.5f,
+                                  0.0f, 512.0f, "%.0f px");
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Border in SOURCE-texture pixels. Corners keep\n"
+                                      "their size, edges stretch. 0 = plain stretch.");
+            }
+            // Word-wrap the caption to the element width.
+            if (el->type == UIElement::Type::Label ||
+                el->type == UIElement::Type::Button ||
+                el->type == UIElement::Type::Panel) {
+                bool wrap = el->wrap;
+                if (ImGui::Checkbox("Wrap Text", &wrap)) {
+                    PushUndo(scene);
+                    el->wrap = wrap;
+                }
+            }
+
             if (el->type == UIElement::Type::ProgressBar) {
                 ImGui::SliderFloat("Fill", &el->fill, 0.0f, 1.0f);
                 undoOnActivate();
@@ -6019,10 +6143,202 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 }
             }
 
+            if (el->type == UIElement::Type::Slider) {
+                ImGui::SliderFloat("Value", &el->value, 0.0f, 1.0f);
+                undoOnActivate();
+                ImGui::ColorEdit4("Fill / Handle", glm::value_ptr(el->fillColor));
+                undoOnActivate();
+            }
+            if (el->type == UIElement::Type::Toggle) {
+                bool t = el->toggled;
+                if (ImGui::Checkbox("Toggled (default)", &t)) {
+                    PushUndo(scene);
+                    el->toggled = t;
+                }
+                ImGui::ColorEdit4("On Color", glm::value_ptr(el->fillColor));
+                undoOnActivate();
+            }
+            if (el->type == UIElement::Type::Selector) {
+                ImGui::DragInt("Selected", &el->selected, 0.1f, 0,
+                               glm::max(0, static_cast<int>(el->options.size()) - 1));
+                undoOnActivate();
+                ImGui::ColorEdit4("Highlight", glm::value_ptr(el->fillColor));
+                undoOnActivate();
+                // Options as a comma-separated list (e.g. "High,Med,Low").
+                std::string joined;
+                for (size_t i = 0; i < el->options.size(); ++i) {
+                    if (i) joined += ",";
+                    joined += el->options[i];
+                }
+                char buf[256];
+                std::snprintf(buf, sizeof(buf), "%s", joined.c_str());
+                if (ImGui::InputText("Options (comma-sep)", buf, sizeof(buf))) {
+                    PushUndo(scene);
+                    el->options.clear();
+                    std::string cur;
+                    for (const char* p = buf;; ++p) {
+                        if (*p == ',' || *p == '\0') {
+                            const size_t a = cur.find_first_not_of(' ');
+                            const size_t b = cur.find_last_not_of(' ');
+                            if (a != std::string::npos)
+                                el->options.push_back(cur.substr(a, b - a + 1));
+                            cur.clear();
+                            if (*p == '\0') break;
+                        } else {
+                            cur += *p;
+                        }
+                    }
+                }
+            }
+
+            if (el->type == UIElement::Type::TextInput) {
+                char pbuf[256];
+                std::snprintf(pbuf, sizeof(pbuf), "%s", el->placeholder.c_str());
+                if (ImGui::InputText("Placeholder", pbuf, sizeof(pbuf))) {
+                    el->placeholder = pbuf;
+                }
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Grayed hint shown while the box is empty.\n"
+                                      "The Text field above is the edit buffer\n"
+                                      "(and its starting content).");
+                ImGui::DragInt("Max Length", &el->maxLength, 1.0f, 1, 4096);
+                undoOnActivate();
+                ImGui::ColorEdit4("Focus Ring", glm::value_ptr(el->fillColor));
+                undoOnActivate();
+            }
+
+            if (el->type == UIElement::Type::ScrollView) {
+                ImGui::DragFloat2("Content Size", glm::value_ptr(el->contentSize),
+                                  1.0f, 0.0f, 20000.0f);
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Scrollable extent in canvas px.\n"
+                                      "0 = auto (measured from the children).");
+                ImGui::DragFloat2("Scroll Pos", glm::value_ptr(el->scrollPos), 1.0f);
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Start offset into the content. For a credits\n"
+                                      "roll set Y to -(view height) so the content\n"
+                                      "enters from below.");
+                ImGui::DragFloat("Scroll Speed", &el->scrollSpeed, 1.0f, 1.0f, 4000.0f,
+                                 "%.0f px/notch");
+                undoOnActivate();
+                bool sv = el->scrollVertical;
+                if (ImGui::Checkbox("Vertical", &sv)) {
+                    PushUndo(scene);
+                    el->scrollVertical = sv;
+                }
+                ImGui::SameLine();
+                bool sh = el->scrollHorizontal;
+                if (ImGui::Checkbox("Horizontal", &sh)) {
+                    PushUndo(scene);
+                    el->scrollHorizontal = sh;
+                }
+                ImGui::DragFloat("Auto Scroll", &el->autoScroll, 1.0f, -4000.0f,
+                                 4000.0f, "%.0f px/s");
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Content drift for credits rolls (0 = manual\n"
+                                      "wheel scrolling; the scrollbar hides while\n"
+                                      "auto-scrolling).");
+                ImGui::SameLine();
+                bool loop = el->autoScrollLoop;
+                if (ImGui::Checkbox("Loop", &loop)) {
+                    PushUndo(scene);
+                    el->autoScrollLoop = loop;
+                }
+                ImGui::ColorEdit4("Scrollbar", glm::value_ptr(el->fillColor));
+                undoOnActivate();
+                ImGui::TextDisabled("Children lay out inside the scrolled content\n"
+                                    "rect and are clipped to this view.");
+            }
+
+            // --- Skinning (U5): state styling + widget-part textures ----------
+            {
+                using T = UIElement::Type;
+                const bool interactive = el->type == T::Button || el->type == T::Slider ||
+                                         el->type == T::Toggle || el->type == T::Selector ||
+                                         el->type == T::TextInput;
+                // A DRY texture picker (picker + drag-drop) writing into `ref`.
+                const auto texField = [&](const char* label, std::string& ref) {
+                    std::string pick;
+                    if (AssetPicker(label, ref, ".uaf", uaf::AssetType::Texture, pick)) {
+                        PushUndo(scene);
+                        ref = pick;
+                    }
+                    AssetDropTarget(".uaf", uaf::AssetType::Texture,
+                                    [&](const std::filesystem::path& src) {
+                                        PushUndo(scene);
+                                        ref = Project::Active().RelativeAssetPath(src);
+                                    });
+                };
+                if (interactive || el->type == T::ProgressBar) {
+                    if (ImGui::TreeNode("Skinning")) {
+                        if (interactive) {
+                            bool en = el->enabled;
+                            if (ImGui::Checkbox("Enabled", &en)) {
+                                PushUndo(scene);
+                                el->enabled = en;
+                            }
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Off = inert + dimmed (or the Disabled\n"
+                                                  "color/texture below if set).");
+                            ImGui::TextDisabled("State colors (alpha 0 = auto tint)");
+                            ImGui::ColorEdit4("Hover Color", glm::value_ptr(el->hoverColor));
+                            undoOnActivate();
+                            ImGui::ColorEdit4("Pressed Color",
+                                              glm::value_ptr(el->pressedColor));
+                            undoOnActivate();
+                            ImGui::ColorEdit4("Disabled Color",
+                                              glm::value_ptr(el->disabledColor));
+                            undoOnActivate();
+                            std::string sp;
+                            if (AssetPicker("Hover Sound", el->hoverSound, ".uaf",
+                                            uaf::AssetType::Audio, sp)) {
+                                PushUndo(scene);
+                                el->hoverSound = sp;
+                            }
+                            if (AssetPicker("Click Sound", el->clickSound, ".uaf",
+                                            uaf::AssetType::Audio, sp)) {
+                                PushUndo(scene);
+                                el->clickSound = sp;
+                            }
+                        }
+                        // Per-type part textures (empty = flat-color legacy look).
+                        if (el->type == T::Button) {
+                            texField("Hover Tex", el->hoverTexture);
+                            texField("Pressed Tex", el->pressedTexture);
+                            texField("Disabled Tex", el->disabledTexture);
+                        } else if (el->type == T::Slider) {
+                            texField("Track Tex", el->trackTexture);
+                            texField("Fill Tex", el->fillTexture);
+                            texField("Handle Tex", el->handleTexture);
+                            ImGui::DragFloat("Handle Size", &el->handleSize, 0.5f, 0.0f,
+                                             512.0f, "%.0f px (0=auto)");
+                            undoOnActivate();
+                        } else if (el->type == T::Toggle) {
+                            texField("On Tex", el->onTexture);
+                            texField("Off Tex", el->offTexture);
+                        } else if (el->type == T::Selector) {
+                            texField("Cell Tex", el->cellTexture);
+                        } else if (el->type == T::ProgressBar) {
+                            texField("Fill Tex", el->fillTexture);
+                        } else if (el->type == T::TextInput) {
+                            texField("Disabled Tex", el->disabledTexture);
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+            }
+
             // Button game-flow action: the engine handles the click (no script).
+            // "settings" pushes the "Settings" panel (main-menu options AND the
+            // in-game pause overlay); "back" pops it (saving changed settings).
             if (el->type == UIElement::Type::Button) {
-                const char* kActions[] = {"(none)", "play", "menu", "restart", "quit"};
-                constexpr int kActionCount = 5;
+                const char* kActions[] = {"(none)",  "play", "menu", "restart",
+                                          "quit",    "settings", "back"};
+                constexpr int kActionCount = 7;
                 int cur = 0;
                 for (int i = 1; i < kActionCount; ++i)
                     if (el->action == kActions[i]) cur = i;
@@ -6032,8 +6348,25 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 }
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("play: menu->loading->gameplay; menu: back to main "
-                                      "menu; restart: reload via the game loading screen; "
-                                      "quit: exit. Handled by the engine.");
+                                      "menu; restart: reload via the loading screen; quit: "
+                                      "exit; settings: open the \"Settings\" panel (also the "
+                                      "in-game pause overlay); back: close it. "
+                                      "Handled by the engine.");
+            }
+
+            // Free-text binding id for non-Button elements, read by the UI manager /
+            // settings (e.g. setting:volume, setting:graphics, back) or the caption
+            // system ("caption" on a Label). Buttons use the Action combo above instead.
+            if (el->type != UIElement::Type::Button) {
+                char abuf[64];
+                std::snprintf(abuf, sizeof(abuf), "%s", el->action.c_str());
+                if (ImGui::InputText("Action / binding", abuf, sizeof(abuf))) {
+                    PushUndo(scene);
+                    el->action = abuf;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Binding id read by the UI manager / settings,\n"
+                                      "e.g. setting:volume, setting:graphics, setting:captions.");
             }
 
             bool visible = el->visible;
@@ -6052,6 +6385,196 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<UIElement>(sel);
+        }
+    }
+
+    // --- UI layout group (auto-positions child elements) ------------------------
+    if (UILayoutGroup* lg = reg.try_get<UILayoutGroup>(sel)) {
+        const SectionState s = ComponentSection("UI Layout Group");
+        if (s.open) {
+            int kind = static_cast<int>(lg->kind);
+            if (ImGui::Combo("Kind", &kind, "Vertical\0Horizontal\0Grid\0")) {
+                PushUndo(scene);
+                lg->kind = static_cast<UILayoutGroup::Kind>(kind);
+            }
+            ImGui::DragFloat("Spacing", &lg->spacing, 0.5f, 0.0f, 1000.0f, "%.0f px");
+            undoOnActivate();
+            ImGui::DragFloat4("Padding (L,T,R,B)", glm::value_ptr(lg->padding), 0.5f,
+                              0.0f, 1000.0f, "%.0f px");
+            undoOnActivate();
+            if (lg->kind == UILayoutGroup::Kind::Grid) {
+                ImGui::DragFloat2("Cell Size", glm::value_ptr(lg->cellSize), 1.0f, 1.0f,
+                                  4000.0f);
+                undoOnActivate();
+                ImGui::DragInt("Columns", &lg->columns, 0.1f, 1, 64);
+                undoOnActivate();
+            }
+            bool fit = lg->fitContent;
+            if (ImGui::Checkbox("Fit Content", &fit)) {
+                PushUndo(scene);
+                lg->fitContent = fit;
+            }
+            ImGui::TextDisabled("Positions non-stretch child UIElements in order.\n"
+                                "Fit Content grows this element to wrap them.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<UILayoutGroup>(sel);
+        }
+    }
+
+    // --- UI canvas group (inherited opacity + interactivity) --------------------
+    if (UICanvasGroup* cg = reg.try_get<UICanvasGroup>(sel)) {
+        const SectionState s = ComponentSection("UI Canvas Group");
+        if (s.open) {
+            ImGui::SliderFloat("Opacity", &cg->opacity, 0.0f, 1.0f);
+            undoOnActivate();
+            bool inter = cg->interactable;
+            if (ImGui::Checkbox("Interactable", &inter)) {
+                PushUndo(scene);
+                cg->interactable = inter;
+            }
+            ImGui::TextDisabled("Multiplies alpha over this whole subtree (menu\n"
+                                "fades); off = subtree ignores the pointer.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<UICanvasGroup>(sel);
+        }
+    }
+
+    // --- UI animator (plays a .hbuianim clip on this element) --------------------
+    if (UIAnimator* an = reg.try_get<UIAnimator>(sel)) {
+        const SectionState s = ComponentSection("UI Animator");
+        if (s.open) {
+            char cbuf[128];
+            std::snprintf(cbuf, sizeof(cbuf), "%s", an->clip.c_str());
+            if (ImGui::InputText("Clip (.hbuianim)", cbuf, sizeof(cbuf))) {
+                PushUndo(scene);
+                an->clip = cbuf;
+            }
+            int trig = static_cast<int>(an->trigger);
+            if (ImGui::Combo("Trigger", &trig,
+                             "Manual\0On Show\0On Hide\0Hover\0Click\0Loop\0")) {
+                PushUndo(scene);
+                an->trigger = static_cast<UIAnimator::Trigger>(trig);
+            }
+            if (ImGui::Button("Play (test)")) {
+                ui::ClearClipCache(); // pick up any re-authored clip
+                an->time = 0.0f;
+                an->playing = true;
+                an->captured = false;
+            }
+            if (Project::HasActive()) {
+                ImGui::TextDisabled("Create preset clip -> Assets/UI/:");
+                const auto writePreset = [&](const char* name, const ui::UIClip& clip) {
+                    const std::filesystem::path rel =
+                        std::filesystem::path("UI") / (std::string(name) + ".hbuianim");
+                    if (ui::SaveClip(Project::Active().AssetsDir() / rel, clip)) {
+                        PushUndo(scene);
+                        an->clip = rel.generic_string();
+                        ui::ClearClipCache();
+                    }
+                };
+                if (ImGui::SmallButton("FadeIn")) {
+                    ui::UIClip c;
+                    c.duration = 0.4f;
+                    c.tracks.push_back({ui::AnimTarget::Opacity,
+                                        {{0.0f, 0.0f, ease::Curve::OutQuad},
+                                         {0.4f, 1.0f, ease::Curve::OutQuad}}});
+                    writePreset("FadeIn", c);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("PopIn")) {
+                    ui::UIClip c;
+                    c.duration = 0.35f;
+                    const std::vector<ui::AnimKey> s01{{0.0f, 0.8f, ease::Curve::OutCubic},
+                                                       {0.35f, 1.0f, ease::Curve::OutCubic}};
+                    c.tracks.push_back({ui::AnimTarget::ScaleX, s01});
+                    c.tracks.push_back({ui::AnimTarget::ScaleY, s01});
+                    c.tracks.push_back({ui::AnimTarget::Opacity,
+                                        {{0.0f, 0.0f, ease::Curve::OutQuad},
+                                         {0.35f, 1.0f, ease::Curve::OutQuad}}});
+                    writePreset("PopIn", c);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("SlideIn")) {
+                    ui::UIClip c;
+                    c.duration = 0.4f;
+                    c.tracks.push_back({ui::AnimTarget::OffsetX,
+                                        {{0.0f, -240.0f, ease::Curve::OutCubic},
+                                         {0.4f, 0.0f, ease::Curve::OutCubic}}});
+                    c.tracks.push_back({ui::AnimTarget::Opacity,
+                                        {{0.0f, 0.0f, ease::Curve::Linear},
+                                         {0.4f, 1.0f, ease::Curve::Linear}}});
+                    writePreset("SlideIn", c);
+                }
+            }
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<UIAnimator>(sel);
+        }
+    }
+
+    // --- UI panel (a named screen the UI manager shows/hides) --------------------
+    if (UIPanel* panel = reg.try_get<UIPanel>(sel)) {
+        const SectionState s = ComponentSection("UI Panel");
+        if (s.open) {
+            char nbuf[64];
+            std::snprintf(nbuf, sizeof(nbuf), "%s", panel->name.c_str());
+            if (ImGui::InputText("Screen name", nbuf, sizeof(nbuf))) {
+                PushUndo(scene);
+                panel->name = nbuf;
+            }
+            bool sv = panel->startVisible;
+            if (ImGui::Checkbox("Start visible", &sv)) {
+                PushUndo(scene);
+                panel->startVisible = sv;
+            }
+            ImGui::TextDisabled("A named screen (e.g. MainMenu / Settings / HUD). The\n"
+                                "UI manager shows/hides this whole subtree as a unit.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<UIPanel>(sel);
+        }
+    }
+
+    // --- World Text (3D text as its own object) -----------------------------------
+    if (WorldText* wt = reg.try_get<WorldText>(sel)) {
+        const SectionState s = ComponentSection("World Text (3D)");
+        if (s.open) {
+            char tbuf[512];
+            std::snprintf(tbuf, sizeof(tbuf), "%s", wt->text.c_str());
+            if (ImGui::InputTextMultiline("Text", tbuf, sizeof(tbuf),
+                                          ImVec2(0, ImGui::GetTextLineHeight() * 4))) {
+                PushUndo(scene);
+                wt->text = tbuf;
+            }
+            ImGui::DragFloat("Size (m)", &wt->size, 0.01f, 0.01f, 100.0f, "%.2f");
+            undoOnActivate();
+            ImGui::ColorEdit4("Color", &wt->color.x);
+            undoOnActivate();
+            char fbuf[256];
+            std::snprintf(fbuf, sizeof(fbuf), "%s", wt->font.c_str());
+            if (ImGui::InputText("Font (asset)", fbuf, sizeof(fbuf))) {
+                PushUndo(scene);
+                wt->font = fbuf;
+            }
+            bool bb = wt->billboard;
+            if (ImGui::Checkbox("Billboard (face camera)", &bb)) {
+                PushUndo(scene);
+                wt->billboard = bb;
+            }
+            ImGui::TextDisabled("3D text placed by this entity's Transform (no canvas).\n"
+                                "Reads in the local XY plane facing +Z - rotate to aim it;\n"
+                                "Billboard always faces the camera (floating label).\n"
+                                "Unlit, depth-tested; supports multi-line text.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<WorldText>(sel);
         }
     }
 
@@ -6078,6 +6601,38 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             }
             ImGui::TextDisabled("UI elements parented under this entity lay out\n"
                                 "inside this canvas (higher sort orders draw on top).");
+            ImGui::SeparatorText("World Space (physical UI)");
+            bool world = canvas->worldSpace;
+            if (ImGui::Checkbox("World Space", &world)) {
+                PushUndo(scene);
+                canvas->worldSpace = world;
+                // A world canvas is placed by its Transform - make sure one exists.
+                if (world && !reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (canvas->worldSpace) {
+                ImGui::DragFloat("World Width (m)", &canvas->worldWidth, 0.01f, 0.01f,
+                                 100.0f, "%.2f");
+                undoOnActivate();
+                ImGui::DragFloat("Emissive", &canvas->emissive, 0.01f, 0.0f, 10.0f, "%.2f");
+                undoOnActivate();
+                int rt[2] = {static_cast<int>(canvas->rtWidth),
+                             static_cast<int>(canvas->rtHeight)};
+                if (ImGui::InputInt2("RT Resolution (0 = ref)", rt)) {
+                    PushUndo(scene);
+                    canvas->rtWidth = rt[0] <= 0 ? 0u : static_cast<u32>(glm::clamp(rt[0], 64, 4096));
+                    canvas->rtHeight = rt[1] <= 0 ? 0u : static_cast<u32>(glm::clamp(rt[1], 64, 4096));
+                }
+                ImGui::TextDisabled(
+                    "The canvas renders onto a LIT page in the scene (paper-like:\n"
+                    "shaded and occluded by the world, exempt from the painterly\n"
+                    "filter so text stays crisp). The page lies in this entity's\n"
+                    "local XZ plane facing +Y - rotate the entity to mount it;\n"
+                    "parent it under an object (a notebook) to follow it. The page\n"
+                    "is OPAQUE: author a full-bleed background (paper) - empty\n"
+                    "canvas regions render black. Panels, widgets, animations and\n"
+                    "tokens all work as on screen. Emissive > 0 adds self-glow\n"
+                    "for readability in dark scenes.");
+            }
         }
         if (s.remove) {
             PushUndo(scene);
@@ -6443,7 +6998,10 @@ void Editor::DrawPostLookControls(rhi::PostSettings& p, f32* exposure) {
         ImGui::SliderFloat("Density##fog", &p.fogDensity, 0.0f, 0.1f, "%.4f");
         ImGui::SliderFloat("Height falloff##fog", &p.fogHeightFalloff, 0.0f, 1.0f, "%.3f");
         ImGui::SliderFloat("Fog height##fog", &p.fogHeight, -50.0f, 50.0f, "%.1f");
-        ImGui::SliderFloat("Anisotropy##fog", &p.fogAnisotropy, -0.95f, 0.95f, "%.2f");
+        // Clamped to +/-0.9: beyond that the HG forward peak explodes and amplifies
+        // the coarse fog shadow into blocky artifacts (the phase is also bounded in
+        // the shader as a safety net).
+        ImGui::SliderFloat("Anisotropy##fog", &p.fogAnisotropy, -0.9f, 0.9f, "%.2f");
         ImGui::SliderFloat("Sun scatter##fog", &p.fogSunIntensity, 0.0f, 4.0f, "%.2f");
         ImGui::SliderFloat("God rays##fog", &p.fogGodRays, 0.0f, 6.0f, "%.2f");
         if (ImGui::IsItemHovered())
@@ -6453,7 +7011,7 @@ void Editor::DrawPostLookControls(rhi::PostSettings& p, f32* exposure) {
         ImGui::SliderFloat("Ambient##fog", &p.fogAmbient, 0.0f, 0.5f, "%.3f");
         ImGui::SliderFloat("Max distance##fog", &p.fogMaxDistance, 10.0f, 1000.0f, "%.0f");
         int steps = static_cast<int>(p.fogStepCount);
-        if (ImGui::SliderInt("Steps##fog", &steps, 4, 64)) p.fogStepCount = static_cast<u32>(steps);
+        if (ImGui::SliderInt("Steps##fog", &steps, 8, 64)) p.fogStepCount = static_cast<u32>(steps);
     }
 
     ImGui::SeparatorText("Depth of field");
@@ -6907,6 +7465,7 @@ void Editor::DrawSchematicCanvas() {
         if (c == "Entity")    return IM_COL32(54, 86, 96, 255);
         if (c == "Input")     return IM_COL32(98, 76, 50, 255);
         if (c == "Transform") return IM_COL32(54, 82, 70, 255);
+        if (c == "UI")        return IM_COL32(96, 62, 96, 255);
         return IM_COL32(72, 72, 84, 255);
     };
 
@@ -7376,6 +7935,41 @@ std::filesystem::path Editor::CreateAudioEventAsset(const std::filesystem::path&
         stem = base + std::to_string(i);
     const std::filesystem::path p = dir / (stem + assets::kAudioEventExtension);
     return assets::SaveAudioEvent(p, AudioEvent{}) ? p : std::filesystem::path{};
+}
+
+std::filesystem::path Editor::CreateDialogueAsset(const std::filesystem::path& dir,
+                                                  const std::string& name) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::string base = SanitizeFileStem(name);
+    if (base.empty()) base = "NewDialogue";
+    std::string stem = base;
+    for (int i = 1; std::filesystem::exists(dir / (stem + assets::kDialogueExtension), ec); ++i)
+        stem = base + std::to_string(i);
+    const std::filesystem::path p = dir / (stem + assets::kDialogueExtension);
+    DialogueAsset d;
+    d.lines.push_back(DialogueLine{"Speaker", "Line of dialogue.", "", 0.0f});
+    return assets::SaveDialogue(p, d) ? p : std::filesystem::path{};
+}
+
+std::filesystem::path Editor::CreateCutsceneAsset(const std::filesystem::path& dir,
+                                                  const std::string& name) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::string base = SanitizeFileStem(name);
+    if (base.empty()) base = "NewCutscene";
+    std::string stem = base;
+    for (int i = 1; std::filesystem::exists(dir / (stem + assets::kCutsceneExtension), ec); ++i)
+        stem = base + std::to_string(i);
+    const std::filesystem::path p = dir / (stem + assets::kCutsceneExtension);
+    CutsceneAsset c; // a 5s cinematic with two camera keys as a starting point
+    c.duration = 5.0f;
+    c.camera.push_back(CutsceneCameraKey{});
+    CutsceneCameraKey end;
+    end.time = 5.0f;
+    end.position = {5.0f, 2.0f, 5.0f};
+    c.camera.push_back(end);
+    return assets::SaveCutscene(p, c) ? p : std::filesystem::path{};
 }
 
 void Editor::DrawMusicEditor(Engine& engine) {
@@ -8065,9 +8659,12 @@ void Editor::DrawAssetViewer(Engine& engine) {
     const bool isMat = ext == ".hbmat";
     const bool isScene = ext == ".hbscene";
     const bool isEvent = ext == ".hbevent";
+    const bool isDialogue = ext == ".hbdialogue";
+    const bool isCutscene = ext == ".hbcutscene";
     const bool isUaf = ext == ".uaf";
     static std::vector<std::string> texChoices;   // rebuilt when the viewer re-targets
-    static std::vector<std::string> audioChoices; // .uaf audio assets for events
+    static std::vector<std::string> audioChoices; // .uaf audio assets for events/dialogue
+    static std::vector<std::string> dialogueChoices; // .hbdialogue assets for cutscene markers
 
     // (Re)build the cached preview + info lines.
     if (viewerDirty_) {
@@ -8134,6 +8731,8 @@ void Editor::DrawAssetViewer(Engine& engine) {
                     viewedAudioKind_ = static_cast<int>(audio->kind);
                     std::snprintf(viewedAudioCaption_, sizeof(viewedAudioCaption_), "%s",
                                   audio->caption.c_str());
+                    std::snprintf(viewedAudioSpeaker_, sizeof(viewedAudioSpeaker_), "%s",
+                                  audio->speaker.c_str());
                 }
             }
         } else if (isMat) {
@@ -8160,6 +8759,26 @@ void Editor::DrawAssetViewer(Engine& engine) {
                 editedEventDirty_ = false;
             }
             audioChoices = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
+        } else if (isDialogue) {
+            viewedTypeName_ = "Dialogue";
+            editedDialogueValid_ = false;
+            if (const auto d = assets::LoadDialogue(viewedAsset_)) {
+                editedDialogue_ = *d;
+                editedDialogueValid_ = true;
+                editedDialogueDirty_ = false;
+            }
+            audioChoices = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
+        } else if (isCutscene) {
+            viewedTypeName_ = "Cutscene";
+            editedCutsceneValid_ = false;
+            if (const auto c = assets::LoadCutscene(viewedAsset_)) {
+                editedCutscene_ = *c;
+                editedCutsceneValid_ = true;
+                editedCutsceneDirty_ = false;
+                cutsceneEditTime_ = 0.0f;
+            }
+            audioChoices = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
+            dialogueChoices = ListAssetsByExt(".hbdialogue");
         }
     }
 
@@ -8423,6 +9042,273 @@ void Editor::DrawAssetViewer(Engine& engine) {
         return;
     }
 
+    // --- Dialogue editor: an ordered list of spoken lines --------------------
+    if (isDialogue && editedDialogueValid_) {
+        ImGui::TextDisabled("Lines play top to bottom. Each shows \"Speaker: Text\" and\n"
+                            "plays its clip; empty Text uses the clip's own caption.\n"
+                            "Run it from a schematic Play Dialogue node.");
+        ImGui::Separator();
+        bool edited = false;
+        int removeIndex = -1, moveUp = -1, moveDown = -1;
+        const int count = static_cast<int>(editedDialogue_.lines.size());
+        for (int i = 0; i < count; ++i) {
+            DialogueLine& l = editedDialogue_.lines[static_cast<usize>(i)];
+            ImGui::PushID(i);
+            ImGui::SeparatorText(
+                (std::to_string(i + 1) + ".  " +
+                 (l.speaker.empty() ? std::string("(no speaker)") : l.speaker))
+                    .c_str());
+            char sp[96];
+            std::snprintf(sp, sizeof(sp), "%s", l.speaker.c_str());
+            if (ImGui::InputText("Speaker", sp, sizeof(sp))) { l.speaker = sp; edited = true; }
+            char tx[1024]; // generous: a subtitle line rarely exceeds this
+            std::snprintf(tx, sizeof(tx), "%s", l.text.c_str());
+            if (ImGui::InputTextMultiline("Text", tx, sizeof(tx), ImVec2(-1.0f, 46.0f))) {
+                l.text = tx;
+                edited = true;
+            }
+            if (ImGui::BeginCombo("Clip", l.clip.empty() ? "(none)" : l.clip.c_str())) {
+                if (ImGui::Selectable("(none)", l.clip.empty())) { l.clip.clear(); edited = true; }
+                for (const std::string& c : audioChoices) {
+                    if (ImGui::Selectable(c.c_str(), c == l.clip)) { l.clip = c; edited = true; }
+                }
+                ImGui::EndCombo();
+            }
+            edited |= ImGui::DragFloat("Hold (s, 0=auto)", &l.hold, 0.05f, 0.0f, 60.0f);
+            if (ImGui::SmallButton("Up") && i > 0) moveUp = i;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Down") && i + 1 < count) moveDown = i;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove")) removeIndex = i;
+            ImGui::PopID();
+        }
+        if (moveUp > 0) {
+            std::swap(editedDialogue_.lines[static_cast<usize>(moveUp)],
+                      editedDialogue_.lines[static_cast<usize>(moveUp - 1)]);
+            edited = true;
+        } else if (moveDown >= 0) {
+            std::swap(editedDialogue_.lines[static_cast<usize>(moveDown)],
+                      editedDialogue_.lines[static_cast<usize>(moveDown + 1)]);
+            edited = true;
+        } else if (removeIndex >= 0) {
+            editedDialogue_.lines.erase(editedDialogue_.lines.begin() + removeIndex);
+            edited = true;
+        }
+        if (ImGui::Button("+ Add line")) {
+            editedDialogue_.lines.push_back(DialogueLine{});
+            edited = true;
+        }
+        if (edited) editedDialogueDirty_ = true;
+        ImGui::Separator();
+        if (ImGui::Button(editedDialogueDirty_ ? "Save*" : "Save")) {
+            if (assets::SaveDialogue(viewedAsset_, editedDialogue_)) editedDialogueDirty_ = false;
+        }
+        if (editedDialogueDirty_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(unsaved changes)");
+        }
+        ImGui::End();
+        return;
+    }
+
+    // --- Cutscene editor: camera + animation + dialogue tracks ---------------
+    if (isCutscene && editedCutsceneValid_) {
+        CutsceneAsset& cs = editedCutscene_;
+        auto& reg = engine.GetScene().Registry();
+        Camera& vcam = engine.GetRenderer().GetCamera();
+        const auto findByName = [&](const std::string& n) -> entt::entity {
+            if (n.empty()) return entt::null;
+            for (const entt::entity e : reg.view<Name>())
+                if (reg.get<Name>(e).value == n) return e;
+            return entt::null;
+        };
+        const auto insertCamKey = [](std::vector<CutsceneCameraKey>& v, CutsceneCameraKey k) {
+            v.insert(std::upper_bound(v.begin(), v.end(), k,
+                         [](const CutsceneCameraKey& a, const CutsceneCameraKey& b) {
+                             return a.time < b.time;
+                         }),
+                     k);
+        };
+        bool ed = false;
+        ImGui::TextDisabled("Position the editor camera, then Capture keys to author\n"
+                            "shots. Entities are targeted by Name. Run it from a\n"
+                            "schematic \"Play Cutscene\" node.");
+        ImGui::SetNextItemWidth(120.0f);
+        ed |= ImGui::DragFloat("Duration (s)", &cs.duration, 0.1f, 0.1f, 3600.0f);
+        ImGui::SetNextItemWidth(-120.0f);
+        ImGui::SliderFloat("Playhead (s)", &cutsceneEditTime_, 0.0f,
+                           glm::max(cs.duration, 0.1f), "%.2f");
+
+        // -- Camera track --
+        ImGui::SeparatorText("Camera track");
+        if (ImGui::Button("Capture camera key @ playhead")) {
+            CutsceneCameraKey k;
+            k.time = cutsceneEditTime_;
+            k.position = vcam.Position();
+            k.aim = vcam.Position() + vcam.Forward() * 5.0f;
+            k.fov = glm::degrees(vcam.FovY()); // match the live viewport FOV, not the 60 default
+            insertCamKey(cs.camera, k);
+            ed = true;
+        }
+        int camRemove = -1;
+        for (int i = 0; i < static_cast<int>(cs.camera.size()); ++i) {
+            CutsceneCameraKey& k = cs.camera[static_cast<usize>(i)];
+            ImGui::PushID(1000 + i);
+            ImGui::SetNextItemWidth(64.0f);
+            ed |= ImGui::DragFloat("t", &k.time, 0.02f, 0.0f, cs.duration);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0f);
+            ed |= ImGui::DragFloat3("pos", glm::value_ptr(k.position), 0.05f);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(150.0f);
+            ed |= ImGui::DragFloat3("aim", glm::value_ptr(k.aim), 0.05f);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(54.0f);
+            ed |= ImGui::DragFloat("fov", &k.fov, 0.2f, 10.0f, 170.0f);
+            ImGui::SameLine();
+            ed |= ImGui::Checkbox("cut", &k.cut);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) camRemove = i;
+            ImGui::PopID();
+        }
+        if (camRemove >= 0) { cs.camera.erase(cs.camera.begin() + camRemove); ed = true; }
+
+        // -- Animation tracks --
+        ImGui::SeparatorText("Animation tracks");
+        int trackRemove = -1;
+        for (int ti = 0; ti < static_cast<int>(cs.animTracks.size()); ++ti) {
+            CutsceneAnimTrack& tr = cs.animTracks[static_cast<usize>(ti)];
+            ImGui::PushID(2000 + ti);
+            std::string tgt;
+            if (EntityNameCombo("Target", reg, tr.target, 0, tgt)) { tr.target = tgt; ed = true; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove track")) trackRemove = ti;
+            if (ImGui::SmallButton("Capture transform key @ playhead")) {
+                const entt::entity e = findByName(tr.target);
+                if (const Transform* xf = e != entt::null ? reg.try_get<Transform>(e) : nullptr) {
+                    CutsceneTransformKey k;
+                    k.time = cutsceneEditTime_;
+                    k.position = xf->position;
+                    k.rotation = xf->rotation;
+                    k.scale = xf->scale;
+                    tr.keys.insert(std::upper_bound(tr.keys.begin(), tr.keys.end(), k,
+                                       [](const CutsceneTransformKey& a,
+                                          const CutsceneTransformKey& b) {
+                                           return a.time < b.time;
+                                       }),
+                                   k);
+                    ed = true;
+                }
+            }
+            int keyRemove = -1;
+            for (int ki = 0; ki < static_cast<int>(tr.keys.size()); ++ki) {
+                CutsceneTransformKey& k = tr.keys[static_cast<usize>(ki)];
+                ImGui::PushID(ki);
+                ImGui::SetNextItemWidth(64.0f);
+                ed |= ImGui::DragFloat("t##k", &k.time, 0.02f, 0.0f, cs.duration);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(150.0f);
+                ed |= ImGui::DragFloat3("pos##k", glm::value_ptr(k.position), 0.05f);
+                ImGui::SameLine();
+                glm::vec3 euler = glm::degrees(glm::eulerAngles(k.rotation));
+                ImGui::SetNextItemWidth(150.0f);
+                if (ImGui::DragFloat3("rot##k", glm::value_ptr(euler), 0.5f)) {
+                    k.rotation = glm::quat(glm::radians(euler));
+                    ed = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) keyRemove = ki;
+                ImGui::PopID();
+            }
+            if (keyRemove >= 0) { tr.keys.erase(tr.keys.begin() + keyRemove); ed = true; }
+            // Skeletal clip triggers.
+            if (ImGui::SmallButton("+ clip trigger @ playhead")) {
+                tr.clips.push_back({cutsceneEditTime_, 0});
+                ed = true;
+            }
+            int clipRemove = -1;
+            for (int ci = 0; ci < static_cast<int>(tr.clips.size()); ++ci) {
+                CutsceneClipMarker& m = tr.clips[static_cast<usize>(ci)];
+                ImGui::PushID(3000 + ci);
+                ImGui::SetNextItemWidth(64.0f);
+                ed |= ImGui::DragFloat("t##c", &m.time, 0.02f, 0.0f, cs.duration);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(80.0f);
+                ed |= ImGui::DragInt("clip##c", &m.clip, 0.1f, 0, 256);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) clipRemove = ci;
+                ImGui::PopID();
+            }
+            if (clipRemove >= 0) { tr.clips.erase(tr.clips.begin() + clipRemove); ed = true; }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (trackRemove >= 0) {
+            cs.animTracks.erase(cs.animTracks.begin() + trackRemove);
+            ed = true;
+        }
+        if (ImGui::Button("+ Add animation track")) {
+            cs.animTracks.push_back(CutsceneAnimTrack{});
+            ed = true;
+        }
+
+        // -- Dialogue markers --
+        ImGui::SeparatorText("Dialogue markers");
+        int dlgRemove = -1;
+        for (int i = 0; i < static_cast<int>(cs.dialogue.size()); ++i) {
+            CutsceneDialogueMarker& m = cs.dialogue[static_cast<usize>(i)];
+            ImGui::PushID(4000 + i);
+            ImGui::SetNextItemWidth(64.0f);
+            ed |= ImGui::DragFloat("t##d", &m.time, 0.02f, 0.0f, cs.duration);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::BeginCombo("dialogue", m.dialogue.empty() ? "(none)" : m.dialogue.c_str())) {
+                if (ImGui::Selectable("(none)", m.dialogue.empty())) { m.dialogue.clear(); ed = true; }
+                for (const std::string& c : dialogueChoices)
+                    if (ImGui::Selectable(c.c_str(), c == m.dialogue)) { m.dialogue = c; ed = true; }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::BeginCombo("voice", m.voiceline.empty() ? "(none)" : m.voiceline.c_str())) {
+                if (ImGui::Selectable("(none)", m.voiceline.empty())) { m.voiceline.clear(); ed = true; }
+                for (const std::string& c : audioChoices)
+                    if (ImGui::Selectable(c.c_str(), c == m.voiceline)) { m.voiceline = c; ed = true; }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) dlgRemove = i;
+            ImGui::PopID();
+        }
+        if (dlgRemove >= 0) { cs.dialogue.erase(cs.dialogue.begin() + dlgRemove); ed = true; }
+        if (ImGui::Button("+ Add dialogue marker")) {
+            cs.dialogue.push_back(CutsceneDialogueMarker{cutsceneEditTime_, "", ""});
+            ed = true;
+        }
+
+        if (ed) editedCutsceneDirty_ = true;
+        ImGui::Separator();
+        if (ImGui::Button(editedCutsceneDirty_ ? "Save*" : "Save")) {
+            // Dragging a key's time can leave a track out of order; sort by time
+            // before writing so the on-disk asset (and the runtime that loads it)
+            // sees ascending keys. Mirrors the normalise-on-load in LoadCutscene.
+            auto byTime = [](const auto& a, const auto& b) { return a.time < b.time; };
+            std::stable_sort(cs.camera.begin(), cs.camera.end(), byTime);
+            for (CutsceneAnimTrack& t : cs.animTracks) {
+                std::stable_sort(t.keys.begin(), t.keys.end(), byTime);
+                std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
+            }
+            std::stable_sort(cs.dialogue.begin(), cs.dialogue.end(), byTime);
+            if (assets::SaveCutscene(viewedAsset_, cs)) editedCutsceneDirty_ = false;
+        }
+        if (editedCutsceneDirty_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(unsaved changes)");
+        }
+        ImGui::End();
+        return;
+    }
+
     // --- Mesh editor: interactive 3D preview + material slots (Unreal-style) --
     if (isUaf && viewedTypeName_ == "Mesh") {
         EnsureMeshPreview(engine);
@@ -8613,6 +9499,10 @@ void Editor::DrawAssetViewer(Engine& engine) {
         bool tagsChanged = false;
         if (ImGui::Combo("Type##audiokind", &viewedAudioKind_, kinds, 4)) tagsChanged = true;
         if (viewedAudioKind_ == static_cast<int>(uaf::AudioKind::Voiceline)) {
+            ImGui::TextDisabled("Speaker (character name; shown as \"Name: caption\"):");
+            ImGui::InputText("##audiospeaker", viewedAudioSpeaker_,
+                             sizeof(viewedAudioSpeaker_));
+            if (ImGui::IsItemDeactivatedAfterEdit()) tagsChanged = true;
             ImGui::TextDisabled("Caption (shown on screen when this voiceline plays):");
             ImGui::InputTextMultiline("##audiocaption", viewedAudioCaption_,
                                       sizeof(viewedAudioCaption_), ImVec2(-1.0f, 56.0f));
@@ -8622,7 +9512,10 @@ void Editor::DrawAssetViewer(Engine& engine) {
             if (auto a = uaf::ReadAudio(viewedAsset_)) { // read-modify-write keeps PCM
                 a->kind = static_cast<uaf::AudioKind>(viewedAudioKind_);
                 a->caption = viewedAudioCaption_;
+                a->speaker = viewedAudioSpeaker_;
                 uaf::WriteAudio(viewedAsset_, *a);
+                // Drop the play cache so the next play reflects the new tags.
+                engine.GetAudio().ClearUAFCache();
             }
         }
     }
@@ -9022,21 +9915,51 @@ bool Editor::BuildShipping(std::string& outMessage) {
     const fs::path dst = Project::Active().Root() / "Build";
     fs::create_directories(dst, ec);
 
-    // Pick the freshest runtime executable across build configs (a Release
-    // runtime ships several times smaller than a Debug one).
+    // Ship the RELEASE runtime: it is the fastest build (full inlining, /Ob2) and the
+    // smallest. Fall back to another config only if Release was never built - with a
+    // warning, since a Debug/RelWithDebInfo runtime runs markedly slower (it was the
+    // cause of a shipped build stuck well below the editor's frame rate). This used to
+    // pick the "freshest" config, which silently shipped whatever was rebuilt last.
     wchar_t buf[MAX_PATH] = {};
     ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
     const fs::path editorDir = fs::path(buf).parent_path();
-    fs::path runtimeDir = editorDir;
-    fs::file_time_type best{};
-    for (const char* config : {".", "../Release", "../RelWithDebInfo", "../MinSizeRel"}) {
-        const fs::path candidate = editorDir / config / "HeartbreakRuntime.exe";
-        if (!fs::exists(candidate, ec)) continue;
-        const auto t = fs::last_write_time(candidate, ec);
-        if (t > best) {
-            best = t;
-            runtimeDir = candidate.parent_path();
+
+    struct CfgCand { const char* rel; const char* name; };
+    static constexpr CfgCand kCands[] = {
+        {"../Release", "Release"},   {"../RelWithDebInfo", "RelWithDebInfo"},
+        {"../MinSizeRel", "MinSizeRel"}, {"../Debug", "Debug"}, {".", "current"}};
+
+    fs::path runtimeDir;      // chosen (Release if present)
+    std::string shipCfg;      // its config name, for the report
+    fs::path freshestPath;    // newest runtime of ANY config, for a staleness check
+    std::string freshestCfg;
+    fs::file_time_type freshest{};
+    for (const CfgCand& cfg : kCands) {
+        const fs::path cand = editorDir / cfg.rel / "HeartbreakRuntime.exe";
+        if (!fs::exists(cand, ec)) continue;
+        const auto t = fs::last_write_time(cand, ec);
+        if (freshestPath.empty() || t > freshest) {
+            freshest = t;
+            freshestPath = cand;
+            freshestCfg = cfg.name;
         }
+        if (runtimeDir.empty() && std::string(cfg.rel) == "../Release") {
+            runtimeDir = cand.parent_path();
+            shipCfg = "Release";
+        }
+    }
+    if (runtimeDir.empty()) {
+        // No Release build present: ship the freshest available, but warn - it's slower.
+        runtimeDir = freshestPath.empty() ? editorDir : freshestPath.parent_path();
+        shipCfg = freshestPath.empty() ? "unknown" : freshestCfg;
+        HBE_WARN("BuildShipping: no Release runtime found - shipping the '{}' build, which "
+                 "runs SLOWER. Build the Release config and re-ship for best performance.",
+                 shipCfg);
+    } else if (!freshestPath.empty() && freshestCfg != "Release" &&
+               freshest > fs::last_write_time(runtimeDir / "HeartbreakRuntime.exe", ec)) {
+        HBE_WARN("BuildShipping: your '{}' build is newer than Release - shipping Release "
+                 "(fastest) anyway. Rebuild the Release config to ship your latest code.",
+                 freshestCfg);
     }
 
     const auto copy = [&](const fs::path& from, const fs::path& to) {
@@ -9071,12 +9994,22 @@ bool Editor::BuildShipping(std::string& outMessage) {
     if (exeStem.empty()) exeStem = "Game";
     bool ok = copy(runtimeDir / "HeartbreakRuntime.exe", dst / (exeStem + ".exe"));
 
-    // 2) DLLs. Native dependencies sit next to the runtime (they link statically
-    //    today, but this keeps any future ones working).
+    // 2) DLLs. Native deps link statically and the MSVC runtime is /MT (static), so a
+    //    shipped build normally needs NO DLLs. Copy any that are genuinely present, but
+    //    SKIP the MSVC redistributable DLLs (in case a stale copy lingers in the build
+    //    dir) and the dead HeartbreakEngine.Managed.dll (removed C# scripting) - so the
+    //    shipped folder stays just the exe + packs.
     for (const auto& it : fs::directory_iterator(runtimeDir, ec)) {
-        if (it.is_regular_file() && it.path().extension() == ".dll") {
-            ok &= copy(it.path(), dst / it.path().filename());
-        }
+        if (!it.is_regular_file() || it.path().extension() != ".dll") continue;
+        std::string lower = it.path().filename().string();
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const bool msvcRuntime = lower.rfind("msvcp140", 0) == 0 ||
+                                 lower.rfind("vcruntime140", 0) == 0 ||
+                                 lower.rfind("concrt140", 0) == 0 ||
+                                 lower.rfind("vccorlib140", 0) == 0;
+        if (msvcRuntime || lower == "heartbreakengine.managed.dll") continue;
+        ok &= copy(it.path(), dst / it.path().filename());
     }
 
     // 3) The asset packs - now also carrying the engine's compiled shaders and
@@ -9146,8 +10079,8 @@ bool Editor::BuildShipping(std::string& outMessage) {
     }
     char size[64];
     std::snprintf(size, sizeof(size), "%.1f MB", totalBytes / (1024.0 * 1024.0));
-    outMessage = ok ? "Shipping build (" + std::string(size) + ") at " + dst.string() +
-                          (packed ? "  [" + PackSummary(*packed) + "]" : "")
+    outMessage = ok ? "Shipping build (" + std::string(size) + ", " + shipCfg + " runtime) at " +
+                          dst.string() + (packed ? "  [" + PackSummary(*packed) + "]" : "")
                     : "Shipping build finished with errors (see log).";
     HBE_INFO("Shipping: {}", outMessage);
     return ok;
@@ -9246,6 +10179,10 @@ void Editor::DrawBuildSettings(Engine& engine) {
         }
         changed |= ImGui::Checkbox("Fullscreen (borderless, covers the screen)",
                                    &build.fullscreen);
+        changed |= ImGui::Checkbox("VSync", &build.vsync);
+        if (!build.vsync)
+            ImGui::TextDisabled("Uncapped frame rate (tearing allowed). Applies at\n"
+                                "the next launch; --vsync/--novsync override.");
         ImGui::BeginDisabled(build.fullscreen);
         int res[2] = {static_cast<int>(build.width), static_cast<int>(build.height)};
         if (ImGui::InputInt2("Resolution", res)) {
@@ -9288,12 +10225,12 @@ void Editor::DrawBuildSettings(Engine& engine) {
 
     ImGui::SeparatorText("Game Flow");
     {
-        // Optional scene slots that wire up the runtime's menu -> loading ->
-        // gameplay flow. Setting a Main Menu scene makes the runtime boot into it
-        // (instead of the Startup Scene); UI buttons with a "play"/"menu"/"quit"
-        // action drive the transitions. Each is a plain (non-level) UI scene.
-        ImGui::TextDisabled("Set a Main Menu scene to boot into the menu flow.\n"
-                            "Buttons with a play/menu/quit Action drive it.");
+        // The game's UI is ONE persistent scene of UIPanel screens the UI manager
+        // shows/hides; UI buttons with a "play"/"settings"/"back"/"menu"/"quit"
+        // action drive the transitions. The studio scene is separate: it renders
+        // during boot, before the UI scene exists.
+        ImGui::TextDisabled("Set a UI Scene to enable the menu flow.\n"
+                            "Buttons with a play/settings/back/menu/quit Action drive it.");
         auto scenePicker = [&](const char* label, std::string& slot) {
             if (ImGui::BeginCombo(label, slot.empty() ? "(none)" : slot.c_str())) {
                 if (ImGui::Selectable("(none)", slot.empty())) {
@@ -9310,15 +10247,18 @@ void Editor::DrawBuildSettings(Engine& engine) {
                 ImGui::EndCombo();
             }
         };
-        scenePicker("Main Menu Scene", project.Settings().mainMenuScene);
-        scenePicker("HUD Scene", project.Settings().hudScene);
-        scenePicker("Game Loading Scene", project.Settings().loadingScene);
+        scenePicker("UI Scene (panels)", project.Settings().uiScene);
+        ImGui::TextDisabled("UI Scene: one persistent scene of UIPanel screens\n"
+                            "(name them MainMenu / Settings / HUD / Pause / Loading).\n"
+                            "The \"Loading\" panel is the loading screen: give it a\n"
+                            "ProgressBar and the engine drives its fill during loads.\n"
+                            "Empty = no menus: the runtime boots straight into the\n"
+                            "Startup Scene.");
         scenePicker("Studio (Boot) Scene", project.Settings().studioLoadingScene);
         ImGui::TextDisabled(
-            "Loading scenes: add a ProgressBar; the engine drives its fill.\n"
-            "Studio scene shows at boot. Put {log} in a Label to show the live\n"
-            "boot console as it loads. Other text tokens: {progress} {version}\n"
-            "{backend} {gpu} {audio}.");
+            "Studio scene shows at boot (before the UI scene loads). Put {log}\n"
+            "in a Label to show the live boot console. Other text tokens:\n"
+            "{progress} {version} {backend} {gpu} {audio}.");
     }
 
     ImGui::SeparatorText("UI Canvas");
