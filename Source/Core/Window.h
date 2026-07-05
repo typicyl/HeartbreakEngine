@@ -3,8 +3,10 @@
 
 #include "Core/Types.h"
 
+#include <filesystem>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace hbe {
 
@@ -59,6 +61,12 @@ public:
     // translates native events; `input` just stores platform-agnostic state.
     void SetInputSink(Input* input) { input_ = input; }
 
+    // Files dropped onto the window from the OS since the last call (native
+    // paths, encoding-safe). Moves them out and clears the queue - the editor
+    // drains this each frame to import; unread drops are bounded so a runtime
+    // that never drains can't leak.
+    std::vector<std::filesystem::path> TakeDroppedFiles();
+
     // Locks the OS cursor to the window centre and hides it (FPS/mouse-look mode):
     // each mouse-move is fed to Input as a raw delta and the cursor is re-centred,
     // so it never reaches a screen edge. Unlocking shows the cursor again.
@@ -78,6 +86,7 @@ private:
     Input* input_ = nullptr;
     int mouseCapture_ = 0; // held-button count driving SetCapture/ReleaseCapture
     bool cursorLocked_ = false; // mouse-look mode: hidden + recentred each move
+    std::vector<std::filesystem::path> droppedFiles_; // OS drag-drop, drained by the editor
 
     // Win32 window procedure dispatches into this instance.
     static i64 __stdcall WndProcThunk(void* hwnd, u32 msg, u64 wparam, i64 lparam);

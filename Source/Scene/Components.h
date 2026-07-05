@@ -62,6 +62,13 @@ struct ParticleEmitter {
     // Motion
     glm::vec3 gravity{0.0f, -0.6f, 0.0f};
     f32 drag = 0.0f;           // velocity damping (per second)
+    // Buoyancy: upward accel proportional to remaining "heat" (1 at birth -> 0 at
+    // death), so hot young particles rise fast then stall as they cool. This is what
+    // makes a rising fireball pile material into a cap (mushroom clouds, big fire).
+    f32 buoyancy = 0.0f;
+    // Vortex ring: a toroidal roll about the emitter's vertical axis - particles push
+    // outward and curl over/down as they rise, forming the classic mushroom-cap roll.
+    f32 vortex = 0.0f;
     // Look (lerped over each particle's life)
     glm::vec4 startColor{1.0f, 0.85f, 0.4f, 1.0f};
     glm::vec4 endColor{1.0f, 0.2f, 0.05f, 0.0f};
@@ -70,6 +77,46 @@ struct ParticleEmitter {
     f32 spin = 0.0f;           // billboard rotation speed (rad/s)
     std::string texture;       // sprite .uaf (empty = soft round dot)
     bool additive = true;      // additive (fire/sparks) vs alpha blend (smoke)
+
+    // --- Volumetric overhaul (defaults reproduce the legacy sphere emitter) ---
+    // Emission shape (how spawn position + direction are sampled).
+    enum class Shape : u32 { Point = 0, Sphere, Hemisphere, Box, Disc, Cone };
+    Shape shape = Shape::Sphere;         // Sphere + emitRadius == legacy behaviour
+    glm::vec3 boxHalfExtents{0.5f};      // Box shape half-size
+    f32 coneAngle = 25.0f;               // Cone half-angle (degrees)
+    // Bursts / one-shot (explosions): `burst` particles fire when emission starts;
+    // when !loop, continuous emission runs for `duration` seconds then auto-stops.
+    u32 burst = 0;
+    bool loop = true;
+    f32 duration = 1.0f;
+    // Turbulence: a swirly noise force added to velocity (smoke/dust/magic).
+    f32 turbulence = 0.0f;               // strength
+    f32 turbulenceScale = 1.0f;          // spatial frequency
+    // Alpha envelope over life (fractions of life to ramp; 0 = off).
+    f32 fadeIn = 0.0f;
+    f32 fadeOut = 0.0f;
+    // Rendering.
+    enum class Render : u32 { Billboard = 0, Stretched, Horizontal };
+    Render render = Render::Billboard;   // Stretched = velocity streaks (rain/sparks)
+    f32 stretch = 2.0f;                  // length/width aspect for Stretched mode
+    u32 subUVCols = 1, subUVRows = 1;    // sprite-sheet grid (1x1 = single frame)
+    f32 subUVFps = 0.0f;                 // >0 loops the sheet; 0 plays it once over life
+    f32 softFade = 0.0f;                 // soft-particle depth-fade distance (0 = hard)
+
+    // --- True volumetric VFX (raymarched 3D density; see heartbreak-volumetric-vfx) ---
+    // When set, this emitter's particles ALSO feed a 3D density/temperature volume
+    // that a compute pass splats and a raymarch pass lights + composites (real
+    // volumetric smoke/fire, not billboards). The billboard pass still runs too;
+    // set emitting/rate low + additive off for pure volumetric.
+    bool volumetric = false;
+    f32 volDensity = 1.0f;       // per-particle density contribution
+    f32 volRadiusScale = 2.0f;   // blob radius = particle size * this
+    f32 volTemperature = 0.0f;   // 0 = smoke, 1 = fire (drives blackbody emission)
+    f32 volEmission = 2.5f;      // fire glow strength
+    f32 volExtinction = 1.5f;    // absorption (higher = denser/darker smoke)
+    i32 volSteps = 48;           // raymarch step count (perf vs quality)
+    i32 volResolution = 96;      // volume voxel dim (quality knob; 64 = low-end)
+    f32 volDetail = 0.6f;        // procedural noise detail: 0 = raw blobs, 1 = heavy wisps
 
     // --- runtime (NOT serialized) ---
     struct Particle {
@@ -85,6 +132,10 @@ struct ParticleEmitter {
     u32 rngState = 0x1234567u;      // per-emitter PRNG
     u32 textureCache = 0;           // resolved bindless index
     bool textureResolved = false;
+    f32 simTime = 0.0f;             // ever-accumulating time (turbulence phase)
+    f32 activeAge = 0.0f;           // time since emission (re)started (duration gate)
+    bool bursted = false;           // one-shot burst already fired this activation
+    bool wasEmitting = false;       // edge-detect emission restart
 };
 
 // Renders a GPU mesh with a metallic-roughness material.
@@ -215,6 +266,15 @@ struct RigidBody {
 // Optional human-readable label (debugging / editor).
 struct Name {
     std::string value;
+};
+
+// Marks the ROOT entity of a placed prefab instance, linking it back to the
+// source `.hbprefab` (path relative to Assets/). The editor uses this to Apply
+// the instance's edits to the source, Revert the instance to the source, or
+// Unpack (drop the link). Serialized so links survive save/load and nest (a
+// prefab whose subtree contains instances keeps their links). Runtime ignores it.
+struct PrefabInstance {
+    std::string source; // `.hbprefab` path relative to Assets/
 };
 
 // Runtime tag: which loaded scene an entity came from (a streamed/additive scene
@@ -613,6 +673,19 @@ struct UIElement {
     bool textureResolved = false;    // reset to re-resolve `texture`
 };
 
+// Runtime-only tag on a dialogue Choice button the conversation player spawns while
+// a Choice node is active. Maps the clicked button back to its node's output pin so
+// the player can follow the right branch. Transient - never serialized, destroyed
+// when the choice is resolved.
+struct DialogueChoiceButton {
+    u32 outPin = 0;
+};
+
+// Runtime-only tag on the interaction prompt ("[E] Talk") the Engine shows while the
+// player is near an Interactable. One shared entity, toggled visible. Transient -
+// never serialized (excluded from the scene snapshot like DialogueChoiceButton).
+struct InteractPromptTag {};
+
 // Plays a reusable UI animation clip (.hbuianim) on this entity's UIElement. The clip
 // drives offset/scale/rotation/color/opacity/sprite-frame over time; ui::UpdateAnimations
 // advances it each frame per `trigger`. See UI/UIAnimation.h.
@@ -979,6 +1052,52 @@ struct NavmeshInput {
 // walking into its box trigger (`triggerOnEnter`) or programmatically -
 // game::ReachCheckpoint(id) from a Schematic/script (e.g. an enemy-death graph).
 // The reached set lives in game:: (run state), so `reached` here is just a cache.
+// What an Interactable / TriggerVolume does when activated. All reuse the deferred
+// game:: queues, so they behave exactly like a schematic firing the same action.
+enum class InteractAction : u8 {
+    Dialogue = 0,       // run `asset` (.hbdialogue) as a branching conversation
+    Cutscene,           // run `asset` (.hbcutscene) cinematic
+    SetFlag,            // game::SetFlag(flag, flagValue) - story state
+    SetObjective,       // game::SetObjective(flag, text)   (flag = objective id)
+    CompleteObjective,  // game::CompleteObjective(flag)
+    None,               // no-op
+};
+
+// A world object / NPC the player can interact with. While the player is within
+// `range` a prompt ("[E] <prompt>") shows; pressing the interact key (E / gamepad Y)
+// fires `action`. `requiredFlag` gates availability (non-empty => only while that
+// story flag != 0); `once` disables it after the first activation. This is how the
+// player TOUCHES the narrative - e.g. talk to an NPC (Dialogue), examine/pick up
+// (SetFlag/Objective). See [[heartbreak-dialogue-graph]].
+struct Interactable {
+    InteractAction action = InteractAction::Dialogue;
+    std::string prompt = "Interact"; // shown as "[E] <prompt>"
+    std::string asset;               // Dialogue/Cutscene asset (relative to Assets/)
+    std::string flag;                // SetFlag/Objective: flag name or objective id
+    f32 flagValue = 1.0f;            // SetFlag value written
+    std::string text;                // SetObjective: the objective text to show
+    f32 range = 2.5f;                // interact distance (world units)
+    bool once = false;               // fire only the first time
+    std::string requiredFlag;        // gate: interactable only while this flag != 0 (empty = always)
+    bool fired = false;              // runtime: already activated (honours `once`)
+};
+
+// A box trigger: when the player enters the Transform-centred box, `action` fires
+// (same set as Interactable). Great for "enter room -> start cutscene/dialogue".
+// Fires on the ENTER edge; `once` (default) prevents re-firing; `requiredFlag` gates.
+struct TriggerVolume {
+    InteractAction action = InteractAction::Dialogue;
+    std::string asset;
+    std::string flag;
+    f32 flagValue = 1.0f;
+    std::string text;
+    glm::vec3 halfExtents{2.0f, 2.0f, 2.0f}; // box around the Transform
+    bool once = true;
+    std::string requiredFlag;
+    bool fired = false;               // runtime: already fired (honours `once`)
+    bool inside = false;              // runtime: player was inside last frame (enter-edge detect)
+};
+
 struct Checkpoint {
     std::string id;               // unique key (save/restore + ReachCheckpoint)
     std::string setObjective;     // objective text to SHOW when reached ("" = none)

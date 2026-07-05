@@ -11,6 +11,7 @@
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h> // DragAcceptFiles / WM_DROPFILES
 
 namespace hbe {
 
@@ -68,6 +69,8 @@ Window::Window(const WindowDesc& desc) {
 
     native_.hwnd = hwnd;
     native_.hinstance = hinstance;
+
+    ::DragAcceptFiles(hwnd, TRUE); // accept OS file drops (WM_DROPFILES)
 
     ::ShowWindow(hwnd, SW_SHOW); // already screen-sized when fullscreen
     ::UpdateWindow(hwnd);
@@ -249,10 +252,34 @@ i64 Window::HandleMessage(void* hwnd, u32 msg, u64 wparam, i64 lparam) {
         case WM_DESTROY:
             ::PostQuitMessage(0);
             return 0;
+        case WM_DROPFILES: {
+            // Files dropped from Explorer. Queue their native paths; the editor
+            // drains TakeDroppedFiles() each frame and imports the supported ones.
+            HDROP drop = reinterpret_cast<HDROP>(static_cast<uintptr_t>(wparam));
+            const UINT count = ::DragQueryFileW(drop, 0xFFFFFFFFu, nullptr, 0);
+            for (UINT idx = 0; idx < count; ++idx) {
+                const UINT len = ::DragQueryFileW(drop, idx, nullptr, 0);
+                if (len == 0) continue;
+                std::wstring wpath(len, L'\0');
+                ::DragQueryFileW(drop, idx, wpath.data(), len + 1); // +1: room for the null
+                droppedFiles_.emplace_back(std::move(wpath));       // path from native wstring
+            }
+            ::DragFinish(drop);
+            // Bound growth if nobody drains (e.g. a shipped runtime): keep newest.
+            if (droppedFiles_.size() > 256)
+                droppedFiles_.erase(droppedFiles_.begin(), droppedFiles_.end() - 128);
+            return 0;
+        }
         default:
             break;
     }
     return ::DefWindowProcW(h, msg, static_cast<WPARAM>(wparam), static_cast<LPARAM>(lparam));
+}
+
+std::vector<std::filesystem::path> Window::TakeDroppedFiles() {
+    std::vector<std::filesystem::path> out = std::move(droppedFiles_);
+    droppedFiles_.clear(); // moved-from vector is valid-but-unspecified; force empty
+    return out;
 }
 
 } // namespace hbe

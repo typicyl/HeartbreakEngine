@@ -76,6 +76,18 @@ public:
         particleAddCount_ = static_cast<u32>(additive.size());
     }
 
+    // Volumetric-VFX blobs for this frame (splatted into a 3D density volume; see
+    // VolumeSplat.hlsl). Forwarded to the device IMMEDIATELY (not deferred like
+    // particles) because the Vulkan splat runs in BeginFrame - so call this BEFORE
+    // RenderScene. Empty = volumetrics off this frame (zero GPU cost).
+    void SetVolumeParticles(const std::vector<rhi::VolumeBlob>& blobs,
+                            const rhi::VolumeParams& params) {
+        if (device_) {
+            device_->SetVolumeParticles(blobs.empty() ? nullptr : blobs.data(),
+                                        static_cast<u32>(blobs.size()), params);
+        }
+    }
+
     void Resize(u32 width, u32 height);
     void Shutdown();
 

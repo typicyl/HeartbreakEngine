@@ -9,6 +9,8 @@
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
 
+#include <cmath>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -18,6 +20,7 @@ namespace hbe::game {
 namespace {
 std::vector<Objective> g_objectives;
 std::unordered_set<std::string> g_reached;
+std::unordered_map<std::string, f32> g_flags; // global story variables (persisted)
 bool g_saveRequested = false;
 std::string g_saveId;
 // Deferred adaptive-music commands (drained by the engine).
@@ -79,6 +82,8 @@ bool ConsumeDialogue(std::string& outAsset) {
     outAsset = g_dialogue;
     return true;
 }
+bool DialoguePending() { return g_dialoguePending; }
+bool CutscenePending() { return g_cutscenePending; }
 void PlayCutscene(const std::string& asset) {
     g_cutscene = asset;
     g_cutscenePending = true;
@@ -97,6 +102,18 @@ bool ConsumeUICommand(UICommand& out) {
     g_uiCommands.erase(g_uiCommands.begin());
     return true;
 }
+
+void SetFlag(const std::string& name, f32 value) {
+    if (name.empty()) return;
+    // Guard non-finite values: NaN/Inf can't be represented in JSON (dump() emits
+    // null) and would corrupt the flag on the next save round-trip.
+    g_flags[name] = std::isfinite(value) ? value : 0.0f;
+}
+f32 GetFlag(const std::string& name) {
+    const auto it = g_flags.find(name);
+    return it != g_flags.end() ? it->second : 0.0f;
+}
+bool HasFlag(const std::string& name) { return g_flags.count(name) != 0; }
 
 void SetObjective(const std::string& id, const std::string& text) {
     for (Objective& o : g_objectives)
@@ -177,6 +194,8 @@ std::string SerializeState() {
         objs.push_back({{"id", o.id}, {"text", o.text}, {"done", o.done}});
     nlohmann::json& cps = j["checkpoints"] = nlohmann::json::array();
     for (const std::string& id : g_reached) cps.push_back(id);
+    nlohmann::json& fl = j["flags"] = nlohmann::json::object();
+    for (const auto& [name, value] : g_flags) fl[name] = value;
     return j.dump();
 }
 
@@ -190,6 +209,9 @@ void DeserializeState(const std::string& json) {
                 {o.value("id", std::string()), o.value("text", std::string()), o.value("done", false)});
         for (const nlohmann::json& c : j.value("checkpoints", nlohmann::json::array()))
             g_reached.insert(c.get<std::string>());
+        if (const auto fit = j.find("flags"); fit != j.end() && fit->is_object())
+            for (const auto& [name, value] : fit->items())
+                if (value.is_number()) g_flags[name] = value.get<f32>(); // skip null/string (corrupt)
     } catch (const std::exception& e) {
         HBE_WARN("game: failed to parse save state: {}", e.what());
     }
@@ -198,12 +220,21 @@ void DeserializeState(const std::string& json) {
 void Reset() {
     g_objectives.clear();
     g_reached.clear();
+    g_flags.clear();
     g_saveRequested = false;
     g_saveId.clear();
     g_musicStatePending = false;
     g_musicState.clear();
     g_musicParams.clear();
     g_stingers.clear();
+    // Newer deferred queues (parity with the music queues): clear so a request
+    // queued right before a restart/level transition can't fire into the fresh run.
+    g_voicelines.clear();
+    g_dialogue.clear();
+    g_dialoguePending = false;
+    g_cutscene.clear();
+    g_cutscenePending = false;
+    g_uiCommands.clear();
 }
 
 } // namespace hbe::game

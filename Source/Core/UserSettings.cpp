@@ -35,6 +35,12 @@ bool UserSettings::Save(const std::filesystem::path& dir) const {
     j["graphicsPreset"] = graphicsPreset;
     j["brightness"] = brightness;
     j["captionsEnabled"] = captionsEnabled;
+    {
+        nlohmann::json binds = nlohmann::json::object();
+        for (const auto& [name, b] : inputBindings)
+            binds[name] = {{"key", static_cast<u32>(b.key)}, {"pad", b.pad}};
+        j["inputBindings"] = std::move(binds);
+    }
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     std::ofstream f(dir / "usersettings.json", std::ios::binary | std::ios::trunc);
@@ -57,6 +63,11 @@ bool UserSettings::Load(const std::filesystem::path& dir) {
     graphicsPreset = j.value("graphicsPreset", 0);
     brightness = j.value("brightness", 0.5f);
     captionsEnabled = j.value("captionsEnabled", false);
+    inputBindings.clear();
+    if (const auto it = j.find("inputBindings"); it != j.end() && it->is_object())
+        for (const auto& [name, jb] : it->items())
+            inputBindings[name] = input::Binding{static_cast<Key>(jb.value("key", 0u)),
+                                                 jb.value("pad", 0u)};
     return true;
 }
 

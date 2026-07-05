@@ -33,6 +33,14 @@ const std::vector<Objective>& Objectives();
 // The first not-yet-done objective's text (what the HUD shows); "" if none.
 std::string CurrentObjectiveText();
 
+// --- Story flags (global variables) -----------------------------------------
+// A global, persistent float store: the "your choices matter" backbone. Dialogue
+// choices / conditions and schematics read + write these; they persist in the
+// .hbsave (serialized alongside objectives + checkpoints). A missing flag reads 0.
+void SetFlag(const std::string& name, f32 value);
+f32 GetFlag(const std::string& name);
+bool HasFlag(const std::string& name);
+
 // --- Checkpoints ------------------------------------------------------------
 // Marks `id` reached (idempotent). When `requestSave`, flags a save the engine
 // performs next frame. Safe from Schematics/scripts and the trigger system.
@@ -67,6 +75,11 @@ bool ConsumeVoiceline(std::string& outAsset);
 // over time (each shows its caption + plays its clip). Latest request wins.
 void PlayDialogue(const std::string& asset);
 bool ConsumeDialogue(std::string& outAsset);
+// True if a dialogue/cutscene is queued this frame but not yet consumed. Lets the
+// interaction system avoid clobbering a schematic's just-queued conversation (the
+// queues are single-slot latest-wins) before the engine's consume block runs.
+bool DialoguePending();
+bool CutscenePending();
 
 // --- Cutscene (deferred; a `.hbcutscene` timeline) --------------------------
 // A schematic starts a cinematic; the engine takes over the camera and runs

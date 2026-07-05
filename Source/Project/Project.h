@@ -7,6 +7,7 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "Core/InputActions.h" // input::ActionDef (data-driven action defaults)
 #include "RHI/RHI.h" // rhi::PostSettings
 
 #include <glm/glm.hpp>
@@ -117,6 +118,42 @@ struct AudioBusSetting {
     bool muted = false;
 };
 
+// One device's button/key icon set: id -> texture `.uaf` path (relative to Assets).
+// `id` is a GamepadButton bit (pad devices) or a (u32)Key (keyboard). Sparse - only
+// the buttons the artist supplied art for. See input::PadButtons() / input::KeyName().
+struct DeviceGlyphs {
+    std::vector<std::pair<u32, std::string>> icons;
+    const std::string* Find(u32 id) const {
+        for (const auto& e : icons)
+            if (e.first == id) return &e.second;
+        return nullptr;
+    }
+    void Set(u32 id, const std::string& tex) { // upsert; empty path removes the entry
+        for (usize i = 0; i < icons.size(); ++i)
+            if (icons[i].first == id) {
+                if (tex.empty()) icons.erase(icons.begin() + static_cast<std::ptrdiff_t>(i));
+                else icons[i].second = tex;
+                return;
+            }
+        if (!tex.empty()) icons.emplace_back(id, tex);
+    }
+};
+
+// Full input-glyph library shipped with the project: per-device button/key icon art
+// (the "unique art style" set), plus a general fallback icon and a game logo. The
+// interact prompt shows the icon for an action's CURRENT bound button on the active
+// device (fallback: general -> text glyph). Edited in the Icon Manager panel +
+// Build Settings; serialized in the .hbproj.
+struct InputIcons {
+    std::string general; // fallback icon (device/button with no specific art)
+    std::string logo;    // game / brand logo icon (available for menus & HUD)
+    DeviceGlyphs keyboard, xbox, playstation, nintendo, generic;
+    // When set, prompts ALWAYS show the single `general` icon regardless of the active
+    // device or bound button - a platform-agnostic "just press this" glyph for a game
+    // whose art style uses one universal interact symbol.
+    bool useGeneralAlways = false;
+};
+
 struct ProjectSettings {
     std::string name = "Untitled";
     std::string startupScene; // relative path under Assets (optional)
@@ -140,6 +177,11 @@ struct ProjectSettings {
     // installs it on boot and crossfades into `musicStartState` when the game runs.
     std::string musicGraph;
     std::string musicStartState; // state played on game start (empty = graph default)
+    InputIcons inputIcons;       // per-device prompt icon library (ships with the game)
+    // Data-driven input actions: named actions + default key/gamepad binding. Players
+    // rebind them at runtime (overrides in UserSettings); the interact prompt shows
+    // the icon for an action's current binding. Seeded with "Interact" on load.
+    std::vector<input::ActionDef> inputActions;
 };
 
 class Project {

@@ -4,6 +4,7 @@
 #include "Assets/AudioEvent.h"
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
+#include "Dialogue/DialogueGraph.h" // branching-dialogue graph editor
 #include "Assets/MaterialAsset.h"
 #include "Assets/UAF.h"
 #include "Core/Types.h"
@@ -30,6 +31,7 @@ class Scene;
 class Renderer;
 class Input;
 class Engine;
+class Project;
 
 class Editor {
 public:
@@ -108,6 +110,9 @@ private:
     // playhead, key diamonds, capture/delete keys, play controls.
     void DrawTimeline(Engine& engine);
     void DrawAssetBrowser(Engine& engine);
+    // Imports OS files dropped on the window into the current browser folder,
+    // drained once per frame from the window's drop queue (editor-only).
+    void ConsumeDroppedFiles(Engine& engine);
     void DrawGizmo(Engine& engine);
     // Spline-point editing for a selected CameraSpline: a translate gizmo on the
     // active control point, click-to-select points, and Tab to extend the end.
@@ -241,7 +246,8 @@ private:
     void StopPlayMode(Engine& engine);
     bool playMode_ = false;
     bool playPaused_ = false;
-    std::string playSnapshot_;   // scene state at Play, restored on Stop
+    std::string playSnapshot_;      // scene state at Play, restored on Stop
+    std::string gameStateSnapshot_; // game:: story state (flags/objectives) at Play, restored on Stop
     bool focusGameView_ = false; // focus the Game tab next frame
     bool focusViewport_ = false; // focus the Viewport tab next frame
 
@@ -363,7 +369,9 @@ private:
     // Creates Assets/<dir>/NewAudioEvent[N].hbevent and returns its path.
     std::filesystem::path CreateAudioEventAsset(const std::filesystem::path& dir,
                                                 const std::string& name = {});
-    std::filesystem::path CreateDialogueAsset(const std::filesystem::path& dir,
+    // Creates <dir>/<name>.hbdialogue (a fresh branching graph = Start -> Line). dir
+    // empty = Assets/Dialogue/.
+    std::filesystem::path CreateDialogueAsset(const std::filesystem::path& dir = {},
                                               const std::string& name = {});
     bool mixerSynced_ = false;          // buses pushed to AudioSystem this project
     AudioEvent editedEvent_;            // working copy of a viewed .hbevent
@@ -375,9 +383,41 @@ private:
     CutsceneAsset editedCutscene_;      // working copy of a viewed .hbcutscene
     bool editedCutsceneValid_ = false;
     bool editedCutsceneDirty_ = false;
-    f32 cutsceneEditTime_ = 0.0f;       // editor playhead for "add key at time"
+    f32 cutsceneEditTime_ = 0.0f;       // timeline playhead (seconds)
     std::filesystem::path CreateCutsceneAsset(const std::filesystem::path& dir,
                                               const std::string& name = {});
+
+    // -- Cutscene timeline panel ----------------------------------------------------
+    // A dockable, artist-facing timeline: a horizontal time ruler, one lane per
+    // track (camera, each animation entity, dialogue), keyframes drawn as
+    // draggable diamonds, a scrubbable playhead, a selected-key inspector, and a
+    // live viewport preview (evaluates cutscene::Evaluate into the scene/camera).
+    std::filesystem::path editedCutscenePath_;   // file backing editedCutscene_
+    bool cutsceneFocus_ = false;                 // request panel focus next frame
+    f32 csZoom_ = 90.0f;                          // pixels per second
+    f32 csScroll_ = 0.0f;                         // seconds at the lane's left edge
+    // Selected item: kind 0=camera key, 1=transform key, 2=clip marker,
+    // 3=dialogue marker; track = anim-track index (kinds 1/2); index = slot.
+    int csSelKind_ = -1, csSelTrack_ = -1, csSelIndex_ = -1;
+    bool csDragKey_ = false;                     // a key drag is in progress
+    bool csDragPlayhead_ = false;                // playhead scrub in progress
+    // Live preview: previewing owns the viewport; playing advances the playhead.
+    bool csPreview_ = false;
+    bool csPlaying_ = false;
+    f32 csPrevTime_ = 0.0f;                      // last eval time (marker firing)
+    std::string csPreviewSnapshot_;              // scene JSON to restore on stop
+    std::vector<std::string> csAudioChoices_;    // .uaf voicelines (dialogue lane)
+    std::vector<std::string> csDialogueChoices_; // .hbdialogue assets
+    void OpenCutscene(Engine& engine, const std::filesystem::path& path);
+    void DrawCutsceneTimeline(Engine& engine);
+    void CutscenePreviewBegin(Engine& engine);
+    void CutscenePreviewEnd(Engine& engine);   // stop + restore the authored scene
+    // Drop a live preview WITHOUT restoring: for paths that replace the whole
+    // scene from another source (scene/level load, project switch, undo/redo),
+    // where the snapshot is about to become stale and the scene is discarded.
+    void CutscenePreviewAbandon() {
+        csPreview_ = false; csPlaying_ = false; csPreviewSnapshot_.clear();
+    }
     u32  lastPostedVoice_ = 0;          // editor Play test voice (stoppable)
 
     // -- Scene manager --------------------------------------------------------------
@@ -411,6 +451,23 @@ private:
     u32 schemDragPin_ = 0;                    // wire-drag source pin index
     bool schemDragFromOutput_ = false;        // dragging from an output pin
     bool schemDragging_ = false;
+
+    // --- Dialogue graph editor (its own window; same look as the schematic one) ---
+    void DrawDialogueEditor(Engine& engine); // toolbar + canvas + node inspector
+    void DrawDialogueCanvas(float width);    // node canvas (links/nodes/interaction)
+    void OpenDialogue(const std::filesystem::path& path);
+    void SaveDialogue();                     // writes dlgGraph_ back to editedDialoguePath_
+    std::filesystem::path editedDialoguePath_; // open .hbdialogue graph (empty = none)
+    dlg::Graph dlgGraph_;                      // working copy
+    bool dlgDirty_ = false;
+    bool dlgFocus_ = false;                    // focus the panel when a graph opens
+    glm::vec2 dlgPan_{0.0f, 0.0f};
+    glm::vec2 dlgAddPos_{0.0f, 0.0f};
+    u32 dlgSelected_ = 0;
+    u32 dlgDragNode_ = 0;
+    u32 dlgDragPin_ = 0;
+    bool dlgDragFromOutput_ = false;
+    bool dlgDragging_ = false;
 
     // -- Project settings (environment / skybox / lighting) -----------------------
     // Edits Project::Settings().environment; "Rebuild Sky" regenerates the
@@ -565,6 +622,7 @@ private:
         Panel_Navigation, Panel_Streaming, Panel_Stats, Panel_Timeline,
         Panel_Scenes, Panel_AudioMixer, Panel_Assets,
         Panel_ArtEditor, Panel_SchematicEditor, Panel_Music,
+        Panel_CutsceneTimeline, Panel_DialogueEditor, Panel_InputIcons,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
@@ -596,8 +654,10 @@ private:
     // and pushes one undo step. Shared by paste and duplicate.
     // Instantiates a subtree JSON fragment additively. `placeAt` (when given)
     // positions the new root there; otherwise the root is nudged off the original.
+    // pushUndo=false lets a caller that already snapshotted (e.g. prefab Revert)
+    // record the whole operation as a single undo step.
     void PasteSubtree(Engine& engine, const std::string& fragment,
-                      const glm::vec3* placeAt = nullptr);
+                      const glm::vec3* placeAt = nullptr, bool pushUndo = true);
     std::string clipboard_; // last copied subtree (.hbscene JSON fragment)
 
     // -- Prefabs (.hbprefab = a saved entity subtree, reusable across scenes) ------
@@ -606,8 +666,21 @@ private:
                                                     const std::filesystem::path& dir,
                                                     const std::string& name);
     // Instantiates a .hbprefab into the world (at `at` if given, else as authored).
+    // Tags the new root with a PrefabInstance link back to `path`.
     void InstantiatePrefab(Engine& engine, const std::filesystem::path& path,
                            const glm::vec3* at = nullptr);
+    // Linked-prefab ops on the root entity of a placed instance (PrefabInstance):
+    //  Apply  - overwrite the source .hbprefab with this instance's current subtree.
+    //  Revert - re-instantiate from the source, keeping the root's world transform.
+    // (Unpack = just drop the PrefabInstance component; done inline in the inspector.)
+    void ApplyPrefabInstance(Engine& engine, entt::entity root);
+    void RevertPrefabInstance(Engine& engine, entt::entity root);
+    // Absolute path of a PrefabInstance's source (AssetsDir / rel).
+    std::filesystem::path PrefabSourcePath(const std::string& rel) const;
+    // The inspector defers Apply/Revert/Unpack here (they destroy/replace the
+    // selected subtree, unsafe mid-inspector-draw); BuildUI runs it post-draw.
+    int pendingPrefabAction_ = 0;                   // 0 none, 1 apply, 2 revert, 3 unpack
+    entt::entity pendingPrefabEntity_ = entt::null; // target instance root
 
     // -- Scenes ------------------------------------------------------------------
     std::filesystem::path currentScenePath_; // last saved/loaded .hbscene
@@ -654,6 +727,13 @@ private:
     // Build configurator window (game name, platform/backend, resolution,
     // packing options) backed by the project's BuildSettings.
     void DrawBuildSettings(Engine& engine);
+    // Interaction-prompt icon mapping (dev): texture pickers for each input device.
+    // Shared by the dedicated Input Icons panel and the Build Settings section;
+    // returns true if any icon changed (caller saves the project).
+    bool DrawInputIconsEditor(Project& project);   // per-device button icon grid
+    bool DrawInputActionsEditor(Project& project);  // define actions + default bindings
+    void DrawInputIconsPanel(Engine& engine); // dev-only dockable panel (Window menu)
+    int inputIconDevice_ = 0;                 // Icon Manager: selected device tab
     bool showBuildSettings_ = false;
     std::string buildResult_; // last build status line (shown in Stats)
 

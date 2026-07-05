@@ -109,11 +109,18 @@ struct TextureHandle {
 struct TextureDesc {
     u32 width = 1;
     u32 height = 1;
+    // depth > 1 makes this a 3D volume texture (TEXTURE3D / VK_IMAGE_TYPE_3D),
+    // used by the volumetric-VFX system. depth == 1 is a normal 2D texture and
+    // every existing call site is unaffected.
+    u32 depth = 1;
     Format format = Format::R8G8B8A8_UNORM;
     // Pixel data. When mipCount > 1, all mip levels are tightly packed back to
     // back (mip 0 first); mip i has size max(1,width>>i) x max(1,height>>i).
     const void* pixels = nullptr;
     u32 mipCount = 1;
+    // When true, the texture also gets an unordered-access view so a compute
+    // pass can write it (e.g. the volumetric density-splat writing a 3D volume).
+    bool storage = false;
     const char* debugName = nullptr;
 };
 
@@ -522,6 +529,36 @@ struct ParticleVertex {
     u32 texIndex = 0;          // bindless sprite (0 = soft dot)
 };
 
+// One volumetric "blob": a spherical density/temperature sample the compute
+// splat writes into the 3D volume (Embergen-style volumetric smoke/fire). Built
+// per-frame from particle emitters. GPU-ready layout (32 bytes, float4-packed).
+struct VolumeBlob {
+    glm::vec3 pos{0.0f};   // world position
+    f32 radius = 0.3f;     // world-space influence radius
+    f32 density = 1.0f;    // opacity contribution
+    f32 temperature = 0.0f; // 0..1 -> blackbody emission (fire) in the raymarch
+    f32 _pad0 = 0.0f, _pad1 = 0.0f;
+};
+
+// Per-frame volumetric parameters: the world-space AABB the volume covers (built
+// from the blob bounds), plus the blob count. The raymarch (VV4) reuses the same
+// bounds to map ray samples into the volume's UVW space.
+struct VolumeParams {
+    // NOTE: densityScale is applied EXACTLY ONCE, in the compute splat (VolumeSplat.hlsl),
+    // which bakes it into the stored volume. The raymarch reads that volume with a density
+    // multiplier of 1.0 — do NOT re-scale by densityScale there or density becomes squared.
+    glm::vec3 boundsMin{0.0f}; f32 densityScale = 1.0f;
+    glm::vec3 boundsMax{0.0f}; f32 emission = 2.5f;   // fire glow strength
+    u32 blobCount = 0;
+    f32 extinction = 1.5f;     // absorption (denser/darker smoke)
+    u32 stepCount = 48;        // raymarch steps
+    u32 resolution = 96;       // volume voxel dim (quality knob; read once at first enable)
+    f32 noiseDetail = 0.6f;    // procedural detail: 0 = raw blobs, 1 = heavy billowing wisps
+    f32 noiseScale = 1.0f;     // world-space turbulence scale (avg blob radius); STABLE across
+                               // frames so the noise doesn't crawl/pop when the AABB resizes
+};
+inline constexpr u32 kMaxVolumeBlobs = 4096; // cap (per-frame upload buffer size)
+
 // Default reference canvas the UI is authored against (configurable per
 // project; see ui::CanvasConfig).
 inline constexpr f32 kUICanvasWidth = 1920.0f;
@@ -566,6 +603,21 @@ public:
 
     // Uploads a 2D texture into the bindless array; returns its index handle.
     virtual TextureHandle CreateTexture(const TextureDesc&) { return {}; }
+
+    // Creates an uninitialised texture writable by a compute pass. With depth>1
+    // it is a 3D volume (TEXTURE3D / VK_IMAGE_TYPE_3D). It always gets a sampled
+    // SRV (the returned handle, for the raymarch) and, when desc.storage, a UAV
+    // the backend records internally for the compute splat to bind. Used by the
+    // volumetric-VFX system; returns an invalid handle when unsupported.
+    virtual TextureHandle CreateVolumeTexture(const TextureDesc&) { return {}; }
+
+    // Feeds the volumetric-VFX system for this frame: `blobs` are splatted into a
+    // 3D density/temperature volume by a compute pass (see VolumeSplat.hlsl), which
+    // the raymarch then lights + composites. count==0 disables volumetrics this
+    // frame (zero GPU cost). Pointers must stay valid through DrawScene, like
+    // SetParticles. No-op on backends without compute support.
+    virtual void SetVolumeParticles(const VolumeBlob* /*blobs*/, u32 /*count*/,
+                                    const VolumeParams& /*params*/) {}
 
     // Re-uploads pixel data (all mips) into an EXISTING bindless texture in place
     // (no new slot/resource), the texture-equivalent of UpdateMesh. The desc must

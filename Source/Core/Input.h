@@ -146,11 +146,22 @@ public:
         return pads_[index < kMaxGamepads ? index : 0];
     }
 
+    // -- Active device (for adaptive prompts) ---------------------------------
+    // Which controller family a connected gamepad is, so button prompts can show
+    // the right glyph. Read via a raw-input vendor-id scan (XInput can't tell
+    // brands apart); defaults to Xbox when no HID game controller is identified.
+    enum class PadBrand : u8 { Xbox = 0, PlayStation, Nintendo, Generic };
+    // True if the most recent input came from a gamepad (vs keyboard/mouse); flips
+    // live as the player switches devices, so the UI can swap prompts to match.
+    bool LastInputWasGamepad() const { return lastGamepad_; }
+    PadBrand GamepadBrand() const { return padBrand_; }
+
 private:
     static usize Index(Key k) { return static_cast<usize>(k); }
     static usize Index(MouseButton b) { return static_cast<usize>(b); }
 
     void PollGamepads(); // platform-specific (XInput on Windows)
+    void RefreshGamepadBrand(); // platform-specific: raw-input vendor-id scan
     void PushEditKey(Key k); // append an editing key to the text-event stream
 
     static constexpr u32 kMaxTextEvents = 128; // text edits buffered per frame
@@ -172,6 +183,9 @@ private:
 
     GamepadState pads_[kMaxGamepads];
     u32 padRetryCooldown_[kMaxGamepads] = {}; // frames until re-probing a disconnected pad
+    bool lastGamepad_ = false;                // most recent input came from a gamepad
+    PadBrand padBrand_ = PadBrand::Xbox;      // detected controller family (default Xbox)
+    u32 padBrandCooldown_ = 0;                // frames until the next brand rescan
 };
 
 } // namespace hbe

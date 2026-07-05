@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace hbe {
 
@@ -90,6 +91,7 @@ void Input::PushEditKey(Key k) {
 void Input::OnKeyVK(u32 nativeKey, bool down) {
     const Key k = TranslateVK(nativeKey);
     if (k == Key::Unknown) return;
+    if (down) lastGamepad_ = false; // deliberate keyboard input -> keyboard/mouse prompts
     if (down) {
         // Down-transition = a fresh press edge (survives a same-frame release).
         if (!keys_[Index(k)]) pressedEdge_[Index(k)] = true;
@@ -108,6 +110,7 @@ void Input::OnChar(u32 codepoint) {
 }
 
 void Input::OnMouseButton(MouseButton b, bool down) {
+    if (down) lastGamepad_ = false;
     mouse_[Index(b)] = down;
 }
 
@@ -115,6 +118,9 @@ void Input::OnMouseMove(f32 x, f32 y) {
     if (hasMousePos_) {
         mouseDeltaX_ += x - mouseX_;
         mouseDeltaY_ += y - mouseY_;
+        // Notable mouse movement -> the player is on mouse (not a resting cursor
+        // while playing on a pad); flip prompts back to keyboard/mouse.
+        if (std::fabs(x - mouseX_) + std::fabs(y - mouseY_) > 2.0f) lastGamepad_ = false;
     }
     mouseX_ = x;
     mouseY_ = y;
@@ -175,7 +181,62 @@ void Input::PollGamepads() {
                                      (255.0f - XINPUT_GAMEPAD_TRIGGER_THRESHOLD)
                                : 0.0f;
         pad.buttons = g.wButtons;
+
+        // Deliberate gamepad activity flips the active device to the pad, so prompts
+        // swap to controller glyphs. (Buttons, a stick push, or a trigger pull -
+        // not idle drift, which the deadzone already zeroed.)
+        if (pad.buttons != 0 || std::fabs(pad.leftX) > 0.5f || std::fabs(pad.leftY) > 0.5f ||
+            std::fabs(pad.rightX) > 0.5f || std::fabs(pad.rightY) > 0.5f ||
+            pad.leftTrigger > 0.5f || pad.rightTrigger > 0.5f)
+            lastGamepad_ = true;
     }
+
+    // Periodically re-identify the controller family (cheap; handles hot-plug).
+    if (padBrandCooldown_ == 0) {
+        RefreshGamepadBrand();
+        padBrandCooldown_ = 120; // ~2s at 60 FPS
+    } else {
+        --padBrandCooldown_;
+    }
+}
+
+void Input::RefreshGamepadBrand() {
+    // XInput reports every pad as an Xbox pad, so identify the brand from the
+    // connected HID game controllers' USB vendor ids via Raw Input (no window /
+    // registration needed). Prefer Sony/Nintendo over Microsoft when several are
+    // present; keep the default (Xbox) if nothing identifiable is found.
+    UINT count = 0;
+    if (GetRawInputDeviceList(nullptr, &count, sizeof(RAWINPUTDEVICELIST)) != 0 || count == 0)
+        return;
+    std::vector<RAWINPUTDEVICELIST> list(count);
+    if (GetRawInputDeviceList(list.data(), &count, sizeof(RAWINPUTDEVICELIST)) == static_cast<UINT>(-1))
+        return;
+
+    bool sony = false, nintendo = false, microsoft = false, anyPad = false;
+    for (UINT i = 0; i < count; ++i) {
+        if (list[i].dwType != RIM_TYPEHID) continue;
+        RID_DEVICE_INFO info{};
+        info.cbSize = sizeof(info);
+        UINT sz = sizeof(info);
+        if (GetRawInputDeviceInfoW(list[i].hDevice, RIDI_DEVICEINFO, &info, &sz) ==
+            static_cast<UINT>(-1))
+            continue;
+        // HID usage page 0x01 (generic desktop), usage 0x04 joystick / 0x05 gamepad.
+        if (info.hid.usUsagePage != 0x01 || (info.hid.usUsage != 0x04 && info.hid.usUsage != 0x05))
+            continue;
+        anyPad = true;
+        switch (info.hid.dwVendorId) {
+            case 0x054C: sony = true; break;      // Sony
+            case 0x057E: nintendo = true; break;  // Nintendo
+            case 0x045E: microsoft = true; break; // Microsoft
+            default: break;
+        }
+    }
+    if (sony) padBrand_ = PadBrand::PlayStation;
+    else if (nintendo) padBrand_ = PadBrand::Nintendo;
+    else if (microsoft) padBrand_ = PadBrand::Xbox;
+    else if (anyPad) padBrand_ = PadBrand::Generic;
+    // else: no HID game controller found -> leave the previous/default brand.
 }
 
 } // namespace hbe

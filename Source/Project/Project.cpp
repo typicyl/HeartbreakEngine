@@ -34,6 +34,41 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     s.uiScene = j.value("uiScene", "");
     s.musicGraph = j.value("musicGraph", "");
     s.musicStartState = j.value("musicStartState", "");
+    // Reset before reading so a re-parse REPLACES rather than appends (the same
+    // settings_ member is reused across in-process project switches; the glyph vectors
+    // and inputActions would otherwise accumulate the previous project's entries).
+    s.inputIcons = InputIcons{};
+    s.inputActions.clear();
+    const auto readGlyphs = [](const json& jd, DeviceGlyphs& g) {
+        if (!jd.is_array()) return;
+        for (const json& e : jd)
+            g.icons.emplace_back(e.value("id", 0u), e.value("tex", std::string()));
+    };
+    if (const auto it = j.find("inputIcons"); it != j.end() && it->is_object()) {
+        InputIcons& ic = s.inputIcons;
+        ic.general = it->value("general", "");
+        ic.logo = it->value("logo", "");
+        ic.useGeneralAlways = it->value("useGeneralAlways", false);
+        readGlyphs(it->value("keyboard", json::array()), ic.keyboard);
+        readGlyphs(it->value("xbox", json::array()), ic.xbox);
+        readGlyphs(it->value("playstation", json::array()), ic.playstation);
+        readGlyphs(it->value("nintendo", json::array()), ic.nintendo);
+        readGlyphs(it->value("generic", json::array()), ic.generic);
+    }
+    // Data-driven input actions. Seed a default "Interact" ONLY when the key is entirely
+    // absent (legacy / first-time project); a present-but-empty array is an intentional
+    // zero-action project and must round-trip as empty rather than resurrect "Interact".
+    if (const auto it = j.find("inputActions"); it != j.end() && it->is_array()) {
+        for (const json& ja : *it) {
+            input::ActionDef a;
+            a.name = ja.value("name", "");
+            a.defaults.key = static_cast<Key>(ja.value("key", 0u));
+            a.defaults.pad = ja.value("pad", 0u);
+            if (!a.name.empty()) s.inputActions.push_back(std::move(a));
+        }
+    } else {
+        s.inputActions.push_back({"Interact", {Key::E, static_cast<u32>(Gamepad_X)}});
+    }
     s.audioBuses.clear();
     if (const auto it = j.find("audioBuses"); it != j.end() && it->is_array()) {
         for (const json& jb : *it) {
@@ -193,6 +228,30 @@ bool Project::Save() const {
     j["uiScene"] = settings_.uiScene;
     j["musicGraph"] = settings_.musicGraph;
     j["musicStartState"] = settings_.musicStartState;
+    const auto writeGlyphs = [](const DeviceGlyphs& g) {
+        json arr = json::array();
+        for (const auto& e : g.icons) arr.push_back({{"id", e.first}, {"tex", e.second}});
+        return arr;
+    };
+    {
+        const InputIcons& ic = settings_.inputIcons;
+        j["inputIcons"] = {{"general", ic.general},
+                           {"logo", ic.logo},
+                           {"useGeneralAlways", ic.useGeneralAlways},
+                           {"keyboard", writeGlyphs(ic.keyboard)},
+                           {"xbox", writeGlyphs(ic.xbox)},
+                           {"playstation", writeGlyphs(ic.playstation)},
+                           {"nintendo", writeGlyphs(ic.nintendo)},
+                           {"generic", writeGlyphs(ic.generic)}};
+    }
+    {
+        json arr = json::array();
+        for (const input::ActionDef& a : settings_.inputActions)
+            arr.push_back({{"name", a.name},
+                           {"key", static_cast<u32>(a.defaults.key)},
+                           {"pad", a.defaults.pad}});
+        j["inputActions"] = std::move(arr);
+    }
     j["engine"] = "HeartbreakEngine";
     j["version"] = 1;
     const BuildSettings& b = settings_.build;

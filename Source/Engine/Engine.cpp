@@ -1,5 +1,6 @@
 // Engine/Engine.cpp
 #include "Engine/Engine.h"
+#include "Engine/CutscenePlayer.h"
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
 #include "Assets/VFS.h"
@@ -564,6 +565,7 @@ int Engine::Run(const EngineConfig& configIn) {
         userSettings_.Load(userSettingsDir_); // keeps defaults if absent
         audio.SetBusVolume("Master", userSettings_.masterVolume);
         audio.SetCaptionsEnabled(userSettings_.captionsEnabled);
+        SyncActionMap(); // action defaults (project) + rebind overrides (user settings)
     }
 
     // Build the scene (skipped when the studio splash or UI scene already owns the
@@ -843,9 +845,13 @@ int Engine::Run(const EngineConfig& configIn) {
         // the runtime build (gated by the flag), no editor required.
         const bool devEnabled =
             Project::HasActive() && Project::Active().Settings().build.devMenu;
-        if (devEnabled && input.IsKeyDown(Key::Ctrl) && input.WasKeyPressed(Key::Grave))
+        // Suppress the dev overlay chord + its function keys while listening for a
+        // rebind, so pressing Ctrl+` (or a dev F-key) during a rebind neither toggles
+        // the overlay nor fires a dev action.
+        if (devEnabled && !actionMap_.Rebinding() && input.IsKeyDown(Key::Ctrl) &&
+            input.WasKeyPressed(Key::Grave))
             devMenuOpen_ = !devMenuOpen_;
-        if (devEnabled && devMenuOpen_) {
+        if (devEnabled && devMenuOpen_ && !actionMap_.Rebinding()) {
             if (input.WasKeyPressed(Key::F5)) SaveGame("checkpoint");
             if (input.WasKeyPressed(Key::F9)) LoadGame("checkpoint");
             if (flowActive_ && input.WasKeyPressed(Key::F2)) FlowReload();
@@ -942,12 +948,26 @@ int Engine::Run(const EngineConfig& configIn) {
             gridNav.EnsureBuilt(scene, navAssets);
             nav::UpdateAgents(scene, gridNav, dt);
         }
+        // Control rebinding (from a "rebind:<action>" UI button): capture the next
+        // key/button and persist. Runs regardless of physics so it works in menus.
+        rebindJustCommitted_ = false; // reset each frame; set below on a fresh commit
+        if (input_ && actionMap_.Rebinding()) {
+            if (actionMap_.UpdateRebind(*input_)) {
+                userSettings_.inputBindings = actionMap_.Overrides();
+                SaveUserSettings();
+                // The just-bound key's down-edge is still live this frame; guard so
+                // UpdateInteractions doesn't read it as an Interact press (double-fire).
+                rebindJustCommitted_ = true;
+            }
+        }
         // Checkpoints: fire box-triggers the player entered, then perform any save
         // a reached checkpoint (trigger / script / schematic) requested this frame.
         if (physics.IsRunning()) {
             game::UpdateCheckpoints(scene);
             std::string cpId;
             if (game::ConsumeSaveRequest(cpId)) SaveGame("checkpoint");
+            // Interactables (proximity "[E]" prompt + key) + box TriggerVolumes.
+            UpdateInteractions(scene, dt);
         }
         if (physics.IsRunning()) anim::UpdateRotators(scene, dt);
         audio.UpdateScene(scene,
@@ -993,13 +1013,16 @@ int Engine::Run(const EngineConfig& configIn) {
                 // surfaces its baked "Speaker: caption" into the caption stack.
                 std::string va;
                 while (game::ConsumeVoiceline(va)) audio.PlayUAF(mAssets / va);
-                // Start a requested dialogue (a .hbdialogue conversation).
-                std::string dlg;
-                if (game::ConsumeDialogue(dlg)) {
-                    if (auto d = assets::LoadDialogue(mAssets / dlg)) {
-                        dialogue_ = std::move(*d);
-                        dialogueLine_ = 0;   // fire line 0 on the next UpdateDialogue
+                // Start a requested dialogue (a .hbdialogue graph): load it and
+                // enter its Start node (walks to the first Line/Choice).
+                std::string dlgPath;
+                if (game::ConsumeDialogue(dlgPath)) {
+                    dlg::Graph g;
+                    if (dlg::LoadGraph(mAssets / dlgPath, g)) {
+                        ClearDialogueChoices();
+                        dialogueGraph_ = std::move(g);
                         dialogueTimer_ = 0.0f;
+                        EnterDialogueNode(dialogueGraph_.StartNode());
                     }
                 }
                 UpdateDialogue(dt); // step the active conversation over time
@@ -1088,6 +1111,44 @@ int Engine::Run(const EngineConfig& configIn) {
             // 3D text objects (WorldText) ride the same depth-tested quad batch.
             ui::AppendWorldText(scene, renderer, assetsDir, pRight, pUp, particleAlpha);
             renderer.SetParticles(particleAlpha, particleAdd);
+        }
+
+        // Volumetric VFX: feed the density-splat compute. Blobs come from every
+        // `volumetric`-flagged emitter (one per live particle); the raymarch pass
+        // then lights + composites them. HBE_VOLTEST injects a static test plume as
+        // a fallback so the splat path can be exercised with no authored emitter.
+        {
+            static std::vector<rhi::VolumeBlob> volumeBlobs; // persists across the frame
+            rhi::VolumeParams vp{};
+            const bool haveEmitters = particle::BuildVolumetricBlobs(scene, volumeBlobs, vp);
+            if (!haveEmitters) {
+                static const bool kVolTest = [] {
+                    const char* e = std::getenv("HBE_VOLTEST");
+                    return e && e[0] && e[0] != '0';
+                }();
+                volumeBlobs.clear();
+                vp = rhi::VolumeParams{};
+                if (kVolTest) {
+                    for (int i = 0; i < 10; ++i) {
+                        rhi::VolumeBlob b;
+                        b.pos = {0.0f, 0.3f + 0.35f * static_cast<f32>(i), 0.0f};
+                        b.radius = 0.6f + 0.05f * static_cast<f32>(i);
+                        b.density = 0.35f; // blobs overlap heavily; keep the sum reasonable
+                        b.temperature = glm::clamp(1.0f - 0.12f * static_cast<f32>(i), 0.0f, 1.0f);
+                        volumeBlobs.push_back(b);
+                    }
+                    glm::vec3 lo(1e9f), hi(-1e9f);
+                    for (const rhi::VolumeBlob& b : volumeBlobs) {
+                        lo = glm::min(lo, b.pos - glm::vec3(b.radius));
+                        hi = glm::max(hi, b.pos + glm::vec3(b.radius));
+                    }
+                    vp.boundsMin = lo - glm::vec3(0.25f); // small padding
+                    vp.boundsMax = hi + glm::vec3(0.25f);
+                    vp.blobCount = static_cast<u32>(volumeBlobs.size());
+                    vp.densityScale = 1.0f;
+                }
+            }
+            renderer.SetVolumeParticles(volumeBlobs, vp); // before RenderScene (Vulkan splats in BeginFrame)
         }
 
         // Advance UI animation clips (writes UIElement transform/color/frame fields)
@@ -1257,6 +1318,10 @@ bool Engine::LoadGame(const std::string& slot) {
     scene::StageAssets(data, Project::Active().AssetsDir(), staged);
     scene::Instantiate(*scene_, *renderer_, data, staged, scene::LoadMode::Replace);
     game::DeserializeState(j.value("game", std::string()));
+    // Reset the dialogue runner (Engine members survive the scene Replace): loading
+    // a save mid-conversation must not resume a stale graph over the restored world
+    // or hang on a Choice whose buttons the Replace destroyed.
+    ResetDialogueRuntime();
     // Resume gameplay through the normal reveal so physics is un-paused, the cursor
     // locks, and any loading overlay is dropped - loading a save (e.g. dev F9) DURING
     // the loading screen would otherwise land in Playing with the sim still frozen.
@@ -1366,10 +1431,7 @@ void Engine::FlowMainMenu() {
     loadingPanelEntities_.clear();
     // Leaving gameplay: stop any in-progress dialogue and clear its captions so
     // they don't linger/resume over the menu.
-    dialogueLine_ = -1;
-    dialogueTimer_ = 0.0f;
-    dialogue_.lines.clear();
-    captions_.clear();
+    ResetDialogueRuntime();
     // Stop any in-progress cutscene and restore the camera before the menu.
     if (cutsceneCamOwned_) SetGameCameraEnabled(cutsceneRestoreCam_);
     cutsceneCamOwned_ = false;
@@ -1410,10 +1472,7 @@ void Engine::LoadGameplayWorld() {
     game::Reset(); // a fresh run: clear objectives + reached checkpoints
     // Stop any dialogue/captions left over from a prior run (the runner state
     // is an Engine member, so it survives the scene Replace below).
-    dialogueLine_ = -1;
-    dialogueTimer_ = 0.0f;
-    dialogue_.lines.clear();
-    captions_.clear();
+    ResetDialogueRuntime();
     // Stop any in-progress cutscene and hand the camera back (else it stays
     // disabled into the new run).
     if (cutsceneCamOwned_) SetGameCameraEnabled(cutsceneRestoreCam_);
@@ -1732,132 +1791,412 @@ void Engine::PlayUISounds() {
 }
 
 void Engine::UpdateDialogue(f32 dt) {
-    if (dialogueLine_ < 0) return; // nothing running
-    const std::filesystem::path assets =
-        Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    if (dialogueNode_ == 0) return; // nothing running
+
+    // Waiting on a Choice: poll the spawned buttons; the first clicked one wins.
+    if (dialogueChoiceActive_) {
+        if (!scene_) return;
+        int pickedPin = -1;
+        scene_->Registry().view<DialogueChoiceButton, UIElement>().each(
+            [&](const DialogueChoiceButton& b, const UIElement& el) {
+                if (pickedPin < 0 && el.clicked) pickedPin = static_cast<int>(b.outPin);
+            });
+        if (pickedPin >= 0) {
+            const u32 next = dialogueGraph_.Follow(dialogueNode_, static_cast<u32>(pickedPin));
+            ClearDialogueChoices(); // also clears dialogueChoiceActive_
+            EnterDialogueNode(next);
+        }
+        return;
+    }
+
+    // A Line is holding on screen; advance via its single out pin when it lapses.
     dialogueTimer_ -= dt;
-    // Advance through every line whose hold has elapsed (normally one per frame;
-    // the loop also cleanly finishes a run where the last hold already lapsed).
-    while (dialogueLine_ >= 0 && dialogueTimer_ <= 0.0f) {
-        if (dialogueLine_ >= static_cast<int>(dialogue_.lines.size())) {
-            dialogueLine_ = -1; // conversation finished
-            break;
+    if (dialogueTimer_ > 0.0f) return;
+    EnterDialogueNode(dialogueGraph_.Follow(dialogueNode_, 0));
+}
+
+// Walk the graph from `nodeId`, chaining through instantaneous nodes (Start /
+// Condition / SetFlag) until we hit a Line (waits on its hold) or a Choice (waits
+// on the player), or run out of graph. A step guard stops an authored cycle from
+// hanging the frame.
+void Engine::EnterDialogueNode(u32 nodeId) {
+    int guard = 0;
+    while (nodeId != 0 && guard++ < 512) {
+        const dlg::Node* n = dialogueGraph_.Find(nodeId);
+        if (!n) { nodeId = 0; break; }
+        dialogueNode_ = nodeId;
+        if (n->type == dlg::NodeType::Start) {
+            nodeId = dialogueGraph_.Follow(nodeId, 0);
+        } else if (n->type == dlg::NodeType::SetFlag) {
+            game::SetFlag(n->setFlag, n->setValue);
+            nodeId = dialogueGraph_.Follow(nodeId, 0);
+        } else if (n->type == dlg::NodeType::Condition) {
+            const f32 v = game::GetFlag(n->flag);
+            bool pass = false;
+            switch (n->op) {
+                case dlg::CmpOp::NotZero: pass = v != 0.0f; break;
+                case dlg::CmpOp::Equal: pass = v == n->value; break;
+                case dlg::CmpOp::NotEqual: pass = v != n->value; break;
+                case dlg::CmpOp::Greater: pass = v > n->value; break;
+                case dlg::CmpOp::Less: pass = v < n->value; break;
+                case dlg::CmpOp::GreaterEqual: pass = v >= n->value; break;
+                case dlg::CmpOp::LessEqual: pass = v <= n->value; break;
+            }
+            nodeId = dialogueGraph_.Follow(nodeId, pass ? 0u : 1u); // pin 0 True, 1 False
+        } else if (n->type == dlg::NodeType::Line) {
+            const std::filesystem::path assets =
+                Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+            const bool hasText = !n->text.empty();
+            // Resolve the hold FIRST so the caption dwell and the node-advance timer
+            // share one duration - otherwise an authored hold advances the line while
+            // its caption lingers (stacking) or vanishes early (long holds).
+            f32 hold = n->hold;
+            if (hold <= 0.0f) {
+                const usize len = hasText ? n->text.size() : n->speaker.size() + 8;
+                hold = glm::clamp(1.8f + 0.05f * static_cast<f32>(len), 2.5f, 9.0f);
+            }
+            hold = glm::max(hold, 0.25f);
+            if (hasText && userSettings_.captionsEnabled)
+                PushCaption(n->speaker.empty() ? n->text : n->speaker + ": " + n->text, hold);
+            if (!n->clip.empty() && audio_ && !assets.empty())
+                audio_->PlayUAF(assets / n->clip, {}, /*caption=*/!hasText);
+            dialogueTimer_ = hold;
+            return; // wait out the hold (UpdateDialogue advances when it lapses)
+        } else if (n->type == dlg::NodeType::Choice) {
+            SpawnDialogueChoices(*n);
+            if (dialogueChoiceActive_) return;    // wait for the player's pick
+            nodeId = 0;                            // no valid option -> end
+        } else {                                   // End (or unknown)
+            nodeId = 0;
         }
-        const DialogueLine& line = dialogue_.lines[dialogueLine_];
-        const bool hasText = !line.text.empty();
-        // The line's own text wins; if it's empty we let the clip's baked
-        // caption show instead (caption=!hasText below). Respect the player's
-        // captions toggle, matching every other caption path.
-        if (hasText && userSettings_.captionsEnabled)
-            PushCaption(line.speaker.empty() ? line.text
-                                             : line.speaker + ": " + line.text,
-                        0.0f);
-        if (!line.clip.empty() && audio_ && !assets.empty())
-            audio_->PlayUAF(assets / line.clip, {}, /*caption=*/!hasText);
-        // Hold: authored value, else a readable auto-dwell from the line length.
-        f32 hold = line.hold;
-        if (hold <= 0.0f) {
-            const usize len = hasText ? line.text.size() : line.speaker.size() + 8;
-            hold = glm::clamp(1.8f + 0.05f * static_cast<f32>(len), 2.5f, 9.0f);
-        }
-        dialogueTimer_ += glm::max(hold, 0.25f); // >0 so the loop can't spin
-        ++dialogueLine_;
+    }
+    // Conversation finished (End, dead-end wire, or the cycle guard tripped).
+    dialogueNode_ = 0;
+    ClearDialogueChoices();
+}
+
+void Engine::SpawnDialogueChoices(const dlg::Node& node) {
+    ClearDialogueChoices();
+    if (!scene_) return;
+    entt::registry& reg = scene_->Registry();
+
+    // Collect the options that pass their showIf gate, keeping each one's ORIGINAL
+    // out-pin index so a click follows the correct branch.
+    struct Vis { u32 pin; const dlg::ChoiceOption* opt; };
+    std::vector<Vis> visible;
+    for (u32 i = 0; i < node.choices.size(); ++i) {
+        const dlg::ChoiceOption& c = node.choices[i];
+        if (!c.showIf.empty() && game::GetFlag(c.showIf) == 0.0f) continue;
+        visible.push_back({i, &c});
+    }
+    if (visible.empty()) return; // caller ends the conversation (dialogueChoiceActive_ stays false)
+
+    dialogueChoiceActive_ = true;
+    const f32 kW = 660.0f, kH = 54.0f, kGap = 10.0f;
+    const int count = static_cast<int>(visible.size());
+    const f32 totalH = count * kH + (count - 1) * kGap;
+    // Centre the stack, biased a little below the screen middle (above captions).
+    f32 y = -totalH * 0.5f + kH * 0.5f + 90.0f;
+    for (const Vis& v : visible) {
+        const entt::entity e = reg.create();
+        UIElement el;
+        el.type = UIElement::Type::Button;
+        el.text = v.opt->text;
+        el.anchorMin = el.anchorMax = el.pivot = glm::vec2(0.5f, 0.5f);
+        el.offset = glm::vec2(0.0f, y);
+        el.size = glm::vec2(kW, kH);
+        el.color = glm::vec4(0.10f, 0.11f, 0.14f, 0.92f);
+        el.hoverColor = glm::vec4(0.22f, 0.36f, 0.55f, 0.98f);
+        el.pressedColor = glm::vec4(0.12f, 0.22f, 0.36f, 1.0f);
+        el.textSize = 26.0f;
+        el.hAlign = UIElement::HAlign::Center;
+        el.action = "__dlgchoice";   // ignored by the game-flow action switch
+        reg.emplace<UIElement>(e, std::move(el));
+        reg.emplace<DialogueChoiceButton>(e, DialogueChoiceButton{v.pin});
+        y += kH + kGap;
     }
 }
 
-namespace {
-// Cutscenes reference entities by Name (stable across scene loads, unlike entt
-// ids). Linear scan - cutscene tracks are few, evaluated once per frame.
-entt::entity FindEntityByName(Scene& scene, const std::string& name) {
-    if (name.empty()) return entt::null;
-    auto& reg = scene.Registry();
-    for (const entt::entity e : reg.view<Name>())
-        if (reg.get<Name>(e).value == name) return e;
-    return entt::null;
+void Engine::ClearDialogueChoices() {
+    dialogueChoiceActive_ = false;
+    if (!scene_) return;
+    entt::registry& reg = scene_->Registry();
+    std::vector<entt::entity> del;
+    reg.view<DialogueChoiceButton>().each(
+        [&](entt::entity e, const DialogueChoiceButton&) { del.push_back(e); });
+    for (const entt::entity e : del) reg.destroy(e);
 }
-} // namespace
+
+void Engine::ResetDialogueRuntime() {
+    dialogueNode_ = 0;
+    dialogueTimer_ = 0.0f;
+    dialogueGraph_ = dlg::Graph{};
+    ClearDialogueChoices(); // also clears dialogueChoiceActive_ + destroys choice buttons
+    HideInteractPrompt();
+    captions_.clear();
+}
+
+void Engine::SyncActionMap() {
+    if (Project::HasActive()) actionMap_.SetDefinitions(Project::Active().Settings().inputActions);
+    actionMap_.SetOverrides(userSettings_.inputBindings);
+    // The interaction system queries the action literally named "Interact"; warn if the
+    // project has none (renamed/removed in the editor) so the broken prompt is diagnosable.
+    bool hasInteract = false;
+    for (const input::ActionDef& d : actionMap_.Definitions())
+        if (d.name == "Interact") { hasInteract = true; break; }
+    if (!hasInteract)
+        HBE_WARN("Input: no action named 'Interact' - the interaction prompt/key will not work. "
+                 "Add it back in the Input panel.");
+}
+
+void Engine::SaveUserSettings() {
+    if (!userSettingsDir_.empty()) userSettings_.Save(userSettingsDir_);
+}
+
+void Engine::ShowInteractPrompt(const std::string& text, const std::string& iconPath,
+                                glm::vec2 anchor) {
+    if (!scene_) return;
+    entt::registry& reg = scene_->Registry();
+    const bool hasIcon = !iconPath.empty();
+
+    // Text label (the verb, or the "[E] verb" glyph fallback).
+    if (interactPrompt_ == entt::null || !reg.valid(interactPrompt_)) {
+        interactPrompt_ = reg.create();
+        UIElement el;
+        el.type = UIElement::Type::Label;
+        el.size = glm::vec2(360.0f, 40.0f);
+        el.color = glm::vec4(1.0f, 0.96f, 0.75f, 1.0f);
+        el.textSize = 26.0f;
+        el.hAlign = UIElement::HAlign::Center;
+        reg.emplace<UIElement>(interactPrompt_, std::move(el));
+        reg.emplace<InteractPromptTag>(interactPrompt_); // excluded from saves
+    }
+    UIElement& lbl = reg.get<UIElement>(interactPrompt_);
+    lbl.anchorMin = lbl.anchorMax = anchor; // point-anchor at the object centre
+    lbl.runtimeText = text;
+    lbl.visible = true;
+    // With an icon, the verb sits just BELOW the (centred) icon; without one, the
+    // "[E] verb" text is centred on the object.
+    lbl.pivot = hasIcon ? glm::vec2(0.5f, 0.0f) : glm::vec2(0.5f, 0.5f);
+    lbl.offset = hasIcon ? glm::vec2(0.0f, 28.0f) : glm::vec2(0.0f, 0.0f);
+
+    // Device button icon, centred on the object.
+    if (hasIcon) {
+        if (interactIcon_ == entt::null || !reg.valid(interactIcon_)) {
+            interactIcon_ = reg.create();
+            UIElement el;
+            el.type = UIElement::Type::Image;
+            el.pivot = glm::vec2(0.5f, 0.5f);
+            el.size = glm::vec2(52.0f, 52.0f);
+            el.color = glm::vec4(1.0f);
+            reg.emplace<UIElement>(interactIcon_, std::move(el));
+            reg.emplace<InteractPromptTag>(interactIcon_);
+        }
+        UIElement& icon = reg.get<UIElement>(interactIcon_);
+        if (icon.texture != iconPath) {
+            icon.texture = iconPath;
+            icon.textureResolved = false; // re-resolve through the UI texture cache
+        }
+        icon.anchorMin = icon.anchorMax = anchor;
+        icon.visible = true;
+    } else if (interactIcon_ != entt::null && reg.valid(interactIcon_)) {
+        reg.get<UIElement>(interactIcon_).visible = false;
+    }
+}
+
+void Engine::HideInteractPrompt() {
+    if (!scene_) return;
+    entt::registry& reg = scene_->Registry();
+    if (interactPrompt_ != entt::null && reg.valid(interactPrompt_))
+        reg.get<UIElement>(interactPrompt_).visible = false;
+    if (interactIcon_ != entt::null && reg.valid(interactIcon_))
+        reg.get<UIElement>(interactIcon_).visible = false;
+}
+
+void Engine::UpdateInteractions(Scene& scene, f32 dt) {
+    (void)dt;
+    entt::registry& reg = scene.Registry();
+    // Don't offer interactions while a conversation/cutscene is playing OR queued
+    // this frame (the deferred queues are single-slot latest-wins, so firing now
+    // would clobber a schematic's just-queued convo), or while a menu overlay is
+    // open over the HUD (pause/Settings) - the prompt must not draw over it and the
+    // E/gamepad key must not fire behind it.
+    const bool menuOpen =
+        uiManagerMode_ && !uiManager_.Empty() && uiManager_.Top() != "HUD";
+    if (menuOpen || actionMap_.Rebinding() || rebindJustCommitted_ || dialogueNode_ != 0 ||
+        cutsceneTime_ >= 0.0f || game::DialoguePending() || game::CutscenePending()) {
+        HideInteractPrompt();
+        return;
+    }
+
+    // Player = the first CharacterController (matches game::UpdateCheckpoints).
+    auto players = reg.view<Transform, CharacterController>();
+    if (players.begin() == players.end()) { HideInteractPrompt(); return; }
+    const glm::vec3 player = glm::vec3(scene.WorldMatrix(*players.begin())[3]);
+
+    // Dispatch an action through the deferred game:: queues (identical to a schematic
+    // firing it). Returns true if it started a blocking convo/cutscene.
+    const auto fire = [&](InteractAction a, const std::string& asset, const std::string& flag,
+                          f32 val, const std::string& text) -> bool {
+        switch (a) {
+            case InteractAction::Dialogue: if (!asset.empty()) game::PlayDialogue(asset); break;
+            case InteractAction::Cutscene: if (!asset.empty()) game::PlayCutscene(asset); break;
+            case InteractAction::SetFlag: game::SetFlag(flag, val); break;
+            case InteractAction::SetObjective: if (!flag.empty()) game::SetObjective(flag, text); break;
+            case InteractAction::CompleteObjective: if (!flag.empty()) game::CompleteObjective(flag); break;
+            case InteractAction::None: default: break;
+        }
+        return a == InteractAction::Dialogue || a == InteractAction::Cutscene;
+    };
+
+    // Box triggers: fire on the ENTER edge.
+    for (const entt::entity e : reg.view<TriggerVolume>()) {
+        TriggerVolume& tv = reg.get<TriggerVolume>(e);
+        if ((tv.once && tv.fired) ||
+            (!tv.requiredFlag.empty() && game::GetFlag(tv.requiredFlag) == 0.0f)) {
+            tv.inside = false;
+            continue;
+        }
+        const glm::vec3 c = glm::vec3(scene.WorldMatrix(e)[3]);
+        const glm::vec3 d = glm::abs(player - c);
+        const bool inside =
+            d.x <= tv.halfExtents.x && d.y <= tv.halfExtents.y && d.z <= tv.halfExtents.z;
+        const bool enter = inside && !tv.inside;
+        tv.inside = inside;
+        if (enter) {
+            tv.fired = true;
+            if (fire(tv.action, tv.asset, tv.flag, tv.flagValue, tv.text)) {
+                HideInteractPrompt();
+                return; // a trigger started a convo/cutscene - stop here this frame
+            }
+        }
+    }
+
+    // Interactables: pick the nearest available one in range, prompt, fire on the key.
+    // The interactable's world position = its geometry CENTER (AABB center under the
+    // world transform), so the prompt sits dead-centre on the object rather than at
+    // the pivot; falls back to the transform origin when there's no bounds.
+    const auto worldCenter = [&](entt::entity e) -> glm::vec3 {
+        const glm::mat4 m = scene.WorldMatrix(e);
+        if (const AABB* bb = reg.try_get<AABB>(e))
+            return glm::vec3(m * glm::vec4((bb->min + bb->max) * 0.5f, 1.0f));
+        return glm::vec3(m[3]);
+    };
+
+    entt::entity best = entt::null;
+    f32 bestD2 = 0.0f;
+    std::string bestPrompt;
+    glm::vec3 bestCenter(0.0f);
+    for (const entt::entity e : reg.view<Interactable>()) {
+        const Interactable& ia = reg.get<Interactable>(e);
+        if (ia.once && ia.fired) continue;
+        if (!ia.requiredFlag.empty() && game::GetFlag(ia.requiredFlag) == 0.0f) continue;
+        const glm::vec3 center = worldCenter(e);
+        const glm::vec3 rel = center - player;
+        const f32 d2 = glm::dot(rel, rel);
+        if (d2 <= ia.range * ia.range && (best == entt::null || d2 < bestD2)) {
+            best = e;
+            bestD2 = d2;
+            bestPrompt = ia.prompt;
+            bestCenter = center;
+        }
+    }
+    if (best == entt::null) { HideInteractPrompt(); return; }
+
+    // Project the object CENTRE to a screen anchor so the prompt sits over it.
+    // Behind the camera -> hide; off to a side -> clamp on-screen.
+    glm::vec2 anchor(0.5f, 0.85f);
+    if (renderer_) {
+        const glm::mat4 vp = renderer_->GetCamera().ViewProjection();
+        const glm::vec4 clip = vp * glm::vec4(bestCenter, 1.0f);
+        if (clip.w <= 1e-4f) { HideInteractPrompt(); return; }
+        const glm::vec2 ndc(clip.x / clip.w, clip.y / clip.w);
+        anchor = glm::clamp(glm::vec2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f), glm::vec2(0.04f),
+                            glm::vec2(0.96f)); // y-down canvas fraction
+    }
+
+    // Device-adaptive prompt driven by the "Interact" action's CURRENT binding:
+    // on a gamepad show the bound pad button, on keyboard the bound key. Prefer the
+    // project's per-device icon IMAGE for that button (fallback: general icon); if
+    // none is set, show a text glyph of the button name.
+    const bool gamepad = input_ && input_->LastInputWasGamepad();
+    const input::Binding bind = actionMap_.Current("Interact");
+    std::string icon;
+    std::string glyph;
+    // Platform-agnostic mode: one universal icon for every device/button (a single
+    // "just press this" symbol matching the game's art style).
+    const bool useGeneral =
+        Project::HasActive() && Project::Active().Settings().inputIcons.useGeneralAlways;
+    if (useGeneral) {
+        icon = Project::HasActive() ? Project::Active().Settings().inputIcons.general : "";
+        // No image set -> fall back to the current binding's text glyph so there's
+        // still something to press-label.
+        glyph = gamepad ? "" : input::KeyName(bind.key);
+    } else if (gamepad && bind.pad != 0) {
+        const InputIcons* ic = Project::HasActive() ? &Project::Active().Settings().inputIcons : nullptr;
+        const DeviceGlyphs* dev = nullptr;
+        // brandName stays null for every button EXCEPT the PlayStation face buttons;
+        // a null brand falls through to the generic PadButtons() label (A/B/LB/D-Up/...),
+        // so non-PlayStation pads show the correct button rather than a fixed letter.
+        const char* brandName = nullptr;
+        switch (input_->GamepadBrand()) {
+            case Input::PadBrand::PlayStation:
+                dev = ic ? &ic->playstation : nullptr;
+                brandName = (bind.pad == static_cast<u32>(Gamepad_X)) ? "Square"
+                            : (bind.pad == static_cast<u32>(Gamepad_Y)) ? "Triangle"
+                            : (bind.pad == static_cast<u32>(Gamepad_A)) ? "Cross"
+                            : (bind.pad == static_cast<u32>(Gamepad_B)) ? "Circle" : nullptr;
+                break;
+            case Input::PadBrand::Nintendo: dev = ic ? &ic->nintendo : nullptr; break;
+            case Input::PadBrand::Generic: dev = ic ? &ic->generic : nullptr; break;
+            case Input::PadBrand::Xbox:
+            default: dev = ic ? &ic->xbox : nullptr; break;
+        }
+        if (dev)
+            if (const std::string* p = dev->Find(bind.pad)) icon = *p;
+        // Text-glyph fallback: brand-specific name if known, else the generic label.
+        glyph = brandName ? brandName : "?";
+        if (!brandName || glyph == "?") {
+            for (const input::PadButtonInfo& pb : input::PadButtons())
+                if (pb.bit == bind.pad) { glyph = pb.name; break; }
+        }
+    } else if (gamepad) {
+        // Gamepad in hand but the Interact action has no pad binding (e.g. rebound to a
+        // keyboard-only key): show the neutral general icon, NOT a keyboard key glyph.
+        glyph = "?"; // -> falls back to the general icon below if one is set
+    } else {
+        if (Project::HasActive())
+            if (const std::string* p = Project::Active().Settings().inputIcons.keyboard.Find(
+                    static_cast<u32>(bind.key)))
+                icon = *p;
+        glyph = input::KeyName(bind.key);
+    }
+    if (icon.empty() && Project::HasActive()) icon = Project::Active().Settings().inputIcons.general;
+    if (glyph.empty()) glyph = "?";
+    const std::string label =
+        icon.empty() ? (std::string("[") + glyph + "] " + bestPrompt) : bestPrompt;
+    ShowInteractPrompt(label, icon, anchor);
+
+    const bool press = input_ && actionMap_.Pressed(*input_, "Interact");
+    if (press) {
+        Interactable& ia = reg.get<Interactable>(best);
+        fire(ia.action, ia.asset, ia.flag, ia.flagValue, ia.text);
+        ia.fired = true;
+        HideInteractPrompt();
+    }
+}
 
 void Engine::UpdateCutscene(f32 dt) {
     if (cutsceneTime_ < 0.0f || !scene_ || !renderer_) return;
-    auto& reg = scene_->Registry();
     const f32 prev = cutsceneTime_;
     cutsceneTime_ += dt;
     const f32 t = cutsceneTime_;
 
-    // --- Camera track: interpolate eye/aim/fov, honoring hard cuts. -----------
-    if (!cutscene_.camera.empty()) {
-        const auto& ks = cutscene_.camera;
-        glm::vec3 pos = ks.front().position, aim = ks.front().aim;
-        f32 fov = ks.front().fov;
-        if (t >= ks.back().time) {
-            pos = ks.back().position; aim = ks.back().aim; fov = ks.back().fov;
-        } else if (t > ks.front().time) {
-            usize i = 0;
-            while (i + 1 < ks.size() && ks[i + 1].time <= t) ++i; // last key <= t
-            const CutsceneCameraKey& a = ks[i];
-            const CutsceneCameraKey& b = ks[i + 1];
-            if (b.cut) { // hold a's pose until the cut instant (b.time)
-                pos = a.position; aim = a.aim; fov = a.fov;
-            } else {
-                const f32 span = glm::max(b.time - a.time, 1e-4f);
-                const f32 u = glm::clamp((t - a.time) / span, 0.0f, 1.0f);
-                pos = glm::mix(a.position, b.position, u);
-                aim = glm::mix(a.aim, b.aim, u);
-                fov = glm::mix(a.fov, b.fov, u);
-            }
-        }
-        Camera& cam = renderer_->GetCamera();
-        cam.SetFovY(fov);
-        cam.LookAt(pos, aim, glm::vec3(0.0f, 1.0f, 0.0f));
-    }
-
-    // --- Animation tracks: transform keyframes + skeletal-clip triggers. ------
-    for (const CutsceneAnimTrack& tr : cutscene_.animTracks) {
-        const entt::entity e = FindEntityByName(*scene_, tr.target);
-        if (e == entt::null) continue;
-        if (!tr.keys.empty()) {
-            if (Transform* xf = reg.try_get<Transform>(e)) {
-                const auto& ks = tr.keys;
-                if (t <= ks.front().time) {
-                    xf->position = ks.front().position;
-                    xf->rotation = ks.front().rotation;
-                    xf->scale = ks.front().scale;
-                } else if (t >= ks.back().time) {
-                    xf->position = ks.back().position;
-                    xf->rotation = ks.back().rotation;
-                    xf->scale = ks.back().scale;
-                } else {
-                    usize i = 0;
-                    while (i + 1 < ks.size() && ks[i + 1].time <= t) ++i;
-                    const CutsceneTransformKey& a = ks[i];
-                    const CutsceneTransformKey& b = ks[i + 1];
-                    const f32 span = glm::max(b.time - a.time, 1e-4f);
-                    const f32 u = glm::clamp((t - a.time) / span, 0.0f, 1.0f);
-                    xf->position = glm::mix(a.position, b.position, u);
-                    xf->rotation = glm::slerp(a.rotation, b.rotation, u);
-                    xf->scale = glm::mix(a.scale, b.scale, u);
-                }
-            }
-        }
-        // Clip triggers crossed this frame [prev, t): restart the target's clip.
-        if (Animator* an = reg.try_get<Animator>(e)) {
-            for (const CutsceneClipMarker& m : tr.clips) {
-                if (m.time >= prev && m.time < t) {
-                    an->clip = m.clip;
-                    an->time = 0.0f;
-                    an->playing = true;
-                }
-            }
-        }
-    }
-
-    // --- Dialogue markers crossed this frame. ---------------------------------
-    for (const CutsceneDialogueMarker& m : cutscene_.dialogue) {
-        if (m.time >= prev && m.time < t) {
-            if (!m.dialogue.empty()) game::PlayDialogue(m.dialogue);
-            else if (!m.voiceline.empty()) game::PlayVoiceline(m.voiceline);
-        }
-    }
+    // Pose the scene at t (camera only while we own it), then fire any events
+    // crossed in [prev, t). Both live in cutscene::, shared with the editor's
+    // timeline preview.
+    cutscene::Evaluate(cutscene_, t, *scene_, renderer_->GetCamera(), cutsceneCamOwned_);
+    cutscene::FireMarkers(cutscene_, prev, t, *scene_);
 
     // End: restore the game camera (rising edge snaps it back next apply).
     if (t >= cutscene_.duration) {
@@ -1890,6 +2229,9 @@ void Engine::UpdateGameFlow(f32 dt) {
     }
     case GameState::MainMenu: {
         const std::string act = PollClickedAction(*scene_);
+        // A "rebind:<Action>" button starts listening for the next key/button; the
+        // rebind poll (top of the update) captures + persists it.
+        if (act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
         if (act == "play")
             FlowPlay();
         else if (act == "settings" && uiManager_.Has(*scene_, "Settings")) {
@@ -1982,8 +2324,13 @@ void Engine::UpdateGameFlow(f32 dt) {
         // Reconciled per frame so every panel-change path is covered.
         const bool menuOpen =
             uiManagerMode_ && !uiManager_.Empty() && uiManager_.Top() != "HUD";
-        if (IsCursorLocked() == menuOpen) SetCursorLocked(!menuOpen);
+        // Dialogue choices need point-and-click too, so free the cursor for them.
+        const bool wantFreeCursor = menuOpen || dialogueChoiceActive_;
+        if (IsCursorLocked() == wantFreeCursor) SetCursorLocked(!wantFreeCursor);
         const std::string act = PollClickedAction(*scene_);
+        // A "rebind:<Action>" button starts listening for the next key/button; the
+        // rebind poll (top of the update) captures + persists it.
+        if (act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
         if (act == "menu")
             FlowMainMenu();
         else if (act == "restart")

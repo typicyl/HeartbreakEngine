@@ -951,7 +951,9 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
             }
             case UIElement::Type::Image: {
                 const u32 tex = ResolveTexture(el, renderer, assetsDir);
-                quadOrSlice(rect, el.color, tex, el.texture);
+                // A non-empty texture path that failed to resolve (tex==0) would draw
+                // a solid white box; skip it. An empty path is an intentional colour rect.
+                if (el.texture.empty() || tex != 0) quadOrSlice(rect, el.color, tex, el.texture);
                 break;
             }
             case UIElement::Type::ProgressBar: {

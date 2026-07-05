@@ -78,9 +78,11 @@ bool IsPackableExtension(const fs::path& ext) {
     // Every asset type the runtime loads through the VFS must be packable, or it
     // goes missing in shipped builds: meshes/textures/fonts (.uaf), scenes
     // (.hbscene), materials (.hbmat), Art Editor paint canvases (.hbpaint),
-    // audio events (.hbevent) and visual-script graphs (.hbschem).
+    // audio events (.hbevent), visual-script graphs (.hbschem), branching dialogue
+    // (.hbdialogue), cutscenes (.hbcutscene) and adaptive-music graphs (.hbmusic).
     return ext == ".uaf" || ext == ".hbscene" || ext == ".hbmat" ||
-           ext == ".hbpaint" || ext == ".hbevent" || ext == ".hbschem";
+           ext == ".hbpaint" || ext == ".hbevent" || ext == ".hbschem" ||
+           ext == ".hbdialogue" || ext == ".hbcutscene" || ext == ".hbmusic";
 }
 
 // Loads `path -> slot` assignments from the manifest (empty map if missing).

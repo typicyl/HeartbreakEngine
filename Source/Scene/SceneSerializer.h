@@ -34,6 +34,7 @@ enum class LoadMode {
 // CPU-side description of one serialized entity.
 struct EntityData {
     std::string name;
+    std::string prefabSource;  // PrefabInstance link (.hbprefab rel Assets/; "" = none)
     bool editorHidden = false; // editor-only visibility (runtime ignores)
     bool hasTransform = false;
     Transform transform;
@@ -130,6 +131,10 @@ struct EntityData {
     ReflectionProbe probe;
     bool hasCheckpoint = false;
     Checkpoint checkpoint;
+    bool hasInteractable = false;
+    Interactable interactable;
+    bool hasTrigger = false;
+    TriggerVolume trigger;
 
     // Runtime-only tags carried by in-memory snapshots (play mode, undo/redo) so
     // a Replace restore preserves which scene/level-layer each entity belongs to.

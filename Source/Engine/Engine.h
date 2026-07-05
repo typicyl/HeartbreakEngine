@@ -7,10 +7,11 @@
 
 #include "Core/Types.h"
 #include "Assets/CutsceneAsset.h" // active cutscene the player evaluates
-#include "Assets/DialogueAsset.h" // active dialogue the runner steps through
+#include "Dialogue/DialogueGraph.h" // active dialogue graph the conversation player walks
 #include "Navigation/GridNav.h" // real-time A* pathfinder (agents path on this)
 #include "RHI/RHI.h"
 #include "Core/UserSettings.h" // per-user volume/graphics/brightness/captions
+#include "Core/InputActions.h" // data-driven actions + rebindable bindings
 #include "UI/UIManager.h" // persistent-UI-scene panel manager (game flow drives it)
 #include "UI/UISystem.h"  // ui::UIContext (cached layout/interaction state)
 
@@ -200,6 +201,12 @@ public:
     // Play (which would hijack the viewport camera with no schematic trigger).
     void ClearCutscene();
 
+    // Drop any in-progress conversation + choice buttons + interaction prompt +
+    // captions. The editor calls this on Play/Stop (dialogue runner state is an
+    // Engine member that survives a scene Replace, so a conversation left running
+    // when the user hits Stop would otherwise resume over the next Play).
+    void ResetDialogueRuntime();
+
     // In-game UI pointer in NORMALIZED game-image coordinates (0..1; negative
     // = no pointer). The editor feeds this from the Game panel's image rect;
     // the runtime derives it from the OS cursor over the window.
@@ -245,11 +252,13 @@ private:
         f32 timer = 0.0f;   // seconds remaining
     };
     std::vector<ActiveCaption> captions_;
-    // Active dialogue (a .hbdialogue run by a schematic): the runner steps
-    // through lines over time, pushing each caption + playing each clip.
-    DialogueAsset dialogue_;
-    int dialogueLine_ = -1;      // -1 = no dialogue running; else the next line index
-    f32 dialogueTimer_ = 0.0f;   // seconds until the next line advances
+    // Active dialogue (a .hbdialogue graph run by a schematic): the conversation
+    // player walks the graph - Line nodes push captions + play clips, Choice nodes
+    // spawn clickable buttons and branch, Condition/SetFlag read/write story flags.
+    dlg::Graph dialogueGraph_;
+    u32 dialogueNode_ = 0;          // current node id (0 = no conversation running)
+    f32 dialogueTimer_ = 0.0f;      // seconds until the current Line auto-advances
+    bool dialogueChoiceActive_ = false; // waiting on the player to pick a Choice option
     // Active cutscene (a .hbcutscene run by a schematic): the player takes over
     // the camera and evaluates the tracks each frame until the duration elapses.
     CutsceneAsset cutscene_;
@@ -259,7 +268,33 @@ private:
     void SeedSettingsWidgets();  // fill "setting:*" widgets from userSettings_ (on Settings shown)
     void ApplyChangedSettings(); // read changed "setting:*" widgets -> apply live + mark dirty
     void UpdateCaptions(f32 dt); // drain audio captions -> drive the "caption" UI element
-    void UpdateDialogue(f32 dt); // advance the active .hbdialogue line-by-line
+    void UpdateDialogue(f32 dt); // step the active .hbdialogue graph (lines/choices/branches)
+    void EnterDialogueNode(u32 nodeId); // process a node (chains through Condition/SetFlag)
+    void SpawnDialogueChoices(const dlg::Node& node); // create clickable choice buttons
+    void ClearDialogueChoices();  // destroy any spawned choice buttons
+    bool DialogueChoicesActive() const { return dialogueChoiceActive_; }
+    // Interaction: proximity prompts on Interactable objects/NPCs + box TriggerVolumes;
+    // both fire a game:: action (start a dialogue/cutscene, set a flag/objective).
+    void UpdateInteractions(Scene& scene, f32 dt);
+    // Drive the transient prompt UI at a screen anchor (canvas fraction, y-down) so
+    // it sits over the target's world centre. `iconPath` (a texture .uaf rel. Assets,
+    // empty = none) shows the configured device button icon centred on the object,
+    // with `text` (the verb) below it; when empty, `text` carries the "[E]" glyph.
+    void ShowInteractPrompt(const std::string& text, const std::string& iconPath, glm::vec2 anchor);
+    void HideInteractPrompt();
+    entt::entity interactPrompt_ = entt::null; // transient prompt TEXT entity (toggled)
+    entt::entity interactIcon_ = entt::null;   // transient prompt ICON image entity (toggled)
+    // Data-driven input actions + rebindable bindings. Definitions come from the
+    // project, per-user overrides from UserSettings; the editor Input Actions panel
+    // and the runtime rebind menu drive it. Call SyncActionMap after either changes.
+    input::ActionMap actionMap_;
+    bool rebindJustCommitted_ = false; // true the frame a rebind committed; suppresses the
+                                       // just-bound key from double-firing as an Interact press
+public:
+    input::ActionMap& Actions() { return actionMap_; }
+    void SyncActionMap(); // (re)load action defs from the project + overrides from settings
+    void SaveUserSettings(); // persist userSettings_ (rebinds, options) to disk
+private:
     void UpdateCutscene(f32 dt); // evaluate the active .hbcutscene camera/anim/dialogue tracks
     void PlayUISounds();         // play UIElement hover/click sounds (edge-detected)
     nav::GridNav* gridNav_ = nullptr;

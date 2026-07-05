@@ -9,12 +9,16 @@
 #include "Core/Input.h"
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
+#include "Core/Window.h"
 #include "Editor/Importer.h"
 #include "Editor/MeshThumbnail.h"
+#include "Engine/CutscenePlayer.h"
+#include "Game/GameSystems.h" // reset/restore story state (flags/objectives) around Play mode
 #include "Engine/Engine.h"
 #include "Physics/PhysicsWorld.h"
 #include "Scene/AnimationSystem.h"
 #include "Scene/PaintSystem.h"
+#include "Scene/ParticleSystem.h"
 #include "Scene/SceneSerializer.h"
 #include "Scene/StreamingWorld.h"
 #include "Scene/TerrainSystem.h"
@@ -354,6 +358,9 @@ void Editor::BuildUI(Engine& engine) {
     if (!panelsInit_) {
         for (bool& b : panelOpen_) b = true;
         panelOpen_[Panel_ProjectSettings] = false; // opened from Project/Window menu
+        panelOpen_[Panel_CutsceneTimeline] = false; // opened when editing a cutscene
+        panelOpen_[Panel_DialogueEditor] = false;   // opened when editing a dialogue
+        panelOpen_[Panel_InputIcons] = false;        // opened from the Window menu on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -592,6 +599,8 @@ void Editor::BuildUI(Engine& engine) {
 
     DrawProjectManager(); // modal; auto-opens while no project is active
 
+    ConsumeDroppedFiles(engine); // import any files dropped from the OS this frame
+
     // Every panel below is gated by its panelOpen_ flag; the artist build
     // (artMode_) just defaults that set to the painting panels, so the same draw
     // path serves both the full editor and the focused Art Editor exe.
@@ -618,6 +627,9 @@ void Editor::BuildUI(Engine& engine) {
     DrawBuildSettings(engine);
     DrawArtEditor(engine);
     DrawSchematicEditor(engine);
+    DrawDialogueEditor(engine);
+    DrawInputIconsPanel(engine);
+    DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
     DrawSelectionOutline(scene, renderer);
     DrawNavOverlay(scene, renderer);
     UpdateTerrainTool(engine); // terrain sculpt brush (consumes the click below)
@@ -646,6 +658,20 @@ void Editor::BuildUI(Engine& engine) {
     }
 
     if (showDemo_) ImGui::ShowDemoWindow(&showDemo_);
+
+    // Deferred prefab op (set by the inspector; runs here where it's safe to
+    // destroy/replace the selected subtree and Engine& is in scope).
+    if (pendingPrefabAction_) {
+        const entt::entity e = pendingPrefabEntity_;
+        const int act = pendingPrefabAction_;
+        pendingPrefabAction_ = 0;
+        pendingPrefabEntity_ = entt::null;
+        if (scene.Registry().valid(e)) {
+            if (act == 1) ApplyPrefabInstance(engine, e);
+            else if (act == 2) RevertPrefabInstance(engine, e);
+            else if (act == 3) { PushUndo(scene); scene.Registry().remove<PrefabInstance>(e); }
+        }
+    }
 }
 
 void Editor::DrawWindowMenu() {
@@ -657,7 +683,7 @@ void Editor::DrawWindowMenu() {
         "Asset Viewer", "Project Settings", "Post Process", "Navigation",
         "Streaming",    "Stats",      "Timeline",    "Scenes",
         "Audio Mixer",  "Assets",     "Art Editor",
-        "Schematic Editor", "Music"};
+        "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input"};
     if (artMode_) {
         // Artist build: only the painting-relevant panels are listed/reachable.
         static const Panel kArtPanels[] = {Panel_Viewport, Panel_ArtEditor,
@@ -2762,6 +2788,8 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
         if (item.isFolder) navTarget_ = item.path;
         else if (item.isScene) LoadSceneInEditor(engine, item.path);
         else if (item.isSchematic) OpenSchematic(item.path);
+        else if (item.isDialogue) OpenDialogue(item.path);
+        else if (item.isCutscene) OpenCutscene(engine, item.path);
         else if (item.isPrefab) InstantiatePrefab(engine, item.path);
         else if (item.isMesh) SpawnMeshAsset(scene, renderer, item.path);
         else if (item.isAudio) engine.GetAudio().PlayUAF(item.path);
@@ -2793,6 +2821,12 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
         }
         if (item.isSchematic && ImGui::MenuItem("Edit")) {
             OpenSchematic(item.path);
+        }
+        if (item.isDialogue && ImGui::MenuItem("Edit in Dialogue Editor")) {
+            OpenDialogue(item.path);
+        }
+        if (item.isCutscene && ImGui::MenuItem("Edit in Timeline")) {
+            OpenCutscene(engine, item.path);
         }
         if (item.isPrefab && ImGui::MenuItem("Instantiate")) {
             InstantiatePrefab(engine, item.path);
@@ -2831,6 +2865,47 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
         ImGui::EndPopup();
     }
     ImGui::PopID();
+}
+
+void Editor::ConsumeDroppedFiles(Engine& engine) {
+    std::vector<std::filesystem::path> dropped = engine.GetWindow().TakeDroppedFiles();
+    if (dropped.empty()) return;
+    if (!Project::HasActive()) {
+        HBE_WARN("Ignored {} dropped file(s): open a project first.", dropped.size());
+        return;
+    }
+    // Import into the folder the browser is showing (mirrors the "Import..." menu).
+    const std::filesystem::path dst =
+        currentDir_.empty() ? Project::Active().AssetsDir() : currentDir_;
+
+    // Expand any dropped directories into their files (asset folders are common).
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (const std::filesystem::path& p : dropped) {
+        if (std::filesystem::is_directory(p, ec)) {
+            for (std::filesystem::recursive_directory_iterator it(p, ec), end;
+                 it != end; it.increment(ec)) {
+                if (ec) break;
+                if (!it->is_directory(ec)) files.push_back(it->path());
+            }
+        } else {
+            files.push_back(p);
+        }
+    }
+
+    int imported = 0, skipped = 0;
+    for (const std::filesystem::path& f : files) {
+        if (!importer::IsSupportedSource(f)) { ++skipped; continue; }
+        if (importer::Import(f, dst)) ++imported; else ++skipped;
+    }
+    if (imported > 0) {
+        // A drop may overwrite an asset the GPU caches as resident (same as Import...).
+        scene::ClearInstantiateCaches();
+        ui::ClearFontCache();
+        assetsDirty_ = true;
+    }
+    HBE_INFO("Drag-drop import: {} imported, {} skipped -> {}", imported, skipped,
+             dst.filename().string());
 }
 
 void Editor::DrawAssetBrowser(Engine& engine) {
@@ -3002,6 +3077,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
             if (!created.empty()) {
                 assetsDirty_ = true;
                 if (pendingCreateKind_ == 4) OpenSchematic(created); // jump to canvas
+                else if (pendingCreateKind_ == 7) OpenCutscene(engine, created); // jump to timeline
                 else SelectAsset(created);
             }
             pendingCreateKind_ = 0;
@@ -3075,6 +3151,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
 }
 
 void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path) {
+    CutscenePreviewAbandon(); // the previewed scene is about to be replaced
     PushUndo(engine.GetScene()); // Ctrl+Z returns to the previous world
     selected_ = entt::null;
     engine.GetPhysics().SetEditedEntity(entt::null);
@@ -3090,6 +3167,7 @@ void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path
 }
 
 void Editor::OpenLevel(Engine& engine, const scene::LevelPaths& level, bool additive) {
+    CutscenePreviewAbandon(); // loading a level replaces/augments the previewed scene
     Scene& scene = engine.GetScene();
     auto& reg = scene.Registry();
     PushUndo(scene);
@@ -3540,9 +3618,17 @@ void Editor::DrawViewport(Engine& engine) {
 // --- Game view / play mode ----------------------------------------------------
 
 void Editor::EnterPlayMode(Engine& engine) {
+    // Restore the authored scene if a cutscene preview mutated it, so play mode
+    // snapshots the real scene (not a previewed pose).
+    CutscenePreviewEnd(engine);
     if (!playMode_) {
-        // Snapshot the authored scene; Stop restores it exactly.
+        // Snapshot the authored scene + story state; Stop restores both exactly.
         playSnapshot_ = scene::SaveSceneToString(engine.GetScene());
+        gameStateSnapshot_ = game::SerializeState();
+        // Fresh story flags/objectives/checkpoints each Play so the developer tests
+        // the first-time/locked state (mirrors the runtime's LoadGameplayWorld).
+        game::Reset();
+        engine.ResetDialogueRuntime(); // no stale conversation from a prior session
         playMode_ = true;
         focusGameView_ = true;
     }
@@ -3555,6 +3641,7 @@ void Editor::EnterPlayMode(Engine& engine) {
 void Editor::StopPlayMode(Engine& engine) {
     if (!playMode_) return;
     engine.ClearCutscene();             // abort any in-flight cutscene so it can't resume next Play
+    engine.ResetDialogueRuntime();      // drop any conversation/choice/prompt left running
     engine.GetPhysics().SetRunning(false);
     engine.SetGameCameraEnabled(false); // back to the editor camera
     // Resume the editor freecam from the game camera's final pose so the view
@@ -3566,6 +3653,10 @@ void Editor::StopPlayMode(Engine& engine) {
         RestoreSnapshot(engine, playSnapshot_);
         playSnapshot_.clear();
     }
+    // Restore the pre-play story state (flags/objectives/checkpoints live in game::
+    // globals, outside the scene snapshot, so the Replace above doesn't touch them).
+    game::DeserializeState(gameStateSnapshot_);
+    gameStateSnapshot_.clear();
     focusViewport_ = true;
 }
 
@@ -4774,6 +4865,28 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (ImGui::Button("Add Component")) ImGui::OpenPopup("AddComponent");
     }
 
+    // --- Prefab instance: linked to a .hbprefab source ----------------------
+    if (const PrefabInstance* pi = reg.try_get<PrefabInstance>(sel); pi && !pi->source.empty()) {
+        const std::string source = pi->source; // stable across the button clicks below
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.74f, 0.35f, 1.0f));
+        ImGui::Text("Prefab  %s", std::filesystem::path(source).filename().string().c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::SmallButton("Apply")) { pendingPrefabAction_ = 1; pendingPrefabEntity_ = sel; }
+        ImGui::SameLine();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Overwrite the source prefab with this instance's current subtree.");
+        if (ImGui::SmallButton("Revert")) { pendingPrefabAction_ = 2; pendingPrefabEntity_ = sel; }
+        ImGui::SameLine();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-instantiate from the source prefab (keeps this root's position).");
+        if (ImGui::SmallButton("Unpack")) { pendingPrefabAction_ = 3; pendingPrefabEntity_ = sel; }
+        ImGui::SameLine();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Break the link; this becomes a plain entity subtree.");
+        if (ImGui::SmallButton("Select Source")) SelectAsset(PrefabSourcePath(source));
+        ImGui::Separator();
+    }
+
     // --- Static / Dynamic (per object, any scene) --------------------------
     // There is no separate "level" any more: every scene is one file, and each
     // object just carries a Static/Dynamic tag (saved in the scene). Static =
@@ -4874,10 +4987,30 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             reg.emplace<Checkpoint>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
-        if (!reg.all_of<ParticleEmitter>(sel) && ImGui::MenuItem("Particle Emitter")) {
+        if (!reg.all_of<Interactable>(sel) && ImGui::MenuItem("Interactable")) {
             PushUndo(scene);
-            reg.emplace<ParticleEmitter>(sel);
+            reg.emplace<Interactable>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<TriggerVolume>(sel) && ImGui::MenuItem("Trigger Volume")) {
+            PushUndo(scene);
+            reg.emplace<TriggerVolume>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<ParticleEmitter>(sel) && ImGui::BeginMenu("Particle Emitter")) {
+            const auto addEmitter = [&](ParticleEmitter em) {
+                PushUndo(scene);
+                reg.emplace<ParticleEmitter>(sel, std::move(em));
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            };
+            if (ImGui::MenuItem("Default")) addEmitter(ParticleEmitter{});
+            ImGui::Separator();
+            for (u32 i = 0; i < static_cast<u32>(particle::Template::Count); ++i) {
+                const particle::Template tmpl = static_cast<particle::Template>(i);
+                if (ImGui::MenuItem(particle::TemplateName(tmpl)))
+                    addEmitter(particle::MakeTemplate(tmpl));
+            }
+            ImGui::EndMenu();
         }
         if (!reg.all_of<CameraComponent>(sel) && ImGui::MenuItem("Camera")) {
             PushUndo(scene);
@@ -5388,6 +5521,22 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.open) {
             ImGui::TextDisabled("Live: %d / %u", static_cast<int>(pe->pool.size()),
                                 pe->maxParticles);
+            // Apply a preset: bulk-replaces authored params, keeps the live pool.
+            {
+                const char* kTemplates = "Fire\0Smoke\0Dust\0Rain\0Leaves\0Explosion\0Sparks\0Magic\0"
+                                         "Volumetric Fire\0Volumetric Smoke\0"
+                                         "Volumetric Explosion (mushroom)\0";
+                int pick = -1;
+                ImGui::SetNextItemWidth(160.0f);
+                if (ImGui::Combo("Template", &pick, kTemplates) && pick >= 0) {
+                    PushUndo(scene);
+                    ParticleEmitter t = particle::MakeTemplate(static_cast<particle::Template>(pick));
+                    t.pool = std::move(pe->pool); // existing particles keep simulating
+                    t.rngState = pe->rngState;
+                    *pe = std::move(t);
+                    pe->textureResolved = false;
+                }
+            }
             bool emit = pe->emitting;
             if (ImGui::Checkbox("Emitting", &emit)) { PushUndo(scene); pe->emitting = emit; }
             ImGui::SameLine();
@@ -5402,22 +5551,82 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             ImGui::DragFloat("Lifetime", &pe->lifetime, 0.05f, 0.05f, 60.0f); undoOnActivate();
             ImGui::SliderFloat("Life variance", &pe->lifetimeVariance, 0.0f, 1.0f); undoOnActivate();
             ImGui::SeparatorText("Spawn");
+            int shape = static_cast<int>(pe->shape);
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::Combo("Shape", &shape, "Point\0Sphere\0Hemisphere\0Box\0Disc\0Cone\0")) {
+                PushUndo(scene);
+                pe->shape = static_cast<ParticleEmitter::Shape>(shape);
+            }
+            if (pe->shape == ParticleEmitter::Shape::Box) {
+                ImGui::DragFloat3("Box extents", glm::value_ptr(pe->boxHalfExtents), 0.02f, 0.0f, 200.0f);
+                undoOnActivate();
+            } else {
+                ImGui::DragFloat("Emit radius", &pe->emitRadius, 0.02f, 0.0f, 50.0f); undoOnActivate();
+            }
+            if (pe->shape == ParticleEmitter::Shape::Cone) {
+                ImGui::SliderFloat("Cone angle", &pe->coneAngle, 0.0f, 90.0f); undoOnActivate();
+            }
             ImGui::DragFloat3("Direction", glm::value_ptr(pe->direction), 0.01f); undoOnActivate();
             ImGui::DragFloat("Speed", &pe->startSpeed, 0.05f, 0.0f, 200.0f); undoOnActivate();
             ImGui::SliderFloat("Speed variance", &pe->speedVariance, 0.0f, 1.0f); undoOnActivate();
-            ImGui::SliderFloat("Spread", &pe->spread, 0.0f, 1.0f); undoOnActivate();
-            ImGui::DragFloat("Emit radius", &pe->emitRadius, 0.02f, 0.0f, 50.0f); undoOnActivate();
+            if (pe->shape != ParticleEmitter::Shape::Cone) {
+                ImGui::SliderFloat("Spread", &pe->spread, 0.0f, 1.0f); undoOnActivate();
+            }
+            // Bursts / one-shot (explosions).
+            int burst = static_cast<int>(pe->burst);
+            if (ImGui::DragInt("Burst", &burst, 1, 0, 100000)) {
+                PushUndo(scene); pe->burst = static_cast<u32>(glm::max(0, burst));
+            }
+            bool loop = pe->loop;
+            if (ImGui::Checkbox("Loop", &loop)) { PushUndo(scene); pe->loop = loop; }
+            if (!pe->loop) {
+                ImGui::SameLine(); ImGui::SetNextItemWidth(90.0f);
+                ImGui::DragFloat("Duration", &pe->duration, 0.05f, 0.0f, 60.0f); undoOnActivate();
+            }
             ImGui::SeparatorText("Motion");
             ImGui::DragFloat3("Gravity", glm::value_ptr(pe->gravity), 0.05f); undoOnActivate();
             ImGui::SliderFloat("Drag", &pe->drag, 0.0f, 8.0f); undoOnActivate();
+            ImGui::SliderFloat("Turbulence", &pe->turbulence, 0.0f, 5.0f); undoOnActivate();
+            if (pe->turbulence > 0.0f) {
+                ImGui::DragFloat("Turb scale", &pe->turbulenceScale, 0.05f, 0.05f, 10.0f);
+                undoOnActivate();
+            }
+            ImGui::SliderFloat("Buoyancy (heat rise)", &pe->buoyancy, 0.0f, 20.0f); undoOnActivate();
+            ImGui::SliderFloat("Vortex (mushroom roll)", &pe->vortex, 0.0f, 10.0f); undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Buoyancy + Vortex together make a mushroom cloud: hot gas rises "
+                                  "and the front rolls outward into a cap.");
             ImGui::SeparatorText("Look (over life)");
             ImGui::ColorEdit4("Start color", glm::value_ptr(pe->startColor),
-                              ImGuiColorEditFlags_AlphaBar);
+                              ImGuiColorEditFlags_AlphaBar); undoOnActivate();
             ImGui::ColorEdit4("End color", glm::value_ptr(pe->endColor),
-                              ImGuiColorEditFlags_AlphaBar);
+                              ImGuiColorEditFlags_AlphaBar); undoOnActivate();
             ImGui::DragFloat("Start size", &pe->startSize, 0.01f, 0.0f, 50.0f); undoOnActivate();
             ImGui::DragFloat("End size", &pe->endSize, 0.01f, 0.0f, 50.0f); undoOnActivate();
             ImGui::DragFloat("Spin (rad/s)", &pe->spin, 0.05f, -20.0f, 20.0f); undoOnActivate();
+            ImGui::SliderFloat("Fade in", &pe->fadeIn, 0.0f, 1.0f); undoOnActivate();
+            ImGui::SliderFloat("Fade out", &pe->fadeOut, 0.0f, 1.0f); undoOnActivate();
+            ImGui::SeparatorText("Rendering");
+            int rmode = static_cast<int>(pe->render);
+            ImGui::SetNextItemWidth(180.0f);
+            if (ImGui::Combo("Mode", &rmode, "Billboard\0Stretched (velocity)\0Horizontal\0")) {
+                PushUndo(scene);
+                pe->render = static_cast<ParticleEmitter::Render>(rmode);
+            }
+            if (pe->render == ParticleEmitter::Render::Stretched) {
+                ImGui::DragFloat("Stretch", &pe->stretch, 0.1f, 1.0f, 40.0f); undoOnActivate();
+            }
+            int cols = static_cast<int>(pe->subUVCols), rows = static_cast<int>(pe->subUVRows);
+            if (ImGui::DragInt("Sheet cols", &cols, 1, 1, 32)) {
+                PushUndo(scene); pe->subUVCols = static_cast<u32>(glm::max(1, cols));
+            }
+            if (ImGui::DragInt("Sheet rows", &rows, 1, 1, 32)) {
+                PushUndo(scene); pe->subUVRows = static_cast<u32>(glm::max(1, rows));
+            }
+            if (pe->subUVCols > 1 || pe->subUVRows > 1) {
+                ImGui::DragFloat("Sheet FPS (0=life)", &pe->subUVFps, 0.5f, 0.0f, 120.0f);
+                undoOnActivate();
+            }
             std::string tpick;
             if (AssetPicker("Sprite (.uaf)", pe->texture, ".uaf", uaf::AssetType::Texture,
                             tpick, "(soft dot)")) {
@@ -5431,6 +5640,51 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                 pe->texture = Project::Active().RelativeAssetPath(dropped);
                                 pe->textureResolved = false;
                             });
+
+            ImGui::SeparatorText("Volumetric VFX (raymarched 3D)");
+            bool vol = pe->volumetric;
+            if (ImGui::Checkbox("Volumetric", &vol)) { PushUndo(scene); pe->volumetric = vol; }
+            if (pe->volumetric) {
+                ImGui::TextWrapped(
+                    "This emitter's particles feed a raymarched 3D density/temperature "
+                    "volume (real smoke/fire). Only one volumetric emitter drives the volume "
+                    "at a time. Turn Additive off + keep the billboard subtle for a pure look.");
+                ImGui::SliderFloat("Density", &pe->volDensity, 0.0f, 4.0f); undoOnActivate();
+                ImGui::SliderFloat("Radius scale", &pe->volRadiusScale, 0.25f, 8.0f); undoOnActivate();
+                ImGui::SliderFloat("Temperature (0=smoke,1=fire)", &pe->volTemperature, 0.0f, 1.0f);
+                undoOnActivate();
+                ImGui::SliderFloat("Emission (fire glow)", &pe->volEmission, 0.0f, 10.0f);
+                undoOnActivate();
+                ImGui::SliderFloat("Extinction (density/darkness)", &pe->volExtinction, 0.1f, 6.0f);
+                undoOnActivate();
+                ImGui::SliderFloat("Detail (procedural wisps)", &pe->volDetail, 0.0f, 1.0f);
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("0 = raw blobs. Higher = animated fractal noise warps + "
+                                      "erodes the volume into continuous billowing smoke/fire.");
+                ImGui::SliderInt("Raymarch steps", &pe->volSteps, 4, 256); undoOnActivate();
+                pe->volSteps = glm::clamp(pe->volSteps, 4, 256);
+                // Volume resolution: lower = cheaper (low-end scalability). Applied at
+                // first enable per run; a tooltip flags that a restart re-reads it.
+                int resIdx = pe->volResolution <= 48 ? 0
+                             : pe->volResolution <= 72 ? 1
+                             : pe->volResolution <= 112 ? 2
+                                                        : 3;
+                ImGui::SetNextItemWidth(180.0f);
+                if (ImGui::Combo("Volume resolution", &resIdx,
+                                 "Low (48^3)\0Medium (64^3)\0High (96^3)\0Ultra (160^3)\0")) {
+                    PushUndo(scene);
+                    const int res[] = {48, 64, 96, 160};
+                    pe->volResolution = res[glm::clamp(resIdx, 0, 3)];
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Lower = faster (mid/low-end GPUs).");
+                // Always-visible caveat (not just a hover tooltip): the volume texture is
+                // sized once, when the first volumetric emitter activates this run, so a
+                // resolution change here won't take effect until the app is relaunched.
+                ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.35f, 1.0f),
+                                   "Applies at next launch (volume sized once per run).");
+            }
         }
         if (s.remove) { PushUndo(scene); reg.remove<ParticleEmitter>(sel); }
     }
@@ -6707,6 +6961,80 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
+    // --- Interaction (Interactable objects/NPCs + box Trigger Volumes) ----------
+    // Shared "what happens" editor used by both components.
+    const auto drawInteractAction = [&](InteractAction& action, std::string& asset,
+                                        std::string& flag, f32& flagValue, std::string& text) {
+        int ai = static_cast<int>(action);
+        if (ImGui::Combo("Action", &ai,
+                         "Dialogue\0Cutscene\0Set Flag\0Set Objective\0Complete Objective\0None\0"))
+            action = static_cast<InteractAction>(glm::clamp(ai, 0, 5));
+        if (action == InteractAction::Dialogue || action == InteractAction::Cutscene) {
+            const char* ext = action == InteractAction::Dialogue ? ".hbdialogue" : ".hbcutscene";
+            if (ImGui::BeginCombo("Asset", asset.empty() ? "(none)" : asset.c_str())) {
+                if (ImGui::Selectable("(none)", asset.empty())) asset.clear();
+                for (const std::string& a : ListAssetsByExt(ext))
+                    if (ImGui::Selectable(a.c_str(), a == asset)) asset = a;
+                ImGui::EndCombo();
+            }
+        } else if (action == InteractAction::SetFlag) {
+            char fb[64];
+            std::snprintf(fb, sizeof(fb), "%s", flag.c_str());
+            if (ImGui::InputText("Flag", fb, sizeof(fb))) flag = fb;
+            ImGui::DragFloat("Set to", &flagValue, 0.1f);
+        } else if (action == InteractAction::SetObjective) {
+            char fb[64];
+            std::snprintf(fb, sizeof(fb), "%s", flag.c_str());
+            if (ImGui::InputText("Objective id", fb, sizeof(fb))) flag = fb;
+            char tb[128];
+            std::snprintf(tb, sizeof(tb), "%s", text.c_str());
+            if (ImGui::InputText("Objective text", tb, sizeof(tb))) text = tb;
+        } else if (action == InteractAction::CompleteObjective) {
+            char fb[64];
+            std::snprintf(fb, sizeof(fb), "%s", flag.c_str());
+            if (ImGui::InputText("Objective id", fb, sizeof(fb))) flag = fb;
+        }
+    };
+
+    if (Interactable* ia = reg.try_get<Interactable>(sel)) {
+        const SectionState s = ComponentSection("Interactable");
+        if (s.open) {
+            char pb[96];
+            std::snprintf(pb, sizeof(pb), "%s", ia->prompt.c_str());
+            if (ImGui::InputText("Prompt ([E] ...)", pb, sizeof(pb))) ia->prompt = pb;
+            drawInteractAction(ia->action, ia->asset, ia->flag, ia->flagValue, ia->text);
+            ImGui::DragFloat("Range (m)", &ia->range, 0.1f, 0.2f, 50.0f);
+            ImGui::Checkbox("Once", &ia->once);
+            char rb[64];
+            std::snprintf(rb, sizeof(rb), "%s", ia->requiredFlag.c_str());
+            if (ImGui::InputText("Required flag (gate)", rb, sizeof(rb))) ia->requiredFlag = rb;
+            ImGui::TextDisabled("Player walks within Range -> \"[E] Prompt\" -> the Action fires\n"
+                                "(E key / gamepad Y). Required flag: shown only while flag != 0.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<Interactable>(sel);
+        }
+    }
+
+    if (TriggerVolume* tv = reg.try_get<TriggerVolume>(sel)) {
+        const SectionState s = ComponentSection("Trigger Volume");
+        if (s.open) {
+            drawInteractAction(tv->action, tv->asset, tv->flag, tv->flagValue, tv->text);
+            ImGui::DragFloat3("Box half-extents", glm::value_ptr(tv->halfExtents), 0.1f, 0.0f,
+                              1000.0f);
+            ImGui::Checkbox("Once", &tv->once);
+            char rb[64];
+            std::snprintf(rb, sizeof(rb), "%s", tv->requiredFlag.c_str());
+            if (ImGui::InputText("Required flag (gate)", rb, sizeof(rb))) tv->requiredFlag = rb;
+            ImGui::TextDisabled("Fires the Action when the player enters the box (once by default).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<TriggerVolume>(sel);
+        }
+    }
+
     // --- Directional light -----------------------------------------------------
     if (DirectionalLightComponent* light = reg.try_get<DirectionalLightComponent>(sel)) {
         const SectionState s = ComponentSection("Directional Light");
@@ -7791,6 +8119,7 @@ void Editor::PushUndo(Scene& scene) {
 
 void Editor::Undo(Engine& engine) {
     if (undoStack_.empty()) return;
+    CutscenePreviewEnd(engine); // revert previewed poses so the stacks capture authored state
     redoStack_.push_back(scene::SaveSceneToString(engine.GetScene()));
     const std::string snapshot = std::move(undoStack_.back());
     undoStack_.pop_back();
@@ -7799,6 +8128,7 @@ void Editor::Undo(Engine& engine) {
 
 void Editor::Redo(Engine& engine) {
     if (redoStack_.empty()) return;
+    CutscenePreviewEnd(engine); // revert previewed poses so the stacks capture authored state
     undoStack_.push_back(scene::SaveSceneToString(engine.GetScene()));
     const std::string snapshot = std::move(redoStack_.back());
     redoStack_.pop_back();
@@ -7826,13 +8156,13 @@ void Editor::CopySelection(Scene& scene) {
 }
 
 void Editor::PasteSubtree(Engine& engine, const std::string& fragment,
-                          const glm::vec3* placeAt) {
+                          const glm::vec3* placeAt, bool pushUndo) {
     if (fragment.empty()) return;
     scene::SceneData data;
     if (!scene::ParseSceneString(fragment, data) || data.entities.empty()) return;
 
     Scene& scene = engine.GetScene();
-    PushUndo(scene); // a paste is one undo step
+    if (pushUndo) PushUndo(scene); // a paste is one undo step
 
     scene::StagedAssets staged;
     const std::filesystem::path assetsDir =
@@ -7864,23 +8194,64 @@ void Editor::PasteSubtree(Engine& engine, const std::string& fragment,
 
 void Editor::PasteClipboard(Engine& engine) { PasteSubtree(engine, clipboard_); }
 
+std::filesystem::path Editor::PrefabSourcePath(const std::string& rel) const {
+    if (rel.empty() || !Project::HasActive()) return {};
+    // The source is a relative-under-Assets path. Reject anything that could
+    // escape (absolute, drive-qualified, or containing a ".." component) so a
+    // hand-edited scene can't make Apply write / Revert read outside the project.
+    const std::filesystem::path r(rel);
+    if (r.is_absolute() || r.has_root_name()) return {};
+    for (const std::filesystem::path& part : r)
+        if (part == "..") return {};
+    return Project::Active().AssetsDir() / r;
+}
+
+// Stores `abs` relative to the project's Assets dir (portable, matching how the
+// serializer expects the PrefabInstance source); falls back to the filename.
+static std::string PrefabRelPath(const std::filesystem::path& abs) {
+    if (!Project::HasActive()) return abs.filename().generic_string();
+    std::error_code ec;
+    const std::filesystem::path rel =
+        std::filesystem::relative(abs, Project::Active().AssetsDir(), ec);
+    if (ec || rel.empty() || rel.native().rfind(L"..", 0) == 0)
+        return abs.filename().generic_string();
+    return rel.generic_string();
+}
+
 std::filesystem::path Editor::CreatePrefabFromSelection(Scene& scene,
                                                         const std::filesystem::path& dirIn,
                                                         const std::string& name) {
     namespace fs = std::filesystem;
-    if (!Project::HasActive() || selected_ == entt::null || !scene.Registry().valid(selected_))
+    auto& reg = scene.Registry();
+    if (!Project::HasActive() || selected_ == entt::null || !reg.valid(selected_))
         return {};
+    // The saved definition must NOT carry a root prefab link (a definition doesn't
+    // reference itself). Strip it while saving, then re-link the selection to the
+    // NEW prefab so "create prefab" turns the selection into an instance of it.
+    const bool hadLink = reg.all_of<PrefabInstance>(selected_);
+    PrefabInstance oldLink;
+    if (hadLink) { oldLink = reg.get<PrefabInstance>(selected_); reg.remove<PrefabInstance>(selected_); }
+
     const std::string frag = scene::SaveSubtreeToString(scene, selected_);
-    if (frag.empty()) return {};
+    if (frag.empty()) {
+        if (hadLink) reg.emplace<PrefabInstance>(selected_, oldLink);
+        return {};
+    }
     const fs::path dir = dirIn.empty() ? Project::Active().AssetsDir() / "Prefabs" : dirIn;
     std::error_code ec;
     fs::create_directories(dir, ec);
-    const std::string base = name.empty() ? "Prefab" : name;
+    std::string base = SanitizeFileStem(name); // strip path separators / traversal
+    if (base.empty()) base = "Prefab";
     fs::path p = dir / (base + ".hbprefab");
     for (int i = 1; fs::exists(p); ++i) p = dir / (base + std::to_string(i) + ".hbprefab");
     std::ofstream out(p, std::ios::binary | std::ios::trunc);
-    if (!out) return {};
+    if (!out) {
+        if (hadLink) reg.emplace<PrefabInstance>(selected_, oldLink);
+        return {};
+    }
     out.write(frag.data(), static_cast<std::streamsize>(frag.size()));
+    out.close();
+    reg.emplace_or_replace<PrefabInstance>(selected_, PrefabInstance{PrefabRelPath(p)});
     assetsDirty_ = true;
     return p;
 }
@@ -7891,6 +8262,68 @@ void Editor::InstantiatePrefab(Engine& engine, const std::filesystem::path& path
     if (!in) return;
     const std::string frag((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     PasteSubtree(engine, frag, at); // additive; selects + places the new root
+    // Link the new root back to the source prefab so it's a live instance.
+    Scene& scene = engine.GetScene();
+    if (selected_ != entt::null && scene.Registry().valid(selected_))
+        scene.Registry().emplace_or_replace<PrefabInstance>(selected_,
+                                                            PrefabInstance{PrefabRelPath(path)});
+}
+
+void Editor::ApplyPrefabInstance(Engine& engine, entt::entity root) {
+    Scene& scene = engine.GetScene();
+    auto& reg = scene.Registry();
+    if (!reg.valid(root)) return;
+    const PrefabInstance* pi = reg.try_get<PrefabInstance>(root);
+    if (!pi || pi->source.empty()) return;
+    const std::string source = pi->source; // copy: remove<> below invalidates pi
+    const std::filesystem::path dst = PrefabSourcePath(source);
+    if (dst.empty()) return;
+    // Save a clean definition (strip the root link), then restore it.
+    reg.remove<PrefabInstance>(root);
+    const std::string frag = scene::SaveSubtreeToString(scene, root);
+    reg.emplace<PrefabInstance>(root, PrefabInstance{source});
+    if (frag.empty()) return;
+    std::ofstream out(dst, std::ios::binary | std::ios::trunc);
+    if (!out) { HBE_WARN("Prefab Apply: cannot write '{}'.", dst.string()); return; }
+    out.write(frag.data(), static_cast<std::streamsize>(frag.size()));
+    assetsDirty_ = true;
+    HBE_INFO("Prefab Apply: updated '{}'.", source);
+}
+
+void Editor::RevertPrefabInstance(Engine& engine, entt::entity root) {
+    Scene& scene = engine.GetScene();
+    auto& reg = scene.Registry();
+    if (!reg.valid(root)) return;
+    const PrefabInstance* pi = reg.try_get<PrefabInstance>(root);
+    if (!pi || pi->source.empty()) return;
+    const std::string source = pi->source; // copy: DestroyRecursive below invalidates pi
+    const std::filesystem::path src = PrefabSourcePath(source);
+    if (src.empty()) { HBE_WARN("Prefab Revert: invalid source '{}'.", source); return; }
+    std::ifstream in(src, std::ios::binary);
+    if (!in) { HBE_WARN("Prefab Revert: source '{}' missing.", source); return; }
+    const std::string frag((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // Validate BEFORE destroying: an empty/corrupt prefab must NOT delete the
+    // instance (PasteSubtree would silently no-op, leaving nothing behind).
+    scene::SceneData probe;
+    if (frag.empty() || !scene::ParseSceneString(frag, probe) || probe.entities.empty()) {
+        HBE_WARN("Prefab Revert: source '{}' is empty/corrupt; instance kept.", source);
+        return;
+    }
+    // Preserve the instance's placement AND its parenting across the re-instantiate
+    // (the stored position is local when parented; re-attaching keeps it in place).
+    glm::vec3 place{0.0f};
+    if (const Transform* t = reg.try_get<Transform>(root)) place = t->position;
+    const bool hadParent = reg.all_of<Parent>(root);
+    const entt::entity parent = hadParent ? reg.get<Parent>(root).entity : entt::null;
+
+    PushUndo(scene);                              // ONE undo step for the whole revert
+    DestroyRecursive(scene, root);                // clears selected_ if it was root
+    PasteSubtree(engine, frag, &place, /*pushUndo=*/false); // selects the fresh root
+    if (selected_ != entt::null && reg.valid(selected_)) {
+        reg.emplace_or_replace<PrefabInstance>(selected_, PrefabInstance{source});
+        if (hadParent && reg.valid(parent))
+            reg.emplace_or_replace<Parent>(selected_, Parent{parent}); // restore parenting
+    }
 }
 
 void Editor::DuplicateSelection(Engine& engine) {
@@ -7937,23 +8370,36 @@ std::filesystem::path Editor::CreateAudioEventAsset(const std::filesystem::path&
     return assets::SaveAudioEvent(p, AudioEvent{}) ? p : std::filesystem::path{};
 }
 
-std::filesystem::path Editor::CreateDialogueAsset(const std::filesystem::path& dir,
+std::filesystem::path Editor::CreateDialogueAsset(const std::filesystem::path& dirIn,
                                                   const std::string& name) {
+    // A fresh dialogue is a branching graph (Start -> Line), edited in the Dialogue
+    // Editor window. An empty dir (the editor's "New" button) defaults to
+    // Assets/Dialogue so the file lands inside the project.
+    if (dirIn.empty() && !Project::HasActive()) return {};
+    const std::filesystem::path dir =
+        dirIn.empty() ? Project::Active().AssetsDir() / "Dialogue" : dirIn;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     std::string base = SanitizeFileStem(name);
     if (base.empty()) base = "NewDialogue";
     std::string stem = base;
-    for (int i = 1; std::filesystem::exists(dir / (stem + assets::kDialogueExtension), ec); ++i)
+    for (int i = 1; std::filesystem::exists(dir / (stem + dlg::kDialogueExtension), ec); ++i)
         stem = base + std::to_string(i);
-    const std::filesystem::path p = dir / (stem + assets::kDialogueExtension);
-    DialogueAsset d;
-    d.lines.push_back(DialogueLine{"Speaker", "Line of dialogue.", "", 0.0f});
-    return assets::SaveDialogue(p, d) ? p : std::filesystem::path{};
+    const std::filesystem::path p = dir / (stem + dlg::kDialogueExtension);
+    dlg::Graph g;
+    const u32 s = g.AddNode(dlg::NodeType::Start, {48.0f, 60.0f});
+    const u32 l = g.AddNode(dlg::NodeType::Line, {280.0f, 60.0f});
+    g.Connect(s, 0, l, 0);
+    return dlg::SaveGraph(p, g) ? p : std::filesystem::path{};
 }
 
-std::filesystem::path Editor::CreateCutsceneAsset(const std::filesystem::path& dir,
+std::filesystem::path Editor::CreateCutsceneAsset(const std::filesystem::path& dirIn,
                                                   const std::string& name) {
+    if (!Project::HasActive()) return {};
+    // An empty dir (the timeline's "New" button) defaults to Assets/Cutscenes so
+    // the file lands INSIDE the project, not the process working directory.
+    const std::filesystem::path dir =
+        dirIn.empty() ? Project::Active().AssetsDir() / "Cutscenes" : dirIn;
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     std::string base = SanitizeFileStem(name);
@@ -7970,6 +8416,558 @@ std::filesystem::path Editor::CreateCutsceneAsset(const std::filesystem::path& d
     end.position = {5.0f, 2.0f, 5.0f};
     c.camera.push_back(end);
     return assets::SaveCutscene(p, c) ? p : std::filesystem::path{};
+}
+
+// ---------------------------------------------------------------------------
+// Cutscene Timeline: an artist-facing NLE-style editor. A horizontal time axis
+// (zoom/pan), one lane per track (camera, each animation entity, dialogue),
+// keyframes as draggable diamonds, a scrubbable playhead, a selected-item
+// inspector, and a live viewport preview driven by cutscene::Evaluate.
+// ---------------------------------------------------------------------------
+
+void Editor::OpenCutscene(Engine& engine, const std::filesystem::path& path) {
+    // If a preview of a different cutscene is live, restore that scene first.
+    if (csPreview_) CutscenePreviewEnd(engine);
+    CutsceneAsset c;
+    if (const auto loaded = assets::LoadCutscene(path)) c = *loaded;
+    editedCutscene_ = std::move(c);
+    editedCutscenePath_ = path;
+    editedCutsceneValid_ = true;
+    editedCutsceneDirty_ = false;
+    cutsceneEditTime_ = 0.0f;
+    csScroll_ = 0.0f;
+    csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
+    csDragKey_ = csDragPlayhead_ = false;
+    csAudioChoices_ = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
+    csDialogueChoices_ = ListAssetsByExt(".hbdialogue");
+    cutsceneFocus_ = true;
+    panelOpen_[Panel_CutsceneTimeline] = true;
+}
+
+void Editor::CutscenePreviewBegin(Engine& engine) {
+    if (csPreview_ || playMode_ || !editedCutsceneValid_) return;
+    // Snapshot the scene so scrubbing/playback can freely pose entities and we
+    // restore the authored transforms exactly when preview ends.
+    csPreviewSnapshot_ = scene::SaveSceneToString(engine.GetScene());
+    csPreview_ = true;
+}
+
+void Editor::CutscenePreviewEnd(Engine& engine) {
+    if (!csPreview_) return;
+    csPreview_ = false;
+    csPlaying_ = false;
+    if (!csPreviewSnapshot_.empty()) {
+        RestoreSnapshot(engine, csPreviewSnapshot_); // revert previewed poses
+        csPreviewSnapshot_.clear();
+    }
+    // The camera self-restores: the editor freecam drives it again next frame.
+}
+
+void Editor::DrawCutsceneTimeline(Engine& engine) {
+    if (!panelOpen_[Panel_CutsceneTimeline]) {
+        if (csPreview_) CutscenePreviewEnd(engine); // closing the panel ends preview
+        return;
+    }
+    if (cutsceneFocus_) { ImGui::SetNextWindowFocus(); cutsceneFocus_ = false; }
+    if (!ImGui::Begin("Cutscene Timeline", &panelOpen_[Panel_CutsceneTimeline])) {
+        // Collapsed (or clipped): the preview step below won't run, so end the
+        // preview and restore the scene rather than freezing it mid-pose.
+        if (csPreview_) CutscenePreviewEnd(engine);
+        ImGui::End();
+        return;
+    }
+    if (!editedCutsceneValid_) {
+        ImGui::TextDisabled("No cutscene open.");
+        if (ImGui::Button("New")) {
+            const std::filesystem::path p = CreateCutsceneAsset({});
+            if (!p.empty()) OpenCutscene(engine, p);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Open")) ImGui::OpenPopup("##csopen");
+        if (ImGui::BeginPopup("##csopen")) {
+            for (const std::string& rel : ListAssetsByExt(".hbcutscene"))
+                if (ImGui::Selectable(rel.c_str()))
+                    OpenCutscene(engine, Project::Active().AssetsDir() / rel);
+            ImGui::EndPopup();
+        }
+        ImGui::End();
+        return;
+    }
+
+    CutsceneAsset& cs = editedCutscene_;
+    ImGuiIO& io = ImGui::GetIO();
+    auto& reg = engine.GetScene().Registry();
+
+    // Reorder a moved keyframe so its container stays time-sorted, returning the
+    // element's new index (works for any struct with a `.time` member).
+    const auto reorder = [](auto& vec, int idx) -> int {
+        while (idx > 0 && vec[static_cast<usize>(idx)].time < vec[static_cast<usize>(idx - 1)].time) {
+            std::swap(vec[static_cast<usize>(idx)], vec[static_cast<usize>(idx - 1)]); --idx;
+        }
+        while (idx + 1 < static_cast<int>(vec.size()) &&
+               vec[static_cast<usize>(idx)].time > vec[static_cast<usize>(idx + 1)].time) {
+            std::swap(vec[static_cast<usize>(idx)], vec[static_cast<usize>(idx + 1)]); ++idx;
+        }
+        return idx;
+    };
+    const auto markDirty = [&]() { editedCutsceneDirty_ = true; };
+
+    // -- Toolbar: file ops ----------------------------------------------------
+    if (ImGui::Button("New")) {
+        const std::filesystem::path p = CreateCutsceneAsset({});
+        if (!p.empty()) OpenCutscene(engine, p);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Open")) ImGui::OpenPopup("##csopen");
+    if (ImGui::BeginPopup("##csopen")) {
+        for (const std::string& rel : ListAssetsByExt(".hbcutscene"))
+            if (ImGui::Selectable(rel.c_str()))
+                OpenCutscene(engine, Project::Active().AssetsDir() / rel);
+        ImGui::EndPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(editedCutsceneDirty_ ? "Save*" : "Save")) {
+        auto byTime = [](const auto& a, const auto& b) { return a.time < b.time; };
+        std::stable_sort(cs.camera.begin(), cs.camera.end(), byTime);
+        for (CutsceneAnimTrack& t : cs.animTracks) {
+            std::stable_sort(t.keys.begin(), t.keys.end(), byTime);
+            std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
+        }
+        std::stable_sort(cs.dialogue.begin(), cs.dialogue.end(), byTime);
+        if (assets::SaveCutscene(editedCutscenePath_, cs)) {
+            editedCutsceneDirty_ = false;
+            assetsDirty_ = true;
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", editedCutscenePath_.filename().string().c_str());
+
+    // -- Toolbar: transport (live preview) ------------------------------------
+    if (!csPreview_) {
+        if (ImGui::Button("Preview")) { CutscenePreviewBegin(engine); csPlaying_ = true; }
+        if (playMode_) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(stop Play mode to preview)");
+        }
+    } else {
+        if (ImGui::Button(csPlaying_ ? "Pause" : "Play")) csPlaying_ = !csPlaying_;
+        ImGui::SameLine();
+        if (ImGui::Button("Stop")) CutscenePreviewEnd(engine);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "PREVIEW");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("|<")) cutsceneEditTime_ = 0.0f; // rewind
+    ImGui::SameLine();
+    ImGui::Text("%.2f / %.2fs", cutsceneEditTime_, cs.duration);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110.0f);
+    if (ImGui::DragFloat("Duration", &cs.duration, 0.1f, 0.1f, 3600.0f, "%.1f")) markDirty();
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Fit")) { csScroll_ = 0.0f; csZoom_ = 0.0f; /* refit once laneW known */ }
+
+    // -- Toolbar: add ---------------------------------------------------------
+    Camera& vcam = engine.GetRenderer().GetCamera();
+    if (ImGui::Button("+ Camera Key")) {
+        CutsceneCameraKey k;
+        k.time = cutsceneEditTime_;
+        k.position = vcam.Position();
+        k.aim = vcam.Position() + vcam.Forward() * 5.0f;
+        k.fov = glm::degrees(vcam.FovY());
+        cs.camera.push_back(k);
+        // Select the new key (its sorted slot) so the inspector edits IT, not a
+        // stale index left pointing at a shifted neighbour.
+        csSelKind_ = 0; csSelTrack_ = -1;
+        csSelIndex_ = reorder(cs.camera, static_cast<int>(cs.camera.size()) - 1);
+        markDirty();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Track")) {
+        cs.animTracks.push_back(CutsceneAnimTrack{});
+        csSelKind_ = 4; csSelTrack_ = static_cast<int>(cs.animTracks.size()) - 1; csSelIndex_ = -1;
+        markDirty();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+ Dialogue")) {
+        cs.dialogue.push_back(CutsceneDialogueMarker{cutsceneEditTime_, "", ""});
+        csSelKind_ = 3; csSelTrack_ = -1;
+        csSelIndex_ = reorder(cs.dialogue, static_cast<int>(cs.dialogue.size()) - 1);
+        markDirty();
+    }
+
+    // -- Timeline canvas ------------------------------------------------------
+    constexpr float kHeaderW = 132.0f;
+    constexpr float kRowH = 28.0f;
+    constexpr float kRulerH = 22.0f;
+    constexpr float kDiaR = 6.0f;
+    const int animCount = static_cast<int>(cs.animTracks.size());
+    const int laneCount = animCount + 2; // camera + tracks + dialogue
+
+    const float inspectorH = 176.0f;
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float canvasH = glm::max(kRulerH + kRowH * static_cast<float>(laneCount) + 8.0f,
+                                   avail.y - inspectorH);
+    ImGui::BeginChild("##cscanvas", ImVec2(0.0f, canvasH), true,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+                          ImGuiWindowFlags_NoMove);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 p0 = ImGui::GetCursorScreenPos();
+    const ImVec2 sz = ImGui::GetContentRegionAvail();
+    ImGui::InvisibleButton("##csgrid", sz,
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
+                               ImGuiButtonFlags_MouseButtonMiddle);
+    const bool canvasHovered = ImGui::IsItemHovered();
+    const bool canvasActive = ImGui::IsItemActive();
+    const ImVec2 mouse = io.MousePos;
+
+    const float laneX0 = p0.x + kHeaderW;
+    const float laneX1 = p0.x + sz.x;
+    const float laneW = glm::max(laneX1 - laneX0, 1.0f);
+    const float lane0Y = p0.y + kRulerH;
+    const float dur = glm::max(cs.duration, 0.001f);
+
+    // Refit (or first use): size zoom so the whole cutscene spans the lane. laneW
+    // is >= 1 and dur >= 0.001, so this is always positive (no divide-by-zero).
+    if (csZoom_ <= 0.0f) csZoom_ = laneW / dur;
+
+    const auto timeToX = [&](float t) { return laneX0 + (t - csScroll_) * csZoom_; };
+    const auto xToTime = [&](float x) { return csScroll_ + (x - laneX0) / csZoom_; };
+    const auto laneCenterY = [&](int lane) { return lane0Y + (static_cast<float>(lane) + 0.5f) * kRowH; };
+
+    // Wheel zoom, keeping the time under the cursor fixed.
+    if (canvasHovered && io.MouseWheel != 0.0f) {
+        const float tCursor = xToTime(mouse.x);
+        csZoom_ = glm::clamp(csZoom_ * std::pow(1.1f, io.MouseWheel), 4.0f, 4000.0f);
+        csScroll_ = glm::max(0.0f, tCursor - (mouse.x - laneX0) / csZoom_);
+    }
+    // Middle-drag pans the time axis.
+    if (canvasActive && ImGui::IsMouseDragging(ImGuiMouseButton_Middle))
+        csScroll_ = glm::max(0.0f, csScroll_ - io.MouseDelta.x / csZoom_);
+
+    // Backgrounds: ruler + alternating lane bands + header column.
+    dl->AddRectFilled(p0, ImVec2(laneX1, p0.y + kRulerH), IM_COL32(38, 40, 46, 255));
+    for (int i = 0; i < laneCount; ++i) {
+        const float y = lane0Y + static_cast<float>(i) * kRowH;
+        const ImU32 band = (i & 1) ? IM_COL32(30, 31, 36, 255) : IM_COL32(34, 35, 41, 255);
+        dl->AddRectFilled(ImVec2(laneX0, y), ImVec2(laneX1, y + kRowH), band);
+    }
+    dl->AddRectFilled(p0, ImVec2(laneX0, p0.y + sz.y), IM_COL32(26, 27, 32, 255)); // header col
+    dl->AddLine(ImVec2(laneX0, p0.y), ImVec2(laneX0, p0.y + sz.y), IM_COL32(70, 72, 80, 255));
+
+    // Ruler ticks: pick a "nice" step so labels are ~>=60px apart.
+    dl->PushClipRect(ImVec2(laneX0, p0.y), ImVec2(laneX1, p0.y + sz.y), true);
+    {
+        static const float kSteps[] = {0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 30.0f, 60.0f};
+        float step = kSteps[0];
+        for (float s : kSteps) { step = s; if (s * csZoom_ >= 60.0f) break; }
+        const float first = std::floor(csScroll_ / step) * step;
+        for (float t = first; ; t += step) {
+            const float x = timeToX(t);
+            if (x > laneX1) break;
+            if (x >= laneX0 && t >= 0.0f) {
+                dl->AddLine(ImVec2(x, p0.y + 4.0f), ImVec2(x, p0.y + kRulerH), IM_COL32(96, 98, 108, 255));
+                char lbl[24];
+                std::snprintf(lbl, sizeof(lbl), "%.2gs", static_cast<double>(t));
+                dl->AddText(ImVec2(x + 2.0f, p0.y + 3.0f), IM_COL32(150, 152, 162, 255), lbl);
+                dl->AddLine(ImVec2(x, lane0Y), ImVec2(x, p0.y + sz.y), IM_COL32(52, 54, 62, 120));
+            }
+        }
+        // Duration end marker.
+        const float xEnd = timeToX(dur);
+        if (xEnd >= laneX0 && xEnd <= laneX1)
+            dl->AddLine(ImVec2(xEnd, lane0Y), ImVec2(xEnd, p0.y + sz.y), IM_COL32(120, 80, 80, 160));
+    }
+    dl->PopClipRect();
+
+    // Lane labels (header column).
+    const char* camLabel = "Camera";
+    dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(0) - 7.0f), IM_COL32(210, 200, 150, 255), camLabel);
+    for (int ti = 0; ti < animCount; ++ti) {
+        const std::string& tgt = cs.animTracks[static_cast<usize>(ti)].target;
+        const std::string label = tgt.empty() ? "(no target)" : tgt;
+        const bool selT = csSelKind_ == 4 && csSelTrack_ == ti;
+        dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(1 + ti) - 7.0f),
+                    selT ? IM_COL32(255, 235, 180, 255) : IM_COL32(180, 200, 220, 255),
+                    label.c_str());
+    }
+    dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(laneCount - 1) - 7.0f),
+                IM_COL32(200, 170, 210, 255), "Dialogue");
+
+    // Key rendering + hit-testing. Collect the nearest key under the cursor on a
+    // left press so we can select/drag it.
+    dl->PushClipRect(ImVec2(laneX0, lane0Y), ImVec2(laneX1, p0.y + sz.y), true);
+    const auto drawDiamond = [&](float cx, float cy, ImU32 col, bool sel) {
+        const float r = sel ? kDiaR + 1.5f : kDiaR;
+        dl->AddQuadFilled(ImVec2(cx, cy - r), ImVec2(cx + r, cy), ImVec2(cx, cy + r), ImVec2(cx - r, cy), col);
+        if (sel)
+            dl->AddQuad(ImVec2(cx, cy - r), ImVec2(cx + r, cy), ImVec2(cx, cy + r), ImVec2(cx - r, cy),
+                        IM_COL32(255, 255, 255, 255), 1.5f);
+    };
+
+    struct Hit { int kind = -1, track = -1, index = -1; float d2 = 1e9f; };
+    Hit hit;
+    const bool leftPressed = canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    const auto consider = [&](int kind, int track, int index, float x, float y) {
+        if (!leftPressed) return;
+        const float dx = mouse.x - x, dy = mouse.y - y;
+        const float d2 = dx * dx + dy * dy;
+        if (d2 < hit.d2 && d2 < (kDiaR + 5.0f) * (kDiaR + 5.0f)) hit = {kind, track, index, d2};
+    };
+
+    // Camera keys.
+    for (int i = 0; i < static_cast<int>(cs.camera.size()); ++i) {
+        const float x = timeToX(cs.camera[static_cast<usize>(i)].time);
+        const float y = laneCenterY(0);
+        const bool sel = csSelKind_ == 0 && csSelIndex_ == i;
+        drawDiamond(x, y, cs.camera[static_cast<usize>(i)].cut ? IM_COL32(230, 150, 70, 255)
+                                                               : IM_COL32(230, 200, 110, 255), sel);
+        consider(0, -1, i, x, y);
+    }
+    // Animation tracks: transform keys (diamonds) + clip triggers (circles).
+    for (int ti = 0; ti < animCount; ++ti) {
+        const CutsceneAnimTrack& tr = cs.animTracks[static_cast<usize>(ti)];
+        const float y = laneCenterY(1 + ti);
+        for (int ki = 0; ki < static_cast<int>(tr.keys.size()); ++ki) {
+            const float x = timeToX(tr.keys[static_cast<usize>(ki)].time);
+            const bool sel = csSelKind_ == 1 && csSelTrack_ == ti && csSelIndex_ == ki;
+            drawDiamond(x, y - 2.0f, IM_COL32(120, 180, 240, 255), sel);
+            consider(1, ti, ki, x, y - 2.0f);
+        }
+        for (int ci = 0; ci < static_cast<int>(tr.clips.size()); ++ci) {
+            const float x = timeToX(tr.clips[static_cast<usize>(ci)].time);
+            const bool sel = csSelKind_ == 2 && csSelTrack_ == ti && csSelIndex_ == ci;
+            dl->AddCircleFilled(ImVec2(x, y + 7.0f), sel ? 5.5f : 4.0f, IM_COL32(120, 210, 130, 255));
+            if (sel) dl->AddCircle(ImVec2(x, y + 7.0f), 5.5f, IM_COL32(255, 255, 255, 255), 0, 1.5f);
+            consider(2, ti, ci, x, y + 7.0f);
+        }
+    }
+    // Dialogue markers.
+    for (int i = 0; i < static_cast<int>(cs.dialogue.size()); ++i) {
+        const float x = timeToX(cs.dialogue[static_cast<usize>(i)].time);
+        const float y = laneCenterY(laneCount - 1);
+        const bool sel = csSelKind_ == 3 && csSelIndex_ == i;
+        drawDiamond(x, y, IM_COL32(200, 150, 220, 255), sel);
+        consider(3, -1, i, x, y);
+    }
+    dl->PopClipRect();
+
+    // Playhead (drawn over lanes + ruler).
+    {
+        const float px = timeToX(cutsceneEditTime_);
+        if (px >= laneX0 - 1.0f && px <= laneX1 + 1.0f) {
+            dl->AddLine(ImVec2(px, p0.y), ImVec2(px, p0.y + sz.y), IM_COL32(240, 80, 80, 235), 1.5f);
+            dl->AddTriangleFilled(ImVec2(px - 5.0f, p0.y), ImVec2(px + 5.0f, p0.y),
+                                  ImVec2(px, p0.y + 7.0f), IM_COL32(240, 80, 80, 255));
+        }
+    }
+
+    // -- Interaction: grab on left press --------------------------------------
+    if (leftPressed) {
+        if (hit.kind >= 0) {
+            csSelKind_ = hit.kind; csSelTrack_ = hit.track; csSelIndex_ = hit.index;
+            csDragKey_ = true;
+        } else if (mouse.y < lane0Y || std::fabs(mouse.x - timeToX(cutsceneEditTime_)) < 6.0f) {
+            csDragPlayhead_ = true; // ruler or near the playhead line
+            cutsceneEditTime_ = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+        } else if (mouse.x < laneX0 && mouse.y >= lane0Y) {
+            // Clicked a lane header: select that track (for anim lanes).
+            const int lane = static_cast<int>((mouse.y - lane0Y) / kRowH);
+            if (lane >= 1 && lane <= animCount) { csSelKind_ = 4; csSelTrack_ = lane - 1; csSelIndex_ = -1; }
+            else { csSelKind_ = csSelTrack_ = csSelIndex_ = -1; }
+        } else {
+            csSelKind_ = csSelTrack_ = csSelIndex_ = -1; // empty click deselects
+        }
+    }
+    // -- Interaction: continuous drag -----------------------------------------
+    const bool leftDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (csDragPlayhead_ && leftDown) {
+        cutsceneEditTime_ = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+    } else if (csDragKey_ && leftDown && csSelKind_ >= 0) {
+        const float nt = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+        if (csSelKind_ == 0 && csSelIndex_ < static_cast<int>(cs.camera.size())) {
+            cs.camera[static_cast<usize>(csSelIndex_)].time = nt;
+            csSelIndex_ = reorder(cs.camera, csSelIndex_);
+        } else if (csSelKind_ == 1 && csSelTrack_ < animCount) {
+            auto& v = cs.animTracks[static_cast<usize>(csSelTrack_)].keys;
+            if (csSelIndex_ < static_cast<int>(v.size())) {
+                v[static_cast<usize>(csSelIndex_)].time = nt;
+                csSelIndex_ = reorder(v, csSelIndex_);
+            }
+        } else if (csSelKind_ == 2 && csSelTrack_ < animCount) {
+            auto& v = cs.animTracks[static_cast<usize>(csSelTrack_)].clips;
+            if (csSelIndex_ < static_cast<int>(v.size())) {
+                v[static_cast<usize>(csSelIndex_)].time = nt;
+                csSelIndex_ = reorder(v, csSelIndex_);
+            }
+        } else if (csSelKind_ == 3 && csSelIndex_ < static_cast<int>(cs.dialogue.size())) {
+            cs.dialogue[static_cast<usize>(csSelIndex_)].time = nt;
+            csSelIndex_ = reorder(cs.dialogue, csSelIndex_);
+        }
+        markDirty();
+    }
+    if (!leftDown) { csDragPlayhead_ = false; csDragKey_ = false; }
+
+    // -- Right-click context menu: add items at the clicked time/lane ---------
+    static int ctxLane = -1;
+    static float ctxTime = 0.0f;
+    if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+        ctxTime = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+        ctxLane = (mouse.y < lane0Y) ? 0 : static_cast<int>((mouse.y - lane0Y) / kRowH);
+        ImGui::OpenPopup("##csctx");
+    }
+    if (ImGui::BeginPopup("##csctx")) {
+        if (ctxLane == 0) {
+            if (ImGui::MenuItem("Add camera key here (from viewport)")) {
+                CutsceneCameraKey k;
+                k.time = ctxTime; k.position = vcam.Position();
+                k.aim = vcam.Position() + vcam.Forward() * 5.0f; k.fov = glm::degrees(vcam.FovY());
+                cs.camera.push_back(k);
+                csSelKind_ = 0; csSelTrack_ = -1;
+                csSelIndex_ = reorder(cs.camera, static_cast<int>(cs.camera.size()) - 1);
+                markDirty();
+            }
+        } else if (ctxLane >= 1 && ctxLane <= animCount) {
+            CutsceneAnimTrack& tr = cs.animTracks[static_cast<usize>(ctxLane - 1)];
+            const entt::entity e = [&] {
+                if (tr.target.empty()) return entt::entity{entt::null};
+                for (const entt::entity ent : reg.view<Name>())
+                    if (reg.get<Name>(ent).value == tr.target) return ent;
+                return entt::entity{entt::null};
+            }();
+            if (ImGui::MenuItem("Add transform key here (from entity)", nullptr, false,
+                                e != entt::null)) {
+                if (const Transform* xf = reg.try_get<Transform>(e)) {
+                    CutsceneTransformKey k;
+                    k.time = ctxTime; k.position = xf->position;
+                    k.rotation = xf->rotation; k.scale = xf->scale;
+                    tr.keys.push_back(k);
+                    csSelKind_ = 1; csSelTrack_ = ctxLane - 1;
+                    csSelIndex_ = reorder(tr.keys, static_cast<int>(tr.keys.size()) - 1);
+                    markDirty();
+                }
+            }
+            if (ImGui::MenuItem("Add clip trigger here")) {
+                tr.clips.push_back({ctxTime, 0});
+                csSelKind_ = 2; csSelTrack_ = ctxLane - 1;
+                csSelIndex_ = reorder(tr.clips, static_cast<int>(tr.clips.size()) - 1);
+                markDirty();
+            }
+            if (ImGui::MenuItem("Remove this track")) {
+                cs.animTracks.erase(cs.animTracks.begin() + (ctxLane - 1));
+                csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
+                markDirty();
+            }
+        } else if (ctxLane == laneCount - 1) {
+            if (ImGui::MenuItem("Add dialogue marker here")) {
+                cs.dialogue.push_back(CutsceneDialogueMarker{ctxTime, "", ""});
+                csSelKind_ = 3; csSelTrack_ = -1;
+                csSelIndex_ = reorder(cs.dialogue, static_cast<int>(cs.dialogue.size()) - 1);
+                markDirty();
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::EndChild();
+
+    // -- Selected-item inspector ----------------------------------------------
+    ImGui::BeginChild("##csinspector", ImVec2(0.0f, 0.0f), true);
+    if (csSelKind_ == 0 && csSelIndex_ >= 0 && csSelIndex_ < static_cast<int>(cs.camera.size())) {
+        CutsceneCameraKey& k = cs.camera[static_cast<usize>(csSelIndex_)];
+        ImGui::SeparatorText("Camera Key");
+        bool ed = false;
+        ed |= ImGui::DragFloat("Time", &k.time, 0.02f, 0.0f, dur);
+        ed |= ImGui::DragFloat3("Position", glm::value_ptr(k.position), 0.05f);
+        ed |= ImGui::DragFloat3("Aim", glm::value_ptr(k.aim), 0.05f);
+        ed |= ImGui::DragFloat("FOV", &k.fov, 0.2f, 10.0f, 170.0f);
+        ed |= ImGui::Checkbox("Hard cut", &k.cut);
+        if (ImGui::Button("Set from viewport camera")) {
+            k.position = vcam.Position(); k.aim = vcam.Position() + vcam.Forward() * 5.0f;
+            k.fov = glm::degrees(vcam.FovY()); ed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Delete")) {
+            cs.camera.erase(cs.camera.begin() + csSelIndex_);
+            csSelKind_ = -1; markDirty();
+        } else if (ed) { csSelIndex_ = reorder(cs.camera, csSelIndex_); markDirty(); }
+    } else if (csSelKind_ == 4 || (csSelKind_ == 1 || csSelKind_ == 2)) {
+        // Track-level: target + info (also shown while a track's key is selected).
+        if (csSelTrack_ >= 0 && csSelTrack_ < animCount) {
+            CutsceneAnimTrack& tr = cs.animTracks[static_cast<usize>(csSelTrack_)];
+            ImGui::SeparatorText("Animation Track");
+            std::string tgt;
+            if (EntityNameCombo("Target", reg, tr.target, 0, tgt)) { tr.target = tgt; markDirty(); }
+            if (csSelKind_ == 1 && csSelIndex_ >= 0 && csSelIndex_ < static_cast<int>(tr.keys.size())) {
+                CutsceneTransformKey& k = tr.keys[static_cast<usize>(csSelIndex_)];
+                ImGui::SeparatorText("Transform Key");
+                bool ed = false;
+                ed |= ImGui::DragFloat("Time", &k.time, 0.02f, 0.0f, dur);
+                ed |= ImGui::DragFloat3("Position", glm::value_ptr(k.position), 0.05f);
+                glm::vec3 euler = glm::degrees(glm::eulerAngles(k.rotation));
+                if (ImGui::DragFloat3("Rotation", glm::value_ptr(euler), 0.5f)) {
+                    k.rotation = glm::quat(glm::radians(euler)); ed = true;
+                }
+                ed |= ImGui::DragFloat3("Scale", glm::value_ptr(k.scale), 0.02f);
+                if (ImGui::Button("Delete key")) {
+                    tr.keys.erase(tr.keys.begin() + csSelIndex_); csSelKind_ = 4; markDirty();
+                } else if (ed) { csSelIndex_ = reorder(tr.keys, csSelIndex_); markDirty(); }
+            } else if (csSelKind_ == 2 && csSelIndex_ >= 0 &&
+                       csSelIndex_ < static_cast<int>(tr.clips.size())) {
+                CutsceneClipMarker& m = tr.clips[static_cast<usize>(csSelIndex_)];
+                ImGui::SeparatorText("Clip Trigger");
+                bool ed = false;
+                ed |= ImGui::DragFloat("Time", &m.time, 0.02f, 0.0f, dur);
+                ed |= ImGui::DragInt("Clip index", &m.clip, 0.1f, 0, 256);
+                if (ImGui::Button("Delete trigger")) {
+                    tr.clips.erase(tr.clips.begin() + csSelIndex_); csSelKind_ = 4; markDirty();
+                } else if (ed) { csSelIndex_ = reorder(tr.clips, csSelIndex_); markDirty(); }
+            } else {
+                ImGui::TextDisabled("Right-click the lane to add a transform key or clip trigger.");
+            }
+        }
+    } else if (csSelKind_ == 3 && csSelIndex_ >= 0 && csSelIndex_ < static_cast<int>(cs.dialogue.size())) {
+        CutsceneDialogueMarker& m = cs.dialogue[static_cast<usize>(csSelIndex_)];
+        ImGui::SeparatorText("Dialogue Marker");
+        bool ed = false;
+        ed |= ImGui::DragFloat("Time", &m.time, 0.02f, 0.0f, dur);
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::BeginCombo("Dialogue", m.dialogue.empty() ? "(none)" : m.dialogue.c_str())) {
+            if (ImGui::Selectable("(none)", m.dialogue.empty())) { m.dialogue.clear(); ed = true; }
+            for (const std::string& c : csDialogueChoices_)
+                if (ImGui::Selectable(c.c_str(), c == m.dialogue)) { m.dialogue = c; ed = true; }
+            ImGui::EndCombo();
+        }
+        ImGui::SetNextItemWidth(200.0f);
+        if (ImGui::BeginCombo("Voiceline", m.voiceline.empty() ? "(none)" : m.voiceline.c_str())) {
+            if (ImGui::Selectable("(none)", m.voiceline.empty())) { m.voiceline.clear(); ed = true; }
+            for (const std::string& c : csAudioChoices_)
+                if (ImGui::Selectable(c.c_str(), c == m.voiceline)) { m.voiceline = c; ed = true; }
+            ImGui::EndCombo();
+        }
+        if (ImGui::Button("Delete")) {
+            cs.dialogue.erase(cs.dialogue.begin() + csSelIndex_); csSelKind_ = -1; markDirty();
+        } else if (ed) { csSelIndex_ = reorder(cs.dialogue, csSelIndex_); markDirty(); }
+    } else {
+        ImGui::TextDisabled("Select a keyframe to edit it, or a track label to set its target.");
+        ImGui::TextDisabled("Scroll = zoom  -  middle-drag = pan  -  drag the ruler to scrub.");
+        ImGui::TextDisabled("Right-click a lane to add keys. Entities are targeted by Name.");
+    }
+    ImGui::EndChild();
+
+    ImGui::End();
+
+    // -- Live preview: pose the scene/camera at the playhead (after interaction
+    // so a scrub/drag this frame is reflected immediately). ------------------
+    if (csPreview_ && editedCutsceneValid_) {
+        Scene& scene = engine.GetScene();
+        Camera& cam = engine.GetRenderer().GetCamera();
+        if (csPlaying_) {
+            const float prevT = cutsceneEditTime_;
+            cutsceneEditTime_ = glm::min(cutsceneEditTime_ + io.DeltaTime, cs.duration);
+            cutscene::FireMarkers(cs, prevT, cutsceneEditTime_, scene, /*fireDialogue=*/false);
+            if (cutsceneEditTime_ >= cs.duration) csPlaying_ = false; // hold on the last frame
+        }
+        cutscene::Evaluate(cs, cutsceneEditTime_, scene, cam, /*applyCamera=*/true);
+    }
 }
 
 void Editor::DrawMusicEditor(Engine& engine) {
@@ -8769,16 +9767,10 @@ void Editor::DrawAssetViewer(Engine& engine) {
             }
             audioChoices = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
         } else if (isCutscene) {
+            // The dedicated Cutscene Timeline panel owns editedCutscene_; the
+            // viewer only offers a launcher so re-selecting the asset here can't
+            // clobber unsaved timeline edits.
             viewedTypeName_ = "Cutscene";
-            editedCutsceneValid_ = false;
-            if (const auto c = assets::LoadCutscene(viewedAsset_)) {
-                editedCutscene_ = *c;
-                editedCutsceneValid_ = true;
-                editedCutsceneDirty_ = false;
-                cutsceneEditTime_ = 0.0f;
-            }
-            audioChoices = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
-            dialogueChoices = ListAssetsByExt(".hbdialogue");
         }
     }
 
@@ -9042,68 +10034,19 @@ void Editor::DrawAssetViewer(Engine& engine) {
         return;
     }
 
-    // --- Dialogue editor: an ordered list of spoken lines --------------------
-    if (isDialogue && editedDialogueValid_) {
-        ImGui::TextDisabled("Lines play top to bottom. Each shows \"Speaker: Text\" and\n"
-                            "plays its clip; empty Text uses the clip's own caption.\n"
-                            "Run it from a schematic Play Dialogue node.");
-        ImGui::Separator();
-        bool edited = false;
-        int removeIndex = -1, moveUp = -1, moveDown = -1;
-        const int count = static_cast<int>(editedDialogue_.lines.size());
-        for (int i = 0; i < count; ++i) {
-            DialogueLine& l = editedDialogue_.lines[static_cast<usize>(i)];
-            ImGui::PushID(i);
-            ImGui::SeparatorText(
-                (std::to_string(i + 1) + ".  " +
-                 (l.speaker.empty() ? std::string("(no speaker)") : l.speaker))
-                    .c_str());
-            char sp[96];
-            std::snprintf(sp, sizeof(sp), "%s", l.speaker.c_str());
-            if (ImGui::InputText("Speaker", sp, sizeof(sp))) { l.speaker = sp; edited = true; }
-            char tx[1024]; // generous: a subtitle line rarely exceeds this
-            std::snprintf(tx, sizeof(tx), "%s", l.text.c_str());
-            if (ImGui::InputTextMultiline("Text", tx, sizeof(tx), ImVec2(-1.0f, 46.0f))) {
-                l.text = tx;
-                edited = true;
-            }
-            if (ImGui::BeginCombo("Clip", l.clip.empty() ? "(none)" : l.clip.c_str())) {
-                if (ImGui::Selectable("(none)", l.clip.empty())) { l.clip.clear(); edited = true; }
-                for (const std::string& c : audioChoices) {
-                    if (ImGui::Selectable(c.c_str(), c == l.clip)) { l.clip = c; edited = true; }
-                }
-                ImGui::EndCombo();
-            }
-            edited |= ImGui::DragFloat("Hold (s, 0=auto)", &l.hold, 0.05f, 0.0f, 60.0f);
-            if (ImGui::SmallButton("Up") && i > 0) moveUp = i;
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Down") && i + 1 < count) moveDown = i;
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Remove")) removeIndex = i;
-            ImGui::PopID();
-        }
-        if (moveUp > 0) {
-            std::swap(editedDialogue_.lines[static_cast<usize>(moveUp)],
-                      editedDialogue_.lines[static_cast<usize>(moveUp - 1)]);
-            edited = true;
-        } else if (moveDown >= 0) {
-            std::swap(editedDialogue_.lines[static_cast<usize>(moveDown)],
-                      editedDialogue_.lines[static_cast<usize>(moveDown + 1)]);
-            edited = true;
-        } else if (removeIndex >= 0) {
-            editedDialogue_.lines.erase(editedDialogue_.lines.begin() + removeIndex);
-            edited = true;
-        }
-        if (ImGui::Button("+ Add line")) {
-            editedDialogue_.lines.push_back(DialogueLine{});
-            edited = true;
-        }
-        if (edited) editedDialogueDirty_ = true;
-        ImGui::Separator();
-        if (ImGui::Button(editedDialogueDirty_ ? "Save*" : "Save")) {
-            if (assets::SaveDialogue(viewedAsset_, editedDialogue_)) editedDialogueDirty_ = false;
-        }
-        if (editedDialogueDirty_) {
+    // --- Dialogue: launch the dedicated Dialogue Editor window ----------------
+    // (Editing happens in the node-graph Dialogue Editor now; the viewer only
+    // offers a launcher so re-selecting here can't clobber a branching graph.)
+    if (isDialogue) {
+        ImGui::TextWrapped(
+            "Branching conversation graph. Author lines, player choices, and "
+            "flag conditions/effects on a node canvas (same style as the Schematic "
+            "editor), then run it from a schematic \"Play Dialogue\" node.");
+        ImGui::Spacing();
+        const bool openHere = !editedDialoguePath_.empty() && editedDialoguePath_ == viewedAsset_;
+        if (ImGui::Button(openHere ? "Focus Dialogue Editor" : "Open in Dialogue Editor"))
+            OpenDialogue(viewedAsset_);
+        if (openHere && dlgDirty_) {
             ImGui::SameLine();
             ImGui::TextDisabled("(unsaved changes)");
         }
@@ -9111,197 +10054,20 @@ void Editor::DrawAssetViewer(Engine& engine) {
         return;
     }
 
-    // --- Cutscene editor: camera + animation + dialogue tracks ---------------
-    if (isCutscene && editedCutsceneValid_) {
-        CutsceneAsset& cs = editedCutscene_;
-        auto& reg = engine.GetScene().Registry();
-        Camera& vcam = engine.GetRenderer().GetCamera();
-        const auto findByName = [&](const std::string& n) -> entt::entity {
-            if (n.empty()) return entt::null;
-            for (const entt::entity e : reg.view<Name>())
-                if (reg.get<Name>(e).value == n) return e;
-            return entt::null;
-        };
-        const auto insertCamKey = [](std::vector<CutsceneCameraKey>& v, CutsceneCameraKey k) {
-            v.insert(std::upper_bound(v.begin(), v.end(), k,
-                         [](const CutsceneCameraKey& a, const CutsceneCameraKey& b) {
-                             return a.time < b.time;
-                         }),
-                     k);
-        };
-        bool ed = false;
-        ImGui::TextDisabled("Position the editor camera, then Capture keys to author\n"
-                            "shots. Entities are targeted by Name. Run it from a\n"
-                            "schematic \"Play Cutscene\" node.");
-        ImGui::SetNextItemWidth(120.0f);
-        ed |= ImGui::DragFloat("Duration (s)", &cs.duration, 0.1f, 0.1f, 3600.0f);
-        ImGui::SetNextItemWidth(-120.0f);
-        ImGui::SliderFloat("Playhead (s)", &cutsceneEditTime_, 0.0f,
-                           glm::max(cs.duration, 0.1f), "%.2f");
-
-        // -- Camera track --
-        ImGui::SeparatorText("Camera track");
-        if (ImGui::Button("Capture camera key @ playhead")) {
-            CutsceneCameraKey k;
-            k.time = cutsceneEditTime_;
-            k.position = vcam.Position();
-            k.aim = vcam.Position() + vcam.Forward() * 5.0f;
-            k.fov = glm::degrees(vcam.FovY()); // match the live viewport FOV, not the 60 default
-            insertCamKey(cs.camera, k);
-            ed = true;
+    // --- Cutscene: launch the dedicated Cutscene Timeline panel --------------
+    if (isCutscene) {
+        ImGui::TextWrapped(
+            "Cinematic timeline. Author camera shots, per-entity animation, and "
+            "dialogue on a scrubbable track editor with live viewport preview, "
+            "then run it from a schematic \"Play Cutscene\" node.");
+        ImGui::Spacing();
+        const bool openHere = !editedCutscenePath_.empty() &&
+                              editedCutscenePath_ == viewedAsset_;
+        if (ImGui::Button(openHere ? "Focus Cutscene Timeline"
+                                   : "Open in Cutscene Timeline")) {
+            OpenCutscene(engine, viewedAsset_);
         }
-        int camRemove = -1;
-        for (int i = 0; i < static_cast<int>(cs.camera.size()); ++i) {
-            CutsceneCameraKey& k = cs.camera[static_cast<usize>(i)];
-            ImGui::PushID(1000 + i);
-            ImGui::SetNextItemWidth(64.0f);
-            ed |= ImGui::DragFloat("t", &k.time, 0.02f, 0.0f, cs.duration);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(150.0f);
-            ed |= ImGui::DragFloat3("pos", glm::value_ptr(k.position), 0.05f);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(150.0f);
-            ed |= ImGui::DragFloat3("aim", glm::value_ptr(k.aim), 0.05f);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(54.0f);
-            ed |= ImGui::DragFloat("fov", &k.fov, 0.2f, 10.0f, 170.0f);
-            ImGui::SameLine();
-            ed |= ImGui::Checkbox("cut", &k.cut);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x")) camRemove = i;
-            ImGui::PopID();
-        }
-        if (camRemove >= 0) { cs.camera.erase(cs.camera.begin() + camRemove); ed = true; }
-
-        // -- Animation tracks --
-        ImGui::SeparatorText("Animation tracks");
-        int trackRemove = -1;
-        for (int ti = 0; ti < static_cast<int>(cs.animTracks.size()); ++ti) {
-            CutsceneAnimTrack& tr = cs.animTracks[static_cast<usize>(ti)];
-            ImGui::PushID(2000 + ti);
-            std::string tgt;
-            if (EntityNameCombo("Target", reg, tr.target, 0, tgt)) { tr.target = tgt; ed = true; }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Remove track")) trackRemove = ti;
-            if (ImGui::SmallButton("Capture transform key @ playhead")) {
-                const entt::entity e = findByName(tr.target);
-                if (const Transform* xf = e != entt::null ? reg.try_get<Transform>(e) : nullptr) {
-                    CutsceneTransformKey k;
-                    k.time = cutsceneEditTime_;
-                    k.position = xf->position;
-                    k.rotation = xf->rotation;
-                    k.scale = xf->scale;
-                    tr.keys.insert(std::upper_bound(tr.keys.begin(), tr.keys.end(), k,
-                                       [](const CutsceneTransformKey& a,
-                                          const CutsceneTransformKey& b) {
-                                           return a.time < b.time;
-                                       }),
-                                   k);
-                    ed = true;
-                }
-            }
-            int keyRemove = -1;
-            for (int ki = 0; ki < static_cast<int>(tr.keys.size()); ++ki) {
-                CutsceneTransformKey& k = tr.keys[static_cast<usize>(ki)];
-                ImGui::PushID(ki);
-                ImGui::SetNextItemWidth(64.0f);
-                ed |= ImGui::DragFloat("t##k", &k.time, 0.02f, 0.0f, cs.duration);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(150.0f);
-                ed |= ImGui::DragFloat3("pos##k", glm::value_ptr(k.position), 0.05f);
-                ImGui::SameLine();
-                glm::vec3 euler = glm::degrees(glm::eulerAngles(k.rotation));
-                ImGui::SetNextItemWidth(150.0f);
-                if (ImGui::DragFloat3("rot##k", glm::value_ptr(euler), 0.5f)) {
-                    k.rotation = glm::quat(glm::radians(euler));
-                    ed = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("x")) keyRemove = ki;
-                ImGui::PopID();
-            }
-            if (keyRemove >= 0) { tr.keys.erase(tr.keys.begin() + keyRemove); ed = true; }
-            // Skeletal clip triggers.
-            if (ImGui::SmallButton("+ clip trigger @ playhead")) {
-                tr.clips.push_back({cutsceneEditTime_, 0});
-                ed = true;
-            }
-            int clipRemove = -1;
-            for (int ci = 0; ci < static_cast<int>(tr.clips.size()); ++ci) {
-                CutsceneClipMarker& m = tr.clips[static_cast<usize>(ci)];
-                ImGui::PushID(3000 + ci);
-                ImGui::SetNextItemWidth(64.0f);
-                ed |= ImGui::DragFloat("t##c", &m.time, 0.02f, 0.0f, cs.duration);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80.0f);
-                ed |= ImGui::DragInt("clip##c", &m.clip, 0.1f, 0, 256);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("x")) clipRemove = ci;
-                ImGui::PopID();
-            }
-            if (clipRemove >= 0) { tr.clips.erase(tr.clips.begin() + clipRemove); ed = true; }
-            ImGui::Separator();
-            ImGui::PopID();
-        }
-        if (trackRemove >= 0) {
-            cs.animTracks.erase(cs.animTracks.begin() + trackRemove);
-            ed = true;
-        }
-        if (ImGui::Button("+ Add animation track")) {
-            cs.animTracks.push_back(CutsceneAnimTrack{});
-            ed = true;
-        }
-
-        // -- Dialogue markers --
-        ImGui::SeparatorText("Dialogue markers");
-        int dlgRemove = -1;
-        for (int i = 0; i < static_cast<int>(cs.dialogue.size()); ++i) {
-            CutsceneDialogueMarker& m = cs.dialogue[static_cast<usize>(i)];
-            ImGui::PushID(4000 + i);
-            ImGui::SetNextItemWidth(64.0f);
-            ed |= ImGui::DragFloat("t##d", &m.time, 0.02f, 0.0f, cs.duration);
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(160.0f);
-            if (ImGui::BeginCombo("dialogue", m.dialogue.empty() ? "(none)" : m.dialogue.c_str())) {
-                if (ImGui::Selectable("(none)", m.dialogue.empty())) { m.dialogue.clear(); ed = true; }
-                for (const std::string& c : dialogueChoices)
-                    if (ImGui::Selectable(c.c_str(), c == m.dialogue)) { m.dialogue = c; ed = true; }
-                ImGui::EndCombo();
-            }
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(160.0f);
-            if (ImGui::BeginCombo("voice", m.voiceline.empty() ? "(none)" : m.voiceline.c_str())) {
-                if (ImGui::Selectable("(none)", m.voiceline.empty())) { m.voiceline.clear(); ed = true; }
-                for (const std::string& c : audioChoices)
-                    if (ImGui::Selectable(c.c_str(), c == m.voiceline)) { m.voiceline = c; ed = true; }
-                ImGui::EndCombo();
-            }
-            ImGui::SameLine();
-            if (ImGui::SmallButton("x")) dlgRemove = i;
-            ImGui::PopID();
-        }
-        if (dlgRemove >= 0) { cs.dialogue.erase(cs.dialogue.begin() + dlgRemove); ed = true; }
-        if (ImGui::Button("+ Add dialogue marker")) {
-            cs.dialogue.push_back(CutsceneDialogueMarker{cutsceneEditTime_, "", ""});
-            ed = true;
-        }
-
-        if (ed) editedCutsceneDirty_ = true;
-        ImGui::Separator();
-        if (ImGui::Button(editedCutsceneDirty_ ? "Save*" : "Save")) {
-            // Dragging a key's time can leave a track out of order; sort by time
-            // before writing so the on-disk asset (and the runtime that loads it)
-            // sees ascending keys. Mirrors the normalise-on-load in LoadCutscene.
-            auto byTime = [](const auto& a, const auto& b) { return a.time < b.time; };
-            std::stable_sort(cs.camera.begin(), cs.camera.end(), byTime);
-            for (CutsceneAnimTrack& t : cs.animTracks) {
-                std::stable_sort(t.keys.begin(), t.keys.end(), byTime);
-                std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
-            }
-            std::stable_sort(cs.dialogue.begin(), cs.dialogue.end(), byTime);
-            if (assets::SaveCutscene(viewedAsset_, cs)) editedCutsceneDirty_ = false;
-        }
-        if (editedCutsceneDirty_) {
+        if (openHere && editedCutsceneDirty_) {
             ImGui::SameLine();
             ImGui::TextDisabled("(unsaved changes)");
         }
@@ -9836,7 +10602,24 @@ std::set<std::string> Editor::CollectReferencedAssets() {
             }
             // Art Editor paint canvas (.hbpaint): pixels live outside the scene.
             if (d.hasPaint && !d.paintSource.empty()) refs.insert(d.paintSource);
+            // Interactable / Trigger actions reference a .hbdialogue / .hbcutscene.
+            if (d.hasInteractable && !d.interactable.asset.empty())
+                refs.insert(d.interactable.asset);
+            if (d.hasTrigger && !d.trigger.asset.empty()) refs.insert(d.trigger.asset);
         }
+    }
+    // Project-settings assets owned by no scene: interaction-prompt icons + the
+    // adaptive-music graph. Without this they pack out under "Pack only referenced".
+    if (Project::HasActive()) {
+        const ProjectSettings& ps = Project::Active().Settings();
+        const InputIcons& ic = ps.inputIcons;
+        if (!ic.general.empty()) refs.insert(ic.general);
+        if (!ic.logo.empty()) refs.insert(ic.logo);
+        for (const DeviceGlyphs* dg :
+             {&ic.keyboard, &ic.xbox, &ic.playstation, &ic.nintendo, &ic.generic})
+            for (const auto& e : dg->icons)
+                if (!e.second.empty()) refs.insert(e.second);
+        if (!ps.musicGraph.empty()) refs.insert(ps.musicGraph);
     }
     return refs;
 }
@@ -10087,7 +10870,6 @@ bool Editor::BuildShipping(std::string& outMessage) {
 }
 
 void Editor::DrawBuildSettings(Engine& engine) {
-    (void)engine;
     if (!showBuildSettings_) return;
     if (!Project::HasActive()) {
         showBuildSettings_ = false;
@@ -10280,7 +11062,14 @@ void Editor::DrawBuildSettings(Engine& engine) {
                             "with the aspect ratio (recommended).");
     }
 
+    ImGui::SeparatorText("Input Actions & Bindings");
+    const bool ixActionsChanged = DrawInputActionsEditor(project);
+    ImGui::SeparatorText("Input Prompt Icons");
+    if (DrawInputIconsEditor(project)) changed = true;
+    if (ixActionsChanged) changed = true;
+
     if (changed) project.Save();
+    if (ixActionsChanged) engine.SyncActionMap(); // live-apply rebindable defaults
 
     ImGui::Separator();
     // One Build: cooks (compressed) packs AND assembles the shipping folder.
@@ -10288,6 +11077,198 @@ void Editor::DrawBuildSettings(Engine& engine) {
     if (!buildResult_.empty()) {
         ImGui::TextWrapped("%s", buildResult_.c_str());
     }
+    ImGui::End();
+}
+
+bool Editor::DrawInputIconsEditor(Project& project) {
+    InputIcons& ic = project.Settings().inputIcons;
+    bool changed = false;
+    // A .uaf texture picker bound to a scalar string slot (General / Logo).
+    const auto slotPicker = [&](const char* label, std::string& slot) {
+        std::string picked;
+        if (AssetPicker(label, slot, ".uaf", uaf::AssetType::Texture, picked, "(none)")) {
+            slot = picked;
+            changed = true;
+        }
+    };
+    slotPicker("General (fallback icon)", ic.general);
+    slotPicker("Logo", ic.logo);
+    if (ImGui::Checkbox("Always use the General icon (platform-agnostic)", &ic.useGeneralAlways))
+        changed = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show the single General icon for every device/button - a universal\n"
+                          "interact symbol - instead of per-device button glyphs.");
+
+    ImGui::Spacing();
+    ImGui::BeginDisabled(ic.useGeneralAlways); // per-device art is unused in general-only mode
+    ImGui::TextDisabled("Per-device button art. The prompt shows the icon for an\n"
+                        "action's CURRENT binding on the active device; empty = the\n"
+                        "General icon, then a text glyph.");
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::Combo("Device", &inputIconDevice_, "Keyboard\0Xbox\0PlayStation\0Nintendo\0Generic pad\0");
+
+    DeviceGlyphs* dev = &ic.keyboard;
+    switch (inputIconDevice_) {
+        case 1: dev = &ic.xbox; break;
+        case 2: dev = &ic.playstation; break;
+        case 3: dev = &ic.nintendo; break;
+        case 4: dev = &ic.generic; break;
+        default: dev = &ic.keyboard; break;
+    }
+
+    // Texture picker for one button/key id in the current device set.
+    const auto glyphPicker = [&](const char* label, u32 id) {
+        const std::string* cur = dev->Find(id);
+        std::string val = cur ? *cur : std::string();
+        std::string picked;
+        if (AssetPicker(label, val, ".uaf", uaf::AssetType::Texture, picked, "(none)")) {
+            dev->Set(id, picked);
+            changed = true;
+        }
+    };
+
+    ImGui::BeginChild("##glyphgrid", ImVec2(0, 260), ImGuiChildFlags_Borders);
+    if (inputIconDevice_ == 0) {
+        // Keyboard: every bindable key (skip Unknown / unnamed).
+        for (u32 k = 1; k < static_cast<u32>(Key::Count); ++k) {
+            const char* nm = input::KeyName(static_cast<Key>(k));
+            if (nm && nm[0]) glyphPicker(nm, k);
+        }
+    } else {
+        for (const input::PadButtonInfo& pb : input::PadButtons()) glyphPicker(pb.name, pb.bit);
+    }
+    ImGui::EndChild();
+    ImGui::EndDisabled(); // per-device art (matches BeginDisabled(useGeneralAlways))
+    return changed;
+}
+
+bool Editor::DrawInputActionsEditor(Project& project) {
+    std::vector<input::ActionDef>& actions = project.Settings().inputActions;
+    bool changed = false;
+    ImGui::TextDisabled("Named actions the game queries (Interact, Attack, ...), each\n"
+                        "with a default key + gamepad button. Players rebind these at\n"
+                        "runtime; the prompt shows the current binding's icon.");
+
+    // Build the key + pad option strings once (embedded NULs for ImGui::Combo).
+    static std::string keyOpts, padOpts;
+    static std::vector<Key> keyVals;
+    static std::vector<u32> padVals;
+    if (keyOpts.empty()) {
+        keyOpts = std::string("(none)") + '\0';
+        keyVals.push_back(Key::Unknown);
+        for (u32 k = 1; k < static_cast<u32>(Key::Count); ++k) {
+            const Key key = static_cast<Key>(k);
+            // Modifiers + the dev-console key make ambiguous action bindings and can't be
+            // captured at runtime, so keep them out of the authorable defaults too.
+            if (key == Key::Shift || key == Key::Ctrl || key == Key::Alt || key == Key::Grave)
+                continue;
+            const char* nm = input::KeyName(key);
+            if (nm && nm[0]) { keyOpts += nm; keyOpts += '\0'; keyVals.push_back(key); }
+        }
+        padOpts = std::string("(none)") + '\0';
+        padVals.push_back(0);
+        for (const input::PadButtonInfo& pb : input::PadButtons()) {
+            padOpts += pb.name; padOpts += '\0';
+            padVals.push_back(pb.bit);
+        }
+    }
+    const auto keyIndex = [&](Key k) {
+        for (usize i = 0; i < keyVals.size(); ++i) if (keyVals[i] == k) return static_cast<int>(i);
+        return 0;
+    };
+    const auto padIndex = [&](u32 bit) {
+        for (usize i = 0; i < padVals.size(); ++i) if (padVals[i] == bit) return static_cast<int>(i);
+        return 0;
+    };
+
+    // Is this the built-in action the interaction system hard-queries? It must not be
+    // renamed or removed (doing so silently breaks the "[E] Interact" prompt + key).
+    const auto isBuiltin = [](const std::string& nm) { return nm == "Interact"; };
+    // Does an earlier entry already use this name? Duplicate names collide on one
+    // override slot (rebinding one silently rebinds the other), so flag them.
+    const auto isDuplicate = [&](usize idx) {
+        for (usize j = 0; j < idx; ++j)
+            if (actions[j].name == actions[idx].name) return true;
+        return false;
+    };
+
+    int removeIdx = -1;
+    for (usize i = 0; i < actions.size(); ++i) {
+        input::ActionDef& a = actions[i];
+        const bool builtin = isBuiltin(a.name);
+        ImGui::PushID(static_cast<int>(i));
+        char nb[64];
+        std::snprintf(nb, sizeof(nb), "%s", a.name.c_str());
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::BeginDisabled(builtin); // the built-in name is reserved
+        if (ImGui::InputText("Name", nb, sizeof(nb))) { a.name = nb; changed = true; }
+        ImGui::EndDisabled();
+        if (builtin && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Built-in: queried by the interaction system (can't rename/remove).");
+        ImGui::SameLine();
+        int ki = keyIndex(a.defaults.key);
+        ImGui::SetNextItemWidth(90.0f);
+        if (ImGui::Combo("Key", &ki, keyOpts.c_str())) {
+            a.defaults.key = keyVals[static_cast<usize>(ki)];
+            changed = true;
+        }
+        ImGui::SameLine();
+        int pi = padIndex(a.defaults.pad);
+        ImGui::SetNextItemWidth(90.0f);
+        if (ImGui::Combo("Pad", &pi, padOpts.c_str())) {
+            a.defaults.pad = padVals[static_cast<usize>(pi)];
+            changed = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(builtin);
+        if (ImGui::SmallButton("X")) removeIdx = static_cast<int>(i);
+        ImGui::EndDisabled();
+        if (isDuplicate(i)) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "(dup!)");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Duplicate name: shares one binding slot with the earlier action.");
+        }
+        ImGui::PopID();
+    }
+    if (removeIdx >= 0) {
+        actions.erase(actions.begin() + removeIdx);
+        changed = true;
+    }
+    if (ImGui::Button("+ Add Action")) {
+        // Generate a name that doesn't collide with an existing action.
+        const auto nameTaken = [&](const std::string& nm) {
+            for (const input::ActionDef& a : actions) if (a.name == nm) return true;
+            return false;
+        };
+        std::string name = "NewAction";
+        for (int n = 2; nameTaken(name); ++n) name = "NewAction " + std::to_string(n);
+        actions.push_back({name, {Key::Unknown, 0}});
+        changed = true;
+    }
+    return changed;
+}
+
+void Editor::DrawInputIconsPanel(Engine& engine) {
+    if (!panelOpen_[Panel_InputIcons]) return;
+    if (!ImGui::Begin("Input", &panelOpen_[Panel_InputIcons])) {
+        ImGui::End();
+        return;
+    }
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("Open a project to configure input actions + icons.");
+        ImGui::End();
+        return;
+    }
+    Project& project = Project::Active();
+    bool changed = false;
+    bool actionsChanged = false;
+    if (ImGui::CollapsingHeader("Actions & Bindings", ImGuiTreeNodeFlags_DefaultOpen))
+        actionsChanged = DrawInputActionsEditor(project);
+    if (ImGui::CollapsingHeader("Prompt Icons (per device)", ImGuiTreeNodeFlags_DefaultOpen))
+        changed = DrawInputIconsEditor(project);
+    if (changed || actionsChanged) project.Save();
+    if (actionsChanged) engine.SyncActionMap(); // live-apply rebindable defaults
     ImGui::End();
 }
 
@@ -10341,6 +11322,14 @@ void Editor::OnProjectChanged() {
     viewedAsset_.clear();
     editedMatValid_ = false;
     editedEventValid_ = false;
+    // The open cutscene + any live preview belong to the previous project. The
+    // scene is torn down here, so abandon the preview (don't restore a stale
+    // cross-project snapshot) and close the timeline.
+    CutscenePreviewAbandon();
+    editedCutsceneValid_ = false;
+    editedCutscenePath_.clear();
+    csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
+    panelOpen_[Panel_CutsceneTimeline] = false;
     mixerSynced_ = false; // re-push the new project's bus tree
     ui::ClearFontCache(); // font-asset atlases belong to the previous project
     sceneList_.clear();
@@ -10356,6 +11345,7 @@ void Editor::OnProjectChanged() {
     musicPreviewing_ = false;
     brushesLoaded_ = false; // reload the new project's brush library (brushes.json)
     scene::ClearInstantiateCaches();
+    if (engine_) engine_->SyncActionMap(); // adopt the new project's action definitions
 
     // Seed starter content so a brand-new project isn't empty.
     const std::filesystem::path sphereUaf = Project::Active().AssetsDir() / "Sphere.uaf";

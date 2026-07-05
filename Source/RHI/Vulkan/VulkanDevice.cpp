@@ -247,6 +247,8 @@ public:
     MeshHandle CreateMesh(const hbe::MeshData& mesh) override;
     void UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
     TextureHandle CreateTexture(const TextureDesc& desc) override;
+    TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
+    void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
     void UpdateTexture(TextureHandle handle, const TextureDesc& desc) override;
     void DrawShadowPass(const SceneView& view, const DrawItem* items, u32 count) override;
     void SetParticles(const ParticleVertex* alpha, u32 alphaCount,
@@ -535,6 +537,8 @@ private:
     PostTargetVk painterlyComp_; // painterly + dynamic-layer crisp objects composited back
     PostTargetVk vol_;           // volumetric fog composite (HDR, full-res)
     PostTargetVk volHalf_;       // fog (inscatter+transmittance) at reduced res (upscaled into vol_)
+    PostTargetVk volPart_;       // volumetric-particles composite (HDR, full-res)
+    PostTargetVk volPartHalf_;   // volumetric-particles raymarch at reduced res
     PostTargetVk adaptedLum_[2]; // auto-exposure adapted luminance (1x1, ping-pong)
     u32 bloomCount_ = 0;
 
@@ -551,6 +555,8 @@ private:
     u32 slotPainterlyComp_ = 0;
     u32 slotVol_ = 0;
     u32 slotVolHalf_ = 0;
+    u32 slotVolPart_ = 0;
+    u32 slotVolPartHalf_ = 0;
     u32 slotAdaptedLum_[2] = {};
     u32 slotBloom_[kBloomMaxMips] = {};
 
@@ -562,7 +568,8 @@ private:
                exposurePipe_ = VK_NULL_HANDLE, volPipe_ = VK_NULL_HANDLE,
                ssgiPipe_ = VK_NULL_HANDLE, painterlyPipe_ = VK_NULL_HANDLE,
                brushStrokesPipe_ = VK_NULL_HANDLE, copyPipe_ = VK_NULL_HANDLE,
-               compositePipe_ = VK_NULL_HANDLE, applyPipe_ = VK_NULL_HANDLE;
+               compositePipe_ = VK_NULL_HANDLE, applyPipe_ = VK_NULL_HANDLE,
+               volPartPipe_ = VK_NULL_HANDLE; // volumetric-particles raymarch
 
     // Temporal AA: jittered camera + reprojected history accumulation (mirrors D3D12).
     bool taaReady_ = false;
@@ -575,6 +582,7 @@ private:
     bool ssrReady_ = false;
     bool exposureReady_ = false;
     bool volReady_ = false;  // volumetric fog pipeline built
+    bool volPartReady_ = false; // volumetric-particles raymarch pipeline built
     bool ssgiReady_ = false; // screen-space GI pipeline built
     bool painterlyReady_ = false; // painterly repaint pipeline built
     bool brushStrokesReady_ = false; // brush-stroke splat pipeline built
@@ -605,7 +613,41 @@ private:
     // Per-bindless-slot view so editor thumbnails can re-bind a texture.
     std::unordered_map<u32, VkImageView> slotViews_;
     std::unordered_map<u32, VkImage> slotImages_; // slot -> image (in-place UpdateTexture)
+    // Volume textures (CreateVolumeTexture): SRV slot -> STORAGE_IMAGE view the
+    // compute splat binds for writing (VV2). Kept in GENERAL layout so the same
+    // image serves both the storage write and the sampled raymarch read.
+    std::unordered_map<u32, VkImageView> volumeStorageView_;
     std::unordered_map<u32, u64> uiTextureIds_; // bindless slot -> ImGui id
+
+    // -- Volumetric VFX compute (VV2) -------------------------------------------
+    // Compute pipeline that splats a 3D density/temperature volume. Lazily built
+    // the first enabled frame (off by default -> zero cost on low-end GPUs).
+    // Dispatched in BeginFrame (must be OUTSIDE any render pass). Enable is
+    // HBE_VOLTEST env scaffolding for now (VV5 wires the real per-emitter enable).
+    u32 volDim_ = 96;           // volume voxel dim (from VolumeParams.resolution, first enable)
+    bool volInit_ = false, volFailed_ = false;
+    TextureHandle volTex_;
+    VkImage        volImage_ = VK_NULL_HANDLE;
+    VkImageView    volStorageView_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout volSetLayout_ = VK_NULL_HANDLE;
+    VkPipelineLayout      volPipelineLayout_ = VK_NULL_HANDLE;
+    VkPipeline            volSplatPipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool      volDescPool_ = VK_NULL_HANDLE;
+    // Per-frame-in-flight so the CPU can refill them without racing the GPU (the
+    // slot's fence is waited on before reuse). The volume image + storage view are
+    // shared (one froxel volume).
+    VkDescriptorSet volSet_[kMaxFramesInFlight]{};
+    VkBuffer        volParamsBuf_[kMaxFramesInFlight]{};
+    VkDeviceMemory  volParamsMem_[kMaxFramesInFlight]{};
+    void*           volParamsMapped_[kMaxFramesInFlight]{};
+    VkBuffer        volBlobBuf_[kMaxFramesInFlight]{};
+    VkDeviceMemory  volBlobMem_[kMaxFramesInFlight]{};
+    void*           volBlobMapped_[kMaxFramesInFlight]{};
+    const VolumeBlob* volBlobs_ = nullptr;
+    u32 volBlobCount_ = 0;
+    VolumeParams volParams_{};
+    bool EnsureVolumeResources();
+    void DispatchVolumeSplat();
 
     // -- Editor viewport (offscreen scene target) ---------------------------
     VkImage        vpColor_ = VK_NULL_HANDLE;
@@ -1127,7 +1169,7 @@ bool VulkanDevice::CreateDescriptorResources() {
     // immutable clamp sampler (binding 2) + the joint-palette storage buffer
     // (binding 3, vertex skinning) + the instance-transform storage buffer
     // (binding 4, GPU instancing).
-    VkDescriptorSetLayoutBinding bindings[5]{};
+    VkDescriptorSetLayoutBinding bindings[6]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -1151,9 +1193,16 @@ bool VulkanDevice::CreateDescriptorResources() {
     bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     bindings[4].descriptorCount = 1;
     bindings[4].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    // Volumetric raymarch: the 3D density/temperature volume (Texture3D can't live
+    // in the Texture2D[] bindless array). Only the volumetric-particles pass writes
+    // it into its post set; every other pass leaves it unbound (doesn't sample it).
+    bindings[5].binding = 5;
+    bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bindings[5].descriptorCount = 1;
+    bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 5;
+    lci.bindingCount = 6;
     lci.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &descriptorLayout_),
              "vkCreateDescriptorSetLayout");
@@ -1161,7 +1210,7 @@ bool VulkanDevice::CreateDescriptorResources() {
     // Sets per frame: 1 main + kMaxShadowCascades shadow clones + 1 post +
     // 1 editor asset preview.
     const u32 setsPerFrame = 1 + kMaxShadowCascades + 1 + 1;
-    VkDescriptorPoolSize sizes[4]{};
+    VkDescriptorPoolSize sizes[5]{};
     sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     sizes[0].descriptorCount = framesInFlight_ * setsPerFrame;
     sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
@@ -1170,9 +1219,11 @@ bool VulkanDevice::CreateDescriptorResources() {
     sizes[2].descriptorCount = framesInFlight_ * setsPerFrame;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     sizes[3].descriptorCount = framesInFlight_ * setsPerFrame * 2; // bones + instances
+    sizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    sizes[4].descriptorCount = framesInFlight_ * setsPerFrame; // binding 5 volume (post sets)
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     pci.maxSets = framesInFlight_ * setsPerFrame;
-    pci.poolSizeCount = 4;
+    pci.poolSizeCount = 5;
     pci.pPoolSizes = sizes;
     VK_CHECK(vkCreateDescriptorPool(device_, &pci, nullptr, &descriptorPool_),
              "vkCreateDescriptorPool");
@@ -1552,6 +1603,108 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
     w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     w.pImageInfo = &ii;
     vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+
+    slotViews_[slot] = tex.view;
+    slotImages_[slot] = tex.image;
+    textures_.push_back(tex);
+    return TextureHandle{slot};
+}
+
+TextureHandle VulkanDevice::CreateVolumeTexture(const TextureDesc& desc) {
+    // Uninitialised, compute-writable, sampled image. depth>1 => 3D. Kept in
+    // GENERAL layout for its whole life so the same image is valid for both the
+    // storage-image write (compute splat) and the sampled raymarch read - no
+    // per-frame layout transitions, just a memory barrier between the two (VV2).
+    if (bindlessNextSlot_ >= kMaxBindlessTextures) return {};
+    const VkFormat fmt = ToVkFormat(desc.format);
+    const u32 depth = std::max(1u, desc.depth);
+    const bool is3D = depth > 1;
+
+    GpuTextureVk tex;
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.imageType = is3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D;
+    ici.format = fmt;
+    ici.extent = {desc.width, desc.height, depth};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | (desc.storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0);
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(device_, &ici, nullptr, &tex.image) != VK_SUCCESS) return {};
+
+    VkMemoryRequirements req{};
+    vkGetImageMemoryRequirements(device_, tex.image, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(device_, &mai, nullptr, &tex.memory);
+    vkBindImageMemory(device_, tex.image, tex.memory, 0);
+
+    // Transition UNDEFINED -> GENERAL once (its permanent layout).
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = commandPool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device_, &cbai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = tex.image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
+
+    const VkImageViewType viewType = is3D ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D;
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    // Sampled view -> bindless (binding 1), imageLayout GENERAL for this slot.
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = tex.image;
+    vci.viewType = viewType;
+    vci.format = fmt;
+    vci.subresourceRange = range;
+    vkCreateImageView(device_, &vci, nullptr, &tex.view);
+
+    const u32 slot = bindlessNextSlot_++;
+    VkDescriptorImageInfo ii{};
+    ii.imageView = tex.view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = bindlessSet_;
+    w.dstBinding = 1;
+    w.dstArrayElement = slot;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+
+    // Storage view for the compute splat (VV2 binds it as a STORAGE_IMAGE).
+    if (desc.storage) {
+        VkImageView storageView = VK_NULL_HANDLE;
+        VkImageViewCreateInfo sci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        sci.image = tex.image;
+        sci.viewType = viewType;
+        sci.format = fmt;
+        sci.subresourceRange = range;
+        vkCreateImageView(device_, &sci, nullptr, &storageView);
+        volumeStorageView_[slot] = storageView;
+    }
 
     slotViews_[slot] = tex.view;
     slotImages_[slot] = tex.image;
@@ -2588,6 +2741,7 @@ bool VulkanDevice::CreatePostPipelines() {
     ssrReady_ = makePipe(L"SSR", postPass16_, false, ssrPipe_);            // HDR target
     exposureReady_ = makePipe(L"Exposure", postPass16_, false, exposurePipe_); // 1x1 HDR
     volReady_ = makePipe(L"VolumetricFog", postPass16_, false, volPipe_); // HDR composite
+    volPartReady_ = makePipe(L"VolumetricParticles", postPass16_, false, volPartPipe_); // raymarch
     ssgiReady_ = makePipe(L"SSGI", postPass16_, false, ssgiPipe_);        // HDR composite
     painterlyReady_ = makePipe(L"Painterly", postPass16_, false, painterlyPipe_); // HDR repaint
     // Brush-stroke splat: alpha-over, drawn into the painterly target with LOAD so
@@ -2686,6 +2840,8 @@ void VulkanDevice::DestroyPostTargets() {
     destroy(painterlyComp_);
     destroy(vol_);
     destroy(volHalf_);
+    destroy(volPart_);
+    destroy(volPartHalf_);
     destroy(adaptedLum_[0]);
     destroy(adaptedLum_[1]);
     for (u32 i = 0; i < kBloomMaxMips; ++i) destroy(bloom_[i]);
@@ -2702,13 +2858,15 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
 
     // Reserve the bindless slots once; resizes rewrite the same descriptors.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 21 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 23 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
         slotVelocity_ = bindlessNextSlot_++;
         slotVol_ = bindlessNextSlot_++;
         slotVolHalf_ = bindlessNextSlot_++;
+        slotVolPart_ = bindlessNextSlot_++;
+        slotVolPartHalf_ = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
         slotSsgiHalf_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
@@ -2891,6 +3049,15 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
                               volHalf_))
             return false;
     }
+    if (volPartReady_) { // volumetric particles: full-res composite + half-res raymarch
+        if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_,
+                              slotVolPart_, volPart_))
+            return false;
+        const u32 hw = (width + 1u) / 2u, hh = (height + 1u) / 2u;
+        if (!CreatePostTarget(hw, hh, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_, slotVolPartHalf_,
+                              volPartHalf_))
+            return false;
+    }
     if (ssgiReady_) { // HDR (indirect bounce composited before bloom)
         if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, postPass16_, slotSsgi_,
                               ssgi_))
@@ -3063,6 +3230,51 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         hdrInput = slotVol_;
     }
     GpuMark("fog");
+
+    // --- Volumetric particles: raymarch the density/temperature volume (half res),
+    //     lit + self-shadowed + blackbody-emissive, composited over the HDR. Mirrors
+    //     the D3D12 path; the volume stays in GENERAL (sampled read + storage write),
+    //     ordered by the compute->fragment barrier the splat recorded in BeginFrame. ---
+    if (volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
+        slotViews_.count(volTex_.index)) {
+        // Bind the 3D volume into THIS frame's post set at binding 5. Safe to update:
+        // BeginFrame waited on this slot's fence, so the set isn't in flight; only the
+        // raymarch pass (bound after this) samples binding 5.
+        VkDescriptorImageInfo vi{};
+        vi.imageView = slotViews_[volTex_.index];
+        vi.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet vw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        vw.dstSet = postSets_[frameIndex_];
+        vw.dstBinding = 5;
+        vw.descriptorCount = 1;
+        vw.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        vw.pImageInfo = &vi;
+        vkUpdateDescriptorSets(device_, 1, &vw, 0, nullptr);
+
+        const glm::vec2 vTexel(1.0f / volPartHalf_.width, 1.0f / volPartHalf_.height);
+        PostUBO cb;
+        cb.input2 = slotDepth_;
+        cb.outTexel = vTexel;
+        cb.inTexel = sceneTexel;
+        cb.params0 = {volParams_.boundsMin.x, volParams_.boundsMin.y, volParams_.boundsMin.z,
+                      static_cast<f32>(volParams_.stepCount)};
+        cb.params1 = {volParams_.boundsMax.x, volParams_.boundsMax.y, volParams_.boundsMax.z,
+                      1.0f}; // densityMul: 1.0 — the splat already baked densityScale into the volume
+        cb.params2 = {volParams_.emission, 4.0f, volParams_.extinction, // emissionMul, shadowSteps, extinction
+                      ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
+        cb.params3 = {view.timeSeconds, volParams_.noiseDetail, volParams_.noiseScale, 0.0f}; // time, detail, scale
+        DrawPostPass(volPartPipe_, postPass16_, volPartHalf_, cb);
+        PostUBO ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotVolPartHalf_;
+        ap.input2 = slotDepth_;
+        ap.outTexel = sceneTexel;
+        ap.inTexel = vTexel;
+        ap.params0 = {1.0f, 0.0f, 0.0f, 0.0f}; // mild bilateral upscale
+        DrawPostPass(applyPipe_, postPass16_, volPart_, ap);
+        hdrInput = slotVolPart_;
+    }
+    GpuMark("volparticles");
 
     // --- Painterly: repaint the lit HDR as edge-aware brush strokes ----------
     const u32 paintColorSrc = hdrInput; // pre-painterly lit HDR (crisp stroke colour)
@@ -3741,6 +3953,10 @@ void VulkanDevice::BeginFrame() {
         gpuCount_ = 0;
         GpuMark("start");
     }
+
+    // Volumetric density splat: compute dispatch, which MUST run outside any
+    // render pass -> do it here at frame start (no-op unless enabled).
+    DispatchVolumeSplat();
 }
 
 void VulkanDevice::ClearBackBuffer(f32 r, f32 g, f32 b, f32 a) {
@@ -3797,6 +4013,190 @@ void VulkanDevice::ClearBackBuffer(f32 r, f32 g, f32 b, f32 a) {
     VkRect2D scissor{{0, 0}, ext};
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
+}
+
+bool VulkanDevice::EnsureVolumeResources() {
+    if (volInit_) return !volFailed_;
+    volInit_ = true;
+    volDim_ = glm::clamp(volParams_.resolution, 32u, 192u); // quality knob (first enable)
+
+    // 3D density/temperature volume (RGBA16F), sampled + storage, GENERAL layout.
+    TextureDesc vd{};
+    vd.width = volDim_; vd.height = volDim_; vd.depth = volDim_;
+    vd.format = Format::R16G16B16A16_FLOAT;
+    vd.storage = true;
+    vd.debugName = "VolumeDensity";
+    volTex_ = CreateVolumeTexture(vd);
+    if (!volTex_.IsValid() || !volumeStorageView_.count(volTex_.index)) { volFailed_ = true; return false; }
+    volStorageView_ = volumeStorageView_[volTex_.index];
+    volImage_ = slotImages_.count(volTex_.index) ? slotImages_[volTex_.index] : VK_NULL_HANDLE;
+
+    // Descriptor set layout: binding 0 = params UBO, binding 1 = storage image,
+    // binding 2 = blob SSBO (matches VolumeSplat.cs [[vk::binding(0/1/2, 0)]]).
+    VkDescriptorSetLayoutBinding b[3]{};
+    b[0].binding = 0; b[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[0].descriptorCount = 1; b[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[1].binding = 1; b[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    b[1].descriptorCount = 1; b[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    b[2].binding = 2; b[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    b[2].descriptorCount = 1; b[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 3; lci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(device_, &lci, nullptr, &volSetLayout_) != VK_SUCCESS) {
+        volFailed_ = true; return false;
+    }
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1; plci.pSetLayouts = &volSetLayout_;
+    if (vkCreatePipelineLayout(device_, &plci, nullptr, &volPipelineLayout_) != VK_SUCCESS) {
+        volFailed_ = true; return false;
+    }
+
+    const std::wstring dir = ExecutableDir() + L"shaders\\";
+    VkShaderModule cs = LoadShaderModule(dir + L"VolumeSplat.cs.spv");
+    if (cs == VK_NULL_HANDLE) { HBE_ERROR("[Vulkan] VolumeSplat.cs.spv missing"); volFailed_ = true; return false; }
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = cs;
+    cpci.stage.pName = "CSMain";
+    cpci.layout = volPipelineLayout_;
+    const VkResult pr = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr,
+                                                 &volSplatPipeline_);
+    vkDestroyShaderModule(device_, cs, nullptr);
+    if (pr != VK_SUCCESS) { volFailed_ = true; return false; }
+
+    // Per-frame-in-flight params UBO + blob SSBO (host-visible, mapped).
+    const VkDeviceSize blobBytes = static_cast<VkDeviceSize>(kMaxVolumeBlobs) * sizeof(VolumeBlob);
+    const VkMemoryPropertyFlags hostVis =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (u32 i = 0; i < kMaxFramesInFlight; ++i) {
+        if (!CreateBuffer(256, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hostVis,
+                          volParamsBuf_[i], volParamsMem_[i]) ||
+            !CreateBuffer(blobBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVis,
+                          volBlobBuf_[i], volBlobMem_[i])) {
+            volFailed_ = true; return false;
+        }
+        vkMapMemory(device_, volParamsMem_[i], 0, 256, 0, &volParamsMapped_[i]);
+        vkMapMemory(device_, volBlobMem_[i], 0, blobBytes, 0, &volBlobMapped_[i]);
+    }
+
+    // Descriptor pool + one set per frame-in-flight, each updated once (its own
+    // param/blob buffers + the shared storage image).
+    VkDescriptorPoolSize ps[3]{};
+    ps[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; ps[0].descriptorCount = kMaxFramesInFlight;
+    ps[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  ps[1].descriptorCount = kMaxFramesInFlight;
+    ps[2].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps[2].descriptorCount = kMaxFramesInFlight;
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.maxSets = kMaxFramesInFlight; pci.poolSizeCount = 3; pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(device_, &pci, nullptr, &volDescPool_) != VK_SUCCESS) {
+        volFailed_ = true; return false;
+    }
+    for (u32 i = 0; i < kMaxFramesInFlight; ++i) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = volDescPool_; ai.descriptorSetCount = 1; ai.pSetLayouts = &volSetLayout_;
+        if (vkAllocateDescriptorSets(device_, &ai, &volSet_[i]) != VK_SUCCESS) {
+            volFailed_ = true; return false;
+        }
+        VkDescriptorBufferInfo pInfo{volParamsBuf_[i], 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo sInfo{volBlobBuf_[i], 0, VK_WHOLE_SIZE};
+        VkDescriptorImageInfo imgInfo{};
+        imgInfo.imageView = volStorageView_;
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w[3]{};
+        w[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[0].dstSet = volSet_[i];
+        w[0].dstBinding = 0; w[0].descriptorCount = 1;
+        w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &pInfo;
+        w[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[1].dstSet = volSet_[i];
+        w[1].dstBinding = 1; w[1].descriptorCount = 1;
+        w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w[1].pImageInfo = &imgInfo;
+        w[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[2].dstSet = volSet_[i];
+        w[2].dstBinding = 2; w[2].descriptorCount = 1;
+        w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w[2].pBufferInfo = &sInfo;
+        vkUpdateDescriptorSets(device_, 3, w, 0, nullptr);
+    }
+
+    HBE_INFO("[Vulkan] Volumetric compute pipeline ready ({}^3 volume).", volDim_);
+    return true;
+}
+
+void VulkanDevice::SetVolumeParticles(const VolumeBlob* blobs, u32 count,
+                                      const VolumeParams& params) {
+    volBlobs_ = blobs;
+    volBlobCount_ = (blobs && count <= kMaxVolumeBlobs) ? count
+                    : (blobs ? kMaxVolumeBlobs : 0u);
+    volParams_ = params;
+}
+
+void VulkanDevice::DispatchVolumeSplat() {
+    if (volBlobCount_ == 0 || volFailed_ || !frameActive_) return; // data-driven
+    if (!EnsureVolumeResources()) return;
+
+    // Upload this frame's blobs + params into this slot's buffers.
+    std::memcpy(volBlobMapped_[frameIndex_], volBlobs_,
+                static_cast<usize>(volBlobCount_) * sizeof(VolumeBlob));
+    struct VolCB { // must match VolumeSplat.hlsl's VolumeCB (64 bytes)
+        f32 boundsMin[3]; f32 p0;
+        f32 boundsMax[3]; f32 p1;
+        u32 dim[3];       u32 count;
+        f32 densityScale; f32 noiseDetail; f32 noiseScale; f32 p2;
+    };
+    VolCB cb{};
+    cb.boundsMin[0] = volParams_.boundsMin.x; cb.boundsMin[1] = volParams_.boundsMin.y;
+    cb.boundsMin[2] = volParams_.boundsMin.z;
+    cb.boundsMax[0] = volParams_.boundsMax.x; cb.boundsMax[1] = volParams_.boundsMax.y;
+    cb.boundsMax[2] = volParams_.boundsMax.z;
+    cb.dim[0] = volDim_; cb.dim[1] = volDim_; cb.dim[2] = volDim_;
+    cb.count = volBlobCount_;
+    cb.densityScale = volParams_.densityScale;
+    cb.noiseDetail = volParams_.noiseDetail;  // splat-side turbulence (de-sphere)
+    cb.noiseScale = volParams_.noiseScale;    // stable world scale (no crawl on move)
+    std::memcpy(volParamsMapped_[frameIndex_], &cb, sizeof(cb));
+
+    VkCommandBuffer cmd = commandBuffers_[frameIndex_];
+
+    // Cross-frame write-after-read guard: the volume texture is a SINGLE image
+    // shared across frames-in-flight (unlike the per-frame blob/param buffers), so
+    // this frame's splat WRITE must not begin until the PREVIOUS frame's raymarch
+    // READ has finished. A pipeline barrier's first sync scope spans all commands
+    // submitted earlier on this (single) queue, so a FRAGMENT->COMPUTE barrier here
+    // serializes the prior raymarch read before this dispatch. (D3D12 gets this for
+    // free from its UAV<->PIXEL_SHADER_RESOURCE round-trip transition; Vulkan keeps
+    // the image permanently GENERAL and so needs it explicitly.) Harmless on frame 0
+    // (no prior read in scope).
+    {
+        VkImageMemoryBarrier war{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        war.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        war.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        war.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        war.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        war.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        war.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        war.image = volImage_;
+        war.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &war);
+    }
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volSplatPipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, volPipelineLayout_, 0, 1,
+                            &volSet_[frameIndex_], 0, nullptr);
+    const u32 groups = (volDim_ + 3) / 4; // numthreads(4,4,4)
+    vkCmdDispatch(cmd, groups, groups, groups);
+
+    // Make the splat writes visible to a later sampled read (VV4 raymarch). The
+    // image stays in GENERAL, so this is a pure execution/memory barrier.
+    VkImageMemoryBarrier bar{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    bar.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bar.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    bar.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bar.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bar.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bar.image = volImage_;
+    bar.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
 }
 
 void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 count) {
@@ -4298,6 +4698,17 @@ void VulkanDevice::EndFrame() {
     si.pSignalSemaphores = &signalSem;
     vkQueueSubmit(queue_, 1, &si, inFlight_[frameIndex_]);
 
+    // Multi-viewport: render + present the ImGui panels dragged out into their own
+    // OS windows (each with its own swapchain/surface). Draw data was finalized by
+    // ImGui::Render() in RenderUI; this handles the secondary viewports only.
+    // (ImGui is editor-only, so this whole block is compiled out of the runtime.)
+#if HBE_EDITOR
+    if (uiInitialized_ && (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) {
+        ImGui::UpdatePlatformWindows();
+        ImGui::RenderPlatformWindowsDefault();
+    }
+#endif
+
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
     pi.pWaitSemaphores = &signalSem;
@@ -4388,18 +4799,41 @@ bool VulkanDevice::InitUI(void* nativeWindowHandle) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    // Multi-viewport: panels detach into their own OS windows (multi-monitor
+    // docking). Set BEFORE the backends' Init so the viewport interfaces install.
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     io.IniFilename = nullptr;
     ImGui::StyleColorsDark();
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
 
     if (!ImGui_ImplWin32_Init(nativeWindowHandle)) {
         HBE_ERROR("[Vulkan] ImGui_ImplWin32_Init failed");
         return false;
     }
 
-    // We use docking but not multi-viewport (separate OS windows). The Win32
-    // backend advertises PlatformHasViewports, which makes the Vulkan backend
-    // require a CreateVkSurface handler; clear it since we don't create windows.
-    io.BackendFlags &= ~ImGuiBackendFlags_PlatformHasViewports;
+    // Multi-viewport: the Win32 platform backend creates the secondary OS windows,
+    // but the Vulkan renderer needs a VkSurfaceKHR for each. Provide the Win32
+    // surface factory BEFORE ImGui_ImplVulkan_Init (it asserts the handler exists
+    // when it installs the viewport interface). The instance already has
+    // VK_KHR_win32_surface (the main window uses it).
+    if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        ImGui::GetPlatformIO().Platform_CreateVkSurface =
+            [](ImGuiViewport* vp, ImU64 vkInst, const void* alloc, ImU64* outSurface) -> int {
+            VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+            ci.hinstance = ::GetModuleHandleW(nullptr);
+            ci.hwnd = static_cast<HWND>(vp->PlatformHandleRaw);
+            VkSurfaceKHR surf = VK_NULL_HANDLE;
+            const VkResult r = vkCreateWin32SurfaceKHR(reinterpret_cast<VkInstance>(vkInst), &ci,
+                                                       static_cast<const VkAllocationCallbacks*>(alloc),
+                                                       &surf);
+            *outSurface = reinterpret_cast<ImU64>(surf);
+            return static_cast<int>(r);
+        };
+    }
 
     ImGui_ImplVulkan_InitInfo init{};
     init.ApiVersion = VK_API_VERSION_1_2;
@@ -4942,6 +5376,26 @@ VulkanDevice::~VulkanDevice() {
     if (ssrPipe_) vkDestroyPipeline(device_, ssrPipe_, nullptr);
     if (exposurePipe_) vkDestroyPipeline(device_, exposurePipe_, nullptr);
     if (volPipe_) vkDestroyPipeline(device_, volPipe_, nullptr);
+    if (volPartPipe_) vkDestroyPipeline(device_, volPartPipe_, nullptr); // raymarch pipeline
+
+    // Volumetric compute-splat resources (EnsureVolumeResources). The volume image /
+    // backing memory / sampled view live in textures_ (already freed above); only the
+    // dedicated storage views + the compute pipeline/layout/pool + per-frame blob and
+    // param buffers are separate and must be released here. Device is idle (5296).
+    for (auto& [slot, view] : volumeStorageView_)
+        if (view) vkDestroyImageView(device_, view, nullptr);
+    volumeStorageView_.clear();
+    for (u32 i = 0; i < framesInFlight_; ++i) {
+        if (volParamsBuf_[i]) vkDestroyBuffer(device_, volParamsBuf_[i], nullptr);
+        if (volParamsMem_[i]) vkFreeMemory(device_, volParamsMem_[i], nullptr); // implicitly unmaps
+        if (volBlobBuf_[i]) vkDestroyBuffer(device_, volBlobBuf_[i], nullptr);
+        if (volBlobMem_[i]) vkFreeMemory(device_, volBlobMem_[i], nullptr); // implicitly unmaps
+    }
+    if (volDescPool_) vkDestroyDescriptorPool(device_, volDescPool_, nullptr);
+    if (volSplatPipeline_) vkDestroyPipeline(device_, volSplatPipeline_, nullptr);
+    if (volPipelineLayout_) vkDestroyPipelineLayout(device_, volPipelineLayout_, nullptr);
+    if (volSetLayout_) vkDestroyDescriptorSetLayout(device_, volSetLayout_, nullptr);
+
     if (ssgiPipe_) vkDestroyPipeline(device_, ssgiPipe_, nullptr);
     if (painterlyPipe_) vkDestroyPipeline(device_, painterlyPipe_, nullptr);
     if (brushStrokesPipe_) vkDestroyPipeline(device_, brushStrokesPipe_, nullptr);

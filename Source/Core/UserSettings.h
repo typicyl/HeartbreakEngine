@@ -6,9 +6,11 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "Core/InputActions.h" // input::Binding (per-user control rebinds)
 
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 
 namespace hbe {
 
@@ -17,6 +19,9 @@ struct UserSettings {
     int graphicsPreset = 0;       // 0 High (as authored), 1 Medium, 2 Low (degrade-only)
     f32 brightness = 0.5f;        // [0,1] -> +/-1-stop VIEW exposure multiplier (0.5 = neutral)
     bool captionsEnabled = false; // closed captions on/off
+    // Per-user control rebinds: action name -> binding, overriding the project's
+    // default for that action. Empty = use every action's authored default.
+    std::unordered_map<std::string, input::Binding> inputBindings;
 
     bool Save(const std::filesystem::path& dir) const; // <dir>/usersettings.json
     bool Load(const std::filesystem::path& dir);        // false if absent/invalid

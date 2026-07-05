@@ -285,6 +285,8 @@ public:
     MeshHandle CreateMesh(const hbe::MeshData& mesh) override;
     void UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
     TextureHandle CreateTexture(const TextureDesc& desc) override;
+    TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
+    void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
     void UpdateTexture(TextureHandle handle, const TextureDesc& desc) override;
     void DrawShadowPass(const SceneView& view, const DrawItem* items, u32 count) override;
     void SetParticles(const ParticleVertex* alpha, u32 alphaCount,
@@ -374,6 +376,27 @@ private:
     ComPtr<ID3D12PipelineState> skyPSOSingle_;  // single-RT sky (editor preview)
     bool meshPipelineReady_ = false;
 
+    // --- Volumetric VFX compute (VV2) ------------------------------------------
+    // Compute pipeline that splats a 3D density/temperature volume. Lazily created
+    // the first frame it's enabled (off by default -> zero cost on low-end GPUs).
+    // Enable is currently HBE_VOLTEST env scaffolding to verify the compute path;
+    // VV5 wires the real per-emitter enable. VV4 adds the raymarch that reads it.
+    u32 volDim_ = 96;           // volume voxel dim (from VolumeParams.resolution, first enable)
+    bool volInit_ = false;      // resources created (or attempted)
+    bool volFailed_ = false;
+    TextureHandle volTex_;      // 3D density/temperature volume (SRV bindless + UAV)
+    u32 volUavSlot_ = 0;
+    ComPtr<ID3D12RootSignature> computeRootSig_;
+    ComPtr<ID3D12PipelineState> volSplatPSO_;
+    // Per-frame blob buffer (SetVolumeParticles feeds it; the splat reads it).
+    ComPtr<ID3D12Resource> volBlobBuffers_[kMaxBackBuffers];
+    u8* volBlobCpu_[kMaxBackBuffers] = {};
+    const VolumeBlob* volBlobs_ = nullptr;
+    u32 volBlobCount_ = 0;
+    VolumeParams volParams_{};
+    bool EnsureVolumeResources();
+    void DispatchVolumeSplat();
+
     // -- 3D painterly surface strokes (instanced cards, PBR-lit) ---------------
     ComPtr<ID3D12PipelineState> strokeSurfacePSO_; // depth-test LE, no write, alpha-over
     bool strokeSurfaceReady_ = false;
@@ -459,6 +482,8 @@ private:
     ComPtr<ID3D12Resource> ssgiHalf_;           // SSGI GI-only term at reduced res (upscaled into ssgi_)
     ComPtr<ID3D12Resource> volScatter_;         // volumetric fog composite (HDR, full-res)
     ComPtr<ID3D12Resource> volHalf_;            // fog (inscatter+transmittance) at reduced res
+    ComPtr<ID3D12Resource> volPartScatter_;     // volumetric-particles composite (HDR, full-res)
+    ComPtr<ID3D12Resource> volPartHalf_;        // volumetric-particles raymarch at half res
     ComPtr<ID3D12Resource> painterly_;          // painterly stroke pass (HDR)
     ComPtr<ID3D12Resource> painterlyComp_;      // painterly + dynamic-layer crisp composite (HDR)
     ComPtr<ID3D12Resource> adaptedLum_[2];      // auto-exposure adapted luminance (1x1, ping-pong)
@@ -476,6 +501,8 @@ private:
     u32 slotSsgiHalf_ = 0;
     u32 slotVol_ = 0;
     u32 slotVolHalf_ = 0;
+    u32 slotVolPart_ = 0;
+    u32 slotVolPartHalf_ = 0;
     u32 slotPainterly_ = 0;
     u32 slotPainterlyComp_ = 0;
     u32 slotAdaptedLum_[2] = {};
@@ -501,6 +528,8 @@ private:
     bool ssrReady_ = false;          // SSR PSO built
     bool exposureReady_ = false;     // auto-exposure PSO built
     bool volReady_ = false;          // volumetric fog PSO built
+    ComPtr<ID3D12PipelineState> volPartPSO_; // volumetric-particles raymarch PSO
+    bool volPartReady_ = false;      // volumetric-particles raymarch PSO built
     bool ssgiReady_ = false;         // screen-space GI PSO built
     bool painterlyReady_ = false;    // painterly stroke PSO built
     bool brushStrokesReady_ = false; // brush-stroke splat PSO built
@@ -573,6 +602,9 @@ private:
         u32 mipCount = 1;
     };
     std::unordered_map<u32, SlotTexture> slotTextures_;
+    // Volume textures (CreateVolumeTexture): SRV slot -> paired UAV bindless slot,
+    // so the compute splat can bind the volume for writing (VV2). 0 = no UAV.
+    std::unordered_map<u32, u32> volumeUav_;
 
     // Synchronous texture-upload command objects.
     ComPtr<ID3D12CommandAllocator>    uploadAlloc_;
@@ -952,6 +984,18 @@ void D3D12Device::EndFrame() {
     ID3D12CommandList* lists[] = {cmdList_.Get()};
     queue_->ExecuteCommandLists(1, lists);
 
+    // Multi-viewport: render + present any ImGui panels the user dragged out into
+    // their own OS windows (each gets its own swapchain on this queue). Draw data
+    // for all viewports was finalized by ImGui::Render() in RenderUI; the main
+    // viewport was recorded above, so this handles only the secondary windows.
+    // (ImGui is editor-only, so this whole block is compiled out of the runtime.)
+#if HBE_EDITOR
+    if (uiInitialized_ && (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable)) {
+        ImGui::UpdatePlatformWindows();
+        ImGui::RenderPlatformWindowsDefault();
+    }
+#endif
+
     // Vsync on = interval 1; off = interval 0 + ALLOW_TEARING (when supported) so
     // presents never wait for vblank and real frame rates are measurable.
     const HRESULT pr = swapchain_->Present(
@@ -1232,6 +1276,66 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
     return TextureHandle{slot};
 }
 
+TextureHandle D3D12Device::CreateVolumeTexture(const TextureDesc& desc) {
+    // A compute-writable, sampled texture with NO initial upload. depth>1 => 3D.
+    // Consumes 1 bindless slot for the SRV and (when storage) 1 more for the UAV.
+    if (!bindlessHeap_ || bindlessNextSlot_ + 2 > kMaxBindlessTextures) return {};
+    const DXGI_FORMAT fmt = ToDXGIFormat(desc.format);
+    const u32 depth = (std::max)(1u, desc.depth);
+
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = (depth > 1) ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                               : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = desc.width;
+    td.Height = desc.height;
+    td.DepthOrArraySize = static_cast<UINT16>(depth);
+    td.MipLevels = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (desc.storage) td.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    // Initial state matches first use: compute-written volumes start in UAV; a
+    // plain sampled volume starts ready to read. The splat pass (VV2/VV3) manages
+    // the per-frame UAV<->SRV transitions.
+    const D3D12_RESOURCE_STATES init = desc.storage
+                                           ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                           : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_HEAP_PROPERTIES def = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
+    ComPtr<ID3D12Resource> tex;
+    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, init, nullptr,
+                                                IID_PPV_ARGS(&tex)))) {
+        return {};
+    }
+
+    const u32 srvSlot = bindlessNextSlot_++;
+    D3D12_CPU_DESCRIPTOR_HANDLE hs = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
+    hs.ptr += static_cast<SIZE_T>(srvSlot) * bindlessDescSize_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = fmt;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (depth > 1) { sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D; sv.Texture3D.MipLevels = 1; }
+    else { sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1; }
+    device_->CreateShaderResourceView(tex.Get(), &sv, hs);
+
+    u32 uavSlot = 0;
+    if (desc.storage) {
+        uavSlot = bindlessNextSlot_++;
+        D3D12_CPU_DESCRIPTOR_HANDLE hu = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
+        hu.ptr += static_cast<SIZE_T>(uavSlot) * bindlessDescSize_;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+        uv.Format = fmt;
+        if (depth > 1) { uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D; uv.Texture3D.WSize = depth; }
+        else { uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D; }
+        device_->CreateUnorderedAccessView(tex.Get(), nullptr, &uv, hu);
+    }
+
+    slotTextures_[srvSlot] = SlotTexture{tex.Get(), fmt, 1};
+    textures_.push_back(tex);
+    volumeUav_[srvSlot] = uavSlot;
+    return TextureHandle{srvSlot};
+}
+
 void D3D12Device::UpdateTexture(TextureHandle handle, const TextureDesc& desc) {
     if (!handle.IsValid() || !desc.pixels) return;
     const auto it = slotTextures_.find(handle.index);
@@ -1323,7 +1427,17 @@ bool D3D12Device::CreateMeshPipeline() {
     srvRange.RegisterSpace = 0;
     srvRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER params[5] = {};
+    // SRV table (t0, space6) for the volumetric 3D volume (Texture3D can't live in
+    // the Texture2D[] bindless array). Only the volumetric raymarch pass sets it;
+    // every other pass leaves it unbound (their shaders don't reference it).
+    D3D12_DESCRIPTOR_RANGE volRange{};
+    volRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    volRange.NumDescriptors = 1;
+    volRange.BaseShaderRegister = 0;
+    volRange.RegisterSpace = 6;
+    volRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER params[6] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1348,6 +1462,11 @@ bool D3D12Device::CreateMeshPipeline() {
     params[4].Descriptor.ShaderRegister = 1;
     params[4].Descriptor.RegisterSpace = 1;
     params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    // Volumetric 3D volume SRV table (t0 space6, pixel-only) - the raymarch pass.
+    params[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[5].DescriptorTable.NumDescriptorRanges = 1;
+    params[5].DescriptorTable.pDescriptorRanges = &volRange;
+    params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     // Static samplers: s0 = anisotropic wrap (materials), s1 = linear clamp
     // (post-process sampling; wrap would bleed opposite screen edges).
@@ -1372,7 +1491,7 @@ bool D3D12Device::CreateMeshPipeline() {
     samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 5;
+    rsDesc.NumParameters = 6;
     rsDesc.pParameters = params;
     rsDesc.NumStaticSamplers = 2;
     rsDesc.pStaticSamplers = samplers;
@@ -1994,6 +2113,8 @@ bool D3D12Device::CreatePostPipelines() {
                              DXGI_FORMAT_UNKNOWN, exposurePSO_);
     volReady_ = makePso(L"VolumetricFog", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                         DXGI_FORMAT_UNKNOWN, volPSO_); // composites in HDR
+    volPartReady_ = makePso(L"VolumetricParticles", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+                            DXGI_FORMAT_UNKNOWN, volPartPSO_); // raymarch -> half-res, then ApplyHalfRes
     ssgiReady_ = makePso(L"SSGI", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                          DXGI_FORMAT_UNKNOWN, ssgiPSO_); // composites in HDR
     painterlyReady_ = makePso(L"Painterly", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
@@ -2043,7 +2164,7 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
         // base 4 + bloom + 2 TAA history + DoF + motion blur + SSR + 2 lum +
         // G-buffer + velocity + volumetric + SSGI + painterly.
-        hd.NumDescriptors = 19 + kBloomMaxMips; // +painterly composite +ssgiHalf +volHalf RTVs
+        hd.NumDescriptors = 21 + kBloomMaxMips; // +volumetric-particles scatter + half RTVs
         HR_CHECK(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&postRtvHeap_)),
                  "CreateDescriptorHeap(postRTV)");
         postRtvSize_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
@@ -2058,13 +2179,15 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     // Reserve the bindless slots once; resizes rewrite the same descriptors so
     // shader-visible indices stay stable.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 20 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 22 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
         slotVelocity_ = bindlessNextSlot_++;
         slotVol_ = bindlessNextSlot_++;
         slotVolHalf_ = bindlessNextSlot_++;
+        slotVolPart_ = bindlessNextSlot_++;
+        slotVolPartHalf_ = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
         slotSsgiHalf_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
@@ -2229,6 +2352,15 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
                        nullptr, volHalf_))
             return false;
     }
+    if (volPartReady_) { // volumetric particles: full-res composite + half-res raymarch
+        if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 19 + kBloomMaxMips,
+                       slotVolPart_, nullptr, volPartScatter_))
+            return false;
+        const u32 hw = (width + 1u) / 2u, hh = (height + 1u) / 2u;
+        if (!makeColor(hw, hh, DXGI_FORMAT_R16G16B16A16_FLOAT, 20 + kBloomMaxMips, slotVolPartHalf_,
+                       nullptr, volPartHalf_))
+            return false;
+    }
     if (ssgiReady_) { // HDR (indirect bounce composited before bloom)
         if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 14 + kBloomMaxMips,
                        slotSsgi_, nullptr, ssgi_))
@@ -2388,6 +2520,49 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(applyPSO_.Get(), volScatter_.Get(), rtvAt(13 + kBloomMaxMips), sceneW_, sceneH_,
                      ap);
         hdrInput = slotVol_;
+    }
+
+    // --- Volumetric particles: raymarch the density/temperature volume (half res),
+    //     lit + self-shadowed + blackbody-emissive, then composite over the HDR
+    //     (scene*transmittance + inscatter), same shape as the fog pass. ------------
+    if (volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
+        slotTextures_.count(volTex_.index)) {
+        ID3D12Resource* volRes = slotTextures_[volTex_.index].resource;
+        // The splat wrote the volume as a UAV; make it sampleable for the raymarch.
+        auto toSrv = TransitionBarrier(volRes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmdList_->ResourceBarrier(1, &toSrv);
+        D3D12_GPU_DESCRIPTOR_HANDLE volSrv = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
+        volSrv.ptr += static_cast<UINT64>(volTex_.index) * bindlessDescSize_;
+        cmdList_->SetGraphicsRootDescriptorTable(5, volSrv); // Texture3D t0 space6
+
+        const u32 hw = (sceneW_ + 1u) / 2u, hh = (sceneH_ + 1u) / 2u;
+        const glm::vec2 vTexel(1.0f / hw, 1.0f / hh);
+        PostCB cb;
+        cb.input2 = slotDepth_;
+        cb.outTexel = vTexel;
+        cb.inTexel = sceneTexel;
+        cb.params0 = {volParams_.boundsMin.x, volParams_.boundsMin.y, volParams_.boundsMin.z,
+                      static_cast<f32>(volParams_.stepCount)};
+        cb.params1 = {volParams_.boundsMax.x, volParams_.boundsMax.y, volParams_.boundsMax.z,
+                      1.0f}; // densityMul: 1.0 — the splat already baked densityScale into the volume
+        cb.params2 = {volParams_.emission, 4.0f, volParams_.extinction, // emission, shadowSteps, extinction
+                      ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
+        cb.params3 = {view.timeSeconds, volParams_.noiseDetail, volParams_.noiseScale, 0.0f}; // time, detail, scale
+        DrawPostPass(volPartPSO_.Get(), volPartHalf_.Get(), rtvAt(20 + kBloomMaxMips), hw, hh, cb);
+        PostCB ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotVolPartHalf_;
+        ap.input2 = slotDepth_;
+        ap.outTexel = sceneTexel;
+        ap.inTexel = vTexel;
+        ap.params0 = {1.0f, 0.0f, 0.0f, 0.0f}; // mild bilateral upscale
+        DrawPostPass(applyPSO_.Get(), volPartScatter_.Get(), rtvAt(19 + kBloomMaxMips), sceneW_,
+                     sceneH_, ap);
+        hdrInput = slotVolPart_;
+        auto toUav = TransitionBarrier(volRes, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdList_->ResourceBarrier(1, &toUav);
     }
 
     // --- Painterly: repaint the lit HDR as edge-aware brush strokes ----------
@@ -2954,8 +3129,142 @@ void D3D12Device::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
     gm.indexCount = mesh.IndexCount();
 }
 
+bool D3D12Device::EnsureVolumeResources() {
+    if (volInit_) return !volFailed_;
+    volInit_ = true;
+    volDim_ = glm::clamp(volParams_.resolution, 32u, 192u); // quality knob (first enable)
+
+    // 3D density/temperature volume (RGBA16F, compute-writable).
+    TextureDesc vd{};
+    vd.width = volDim_; vd.height = volDim_; vd.depth = volDim_;
+    vd.format = Format::R16G16B16A16_FLOAT;
+    vd.storage = true;
+    vd.debugName = "VolumeDensity";
+    volTex_ = CreateVolumeTexture(vd);
+    if (!volTex_.IsValid()) { volFailed_ = true; return false; }
+    volUavSlot_ = volumeUav_.count(volTex_.index) ? volumeUav_[volTex_.index] : 0;
+
+    // Compute root signature: b0 = params CBV (root), u0 = volume UAV (table),
+    // t0 = blob StructuredBuffer (root SRV).
+    D3D12_DESCRIPTOR_RANGE uavRange{};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0; // u0
+    uavRange.RegisterSpace = 0;
+    uavRange.OffsetInDescriptorsFromTableStart = 0;
+    D3D12_ROOT_PARAMETER cp[3]{};
+    cp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    cp[0].Descriptor.ShaderRegister = 0; // b0
+    cp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    cp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    cp[1].DescriptorTable.NumDescriptorRanges = 1;
+    cp[1].DescriptorTable.pDescriptorRanges = &uavRange;
+    cp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    cp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    cp[2].Descriptor.ShaderRegister = 0; // t0
+    cp[2].Descriptor.RegisterSpace = 0;
+    cp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC rd{};
+    rd.NumParameters = 3;
+    rd.pParameters = cp;
+    rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; // compute: no input assembler
+    ComPtr<ID3DBlob> sig, err;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+        if (err) HBE_ERROR("[D3D12] Volume compute RootSig: {}",
+                           static_cast<const char*>(err->GetBufferPointer()));
+        volFailed_ = true; return false;
+    }
+    if (FAILED(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                            IID_PPV_ARGS(&computeRootSig_)))) {
+        volFailed_ = true; return false;
+    }
+
+    const std::wstring dir = ExecutableDir() + L"shaders\\";
+    const std::vector<u8> cs = ReadBinaryFile(dir + L"VolumeSplat.cs.dxil");
+    if (cs.empty()) { HBE_ERROR("[D3D12] VolumeSplat.cs.dxil missing"); volFailed_ = true; return false; }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cpso{};
+    cpso.pRootSignature = computeRootSig_.Get();
+    cpso.CS = {cs.data(), cs.size()};
+    if (FAILED(device_->CreateComputePipelineState(&cpso, IID_PPV_ARGS(&volSplatPSO_)))) {
+        volFailed_ = true; return false;
+    }
+
+    // Per-frame blob upload buffers (persistently mapped, like the particle ring).
+    const u64 blobBytes = static_cast<u64>(kMaxVolumeBlobs) * sizeof(VolumeBlob);
+    for (u32 i = 0; i < kMaxBackBuffers; ++i) {
+        volBlobBuffers_[i] = CreateUploadBuffer(device_.Get(), blobBytes);
+        if (!volBlobBuffers_[i]) { volFailed_ = true; return false; }
+        void* m = nullptr;
+        D3D12_RANGE noRead{0, 0};
+        volBlobBuffers_[i]->Map(0, &noRead, &m);
+        volBlobCpu_[i] = static_cast<u8*>(m);
+    }
+    HBE_INFO("[D3D12] Volumetric compute pipeline ready ({}^3 volume).", volDim_);
+    return true;
+}
+
+void D3D12Device::SetVolumeParticles(const VolumeBlob* blobs, u32 count,
+                                     const VolumeParams& params) {
+    volBlobs_ = blobs;
+    volBlobCount_ = (blobs && count <= kMaxVolumeBlobs) ? count
+                    : (blobs ? kMaxVolumeBlobs : 0u);
+    volParams_ = params;
+}
+
+void D3D12Device::DispatchVolumeSplat() {
+    if (volBlobCount_ == 0 || volFailed_) return; // data-driven: no blobs -> no volume
+    if (!EnsureVolumeResources()) return;
+
+    // Upload this frame's blobs into the ring buffer.
+    std::memcpy(volBlobCpu_[frameIndex_], volBlobs_,
+                static_cast<usize>(volBlobCount_) * sizeof(VolumeBlob));
+
+    // Params CB (must match VolumeSplat.hlsl's VolumeCB, 64 bytes).
+    struct VolCB {
+        f32 boundsMin[3]; f32 p0;
+        f32 boundsMax[3]; f32 p1;
+        u32 dim[3];       u32 count;
+        f32 densityScale; f32 noiseDetail; f32 noiseScale; f32 p2;
+    };
+    D3D12_GPU_VIRTUAL_ADDRESS gpu{};
+    void* cpu = AllocConstants(sizeof(VolCB), gpu);
+    if (!cpu) return;
+    VolCB cb{};
+    cb.boundsMin[0] = volParams_.boundsMin.x; cb.boundsMin[1] = volParams_.boundsMin.y;
+    cb.boundsMin[2] = volParams_.boundsMin.z;
+    cb.boundsMax[0] = volParams_.boundsMax.x; cb.boundsMax[1] = volParams_.boundsMax.y;
+    cb.boundsMax[2] = volParams_.boundsMax.z;
+    cb.dim[0] = volDim_; cb.dim[1] = volDim_; cb.dim[2] = volDim_;
+    cb.count = volBlobCount_;
+    cb.densityScale = volParams_.densityScale;
+    cb.noiseDetail = volParams_.noiseDetail;  // splat-side turbulence (de-sphere)
+    cb.noiseScale = volParams_.noiseScale;    // stable world scale (no crawl on move)
+    std::memcpy(cpu, &cb, sizeof(cb));
+
+    ID3D12DescriptorHeap* heaps[] = {bindlessHeap_.Get()};
+    cmdList_->SetDescriptorHeaps(1, heaps);
+    cmdList_->SetComputeRootSignature(computeRootSig_.Get());
+    cmdList_->SetPipelineState(volSplatPSO_.Get());
+    cmdList_->SetComputeRootConstantBufferView(0, gpu);
+    D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
+    uavGpu.ptr += static_cast<UINT64>(volUavSlot_) * bindlessDescSize_;
+    cmdList_->SetComputeRootDescriptorTable(1, uavGpu);
+    cmdList_->SetComputeRootShaderResourceView(2, volBlobBuffers_[frameIndex_]->GetGPUVirtualAddress());
+    const u32 groups = (volDim_ + 3) / 4; // numthreads(4,4,4)
+    cmdList_->Dispatch(groups, groups, groups);
+
+    // UAV barrier so the raymarch (VV4) sees the writes; the volume stays in the
+    // UNORDERED_ACCESS state it was created in (no layout transition needed).
+    D3D12_RESOURCE_BARRIER uavb{};
+    uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavb.UAV.pResource = slotTextures_.count(volTex_.index)
+                             ? slotTextures_[volTex_.index].resource : nullptr;
+    if (uavb.UAV.pResource) cmdList_->ResourceBarrier(1, &uavb);
+}
+
 void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 count) {
     if (!meshPipelineReady_) return;
+    DispatchVolumeSplat(); // volumetric density splat (no-op unless enabled)
     const bool drawSky = (view.skyIndex != 0) && skyPSO_;
     // Without the post stack there is nothing to resolve, so an empty scene
     // can skip the pass entirely (legacy behavior).
@@ -3461,8 +3770,18 @@ bool D3D12Device::InitUI(void* nativeWindowHandle) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    // Multi-viewport: panels can be dragged OUT of the main window into their own
+    // OS windows (dock freely across monitors). Must be set BEFORE the backends'
+    // Init so they install the platform/renderer viewport interfaces.
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     io.IniFilename = nullptr; // don't persist an imgui.ini
     ImGui::StyleColorsDark();
+    // Detached platform windows read as normal OS windows (opaque, un-rounded).
+    if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+        ImGuiStyle& style = ImGui::GetStyle();
+        style.WindowRounding = 0.0f;
+        style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+    }
 
     if (!ImGui_ImplWin32_Init(nativeWindowHandle)) {
         HBE_ERROR("[D3D12] ImGui_ImplWin32_Init failed");

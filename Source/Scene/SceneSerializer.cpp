@@ -193,6 +193,11 @@ json BuildSceneJson(const Scene& scene,
         // quads (rebuilt from their UICanvas by ui::UpdateWorldSurfaces).
         if (reg.try_get<TerrainChunk>(e)) return;
         if (reg.try_get<UISurface>(e)) return;
+        // Dialogue Choice buttons are transient UI the conversation player spawns
+        // at runtime; a checkpoint/quicksave landing mid-Choice must NOT bake them
+        // into the .hbsave (they'd reload as permanent, tag-less, un-clearable UI).
+        if (reg.try_get<DialogueChoiceButton>(e)) return;
+        if (reg.all_of<InteractPromptTag>(e)) return; // transient interaction prompt UI (empty tag)
         if (include && !include(e)) return; // not part of the scene being saved
         const u32 key = static_cast<u32>(e);
         if (indexOf.find(key) == indexOf.end()) {
@@ -228,6 +233,8 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const ParticleEmitter>()) add(e);
     for (const entt::entity e : reg.view<const SchematicComponent>()) add(e);
     for (const entt::entity e : reg.view<const Checkpoint>()) add(e);
+    for (const entt::entity e : reg.view<const Interactable>()) add(e);
+    for (const entt::entity e : reg.view<const TriggerVolume>()) add(e);
 
     json root;
     root["version"] = 1;
@@ -252,6 +259,9 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                   const std::unordered_map<u32, int>& indexOf, bool runtimeTags) {
         json je;
         if (const Name* n = reg.try_get<Name>(e)) je["name"] = n->value;
+        // Prefab-instance link (root entity of a placed .hbprefab).
+        if (const PrefabInstance* pi = reg.try_get<PrefabInstance>(e); pi && !pi->source.empty())
+            je["prefab"] = pi->source;
         // Editor-only visibility (hidden but loaded). Runtime ignores it.
         if (reg.all_of<EditorHidden>(e)) je["editorHidden"] = true;
         if (const Transform* t = reg.try_get<Transform>(e)) {
@@ -349,6 +359,37 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                 {"triggerOnEnter", cp->triggerOnEnter},
                                 {"saveOnReach", cp->saveOnReach},
                                 {"once", cp->once}};
+        }
+        if (const Interactable* ia = reg.try_get<Interactable>(e)) {
+            je["interactable"] = {{"action", static_cast<u32>(ia->action)},
+                                  {"prompt", ia->prompt},
+                                  {"asset", ia->asset},
+                                  {"flag", ia->flag},
+                                  {"flagValue", ia->flagValue},
+                                  {"text", ia->text},
+                                  {"range", ia->range},
+                                  {"once", ia->once},
+                                  {"requiredFlag", ia->requiredFlag}};
+            // `fired` is RUNTIME state: persist it only in in-memory snapshots + the
+            // .hbsave (runtimeTags), never the authored .hbscene - else play-testing
+            // then Ctrl+S would bake a consumed-once state into the source scene.
+            if (runtimeTags) je["interactable"]["fired"] = ia->fired;
+        }
+        if (const TriggerVolume* tv = reg.try_get<TriggerVolume>(e)) {
+            je["trigger"] = {{"action", static_cast<u32>(tv->action)},
+                             {"asset", tv->asset},
+                             {"flag", tv->flag},
+                             {"flagValue", tv->flagValue},
+                             {"text", tv->text},
+                             {"halfExtents", ToJson(tv->halfExtents)},
+                             {"once", tv->once},
+                             {"requiredFlag", tv->requiredFlag}};
+            // Runtime state (see Interactable above): `fired` persists "once"; `inside`
+            // the enter-edge so a load-while-inside a repeating trigger doesn't re-fire.
+            if (runtimeTags) {
+                je["trigger"]["fired"] = tv->fired;
+                je["trigger"]["inside"] = tv->inside;
+            }
         }
         if (const CameraComponent* cam = reg.try_get<CameraComponent>(e)) {
             je["camera"] = CameraToJson(*cam);
@@ -540,9 +581,25 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                 {"direction", ToJson(pe->direction)}, {"startSpeed", pe->startSpeed},
                 {"speedVariance", pe->speedVariance}, {"spread", pe->spread},
                 {"gravity", ToJson(pe->gravity)}, {"drag", pe->drag},
+                {"buoyancy", pe->buoyancy}, {"vortex", pe->vortex},
                 {"startColor", ToJson(pe->startColor)}, {"endColor", ToJson(pe->endColor)},
                 {"startSize", pe->startSize}, {"endSize", pe->endSize},
-                {"spin", pe->spin}, {"texture", pe->texture}, {"additive", pe->additive}};
+                {"spin", pe->spin}, {"texture", pe->texture}, {"additive", pe->additive},
+                // Volumetric overhaul (all optional; omit == legacy defaults).
+                {"shape", static_cast<u32>(pe->shape)},
+                {"boxHalfExtents", ToJson(pe->boxHalfExtents)}, {"coneAngle", pe->coneAngle},
+                {"burst", pe->burst}, {"loop", pe->loop}, {"duration", pe->duration},
+                {"turbulence", pe->turbulence}, {"turbulenceScale", pe->turbulenceScale},
+                {"fadeIn", pe->fadeIn}, {"fadeOut", pe->fadeOut},
+                {"render", static_cast<u32>(pe->render)}, {"stretch", pe->stretch},
+                {"subUVCols", pe->subUVCols}, {"subUVRows", pe->subUVRows},
+                {"subUVFps", pe->subUVFps}, {"softFade", pe->softFade},
+                // True volumetric VFX (all optional; omit == billboard-only defaults).
+                {"volumetric", pe->volumetric}, {"volDensity", pe->volDensity},
+                {"volRadiusScale", pe->volRadiusScale}, {"volTemperature", pe->volTemperature},
+                {"volEmission", pe->volEmission}, {"volExtinction", pe->volExtinction},
+                {"volSteps", pe->volSteps}, {"volResolution", pe->volResolution},
+                {"volDetail", pe->volDetail}};
         }
         if (const AudioSource* src = reg.try_get<AudioSource>(e)) {
             je["audio"] = {{"asset", src->asset},
@@ -676,6 +733,7 @@ void ParseSceneJson(const json& root, SceneData& out) {
     for (const json& je : root.value("entities", json::array())) {
         EntityData d;
         d.name = je.value("name", "");
+        d.prefabSource = je.value("prefab", "");
         d.editorHidden = je.value("editorHidden", false);
         if (auto it = je.find("transform"); it != je.end()) {
             d.hasTransform = true;
@@ -764,6 +822,36 @@ void ParseSceneJson(const json& root, SceneData& out) {
             cp.triggerOnEnter = it->value("triggerOnEnter", true);
             cp.saveOnReach = it->value("saveOnReach", true);
             cp.once = it->value("once", true);
+        }
+        if (auto it = je.find("interactable"); it != je.end()) {
+            d.hasInteractable = true;
+            Interactable& ia = d.interactable;
+            ia.action = static_cast<InteractAction>(glm::clamp(
+                it->value("action", 0u), 0u, static_cast<u32>(InteractAction::None)));
+            ia.prompt = it->value("prompt", "Interact");
+            ia.asset = it->value("asset", "");
+            ia.flag = it->value("flag", "");
+            ia.flagValue = it->value("flagValue", 1.0f);
+            ia.text = it->value("text", "");
+            ia.range = it->value("range", 2.5f);
+            ia.once = it->value("once", false);
+            ia.requiredFlag = it->value("requiredFlag", "");
+            ia.fired = it->value("fired", false); // persists "once" state across saves
+        }
+        if (auto it = je.find("trigger"); it != je.end()) {
+            d.hasTrigger = true;
+            TriggerVolume& tv = d.trigger;
+            tv.action = static_cast<InteractAction>(glm::clamp(
+                it->value("action", 0u), 0u, static_cast<u32>(InteractAction::None)));
+            tv.asset = it->value("asset", "");
+            tv.flag = it->value("flag", "");
+            tv.flagValue = it->value("flagValue", 1.0f);
+            tv.text = it->value("text", "");
+            tv.halfExtents = Vec3(it->value("halfExtents", json{}), glm::vec3(2.0f));
+            tv.once = it->value("once", true);
+            tv.requiredFlag = it->value("requiredFlag", "");
+            tv.fired = it->value("fired", false);   // runtime "once" state (present in .hbsave only)
+            tv.inside = it->value("inside", false); // enter-edge state (avoids re-fire on load-inside)
         }
         if (auto it = je.find("camera"); it != je.end()) {
             d.hasCamera = true;
@@ -1053,6 +1141,8 @@ void ParseSceneJson(const json& root, SceneData& out) {
             p.spread = it->value("spread", p.spread);
             p.gravity = Vec3(it->value("gravity", json()), p.gravity);
             p.drag = it->value("drag", p.drag);
+            p.buoyancy = it->value("buoyancy", p.buoyancy);
+            p.vortex = it->value("vortex", p.vortex);
             p.startColor = Vec4(it->value("startColor", json()), p.startColor);
             p.endColor = Vec4(it->value("endColor", json()), p.endColor);
             p.startSize = it->value("startSize", p.startSize);
@@ -1060,6 +1150,34 @@ void ParseSceneJson(const json& root, SceneData& out) {
             p.spin = it->value("spin", p.spin);
             p.texture = it->value("texture", "");
             p.additive = it->value("additive", p.additive);
+            // Volumetric overhaul (older scenes omit these -> struct defaults).
+            p.shape = static_cast<ParticleEmitter::Shape>(
+                it->value("shape", static_cast<u32>(p.shape)));
+            p.boxHalfExtents = Vec3(it->value("boxHalfExtents", json()), p.boxHalfExtents);
+            p.coneAngle = it->value("coneAngle", p.coneAngle);
+            p.burst = it->value("burst", p.burst);
+            p.loop = it->value("loop", p.loop);
+            p.duration = it->value("duration", p.duration);
+            p.turbulence = it->value("turbulence", p.turbulence);
+            p.turbulenceScale = it->value("turbulenceScale", p.turbulenceScale);
+            p.fadeIn = it->value("fadeIn", p.fadeIn);
+            p.fadeOut = it->value("fadeOut", p.fadeOut);
+            p.render = static_cast<ParticleEmitter::Render>(
+                it->value("render", static_cast<u32>(p.render)));
+            p.stretch = it->value("stretch", p.stretch);
+            p.subUVCols = it->value("subUVCols", p.subUVCols);
+            p.subUVRows = it->value("subUVRows", p.subUVRows);
+            p.subUVFps = it->value("subUVFps", p.subUVFps);
+            p.softFade = it->value("softFade", p.softFade);
+            p.volumetric = it->value("volumetric", p.volumetric);
+            p.volDensity = it->value("volDensity", p.volDensity);
+            p.volRadiusScale = it->value("volRadiusScale", p.volRadiusScale);
+            p.volTemperature = it->value("volTemperature", p.volTemperature);
+            p.volEmission = it->value("volEmission", p.volEmission);
+            p.volExtinction = it->value("volExtinction", p.volExtinction);
+            p.volSteps = glm::clamp(it->value("volSteps", p.volSteps), 4, 256);
+            p.volResolution = glm::clamp(it->value("volResolution", p.volResolution), 32, 192);
+            p.volDetail = glm::clamp(it->value("volDetail", p.volDetail), 0.0f, 1.0f);
         }
         if (auto it = je.find("navAgent"); it != je.end()) {
             d.hasNavAgent = true;
@@ -1515,6 +1633,8 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasSceneSourceTag) reg.emplace_or_replace<SceneSource>(e, SceneSource{d.sceneSourceTag});
         if (d.hasSceneLayerTag) reg.emplace_or_replace<SceneLayer>(e, SceneLayer{d.sceneLayerKind});
         if (d.editorHidden) reg.emplace<EditorHidden>(e); // editor-only visibility
+        if (!d.prefabSource.empty())
+            reg.emplace<PrefabInstance>(e, PrefabInstance{d.prefabSource}); // linked prefab root
 
         if (d.hasTransform) reg.emplace<Transform>(e, d.transform);
 
@@ -1612,6 +1732,8 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             reg.emplace<SchematicComponent>(e, std::move(sg));
         }
         if (d.hasCheckpoint) reg.emplace<Checkpoint>(e, d.checkpoint);
+        if (d.hasInteractable) reg.emplace<Interactable>(e, d.interactable);
+        if (d.hasTrigger) reg.emplace<TriggerVolume>(e, d.trigger);
         if (d.hasCamera) reg.emplace<CameraComponent>(e, d.camera);
         if (d.hasCameraZone) reg.emplace<CameraZone>(e, d.cameraZone);
         if (d.hasCameraSpline) reg.emplace<CameraSpline>(e, d.cameraSpline);

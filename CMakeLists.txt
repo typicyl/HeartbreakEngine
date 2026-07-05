@@ -13,6 +13,7 @@ set(HBE_CORE_SOURCES
     "Source/Core/Log.cpp"
     "Source/Core/JobSystem.cpp"
     "Source/Core/UserSettings.cpp"
+    "Source/Core/InputActions.cpp"
     "Source/Core/Window_Win32.cpp"
     "Source/Core/Input_Win32.cpp")
 
@@ -63,6 +64,9 @@ set(HBE_SCHEMATIC_SOURCES
     "Source/Schematic/SchematicSystem.cpp"
     "Source/Schematic/SchematicTranspile.cpp")
 
+set(HBE_DIALOGUE_SOURCES
+    "Source/Dialogue/DialogueGraph.cpp")
+
 set(HBE_UI_SOURCES
     "Source/UI/UISystem.cpp"
     "Source/UI/UIAnimation.cpp"
@@ -80,6 +84,7 @@ set(HBE_RENDERER_SOURCES
     "Source/Renderer/IBL.cpp")
 
 set(HBE_ENGINE_SOURCES
+    "Source/Engine/CutscenePlayer.cpp"
     "Source/Engine/Engine.cpp")
 
 set(HBE_D3D12_SOURCES  "Source/RHI/D3D12/D3D12Device.cpp")
@@ -90,6 +95,7 @@ set(HBE_GL_SOURCES     "Source/RHI/GL/GLDevice.cpp"
 # Editor-only sources (added only to hbe_editor).
 set(HBE_EDITOR_SOURCES
     "Source/Editor/Editor.cpp"
+    "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/Importer.cpp"
     "Source/Editor/MeshThumbnail.cpp"
     "Source/Editor/stb_image_impl.cpp")
@@ -105,6 +111,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_AUDIO_SOURCES}
     ${HBE_PROJECT_SOURCES}
     ${HBE_SCHEMATIC_SOURCES}
+    ${HBE_DIALOGUE_SOURCES}
     ${HBE_UI_SOURCES}
     ${HBE_RHI_SOURCES}
     ${HBE_RENDERER_SOURCES}
@@ -121,6 +128,8 @@ function(hbe_configure_engine_lib tgt is_editor)
     target_link_libraries(${tgt} PRIVATE assimp::assimp nlohmann_json::nlohmann_json)
     # XInput (gamepad). xinput9_1_0 ships with Windows itself (no redist).
     target_link_libraries(${tgt} PRIVATE xinput9_1_0)
+    # shell32 = DragAcceptFiles / WM_DROPFILES (OS file drops onto the window).
+    target_link_libraries(${tgt} PRIVATE shell32)
     # Windows Compression API (UAP pack compression). Ships with Windows 8+.
     target_link_libraries(${tgt} PRIVATE cabinet)
     # stb single-header utilities: stb_easy_font for the in-game UI (runtime
