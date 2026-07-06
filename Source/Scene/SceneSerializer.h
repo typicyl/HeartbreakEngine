@@ -81,6 +81,10 @@ struct EntityData {
     CameraComponent camera;
     bool hasCameraZone = false;
     CameraZone cameraZone;
+    bool hasMusicZone = false;
+    MusicZone musicZone;
+    bool hasDialogueActor = false;
+    DialogueActor dialogueActor;
     bool hasCameraSpline = false;
     CameraSpline cameraSpline;
     bool hasTerrain = false;

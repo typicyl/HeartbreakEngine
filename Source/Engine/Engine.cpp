@@ -41,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -118,9 +119,17 @@ LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
 // for the frame without ever editing the authored data.
 void ApplyGraphicsPreset(rhi::PostSettings& p, int preset) {
     if (preset <= 0) return; // High: the authored look, exactly
-    // Medium: drop the heaviest passes.
+    // Medium (default in shipped builds): drop the heaviest SCREEN-SPACE passes -
+    // they cost the most at native fullscreen resolution and are the least missed.
     p.ssgiEnabled = 0;
     p.motionBlurEnabled = 0;
+    p.ssrEnabled = 0;   // screen-space reflections
+    p.fogEnabled = 0;   // volumetric fog raymarch
+    // DoF + SSAO are the remaining COVERAGE-SCALED costs (they ramp with lit-geometry
+    // screen fill = the daytime dip). Dropping them frees the ~2ms to hold 120 with the
+    // full-res painterly intact. Painterly is untouched (it's the art style).
+    p.dofEnabled = 0;
+    p.ssaoEnabled = 0;
     if (preset >= 2) { // Low: minimal post; TAA falls back to cheap FXAA
         p.ssrEnabled = 0;
         p.dofEnabled = 0;
@@ -782,6 +791,7 @@ int Engine::Run(const EngineConfig& configIn) {
     cam::CameraState cameraState;          // persistent camera smoothing/blend state
     bool prevGameCamEnabled = false;       // rising edge -> snap the camera
     bool musicStarted = false;             // adaptive music armed while the game runs
+    entt::entity musicZoneActive = entt::null; // last MusicZone the player was inside
     f32 dtSmooth = 0.0f;                   // EMA of frame delta (motion smoothing)
     f32 winMaxDt = 0.0f;                   // worst frame in the current report window
     u32 winJank = 0;                       // frames slower than 45 FPS this window
@@ -803,8 +813,9 @@ int Engine::Run(const EngineConfig& configIn) {
         if (rawDt > 1.0f / 45.0f) ++winJank;
         rawDt = glm::clamp(rawDt, 0.0f, 0.1f); // <= 100 ms floor (never < 10 FPS of sim)
         dtSmooth = (dtSmooth <= 0.0f) ? rawDt : glm::mix(dtSmooth, rawDt, 0.2f);
-        const f32 dt = dtSmooth;
-        dt_ = dt;
+        dt_ = dtSmooth; // REAL frame time (FPS display); dev game-speed doesn't skew it
+        // Dev menu game-speed / pause scales the simulation delta (1.0 in ship builds).
+        const f32 dt = dtSmooth * devTimeScale_;
 
         // Periodic FPS report.
         if (++fpsFrames >= 1) {
@@ -848,14 +859,43 @@ int Engine::Run(const EngineConfig& configIn) {
         // Suppress the dev overlay chord + its function keys while listening for a
         // rebind, so pressing Ctrl+` (or a dev F-key) during a rebind neither toggles
         // the overlay nor fires a dev action.
-        if (devEnabled && !actionMap_.Rebinding() && input.IsKeyDown(Key::Ctrl) &&
-            input.WasKeyPressed(Key::Grave))
+        // The dev menu owns the keyboard while open: it reads RAW edges (the frame's
+        // text-capture mute, set below, keeps gameplay/UI-nav/schematics quiet), and
+        // its Ctrl+` toggle is raw so it still closes while the mute is engaged.
+        if (devEnabled && !actionMap_.Rebinding() && input.IsKeyDownRaw(Key::Ctrl) &&
+            input.WasKeyPressedRaw(Key::Grave)) {
             devMenuOpen_ = !devMenuOpen_;
+            if (devMenuOpen_) { DevMenuScanLevels(); devMenuSel_ = 0; } // fresh level list on open
+        }
         if (devEnabled && devMenuOpen_ && !actionMap_.Rebinding()) {
-            if (input.WasKeyPressed(Key::F5)) SaveGame("checkpoint");
-            if (input.WasKeyPressed(Key::F9)) LoadGame("checkpoint");
-            if (flowActive_ && input.WasKeyPressed(Key::F2)) FlowReload();
-            if (flowActive_ && input.WasKeyPressed(Key::F3)) FlowMainMenu();
+            RebuildDevMenu(); // reflects live values; consumed by BuildDevOverlay this frame
+            if (!devItems_.empty()) {
+                const int n = static_cast<int>(devItems_.size());
+                devMenuSel_ = glm::clamp(devMenuSel_, 0, n - 1);
+                const auto step = [&](int dir) {
+                    for (int k = 0; k < n; ++k) { // skip non-selectable section headers
+                        devMenuSel_ = (devMenuSel_ + dir + n) % n;
+                        if (!devItems_[static_cast<usize>(devMenuSel_)].header) break;
+                    }
+                };
+                if (devItems_[static_cast<usize>(devMenuSel_)].header) step(+1); // never rest on a header
+                if (input.WasKeyPressedRaw(Key::Down)) step(+1);
+                if (input.WasKeyPressedRaw(Key::Up)) step(-1);
+                DevMenuItem& it = devItems_[static_cast<usize>(devMenuSel_)];
+                if (input.WasKeyPressedRaw(Key::Enter) && it.activate) it.activate();
+                if (it.adjust) {
+                    if (input.WasKeyPressedRaw(Key::Right)) it.adjust(+1);
+                    if (input.WasKeyPressedRaw(Key::Left)) it.adjust(-1);
+                }
+                // Re-bake the rows so BuildDevOverlay shows the just-changed value/state
+                // (labels are baked at build time; an adjust above would otherwise lag a frame).
+                if (devMenuOpen_) RebuildDevMenu();
+            }
+            // Quick shortcuts (also work with the menu open).
+            if (input.WasKeyPressedRaw(Key::F5)) SaveGame("checkpoint");
+            if (input.WasKeyPressedRaw(Key::F9)) LoadGame("checkpoint");
+            if (flowActive_ && input.WasKeyPressedRaw(Key::F2)) FlowReload();
+            if (flowActive_ && input.WasKeyPressedRaw(Key::F3)) FlowMainMenu();
         }
 
         const std::filesystem::path assetsDir =
@@ -907,7 +947,8 @@ int Engine::Run(const EngineConfig& configIn) {
             // mouse sets, edits text buffers. Suspended while the editor owns
             // the keyboard (ImGui feeds SetUIKeyboardCaptured).
             const bool wasEditing = ui::WantsTextInput(uiCtx_);
-            if (!uiKeyboardExternal_) ui::UpdateNavigation(scene, input, uiCtx_, dt);
+            if (!uiKeyboardExternal_ && !devMenuOpen_) // dev menu owns nav while open
+                ui::UpdateNavigation(scene, input, uiCtx_, dt);
             // While a text field is being edited, mute the normal keyboard
             // queries so gameplay / dev-menu / schematic key reads stay quiet
             // (the editing code uses the raw variants). Latch capture through
@@ -915,18 +956,24 @@ int Engine::Run(const EngineConfig& configIn) {
             // committed/cancelled must not also trigger an Enter/Escape-bound
             // schematic or gameplay action the same frame. The edge is gone by
             // the next frame, so capture releases naturally.
-            input.SetTextCapture(!uiKeyboardExternal_ &&
-                                 (wasEditing || ui::WantsTextInput(uiCtx_)));
+            // Also mute while the dev menu is open so its raw-read navigation doesn't
+            // double-drive gameplay / schematics / character input this frame.
+            input.SetTextCapture(devMenuOpen_ ||
+                                 (!uiKeyboardExternal_ &&
+                                  (wasEditing || ui::WantsTextInput(uiCtx_))));
             PlayUISounds(); // hover/click one-shots (edge-detected)
         }
 
         // High-level game flow: reads the fresh button-click state above to drive
         // menu -> loading -> gameplay transitions (runtime only; opt-in via the
         // project's main-menu scene). Cursor lock is applied here too.
-        if (flowActive_) UpdateGameFlow(dt);
+        // Flow transitions + captions are PRESENTATION timers, not simulation - drive
+        // them off the real frame time so dev-menu pause/slow-mo (which scales `dt`)
+        // never freezes a loading fade or the caption crawl.
+        if (flowActive_) UpdateGameFlow(dt_);
         if (!onInit_) {             // runtime only (not the editor preview)
             ApplyChangedSettings(); // live-apply any Settings widget the user just changed
-            UpdateCaptions(dt);     // drain audio captions -> drive the caption element
+            UpdateCaptions(dt_);    // drain audio captions -> drive the caption element
         }
 
         // Visual-script "Schematics" tick while the simulation runs (the editor's
@@ -970,12 +1017,29 @@ int Engine::Run(const EngineConfig& configIn) {
             UpdateInteractions(scene, dt);
         }
         if (physics.IsRunning()) anim::UpdateRotators(scene, dt);
+        // Spatial-audio occlusion: push the project's tuning + a physics segment
+        // test so 3D sources are attenuated/muffled by geometry (multi-ray leaks
+        // through gaps). Only fed while the game runs (colliders live then).
+        if (Project::HasActive()) {
+            const AudioOcclusionSettings& os = Project::Active().Settings().occlusion;
+            audio.SetOcclusion({os.enabled, os.rays, os.attenuation, os.cutoffHz, os.spread});
+        }
+        std::function<bool(const glm::vec3&, const glm::vec3&)> segBlocked;
+        if (physics.IsRunning()) {
+            segBlocked = [&physics](const glm::vec3& a, const glm::vec3& b) {
+                glm::vec3 d = b - a;
+                const f32 len = glm::length(d);
+                if (len < 1e-3f) return false;
+                return physics.Raycast(a, d / len, len) < len - 0.05f; // blocked before reaching b
+            };
+        }
         audio.UpdateScene(scene,
                           Project::HasActive() ? Project::Active().AssetsDir()
                                                : std::filesystem::path(),
                           renderer.GetCamera().Position(),
                           renderer.GetCamera().Forward(),
-                          physics.IsRunning()); // autoplay only when the game runs
+                          physics.IsRunning(), // autoplay only when the game runs
+                          segBlocked, dt);
         audio.Update();
         // Adaptive music: install + start the project's graph on the edge into the
         // running game; crossfade out when it stops. Parameters/state are then driven
@@ -993,9 +1057,11 @@ int Engine::Run(const EngineConfig& configIn) {
                     }
                 }
                 musicStarted = true;
+                musicZoneActive = entt::null; // re-apply the containing zone next frame
             } else if (!running && musicStarted) {
                 audio.StopMusic();
                 musicStarted = false;
+                musicZoneActive = entt::null;
             }
             // Drain deferred music commands queued by gameplay (schematics): state
             // changes, parameter sets, and one-shot stingers.
@@ -1009,6 +1075,44 @@ int Engine::Run(const EngineConfig& configIn) {
                 while (game::ConsumeMusicParameter(pn, pv)) audio.SetMusicParameter(pn, pv);
                 std::string sa;
                 while (game::ConsumeStinger(sa)) audio.PostStinger(mAssets / sa, "Music");
+                // World music zones: the highest-priority enabled MusicZone the
+                // player is inside drives the music on the ENTER edge (crossfade to
+                // its state + optional parameter). PlayMusicState no-ops if already
+                // there, so this won't fight a schematic that set the same state.
+                {
+                    glm::vec3 lp = renderer.GetCamera().Position();
+                    auto players = scene.Registry().view<Transform, CharacterController>();
+                    if (players.begin() != players.end())
+                        lp = glm::vec3(scene.WorldMatrix(*players.begin())[3]);
+                    entt::entity bestZone = entt::null;
+                    int bestPri = 0;
+                    for (const entt::entity ze : scene.Registry().view<MusicZone>()) {
+                        MusicZone& mz = scene.Registry().get<MusicZone>(ze);
+                        mz.active = false;
+                        if (!mz.enabled || !scene.Registry().all_of<Transform>(ze)) continue;
+                        const glm::vec3 a = glm::abs(
+                            glm::vec3(glm::inverse(scene.WorldMatrix(ze)) * glm::vec4(lp, 1.0f)));
+                        // >= so the LAST equal-priority overlapping zone wins (matches
+                        // CameraZone); the null guard still admits a lone negative-priority zone.
+                        if (a.x <= mz.halfExtents.x && a.y <= mz.halfExtents.y &&
+                            a.z <= mz.halfExtents.z &&
+                            (bestZone == entt::null || mz.priority >= bestPri)) {
+                            bestZone = ze;
+                            bestPri = mz.priority;
+                        }
+                    }
+                    if (bestZone != entt::null) scene.Registry().get<MusicZone>(bestZone).active = true;
+                    if (bestZone != musicZoneActive) {
+                        musicZoneActive = bestZone;
+                        if (bestZone != entt::null) {
+                            const MusicZone& mz = scene.Registry().get<MusicZone>(bestZone);
+                            if (!mz.musicState.empty())
+                                audio.PlayMusicState(mz.musicState, mz.fadeSeconds);
+                            if (!mz.parameter.empty())
+                                audio.SetMusicParameter(mz.parameter, mz.parameterValue);
+                        }
+                    }
+                }
                 // One-shot voicelines from schematics: play the clip; PlayUAF
                 // surfaces its baked "Speaker: caption" into the caption stack.
                 std::string va;
@@ -1245,6 +1349,11 @@ void Engine::LoadLevel(const std::filesystem::path& base) {
     const std::filesystem::path assets = Project::HasActive()
                                              ? Project::Active().AssetsDir()
                                              : base.parent_path();
+    // Switching mid-play (e.g. the dev-menu "skip to zone") must not strand a running
+    // conversation or a cutscene owning the camera: Unload destroys their entities, so
+    // tear down the narrative runtime first (mirrors LoadGame/FlowMainMenu).
+    ResetDialogueRuntime();
+    ClearCutscene();
     // Switching: unload the current level (UI / other scenes stay resident).
     if (currentLevel_->Loaded()) currentLevel_->Unload(*scene_);
     currentLevel_->SetBase(base);
@@ -1601,13 +1710,119 @@ void Engine::PresentBootSplash(f32 progress) {
     renderer_->RenderScene(*scene_, 0.0f); // draws the splash UI + presents
 }
 
+void Engine::DevMenuScanLevels() {
+    devLevels_.clear();
+    if (!Project::HasActive()) return;
+    const std::filesystem::path root = Project::Active().AssetsDir();
+    std::error_code ec;
+    std::vector<std::filesystem::path> bases;
+    for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
+         it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file() || it->path().extension() != ".hbscene") continue;
+        bases.push_back(scene::ResolveLevel(it->path()).base); // dedup members -> one base
+    }
+    std::sort(bases.begin(), bases.end());
+    bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
+    devLevels_ = std::move(bases);
+}
+
+void Engine::RebuildDevMenu() {
+    devItems_.clear();
+    const auto header = [&](std::string s) {
+        DevMenuItem it;
+        it.label = std::move(s);
+        it.header = true;
+        devItems_.push_back(std::move(it));
+    };
+    const auto action = [&](std::string s, std::function<void()> fn) {
+        DevMenuItem it;
+        it.label = std::move(s);
+        it.activate = std::move(fn);
+        devItems_.push_back(std::move(it));
+    };
+    const auto value = [&](std::string s, std::string v, std::function<void(int)> fn) {
+        DevMenuItem it;
+        it.label = std::move(s);
+        it.value = std::move(v);
+        it.adjust = std::move(fn);
+        devItems_.push_back(std::move(it));
+    };
+
+    header("FLOW");
+    action("Restart level", [this] { devMenuOpen_ = false; FlowReload(); });
+    action("Main menu", [this] { devMenuOpen_ = false; FlowMainMenu(); });
+    action("Save checkpoint", [this] { SaveGame("checkpoint"); });
+    action("Load checkpoint", [this] { LoadGame("checkpoint"); });
+
+    if (!devLevels_.empty()) {
+        header("LEVELS (skip to zone)");
+        for (const std::filesystem::path& base : devLevels_) {
+            const std::filesystem::path b = base;
+            action(base.filename().string(), [this, b] { devMenuOpen_ = false; LoadLevel(b); });
+        }
+    }
+
+    header("TIME");
+    {
+        const f32 tod = scene_ ? scene_->Environment().timeOfDay : 12.0f;
+        char v[32];
+        std::snprintf(v, sizeof(v), "%.1f h", tod);
+        value("Time of day", v, [this](int d) {
+            // Remember the authored sky mode the first time we force, so "release"
+            // can restore it (forcing sets dynamicSky=1 each frame in the render loop).
+            if (scene_ && devSkyRestore_ < 0) devSkyRestore_ = scene_->Environment().dynamicSky;
+            f32 t = (forceTimeOfDay_ >= 0.0f) ? forceTimeOfDay_
+                    : (scene_ ? scene_->Environment().timeOfDay : 12.0f);
+            t = std::fmod(t + static_cast<f32>(d) + 24.0f, 24.0f);
+            forceTimeOfDay_ = t; // held each frame by the environment re-apply
+            if (scene_) scene_->Environment().timeOfDay = t;
+        });
+        // Release a dev-menu time override (devSkyRestore_ >= 0 means WE forced it, not
+        // the --time CLI flag): stop holding the hour + restore the authored sky mode.
+        if (forceTimeOfDay_ >= 0.0f && devSkyRestore_ >= 0) {
+            action("Time of day: release (auto)", [this] {
+                forceTimeOfDay_ = -1.0f;
+                if (scene_) scene_->Environment().dynamicSky = devSkyRestore_;
+                devSkyRestore_ = -1;
+            });
+        }
+        char sv[32];
+        std::snprintf(sv, sizeof(sv), "%.2fx", devTimeScale_);
+        value("Game speed", sv,
+              [this](int d) { devTimeScale_ = glm::clamp(devTimeScale_ + static_cast<f32>(d) * 0.25f,
+                                                         0.0f, 4.0f); });
+        action(devTimeScale_ <= 0.001f ? "Resume (unpause)" : "Pause",
+               [this] { devTimeScale_ = devTimeScale_ <= 0.001f ? 1.0f : 0.0f; });
+    }
+
+    if (audio_ && audio_->HasMusicGraph()) {
+        const std::vector<std::string> states = audio_->MusicStateNames();
+        if (!states.empty()) {
+            header("MUSIC");
+            const std::string cur = audio_->CurrentMusicState();
+            value("State", cur.empty() ? "(none)" : cur, [this, states](int d) {
+                const std::string c = audio_->CurrentMusicState();
+                int idx = 0;
+                for (int i = 0; i < static_cast<int>(states.size()); ++i)
+                    if (states[static_cast<usize>(i)] == c) { idx = i; break; }
+                idx = (idx + d + static_cast<int>(states.size())) % static_cast<int>(states.size());
+                audio_->PlayMusicState(states[static_cast<usize>(idx)]);
+            });
+        }
+    }
+}
+
 void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
     if (!devMenuOpen_ || !renderer_ || !scene_) return;
     if (!(Project::HasActive() && Project::Active().Settings().build.devMenu)) return;
     const glm::vec2 target = renderer_->RenderTargetSize();
     if (target.x < 1.0f || target.y < 1.0f) return;
+    ui::FontAtlas& font = ui::SharedFont();
+    font.Initialize(*renderer_);
+    if (!font.Ready()) return;
 
-    // --- Stats ---
+    // --- Stats header string ---
     const f32 fps = dt_ > 1e-5f ? 1.0f / dt_ : 0.0f;
     const char* st = "None";
     switch (gameState_) {
@@ -1622,30 +1837,25 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
     glm::vec3 ppos(0.0f);
     auto pv = scene_->Registry().view<Transform, CharacterController>();
     if (pv.begin() != pv.end()) ppos = glm::vec3(scene_->WorldMatrix(*pv.begin())[3]);
-    const int objects = static_cast<int>(scene_->Registry().view<Transform>().size());
     std::string obj = game::CurrentObjectiveText();
     if (obj.empty()) obj = "(none)";
-
     const Renderer::FrameStats& rs = renderer_->Stats();
     char buf[512];
     std::snprintf(buf, sizeof(buf),
-                  "== DEV MENU ==  (Ctrl+` to close)\n"
-                  "FPS %.0f   |   %.2f ms\n"
-                  "Draws: %u/%u (%u culled)\n"
-                  "State: %s    Level: %s\n"
-                  "Player: %.1f, %.1f, %.1f    Objects: %d\n"
-                  "Objective: %s\n"
-                  "[F5] Save   [F9] Load   [F2] Restart   [F3] Menu",
-                  fps, dt_ * 1000.0f, rs.drawn, rs.total, rs.culled, st, level.c_str(),
-                  ppos.x, ppos.y, ppos.z, objects, obj.c_str());
-    const std::string block = buf;
+                  "== DEV MENU ==  (Ctrl+` close  -  arrows move  -  Enter/<> use)\n"
+                  "FPS %.0f  |  %.2f ms  |  Draws %u/%u (%u culled)\n"
+                  "State: %s   Level: %s   Player %.1f,%.1f,%.1f\n"
+                  "Objective: %s",
+                  fps, dt_ * 1000.0f, rs.drawn, rs.total, rs.culled, st, level.c_str(), ppos.x,
+                  ppos.y, ppos.z, obj.c_str());
+    const std::string stats = buf;
 
-    // --- Emit quads (NDC) ---
-    auto ndc = [&](f32 x, f32 y) {
+    // --- Emit helpers (NDC) ---
+    const auto ndc = [&](f32 x, f32 y) {
         return glm::vec2(x / target.x * 2.0f - 1.0f, 1.0f - y / target.y * 2.0f);
     };
-    auto addRect = [&](f32 x0, f32 y0, f32 x1, f32 y1, f32 r, f32 g, f32 b, f32 a, u32 tex,
-                       f32 u0, f32 v0, f32 u1, f32 v1) {
+    const auto addRect = [&](f32 x0, f32 y0, f32 x1, f32 y1, f32 r, f32 g, f32 b, f32 a, u32 tex,
+                             f32 u0, f32 v0, f32 u1, f32 v1) {
         const glm::vec2 p0 = ndc(x0, y0), p1 = ndc(x1, y1);
         const rhi::UIVertex a00{p0.x, p0.y, u0, v0, r, g, b, a, tex};
         const rhi::UIVertex a10{p1.x, p0.y, u1, v0, r, g, b, a, tex};
@@ -1654,20 +1864,58 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
         out.push_back(a00); out.push_back(a10); out.push_back(a11);
         out.push_back(a00); out.push_back(a11); out.push_back(a01);
     };
-
-    ui::FontAtlas& font = ui::SharedFont();
-    font.Initialize(*renderer_);
-    const f32 textPx = 18.0f, padX = 12.0f, padY = 10.0f, ox = 16.0f, oy = 16.0f;
-    std::vector<ui::GlyphQuad> quads;
-    f32 bw = 0.0f, bh = 0.0f;
-    if (font.Ready()) font.Layout(block, textPx, quads, bw, bh);
-
-    addRect(ox, oy, ox + bw + padX * 2.0f, oy + bh + padY * 2.0f, 0.04f, 0.05f, 0.08f, 0.85f, 0,
-            0, 0, 1, 1); // panel
     const u32 ft = font.TextureIndex();
-    for (const ui::GlyphQuad& q : quads)
-        addRect(ox + padX + q.x0, oy + padY + q.y0, ox + padX + q.x1, oy + padY + q.y1,
-                0.95f, 0.97f, 1.0f, 1.0f, ft, q.u0, q.v0, q.u1, q.v1);
+    const f32 textPx = 17.0f, padX = 12.0f, padY = 10.0f, ox = 16.0f, oy = 16.0f;
+    const auto measure = [&](const std::string& s) {
+        std::vector<ui::GlyphQuad> q;
+        f32 w = 0.0f, h = 0.0f;
+        font.Layout(s, textPx, q, w, h);
+        return glm::vec2(w, h);
+    };
+    const auto drawText = [&](f32 x, f32 y, const std::string& s, f32 r, f32 g, f32 b) {
+        std::vector<ui::GlyphQuad> q;
+        f32 w = 0.0f, h = 0.0f;
+        font.Layout(s, textPx, q, w, h);
+        for (const ui::GlyphQuad& gq : q)
+            addRect(x + gq.x0, y + gq.y0, x + gq.x1, y + gq.y1, r, g, b, 1.0f, ft, gq.u0, gq.v0,
+                    gq.u1, gq.v1);
+    };
+
+    // One display string per menu row.
+    const auto rowText = [&](const DevMenuItem& it, bool sel) {
+        if (it.header) return it.label;
+        std::string s = (sel ? "> " : "  ") + it.label;
+        if (!it.value.empty()) s += "   [" + it.value + "]";
+        return s;
+    };
+
+    // --- Measure for the panel size ---
+    const glm::vec2 statsSz = measure(stats);
+    const f32 lineH = textPx + 7.0f;
+    f32 maxW = statsSz.x;
+    for (const DevMenuItem& it : devItems_) maxW = glm::max(maxW, measure(rowText(it, false)).x + 14.0f);
+    const f32 gap = 8.0f;
+    const f32 contentH = statsSz.y + gap + static_cast<f32>(devItems_.size()) * lineH;
+
+    // Panel.
+    addRect(ox, oy, ox + maxW + padX * 2.0f, oy + contentH + padY * 2.0f, 0.04f, 0.05f, 0.08f, 0.9f,
+            0, 0, 0, 1, 1);
+
+    // Stats (dim), then the menu rows.
+    drawText(ox + padX, oy + padY, stats, 0.85f, 0.88f, 0.95f);
+    f32 y = oy + padY + statsSz.y + gap;
+    for (int i = 0; i < static_cast<int>(devItems_.size()); ++i) {
+        const DevMenuItem& it = devItems_[static_cast<usize>(i)];
+        const bool sel = (i == devMenuSel_) && !it.header;
+        if (sel) // highlight bar behind the selected row
+            addRect(ox + padX - 4.0f, y - 1.0f, ox + maxW + padX + 4.0f, y + lineH - 2.0f, 0.20f,
+                    0.35f, 0.55f, 0.85f, 0, 0, 0, 1, 1);
+        f32 r = 0.92f, g = 0.94f, b = 0.98f;
+        if (it.header) { r = 0.55f; g = 0.75f; b = 1.0f; }
+        else if (sel)  { r = 1.0f; g = 1.0f; b = 0.7f; }
+        drawText(ox + padX, y, rowText(it, sel), r, g, b);
+        y += lineH;
+    }
 }
 
 void Engine::BuildFadeCurtain(std::vector<rhi::UIVertex>& out) {
@@ -1858,8 +2106,40 @@ void Engine::EnterDialogueNode(u32 nodeId) {
             hold = glm::max(hold, 0.25f);
             if (hasText && userSettings_.captionsEnabled)
                 PushCaption(n->speaker.empty() ? n->text : n->speaker + ": " + n->text, hold);
-            if (!n->clip.empty() && audio_ && !assets.empty())
-                audio_->PlayUAF(assets / n->clip, {}, /*caption=*/!hasText);
+            if (!n->clip.empty() && audio_ && !assets.empty()) {
+                // Dialogue actor: if an entity voices this line's speaker, play the
+                // clip 3D from its world position (explicit DialogueActor first, then
+                // any entity whose Name matches); otherwise fall back to flat 2D.
+                bool spatial = false;
+                if (scene_ && !n->speaker.empty()) {
+                    entt::registry& reg = scene_->Registry();
+                    entt::entity actor = entt::null;
+                    std::string bus = "Dialogue";
+                    f32 minD = 1.0f, maxD = 35.0f;
+                    for (const entt::entity ae : reg.view<DialogueActor>()) {
+                        const DialogueActor& da = reg.get<DialogueActor>(ae);
+                        const std::string key =
+                            da.speaker.empty()
+                                ? (reg.all_of<Name>(ae) ? reg.get<Name>(ae).value : std::string())
+                                : da.speaker;
+                        if (key == n->speaker) {
+                            actor = ae;
+                            bus = da.bus;
+                            minD = da.minDistance;
+                            maxD = da.maxDistance;
+                            break;
+                        }
+                    }
+                    if (actor == entt::null)
+                        for (const entt::entity ne : reg.view<Name>())
+                            if (reg.get<Name>(ne).value == n->speaker) { actor = ne; break; }
+                    if (actor != entt::null && reg.all_of<Transform>(actor)) {
+                        const glm::vec3 pos = glm::vec3(scene_->WorldMatrix(actor)[3]);
+                        spatial = audio_->PlayUAFAt(assets / n->clip, pos, bus, minD, maxD, !hasText);
+                    }
+                }
+                if (!spatial) audio_->PlayUAF(assets / n->clip, {}, /*caption=*/!hasText);
+            }
             dialogueTimer_ = hold;
             return; // wait out the hold (UpdateDialogue advances when it lapses)
         } else if (n->type == dlg::NodeType::Choice) {
@@ -2023,8 +2303,9 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
     // E/gamepad key must not fire behind it.
     const bool menuOpen =
         uiManagerMode_ && !uiManager_.Empty() && uiManager_.Top() != "HUD";
-    if (menuOpen || actionMap_.Rebinding() || rebindJustCommitted_ || dialogueNode_ != 0 ||
-        cutsceneTime_ >= 0.0f || game::DialoguePending() || game::CutscenePending()) {
+    if (menuOpen || devMenuOpen_ || actionMap_.Rebinding() || rebindJustCommitted_ ||
+        dialogueNode_ != 0 || cutsceneTime_ >= 0.0f || game::DialoguePending() ||
+        game::CutscenePending()) {
         HideInteractPrompt();
         return;
     }
@@ -2231,7 +2512,7 @@ void Engine::UpdateGameFlow(f32 dt) {
         const std::string act = PollClickedAction(*scene_);
         // A "rebind:<Action>" button starts listening for the next key/button; the
         // rebind poll (top of the update) captures + persists it.
-        if (act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
+        if (!devMenuOpen_ && act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
         if (act == "play")
             FlowPlay();
         else if (act == "settings" && uiManager_.Has(*scene_, "Settings")) {
@@ -2330,7 +2611,7 @@ void Engine::UpdateGameFlow(f32 dt) {
         const std::string act = PollClickedAction(*scene_);
         // A "rebind:<Action>" button starts listening for the next key/button; the
         // rebind poll (top of the update) captures + persists it.
-        if (act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
+        if (!devMenuOpen_ && act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
         if (act == "menu")
             FlowMainMenu();
         else if (act == "restart")

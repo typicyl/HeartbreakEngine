@@ -21,6 +21,20 @@ void FlyCameraController::TakeControl(Renderer& renderer) {
     renderer.SetOrbitEnabled(false);
 }
 
+void FlyCameraController::Focus(Renderer& renderer, const glm::vec3& center, f32 radius) {
+    SyncFrom(renderer.GetCamera()); // adopt the current view angle (no look snap)
+    const f32 cy = std::cos(glm::radians(yaw_));
+    const f32 sy = std::sin(glm::radians(yaw_));
+    const f32 cp = std::cos(glm::radians(pitch_));
+    const f32 sp = std::sin(glm::radians(pitch_));
+    const glm::vec3 forward = glm::normalize(glm::vec3(cy * cp, sp, sy * cp));
+    const f32 dist = glm::max(radius * 2.5f, 1.0f); // frame the sphere with margin
+    pos_ = center - forward * dist;
+    renderer.SetOrbitEnabled(false); // controller owns the camera; holds the framed view
+    flying_ = false;                 // repositioned, not RMB-flying
+    renderer.GetCamera().LookAt(pos_, pos_ + forward);
+}
+
 void FlyCameraController::Update(const Input& input, Renderer& renderer, f32 dt,
                                  bool wantMouseFly) {
     const Input::GamepadState& pad = input.Gamepad(0);

@@ -3290,22 +3290,13 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         cb.params1 = {ps.painterlyLightTint, ps.painterlyWarmCool, ps.painterlyCanvasScale,
                       ps.painterlyCanvasStrength};
         cb.params2 = {ps.painterlyStrokeDetail, ps.painterlyPosterize, 0.0f, 0.0f};
-        // Kuwahara at HALF res: outTexel = half (output positions), inTexel stays full
-        // (the filter samples gInput0 with gInTexel, so its radius stays in full-res
-        // pixels -> half the output pixels, ~4x cheaper, near-lossless once upscaled).
-        const glm::vec2 halfTexel(1.0f / painterlyHalf_.width, 1.0f / painterlyHalf_.height);
-        cb.outTexel = halfTexel;
-        cb.inTexel = sceneTexel;
-        DrawPostPass(painterlyPipe_, postPass16_, painterlyHalf_, cb);
-        // Bilinear-upscale the smooth underpainting back to full-res painterly_ (the
-        // strokes + downstream composite over it at full res).
-        PostUBO up;
-        up.input0 = slotPainterlyHalf_;
-        up.outTexel = sceneTexel;
-        up.inTexel = halfTexel;
-        DrawPostPass(copyPipe_, postPass16_, painterly_, up);
+        // FULL-res Kuwahara: half-res + bilinear upscale blurred the edge-aware regions
+        // into mush (the filter's value is crisp region boundaries), which read as ugly
+        // blocky/blotchy painting. Painterly is the art style - run it full res; reclaim
+        // perf from other passes instead. (cb.outTexel/inTexel stay full-res, set above.)
+        DrawPostPass(painterlyPipe_, postPass16_, painterly_, cb);
         hdrInput = slotPainterly_;
-        GpuMark("kuwahara"); // delta fog->here = half-res Kuwahara + the upscale
+        GpuMark("kuwahara");
 
         // Collect world-anchored censors once (shared by the stroke pass + the
         // composite below). The shader does a 3D sphere test, so no projection here.

@@ -16,7 +16,7 @@ namespace hbe {
 
 struct UserSettings {
     f32 masterVolume = 1.0f;      // [0,1] -> AudioSystem Master bus
-    int graphicsPreset = 0;       // 0 High (as authored), 1 Medium, 2 Low (degrade-only)
+    int graphicsPreset = 1;       // 0 High (as authored), 1 Medium (default; lean shipped stack), 2 Low
     f32 brightness = 0.5f;        // [0,1] -> +/-1-stop VIEW exposure multiplier (0.5 = neutral)
     bool captionsEnabled = false; // closed captions on/off
     // Per-user control rebinds: action name -> binding, overriding the project's

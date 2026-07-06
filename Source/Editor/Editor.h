@@ -196,6 +196,8 @@ private:
     // Captures the live camera into the freecam state (prevents a snap when
     // handing control from auto-orbit to the freecam).
     void SyncFreecam(Renderer& renderer);
+    // "F" hotkey: frame the editor camera on the selected entity's world bounds.
+    void FrameSelected(Engine& engine);
 
     entt::entity selected_ = entt::null;
     int  selectedKey_ = -1;    // timeline keyframe selection
@@ -324,6 +326,9 @@ private:
                      uaf::AssetType uafType, std::string& out,
                      const char* noneLabel = "(none)");
     char assetPickerSearch_[128] = {}; // shared filter text (one popup open at a time)
+    // Case-insensitive test of `rel` against the shared assetPickerSearch_ (empty
+    // filter matches all). Used by AssetPicker + the "open asset" list popups.
+    bool AssetSearchMatch(const std::string& rel) const;
 
     std::filesystem::path viewedAsset_;
     std::string viewedTypeName_;
@@ -366,6 +371,11 @@ private:
     bool musicLoaded_ = false;        // musicEdit_ synced from the project this session
     int  musicStateSel_ = 0;          // selected state row
     bool musicPreviewing_ = false;    // a state is auditioning in the editor
+    // DAW timeline (arrangement view of the selected state's layers over a bar grid).
+    f32  musicZoom_ = 120.0f;         // pixels per second on the timeline
+    f32  musicScroll_ = 0.0f;         // seconds at the timeline's left edge
+    f32  musicEditTime_ = 0.0f;       // playhead (seconds; ticks while previewing)
+    int  musicLayerSel_ = -1;         // selected layer lane in the timeline (-1 = none)
     // Creates Assets/<dir>/NewAudioEvent[N].hbevent and returns its path.
     std::filesystem::path CreateAudioEventAsset(const std::filesystem::path& dir,
                                                 const std::string& name = {});
@@ -406,8 +416,6 @@ private:
     bool csPlaying_ = false;
     f32 csPrevTime_ = 0.0f;                      // last eval time (marker firing)
     std::string csPreviewSnapshot_;              // scene JSON to restore on stop
-    std::vector<std::string> csAudioChoices_;    // .uaf voicelines (dialogue lane)
-    std::vector<std::string> csDialogueChoices_; // .hbdialogue assets
     void OpenCutscene(Engine& engine, const std::filesystem::path& path);
     void DrawCutsceneTimeline(Engine& engine);
     void CutscenePreviewBegin(Engine& engine);
@@ -554,7 +562,10 @@ private:
     // later point projects onto that plane, so the stroke floats in real space and is
     // NOT conformed to the mesh. Lit + transparent + double-sided, with a baked oil
     // brush-streak texture - real brush marks in 3D, viewable from any angle.
-    bool paintStrokeMode_ = true;     // primary mode: free 3D brush strokes on surfaces
+    // Default OFF: opening the Paint tool paints the SURFACE texture (the simple,
+    // expected mode). 3D brush strokes are opt-in via the "3D brush strokes" checkbox,
+    // so they don't surprise the user by spawning floating ribbon geometry.
+    bool paintStrokeMode_ = false;
     rhi::MeshHandle strokeQuadMesh_;  // shared oriented-quad mesh
     std::unordered_map<std::string, std::string> strokeMatCache_; // sig -> .hbmat rel path
     int strokeMatCounter_ = 0;

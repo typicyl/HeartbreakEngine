@@ -16,6 +16,7 @@
 #include <glm/glm.hpp>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -82,9 +83,30 @@ public:
     // enabled) - pass false when the caller shows its own text (dialogue lines).
     bool PlayUAF(const std::filesystem::path& uafPath, const std::string& bus = {},
                  bool caption = true);
+    // Like PlayUAF but plays the clip as a 3D one-shot at a WORLD position (distance
+    // attenuation + occlusion). Used for dialogue ACTORS so a voice line emits from
+    // the speaking character instead of flat 2D. Non-looping.
+    bool PlayUAFAt(const std::filesystem::path& uafPath, const glm::vec3& position,
+                   const std::string& bus = {}, f32 minDist = 1.0f, f32 maxDist = 35.0f,
+                   bool caption = true);
     // Drops PlayUAF's decoded-PCM cache (call after a .uaf is re-imported or its
     // tags edited, so the next play reflects the new PCM / caption / speaker).
     void ClearUAFCache();
+
+    // -- Spatial occlusion -------------------------------------------------------
+    // True positional occlusion for spatial voices: geometry between a source and
+    // the listener both ATTENUATES and MUFFLES (per-voice low-pass) the sound, and
+    // multiple rays let it leak through gaps/openings instead of dead-stopping at a
+    // wall. Off by default; the engine enables it per project + feeds a world
+    // segment-blocked test (physics raycast) into UpdateScene.
+    struct OcclusionConfig {
+        bool enabled = false;
+        int rays = 4;               // 1 = straight line; more = gap leakage
+        f32 attenuation = 0.35f;    // volume floor at full occlusion (0..1)
+        f32 cutoffHz = 700.0f;      // low-pass cutoff at full occlusion
+        f32 spread = 0.7f;          // offset-ray ring radius in metres
+    };
+    void SetOcclusion(const OcclusionConfig& cfg);
 
     // -- Adaptive music director -------------------------------------------------
     // Interactive music: a graph of STATES (each a set of synced looping LAYERS)
@@ -103,6 +125,7 @@ public:
     void SetMusicParameter(const std::string& name, f32 value);
     f32  MusicParameterValue(const std::string& name) const;
     std::string CurrentMusicState() const; // "" when stopped
+    std::vector<std::string> MusicStateNames() const; // states in the installed graph
     bool HasMusicGraph() const;
     // One-shot musical accent over the current music (fire-and-forget on `bus`).
     void PostStinger(const std::filesystem::path& uafPath, const std::string& bus = "Music",
@@ -119,9 +142,15 @@ public:
     // `gamePlaying` is the simulation state: autoplay sources arm only when the
     // GAME runs (play mode / runtime), so merely viewing a scene in the editor
     // stays silent. The inspector's manual Play button still previews anytime.
+    // `segmentBlocked(a, b)` returns true when world geometry blocks the segment a->b
+    // (the engine wraps a physics raycast). When set and occlusion is enabled, every
+    // spatial voice is attenuated/muffled by obstruction each frame. `dt` drives the
+    // smooth glide of the occlusion amount (0 = snap).
     void UpdateScene(Scene& scene, const std::filesystem::path& assetsDir,
                      const glm::vec3& listenerPos, const glm::vec3& listenerForward,
-                     bool gamePlaying);
+                     bool gamePlaying,
+                     const std::function<bool(const glm::vec3&, const glm::vec3&)>& segmentBlocked = {},
+                     f32 dt = 0.0f);
 
     bool IsAvailable() const;
 

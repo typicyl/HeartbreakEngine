@@ -350,21 +350,29 @@ float ShadowFactor(float3 positionWS, float NdotL)
         const float2 tileMin = tile + HBE_SHADOW_ATLAS_TEXEL;
         const float2 tileMax = tile + 0.5f - HBE_SHADOW_ATLAS_TEXEL;
 
-        // 3x3 PCF. UVs are clamped to the tile (the bindless sampler wraps).
+        // Rotated 4-tap PCF (was a 3x3 = 9-tap): ~half the shadow-map samples per
+        // lit pixel for near-identical softness. The directional shadow lookup is the
+        // dominant DAYTIME GPU cost (the sun casts by day, dims to ~0 at night), so
+        // halving it gives the daytime frame the headroom to reach the vsync cap that
+        // night already hits. A per-world-position rotation dithers the sparser kernel
+        // so it doesn't reveal a fixed grid (same trick as ShadowFactorCheap below).
+        const float rot =
+            frac(sin(dot(positionWS.xz, float2(12.9898f, 78.233f))) * 43758.5453f) * 6.2831853f;
+        const float sr = sin(rot), cr = cos(rot);
+        const float2 kBase[4] = {float2(0.9f, 0.9f), float2(-0.9f, 0.9f), float2(0.9f, -0.9f),
+                                 float2(-0.9f, -0.9f)};
         float lit = 0.0f;
         [unroll]
-        for (int y = -1; y <= 1; ++y)
+        for (int i = 0; i < 4; ++i)
         {
-            [unroll]
-            for (int x = -1; x <= 1; ++x)
-            {
-                float2 suv = clamp(tile + uv * 0.5f + float2(x, y) * HBE_SHADOW_ATLAS_TEXEL,
-                                   tileMin, tileMax);
-                float occluder = SampleBindlessLod(gShadowMapIndex, suv, 0.0f).r;
-                lit += (receiver <= occluder) ? 1.0f : 0.0f;
-            }
+            const float2 d = float2(kBase[i].x * cr - kBase[i].y * sr,
+                                    kBase[i].x * sr + kBase[i].y * cr) *
+                             HBE_SHADOW_ATLAS_TEXEL;
+            const float2 suv = clamp(tile + uv * 0.5f + d, tileMin, tileMax);
+            const float occluder = SampleBindlessLod(gShadowMapIndex, suv, 0.0f).r;
+            lit += (receiver <= occluder) ? 1.0f : 0.0f;
         }
-        return lit / 9.0f;
+        return lit * 0.25f;
     }
     return 1.0f;
 }

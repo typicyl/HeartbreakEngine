@@ -2580,6 +2580,9 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.params1 = {ps.painterlyLightTint, ps.painterlyWarmCool, ps.painterlyCanvasScale,
                       ps.painterlyCanvasStrength};
         cb.params2 = {ps.painterlyStrokeDetail, ps.painterlyPosterize, 0.0f, 0.0f};
+        // FULL-res Kuwahara: half-res + bilinear upscale blurred the edge-aware regions
+        // into mush (the filter's whole value is crisp region boundaries), so it runs at
+        // full res. Painterly is the art style; spend the ms on it, save perf elsewhere.
         DrawPostPass(painterlyPSO_.Get(), painterly_.Get(), rtvAt(15 + kBloomMaxMips), sceneW_,
                      sceneH_, cb);
         hdrInput = slotPainterly_;

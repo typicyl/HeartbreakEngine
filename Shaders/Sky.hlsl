@@ -152,9 +152,11 @@ float3 StarField(float3 dir, float time)
 float3 NightSky(float3 dir, float3 sunDir, float time)
 {
     float up = saturate(dir.y);
-    // Deep navy night: a real night sky isn't black - it keeps a blue glow,
-    // brighter (slightly teal) at the horizon, dark navy overhead.
-    float3 night = lerp(float3(0.028f, 0.050f, 0.090f), float3(0.010f, 0.020f, 0.050f), up);
+    // Deep-blue night: a real night sky is NOT black - it keeps a clear blue glow,
+    // brighter (a touch of teal) near the horizon, deep blue overhead. Kept bright
+    // enough to survive the night exposure (~0.6x) + tonemap + painterly and still
+    // read as blue instead of crushing to black.
+    float3 night = lerp(float3(0.060f, 0.105f, 0.190f), float3(0.032f, 0.055f, 0.120f), up);
     night += StarField(dir, time);
 
     float3 moonDir = normalize(float3(-sunDir.x, abs(sunDir.y) * 0.5f + 0.32f, -sunDir.z));

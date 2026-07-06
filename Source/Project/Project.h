@@ -118,6 +118,17 @@ struct AudioBusSetting {
     bool muted = false;
 };
 
+// Project-wide spatial-audio occlusion tuning. When enabled, world geometry
+// between a spatial source and the listener attenuates + muffles it (multi-ray so
+// sound leaks through gaps). Tests against physics colliders.
+struct AudioOcclusionSettings {
+    bool enabled = false;         // off by default (opt-in per project)
+    int rays = 4;                 // 1 = straight line; more = smoother gap leakage
+    f32 attenuation = 0.35f;      // volume floor at full occlusion (0..1)
+    f32 cutoffHz = 700.0f;        // low-pass cutoff (Hz) at full occlusion
+    f32 spread = 0.7f;            // offset-ray ring radius (m) for gap detection
+};
+
 // One device's button/key icon set: id -> texture `.uaf` path (relative to Assets).
 // `id` is a GamepadButton bit (pad devices) or a (u32)Key (keyboard). Sparse - only
 // the buttons the artist supplied art for. See input::PadButtons() / input::KeyName().
@@ -173,6 +184,8 @@ struct ProjectSettings {
     EnvironmentSettings environment;
     // The project's audio mixer (empty = engine defaults: Music/SFX/Ambience).
     std::vector<AudioBusSetting> audioBuses;
+    // Spatial-audio occlusion (geometry muffles/attenuates 3D sources).
+    AudioOcclusionSettings occlusion;
     // Adaptive-music graph (.hbmusic, relative to Assets). When set, the runtime
     // installs it on boot and crossfades into `musicStartState` when the game runs.
     std::string musicGraph;

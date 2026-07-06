@@ -13,7 +13,9 @@
 #include <miniaudio.h>
 
 #include <algorithm>
+#include <cmath>
 #include <deque>
+#include <functional>
 #include <list>
 #include <random>
 #include <string>
@@ -70,9 +72,113 @@ struct AudioSystem::Impl {
         ma_audio_buffer buffer{};
         ma_sound sound{};
         u32 id = 0; // 0 = anonymous (PlayPCM); event voices get an id
+        // Spatial occlusion: a positional voice routes sound -> lpf -> bus so
+        // obstruction can MUFFLE (not just quieten). Updated in UpdateScene.
+        ma_lpf_node lpf{};
+        bool hasLpf = false;
+        bool spatial = false;         // participates in the occlusion pass
+        glm::vec3 worldPos{0.0f};      // last known emitter position (one-shots)
+        f32 baseVolume = 1.0f;         // volume before occlusion attenuation
+        f32 minDist = 1.0f, maxDist = 30.0f;
+        f32 occ = 0.0f;                // smoothed occlusion 0..1 (0 = clear)
+        f32 curCutoff = 20000.0f;      // current LPF cutoff (Hz), to skip no-op reinits
     };
     std::list<Voice> voices;
     u32 nextVoiceId = 1;
+
+    // Spatial occlusion config (set by the engine from project settings).
+    OcclusionConfig occlusion;
+    static constexpr f32 kOpenCutoff = 20000.0f; // "transparent" LPF (no muffle)
+
+    // Insert a per-voice low-pass node between a positional sound and its bus so
+    // occlusion can darken the tone. No-op (leaves hasLpf=false) if unavailable;
+    // the voice then still gets occlusion ATTENUATION, just no muffle.
+    void AttachOcclusionLpf(Voice& v, const std::string& bus) {
+        ma_node_graph* ng = ma_engine_get_node_graph(&engine);
+        if (!ng) return;
+        const ma_uint32 ch = ma_engine_get_channels(&engine);
+        const ma_uint32 sr = ma_engine_get_sample_rate(&engine);
+        ma_lpf_node_config cfg = ma_lpf_node_config_init(ch, sr, kOpenCutoff, 2);
+        if (ma_lpf_node_init(ng, &cfg, nullptr, &v.lpf) != MA_SUCCESS) return;
+        ma_node* dst = GroupOf(bus) ? reinterpret_cast<ma_node*>(GroupOf(bus))
+                                    : ma_node_graph_get_endpoint(ng);
+        // sound -> lpf -> bus (attach the destination first, then reroute the sound).
+        ma_node_attach_output_bus(&v.lpf, 0, dst, 0);
+        ma_node_attach_output_bus(&v.sound, 0, &v.lpf, 0);
+        v.hasLpf = true;
+        v.curCutoff = kOpenCutoff;
+    }
+    void DestroyLpf(Voice& v) {
+        if (v.hasLpf) {
+            ma_lpf_node_uninit(&v.lpf, nullptr);
+            v.hasLpf = false;
+        }
+    }
+
+    // Fraction of rays [0,1] from `src` to `listener` blocked by geometry. The
+    // direct ray plus a ring of offset rays around the source: if some offset ray
+    // finds a clear path (a doorway/gap), occlusion drops and the sound leaks.
+    f32 ComputeOcclusion(const glm::vec3& src, const glm::vec3& listener,
+                         const std::function<bool(const glm::vec3&, const glm::vec3&)>& blocked) const {
+        if (!blocked) return 0.0f;
+        glm::vec3 dir = listener - src;
+        const f32 len = glm::length(dir);
+        if (len < 1e-3f) return 0.0f;
+        dir /= len;
+        // Nudge the origin off the source so its own collider doesn't self-occlude,
+        // but never past the listener (clamp for sources closer than the nudge).
+        const glm::vec3 o0 = src + dir * glm::min(0.3f, len * 0.5f);
+        const glm::vec3 up = std::fabs(dir.y) > 0.9f ? glm::vec3(1, 0, 0) : glm::vec3(0, 1, 0);
+        const glm::vec3 t1 = glm::normalize(glm::cross(dir, up));
+        const glm::vec3 t2 = glm::cross(dir, t1);
+        const int rays = glm::clamp(occlusion.rays, 1, 16);
+        int hit = 0;
+        if (blocked(o0, listener)) ++hit;
+        for (int i = 1; i < rays; ++i) {
+            const f32 a = 6.2831853f * static_cast<f32>(i) / static_cast<f32>(glm::max(rays - 1, 1));
+            const glm::vec3 off = (t1 * std::cos(a) + t2 * std::sin(a)) * occlusion.spread;
+            if (blocked(o0 + off, listener)) ++hit;
+        }
+        return static_cast<f32>(hit) / static_cast<f32>(rays);
+    }
+
+    // Glide a voice's occlusion toward `target` and apply attenuation + LPF cutoff.
+    void ApplyOcclusion(Voice& v, f32 target, f32 dt) {
+        const f32 rate = dt > 0.0f ? dt / 0.15f : 1.0f; // ~150ms glide (snap if dt<=0)
+        v.occ += glm::clamp(target - v.occ, -rate, rate);
+        const f32 o = glm::clamp(v.occ, 0.0f, 1.0f);
+        const f32 gain = glm::mix(1.0f, glm::clamp(occlusion.attenuation, 0.0f, 1.0f), o);
+        ma_sound_set_volume(&v.sound, v.baseVolume * gain); // set_volume is thread-safe
+        if (v.hasLpf) {
+            const f32 cutoff = glm::mix(kOpenCutoff, glm::max(occlusion.cutoffHz, 80.0f), o);
+            // ma_lpf_node_reinit rewrites biquad coefficients in place while the audio
+            // thread may read them: a data race whose worst case is one torn-coefficient
+            // buffer (a brief transient), never a crash/realloc. Reinit only on a coarse
+            // change so steady state does ZERO reinits (no race) and a transition does a
+            // handful, keeping the window tiny. (A fully lock-free fix would double-buffer
+            // two LPF nodes and swap via the thread-safe attach; not worth it for a glitch.)
+            if (std::fabs(cutoff - v.curCutoff) > 250.0f) {
+                ma_lpf_config lc = ma_lpf_config_init(ma_format_f32, ma_engine_get_channels(&engine),
+                                                      ma_engine_get_sample_rate(&engine), cutoff, 2);
+                ma_lpf_node_reinit(&lc, &v.lpf);
+                v.curCutoff = cutoff;
+            }
+        }
+    }
+
+    // Restore a spatial voice to un-occluded (base volume + open LPF). Used when
+    // occlusion is disabled/stops while a voice is mid-flight, so it doesn't stay
+    // muffled forever (matters for looping spatial one-shots).
+    void ClearOcclusion(Voice& v) {
+        ma_sound_set_volume(&v.sound, v.baseVolume);
+        if (v.hasLpf && v.curCutoff < kOpenCutoff - 20.0f) {
+            ma_lpf_config lc = ma_lpf_config_init(ma_format_f32, ma_engine_get_channels(&engine),
+                                                  ma_engine_get_sample_rate(&engine), kOpenCutoff, 2);
+            ma_lpf_node_reinit(&lc, &v.lpf);
+            v.curCutoff = kOpenCutoff;
+        }
+        v.occ = 0.0f;
+    }
 
     std::mt19937 rng{0x5EEDu};
 
@@ -87,13 +193,15 @@ struct AudioSystem::Impl {
     u32 nextSpatialId = 1;
 
     void DestroySpatial(SpatialVoice& sv) {
-        ma_sound_uninit(&sv.voice.sound);
+        ma_sound_uninit(&sv.voice.sound); // detach upstream node first
+        DestroyLpf(sv.voice);
         ma_audio_buffer_uninit(&sv.voice.buffer);
     }
 
     void DestroyVoices() {
         for (Voice& v : voices) {
             ma_sound_uninit(&v.sound);
+            DestroyLpf(v);
             ma_audio_buffer_uninit(&v.buffer);
         }
         voices.clear();
@@ -221,6 +329,14 @@ struct AudioSystem::Impl {
             ma_sound_set_attenuation_model(&v.sound, ma_attenuation_model_inverse);
             ma_sound_set_min_distance(&v.sound, glm::max(minDist, 0.01f));
             ma_sound_set_max_distance(&v.sound, glm::max(maxDist, minDist + 0.01f));
+            // Positional -> occlusion-capable: route through a per-voice LPF and
+            // remember its world position so the occlusion pass can process it.
+            v.spatial = true;
+            v.worldPos = *position;
+            v.baseVolume = volume;
+            v.minDist = minDist;
+            v.maxDist = maxDist;
+            AttachOcclusionLpf(v, bus);
         }
         ma_sound_start(&v.sound);
         return &v;
@@ -427,6 +543,7 @@ void AudioSystem::StopEvent(u32 voiceId) {
     for (auto it = impl_->voices.begin(); it != impl_->voices.end(); ++it) {
         if (it->id == voiceId) {
             ma_sound_uninit(&it->sound);
+            impl_->DestroyLpf(*it);
             ma_audio_buffer_uninit(&it->buffer);
             impl_->voices.erase(it);
             return;
@@ -475,8 +592,32 @@ bool AudioSystem::PlayUAF(const std::filesystem::path& uafPath, const std::strin
                    a.bitsPerSample, bus);
 }
 
+bool AudioSystem::PlayUAFAt(const std::filesystem::path& uafPath, const glm::vec3& position,
+                            const std::string& bus, f32 minDist, f32 maxDist, bool caption) {
+    if (!IsAvailable()) return false;
+    const std::string key = uafPath.string();
+    auto it = impl_->uafCache.find(key);
+    if (it == impl_->uafCache.end()) {
+        std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
+        if (!audio) {
+            HBE_WARN("Audio: failed to read '{}'.", uafPath.string());
+            return false;
+        }
+        it = impl_->uafCache.emplace(key, std::move(*audio)).first;
+    }
+    const uaf::Audio& a = it->second;
+    if (caption && impl_->captionsEnabled && !a.caption.empty())
+        impl_->captions.push_back(a.speaker.empty() ? a.caption : a.speaker + ": " + a.caption);
+    return impl_->StartVoice(a.pcm.data(), a.pcm.size(), a.channels, a.sampleRate, a.bitsPerSample,
+                             bus, 1.0f, 1.0f, false, &position, minDist, maxDist) != nullptr;
+}
+
 void AudioSystem::ClearUAFCache() {
     if (impl_) impl_->uafCache.clear();
+}
+
+void AudioSystem::SetOcclusion(const OcclusionConfig& cfg) {
+    if (impl_) impl_->occlusion = cfg;
 }
 
 void AudioSystem::SetMusicGraph(const MusicGraph& graph,
@@ -553,6 +694,13 @@ std::string AudioSystem::CurrentMusicState() const {
     return impl_ ? impl_->musicState : std::string();
 }
 
+std::vector<std::string> AudioSystem::MusicStateNames() const {
+    std::vector<std::string> names;
+    if (impl_)
+        for (const MusicState& s : impl_->musicGraph.states) names.push_back(s.name);
+    return names;
+}
+
 bool AudioSystem::HasMusicGraph() const { return impl_ && impl_->musicHasGraph; }
 
 void AudioSystem::PostStinger(const std::filesystem::path& uafPath, const std::string& bus,
@@ -591,6 +739,7 @@ void AudioSystem::Update() {
     for (auto it = impl_->voices.begin(); it != impl_->voices.end();) {
         if (ma_sound_at_end(&it->sound)) {
             ma_sound_uninit(&it->sound);
+            impl_->DestroyLpf(*it);
             ma_audio_buffer_uninit(&it->buffer);
             it = impl_->voices.erase(it);
         } else {
@@ -601,8 +750,11 @@ void AudioSystem::Update() {
 
 void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsDir,
                               const glm::vec3& listenerPos,
-                              const glm::vec3& listenerForward, bool gamePlaying) {
+                              const glm::vec3& listenerForward, bool gamePlaying,
+                              const std::function<bool(const glm::vec3&, const glm::vec3&)>& segmentBlocked,
+                              f32 dt) {
     if (!IsAvailable()) return;
+    const bool occlude = impl_->occlusion.enabled && static_cast<bool>(segmentBlocked);
     // Autoplay arms on the edge into "game running" (the runtime is playing from
     // frame 1; the editor only in play mode), so opening/viewing a scene in the
     // editor no longer triggers its audio.
@@ -668,15 +820,21 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
                 format, audio->channels, audio->pcm.size() / bytesPerFrame,
                 sv.voice.data.data(), nullptr);
             cfg.sampleRate = audio->sampleRate;
-            if (ma_audio_buffer_init(&cfg, &sv.voice.buffer) != MA_SUCCESS ||
-                ma_sound_init_from_data_source(&impl_->engine, &sv.voice.buffer, 0,
+            if (ma_audio_buffer_init(&cfg, &sv.voice.buffer) != MA_SUCCESS) {
+                impl_->spatial.erase(id);
+                continue;
+            }
+            if (ma_sound_init_from_data_source(&impl_->engine, &sv.voice.buffer, 0,
                                                impl_->GroupOf(src.bus),
                                                &sv.voice.sound) != MA_SUCCESS) {
+                ma_audio_buffer_uninit(&sv.voice.buffer); // don't leak the buffer
                 impl_->spatial.erase(id);
                 continue;
             }
             ma_sound_set_attenuation_model(&sv.voice.sound, ma_attenuation_model_inverse);
             ma_sound_set_spatialization_enabled(&sv.voice.sound, MA_TRUE);
+            sv.voice.spatial = true;
+            impl_->AttachOcclusionLpf(sv.voice, src.bus); // route through the occlusion LPF
             src.voiceId = id;
             HBE_INFO("Audio: spatial voice for '{}' ready.", src.asset);
             it = impl_->spatial.find(id);
@@ -689,10 +847,18 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
         // Follow the entity, apply component settings.
         const glm::vec3 pos = glm::vec3(scene.WorldMatrix(e)[3]);
         ma_sound_set_position(snd, pos.x, pos.y, pos.z);
-        ma_sound_set_volume(snd, src.volume);
         ma_sound_set_looping(snd, src.loop ? MA_TRUE : MA_FALSE);
         ma_sound_set_min_distance(snd, glm::max(src.minDistance, 0.01f));
         ma_sound_set_max_distance(snd, glm::max(src.maxDistance, src.minDistance + 0.01f));
+        // Volume: occlusion attenuates + muffles when geometry blocks the path;
+        // otherwise the base component volume (and the LPF stays transparent).
+        sv.voice.baseVolume = src.volume;
+        sv.voice.worldPos = pos;
+        if (occlude)
+            impl_->ApplyOcclusion(sv.voice, impl_->ComputeOcclusion(pos, listenerPos, segmentBlocked),
+                                  dt);
+        else
+            impl_->ClearOcclusion(sv.voice); // occlusion off -> base volume + open LPF
 
         const bool isPlaying = ma_sound_is_playing(snd) != MA_FALSE;
         if (src.playing && !isPlaying) {
@@ -716,6 +882,19 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
         } else {
             ++vit;
         }
+    }
+
+    // Occlude one-shot spatial voices too (dialogue-actor voice lines, spatial
+    // events): they don't move, so their emit position was captured at start. When
+    // occlusion is off, restore any still-occluded voice to open (a looping spatial
+    // event would otherwise stay muffled/quiet forever).
+    for (Impl::Voice& v : impl_->voices) {
+        if (!v.spatial) continue;
+        if (occlude)
+            impl_->ApplyOcclusion(v, impl_->ComputeOcclusion(v.worldPos, listenerPos, segmentBlocked),
+                                  dt);
+        else if (v.occ != 0.0f || (v.hasLpf && v.curCutoff < Impl::kOpenCutoff - 20.0f))
+            impl_->ClearOcclusion(v);
     }
 }
 

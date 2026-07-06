@@ -80,6 +80,15 @@ void ParseSettings(const json& j, ProjectSettings& s) {
             if (!bus.name.empty()) s.audioBuses.push_back(std::move(bus));
         }
     }
+    s.occlusion = AudioOcclusionSettings{};
+    if (const auto it = j.find("occlusion"); it != j.end() && it->is_object()) {
+        AudioOcclusionSettings& o = s.occlusion;
+        o.enabled = it->value("enabled", false);
+        o.rays = it->value("rays", 4);
+        o.attenuation = it->value("attenuation", 0.35f);
+        o.cutoffHz = it->value("cutoffHz", 700.0f);
+        o.spread = it->value("spread", 0.7f);
+    }
     s.build = BuildSettings{}; // defaults for projects without a block
     if (const auto it = j.find("build"); it != j.end() && it->is_object()) {
         BuildSettings& b = s.build;
@@ -313,6 +322,14 @@ bool Project::Save() const {
                              {"muted", b2.muted}});
         }
         j["audioBuses"] = std::move(buses);
+    }
+    {
+        const AudioOcclusionSettings& o = settings_.occlusion;
+        j["occlusion"] = {{"enabled", o.enabled},
+                          {"rays", o.rays},
+                          {"attenuation", o.attenuation},
+                          {"cutoffHz", o.cutoffHz},
+                          {"spread", o.spread}};
     }
 
     std::ofstream out(projectFile_);

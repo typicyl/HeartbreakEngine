@@ -334,6 +334,26 @@ private:
     // Full-screen black fade curtain (loading transitions); appends a quad at fadeAlpha_.
     void BuildFadeCurtain(std::vector<rhi::UIVertex>& out);
     bool      devMenuOpen_ = false;
+
+    // --- Developer debug menu (TLOU-style, shipped-build, gated by BuildSettings.devMenu) ---
+    // A keyboard-navigated command list rendered by BuildDevOverlay: skip zones,
+    // control time/speed, cycle music, save/load, restart, etc. Rebuilt each frame
+    // the menu is open; navigated with the arrow keys (Enter activates, Left/Right
+    // adjust a value row).
+    struct DevMenuItem {
+        std::string label;
+        std::string value;                 // right-hand value (value rows); empty for actions
+        bool header = false;               // non-selectable section title
+        std::function<void()> activate;    // Enter (action rows)
+        std::function<void(int)> adjust;   // Left/Right, arg -1/+1 (value rows)
+    };
+    std::vector<DevMenuItem> devItems_;                 // rebuilt each open frame
+    std::vector<std::filesystem::path> devLevels_;      // level bases (cached on open)
+    int  devMenuSel_ = 0;                               // selected row
+    f32  devTimeScale_ = 1.0f;                          // game speed (0 = paused)
+    int  devSkyRestore_ = -1;                           // authored dynamicSky before a dev time force (-1 = not forced by the menu)
+    void RebuildDevMenu();                              // populate devItems_
+    void DevMenuScanLevels();                           // fill devLevels_ (on open)
     bool      gameCameraEnabled_ = true;
     f32       uiPointerU_ = -1.0f;
     f32       uiPointerV_ = -1.0f;

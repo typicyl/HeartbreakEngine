@@ -166,11 +166,12 @@ void Editor::DrawDialogueEditor(Engine& engine) {
                 n->text = buf;
                 dlgDirty_ = true;
             }
-            if (ImGui::BeginCombo("Clip", n->clip.empty() ? "(none)" : n->clip.c_str())) {
-                if (ImGui::Selectable("(none)", n->clip.empty())) { n->clip.clear(); dlgDirty_ = true; }
-                for (const std::string& c : ListAssetsByExt(".uaf", uaf::AssetType::Audio))
-                    if (ImGui::Selectable(c.c_str(), c == n->clip)) { n->clip = c; dlgDirty_ = true; }
-                ImGui::EndCombo();
+            {
+                std::string cpick; // searchable voice-clip picker
+                if (AssetPicker("Clip", n->clip, ".uaf", uaf::AssetType::Audio, cpick)) {
+                    n->clip = cpick;
+                    dlgDirty_ = true;
+                }
             }
             if (ImGui::DragFloat("Hold (s, 0=auto)", &n->hold, 0.05f, 0.0f, 60.0f)) dlgDirty_ = true;
         } else if (n->type == dlg::NodeType::Choice) {

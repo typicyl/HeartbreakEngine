@@ -164,11 +164,18 @@ void StreamingWorld::Unload(Cell& c, Scene& scene) {
 
 void StreamingWorld::Update(Scene& scene, Renderer& renderer, const glm::vec3& focus) {
     if (!enabled_) return; // pinned (e.g. editor "Load All"): no distance load/unload
-    // 1) Finalize completed loads / clear failures (main thread).
+    // 1) Finalize completed loads / clear failures (main thread). BUDGET: finalize at
+    // most ONE ready cell per frame - Finalize runs scene::Instantiate synchronously
+    // (hundreds/thousands of entities), so finalizing several cells that became ready in
+    // the same frame stacks into one big main-thread stall (the ~1-2s streaming jank).
+    // Loads still trickle in via maxConcurrentLoads_, so one finalize/frame keeps up.
+    bool finalizedThisFrame = false;
     for (std::unique_ptr<Cell>& up : cells_) {
         const State s = static_cast<State>(up->state.load(std::memory_order_acquire));
         if (s == State::Ready) {
+            if (finalizedThisFrame) continue; // defer the rest to later frames
             Finalize(*up, scene, renderer);
+            finalizedThisFrame = true;
         } else if (s == State::Failed) {
             HBE_WARN("StreamingWorld: cell '{}' failed to load.", up->desc.name);
             up->state.store(static_cast<int>(State::Unloaded), std::memory_order_relaxed);

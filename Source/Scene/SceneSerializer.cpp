@@ -215,8 +215,10 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const RigidBody>()) add(e);
     for (const entt::entity e : reg.view<const AnimationTrack>()) add(e);
     for (const entt::entity e : reg.view<const AudioSource>()) add(e);
+    for (const entt::entity e : reg.view<const DialogueActor>()) add(e);
     for (const entt::entity e : reg.view<const CameraComponent>()) add(e);
     for (const entt::entity e : reg.view<const CameraZone>()) add(e);
+    for (const entt::entity e : reg.view<const MusicZone>()) add(e);
     for (const entt::entity e : reg.view<const CameraSpline>()) add(e);
     for (const entt::entity e : reg.view<const TerrainComponent>()) add(e);
     for (const entt::entity e : reg.view<const MotionMatching>()) add(e);
@@ -402,6 +404,15 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                 {"enabled", z->enabled},
                                 {"useSettings", z->useSettings},
                                 {"settings", CameraToJson(z->settings)}};
+        }
+        if (const MusicZone* mz = reg.try_get<MusicZone>(e)) {
+            je["musicZone"] = {{"halfExtents", ToJson(mz->halfExtents)},
+                               {"musicState", mz->musicState},
+                               {"parameter", mz->parameter},
+                               {"parameterValue", mz->parameterValue},
+                               {"fadeSeconds", mz->fadeSeconds},
+                               {"priority", mz->priority},
+                               {"enabled", mz->enabled}};
         }
         if (const CameraSpline* sp = reg.try_get<CameraSpline>(e)) {
             json pts = json::array();
@@ -609,6 +620,12 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                            {"maxDistance", src->maxDistance},
                            {"loop", src->loop},
                            {"autoplay", src->autoplay}};
+        }
+        if (const DialogueActor* da = reg.try_get<DialogueActor>(e)) {
+            je["dialogueActor"] = {{"speaker", da->speaker},
+                                   {"bus", da->bus},
+                                   {"minDistance", da->minDistance},
+                                   {"maxDistance", da->maxDistance}};
         }
         if (const NavigationAgent* na = reg.try_get<NavigationAgent>(e)) {
             je["navAgent"] = {{"target", ToJson(na->target)},
@@ -869,6 +886,17 @@ void ParseSceneJson(const json& root, SceneData& out) {
             if (const auto sit = it->find("settings"); sit != it->end() && sit->is_object())
                 CameraFromJson(*sit, z.settings);
         }
+        if (auto it = je.find("musicZone"); it != je.end()) {
+            d.hasMusicZone = true;
+            MusicZone& mz = d.musicZone;
+            mz.halfExtents = Vec3(it->value("halfExtents", json()), mz.halfExtents);
+            mz.musicState = it->value("musicState", "");
+            mz.parameter = it->value("parameter", "");
+            mz.parameterValue = it->value("parameterValue", 1.0f);
+            mz.fadeSeconds = it->value("fadeSeconds", -1.0f);
+            mz.priority = it->value("priority", 0);
+            mz.enabled = it->value("enabled", true);
+        }
         if (auto it = je.find("cameraSpline"); it != je.end()) {
             d.hasCameraSpline = true;
             CameraSpline& sp = d.cameraSpline;
@@ -1125,6 +1153,13 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.audio.maxDistance = it->value("maxDistance", 30.0f);
             d.audio.loop = it->value("loop", true);
             d.audio.autoplay = it->value("autoplay", true);
+        }
+        if (auto it = je.find("dialogueActor"); it != je.end()) {
+            d.hasDialogueActor = true;
+            d.dialogueActor.speaker = it->value("speaker", "");
+            d.dialogueActor.bus = it->value("bus", "Dialogue");
+            d.dialogueActor.minDistance = it->value("minDistance", 1.0f);
+            d.dialogueActor.maxDistance = it->value("maxDistance", 35.0f);
         }
         if (auto it = je.find("particles"); it != je.end()) {
             d.hasParticles = true;
@@ -1736,6 +1771,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasTrigger) reg.emplace<TriggerVolume>(e, d.trigger);
         if (d.hasCamera) reg.emplace<CameraComponent>(e, d.camera);
         if (d.hasCameraZone) reg.emplace<CameraZone>(e, d.cameraZone);
+        if (d.hasMusicZone) reg.emplace<MusicZone>(e, d.musicZone);
         if (d.hasCameraSpline) reg.emplace<CameraSpline>(e, d.cameraSpline);
         if (d.hasPaint && !d.paintSource.empty()) {
             if (const auto pit = staged.paints.find(d.paintSource); pit != staged.paints.end()) {
@@ -1803,6 +1839,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             src.voiceId = AudioSource::kNoVoice;
             reg.emplace<AudioSource>(e, src);
         }
+        if (d.hasDialogueActor) reg.emplace<DialogueActor>(e, d.dialogueActor);
         if (d.hasParticles) reg.emplace<ParticleEmitter>(e, d.particles);
         if (d.hasNavAgent) reg.emplace<NavigationAgent>(e, d.navAgent);
         if (d.hasNavObstacle) reg.emplace<NavigationObstacle>(e, d.navObstacle);

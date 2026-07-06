@@ -60,7 +60,7 @@ bool UserSettings::Load(const std::filesystem::path& dir) {
         return false;
     }
     masterVolume = j.value("masterVolume", 1.0f);
-    graphicsPreset = j.value("graphicsPreset", 0);
+    graphicsPreset = j.value("graphicsPreset", 1); // fresh install defaults to Medium (perf)
     brightness = j.value("brightness", 0.5f);
     captionsEnabled = j.value("captionsEnabled", false);
     inputBindings.clear();

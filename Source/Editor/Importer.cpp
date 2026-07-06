@@ -10,6 +10,11 @@
 
 #include <stb_image.h>
 
+// miniaudio decoder — declarations only; MINIAUDIO_IMPLEMENTATION (with the
+// built-in WAV/MP3/FLAC decoders) lives in Audio/AudioSystem.cpp. Used to decode
+// source audio to PCM on import.
+#include <miniaudio.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -40,7 +45,7 @@ bool IsImage(const std::string& e) {
 bool IsModel(const std::string& e) {
     return e == ".gltf" || e == ".glb" || e == ".obj" || e == ".fbx" || e == ".dae" || e == ".ply";
 }
-bool IsAudio(const std::string& e) { return e == ".wav"; }
+bool IsAudio(const std::string& e) { return e == ".wav" || e == ".mp3" || e == ".flac"; }
 bool IsFont(const std::string& e) { return e == ".ttf" || e == ".otf"; }
 
 // Fonts are stored verbatim (the engine bakes atlases at load time).
@@ -425,45 +430,42 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
     return uaf::WriteMesh(out, *model, GenGuid(), rig.Valid() ? &rig : nullptr);
 }
 
-// Minimal RIFF/WAVE PCM parser.
+// Decodes any miniaudio-supported source (WAV / MP3 / FLAC) to interleaved 16-bit
+// PCM and writes it to a `.uaf`. The engine's asset format is raw PCM, so the
+// compressed source is fully decoded here at import time.
 bool ImportAudio(const fs::path& src, const fs::path& out) {
-    std::ifstream in(src, std::ios::binary);
-    if (!in) return false;
-    std::vector<u8> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    if (bytes.size() < 44 || std::memcmp(bytes.data(), "RIFF", 4) != 0 ||
-        std::memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
-        HBE_ERROR("Importer: '{}' is not a RIFF/WAVE file.", src.string());
+    // Decode to signed-16 PCM, keeping the source's native channel count + rate.
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
+    ma_decoder dec;
+    if (ma_decoder_init_file_w(src.wstring().c_str(), &cfg, &dec) != MA_SUCCESS) {
+        HBE_ERROR("Importer: cannot decode audio '{}' (unsupported/corrupt).", src.string());
         return false;
+    }
+    const u32 channels = dec.outputChannels;
+    // Stream the whole file out in chunks (MP3 can't always report length up front).
+    const ma_uint64 kChunkFrames = 8192;
+    std::vector<i16> chunk(static_cast<usize>(kChunkFrames) * channels);
+    std::vector<u8> pcm;
+    for (;;) {
+        ma_uint64 got = 0;
+        if (ma_decoder_read_pcm_frames(&dec, chunk.data(), kChunkFrames, &got) != MA_SUCCESS ||
+            got == 0) {
+            break;
+        }
+        const u8* b = reinterpret_cast<const u8*>(chunk.data());
+        pcm.insert(pcm.end(), b, b + static_cast<usize>(got) * channels * sizeof(i16));
+        if (got < kChunkFrames) break;
     }
 
     uaf::Audio audio;
-    usize pos = 12;
-    bool haveFmt = false, haveData = false;
-    while (pos + 8 <= bytes.size()) {
-        char id[4];
-        std::memcpy(id, bytes.data() + pos, 4);
-        u32 size = 0;
-        std::memcpy(&size, bytes.data() + pos + 4, 4);
-        const usize body = pos + 8;
-        if (std::memcmp(id, "fmt ", 4) == 0 && body + 16 <= bytes.size()) {
-            u16 ch = 0, bits = 0;
-            u32 rate = 0;
-            std::memcpy(&ch, bytes.data() + body + 2, 2);
-            std::memcpy(&rate, bytes.data() + body + 4, 4);
-            std::memcpy(&bits, bytes.data() + body + 14, 2);
-            audio.channels = ch;
-            audio.sampleRate = rate;
-            audio.bitsPerSample = bits;
-            haveFmt = true;
-        } else if (std::memcmp(id, "data", 4) == 0) {
-            const usize n = std::min<usize>(size, bytes.size() - body);
-            audio.pcm.assign(bytes.begin() + body, bytes.begin() + body + n);
-            haveData = true;
-        }
-        pos = body + size + (size & 1); // chunks are word-aligned
-    }
-    if (!haveFmt || !haveData) {
-        HBE_ERROR("Importer: '{}' missing fmt/data chunk.", src.string());
+    audio.channels = channels;
+    audio.sampleRate = dec.outputSampleRate;
+    audio.bitsPerSample = 16;
+    audio.pcm = std::move(pcm);
+    ma_decoder_uninit(&dec);
+
+    if (audio.channels == 0 || audio.sampleRate == 0 || audio.pcm.empty()) {
+        HBE_ERROR("Importer: '{}' decoded to no audio.", src.string());
         return false;
     }
     return uaf::WriteAudio(out, audio, GenGuid());
@@ -479,6 +481,14 @@ bool IsSupportedSource(const fs::path& path) {
 std::optional<fs::path> Import(const fs::path& src, const fs::path& assetsDir) {
     const std::string e = LowerExt(src);
     fs::path out = assetsDir / (src.stem().string() + ".uaf");
+    // The output name is the source STEM, so different sources sharing a base name
+    // (e.g. track.mp3 + track.wav, or model.glb + model.png) map to one .uaf and the
+    // later import overwrites the earlier. Warn so a folder-drop doesn't lose an asset
+    // silently (a same-source re-import to update the asset is the intended overwrite).
+    std::error_code existEc;
+    if (fs::exists(out, existEc))
+        HBE_WARN("Importer: '{}' overwrites existing '{}' (same asset name).", src.filename().string(),
+                 out.filename().string());
 
     bool ok = false;
     if (IsImage(e))      ok = ImportTexture(src, out, true); // assume a color texture

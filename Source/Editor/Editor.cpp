@@ -510,6 +510,14 @@ void Editor::BuildUI(Engine& engine) {
             }
             if (ImGui::IsKeyPressed(ImGuiKey_D, false) && hasSel) DuplicateSelection(engine);
         }
+        // F (no modifier): frame the camera on the selection (Blender/Unity-style).
+        // Only over the viewport and in edit mode, so it never steals the game camera
+        // during play or fires from another panel.
+        if (vpHovered_ && !playMode_ && !io.WantTextInput && !io.KeyCtrl && !io.KeyAlt &&
+            ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            Scene& s = engine.GetScene();
+            if (selected_ != entt::null && s.Registry().valid(selected_)) FrameSelected(engine);
+        }
     }
 
     // Save-As modal (opened from the Scene menu; popups can't open in menus).
@@ -3932,6 +3940,34 @@ void Editor::SyncFreecam(Renderer& renderer) {
     freecam_.SyncFrom(renderer.GetCamera());
 }
 
+void Editor::FrameSelected(Engine& engine) {
+    if (selected_ == entt::null) return;
+    Scene& scene = engine.GetScene();
+    entt::registry& reg = scene.Registry();
+    if (!reg.valid(selected_)) return;
+    const glm::mat4 m = scene.WorldMatrix(selected_);
+    glm::vec3 center = glm::vec3(m[3]);
+    f32 radius = 1.0f;
+    if (const AABB* bb = reg.try_get<AABB>(selected_)) {
+        // World-space bounds from the 8 local corners (handles rotation + scale).
+        glm::vec3 lo(1e30f), hi(-1e30f);
+        for (int c = 0; c < 8; ++c) {
+            const glm::vec3 corner((c & 1) ? bb->max.x : bb->min.x, (c & 2) ? bb->max.y : bb->min.y,
+                                   (c & 4) ? bb->max.z : bb->min.z);
+            const glm::vec3 w = glm::vec3(m * glm::vec4(corner, 1.0f));
+            lo = glm::min(lo, w);
+            hi = glm::max(hi, w);
+        }
+        center = (lo + hi) * 0.5f;
+        radius = glm::max(glm::length(hi - lo) * 0.5f, 0.1f);
+    } else {
+        // No bounds: frame a small sphere sized by the entity's world scale.
+        radius = glm::max(glm::max(glm::length(glm::vec3(m[0])), glm::length(glm::vec3(m[1]))),
+                          glm::max(glm::length(glm::vec3(m[2])), 0.5f));
+    }
+    freecam_.Focus(engine.GetRenderer(), center, radius);
+}
+
 void Editor::UpdateFreecam(Renderer& renderer, const Input& input, f32 dt) {
     // Start flying only when right-dragging over the viewport; keep flying while
     // the button stays held even if the cursor leaves the panel. Gamepad input
@@ -4256,6 +4292,13 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
             const entt::entity e = scene.CreateEntity("Camera Zone");
             reg.emplace<Transform>(e, Transform{});
             reg.emplace<CameraZone>(e);
+            selected_ = e;
+        }
+        if (ImGui::MenuItem("Music Zone")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Music Zone");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<MusicZone>(e);
             selected_ = e;
         }
         if (ImGui::MenuItem("Post Volume")) {
@@ -4978,6 +5021,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             PushUndo(scene);
             reg.emplace<AudioSource>(sel);
         }
+        if (!reg.all_of<DialogueActor>(sel) && ImGui::MenuItem("Dialogue Actor")) {
+            PushUndo(scene);
+            reg.emplace<DialogueActor>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
         if (!reg.all_of<SchematicComponent>(sel) && ImGui::MenuItem("Schematic (Visual Script)")) {
             PushUndo(scene);
             reg.emplace<SchematicComponent>(sel);
@@ -5020,6 +5068,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (!reg.all_of<CameraZone>(sel) && ImGui::MenuItem("Camera Zone")) {
             PushUndo(scene);
             reg.emplace<CameraZone>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<MusicZone>(sel) && ImGui::MenuItem("Music Zone")) {
+            PushUndo(scene);
+            reg.emplace<MusicZone>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
         if (!reg.all_of<CameraSpline>(sel) && ImGui::MenuItem("Camera Spline")) {
@@ -5515,6 +5568,31 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
+    // --- Dialogue Actor (3D voice for a speaking character) --------------------
+    if (DialogueActor* da = reg.try_get<DialogueActor>(sel)) {
+        const SectionState s = ComponentSection("Dialogue Actor");
+        if (s.open) {
+            char nb[96];
+            std::snprintf(nb, sizeof(nb), "%s", da->speaker.c_str());
+            if (ImGui::InputText("Speaker", nb, sizeof(nb))) { da->speaker = nb; }
+            undoOnActivate();
+            ImGui::TextDisabled("Dialogue lines with this speaker name emit 3D from\n"
+                                "this entity. Empty = use the entity's Name.");
+            char bb[64];
+            std::snprintf(bb, sizeof(bb), "%s", da->bus.c_str());
+            if (ImGui::InputText("Voice Bus", bb, sizeof(bb))) { da->bus = bb; }
+            undoOnActivate();
+            ImGui::DragFloat("Min Distance", &da->minDistance, 0.1f, 0.1f, 100.0f);
+            undoOnActivate();
+            ImGui::DragFloat("Max Distance", &da->maxDistance, 0.5f, 1.0f, 1000.0f);
+            undoOnActivate();
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<DialogueActor>(sel);
+        }
+    }
+
     // --- Particle Emitter ----------------------------------------------------
     if (ParticleEmitter* pe = reg.try_get<ParticleEmitter>(sel)) {
         const SectionState s = ComponentSection("Particle Emitter");
@@ -5769,6 +5847,42 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<CameraZone>(sel);
+        }
+    }
+
+    // --- Music Zone (world volume that drives the adaptive music) --------------
+    if (MusicZone* mz = reg.try_get<MusicZone>(sel)) {
+        const SectionState s = ComponentSection("Music Zone");
+        if (s.open) {
+            ImGui::DragFloat3("Half Extents", glm::value_ptr(mz->halfExtents), 0.1f, 0.01f, 1000.0f);
+            undoOnActivate();
+            char sb[96];
+            std::snprintf(sb, sizeof(sb), "%s", mz->musicState.c_str());
+            if (ImGui::InputText("Music State", sb, sizeof(sb))) { mz->musicState = sb; }
+            undoOnActivate();
+            ImGui::TextDisabled("Crossfade to this state on enter (\"\" = leave state).");
+            char pb[96];
+            std::snprintf(pb, sizeof(pb), "%s", mz->parameter.c_str());
+            if (ImGui::InputText("Parameter", pb, sizeof(pb))) { mz->parameter = pb; }
+            undoOnActivate();
+            if (!mz->parameter.empty()) {
+                ImGui::DragFloat("Parameter Value", &mz->parameterValue, 0.01f, 0.0f, 10.0f);
+                undoOnActivate();
+            }
+            ImGui::DragFloat("Fade (s, -1=default)", &mz->fadeSeconds, 0.05f, -1.0f, 30.0f);
+            undoOnActivate();
+            ImGui::DragInt("Priority", &mz->priority, 0.1f);
+            undoOnActivate();
+            bool en = mz->enabled;
+            if (ImGui::Checkbox("Enabled", &en)) { PushUndo(scene); mz->enabled = en; }
+            ImGui::Separator();
+            ImGui::TextDisabled(mz->active ? "Status: ACTIVE (player inside)" : "Status: inactive");
+            ImGui::TextDisabled("Box uses this entity's Transform. Author a large low-priority\n"
+                                "base zone + smaller high-priority zones (Combat, Boss).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<MusicZone>(sel);
         }
     }
 
@@ -6971,12 +7085,8 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             action = static_cast<InteractAction>(glm::clamp(ai, 0, 5));
         if (action == InteractAction::Dialogue || action == InteractAction::Cutscene) {
             const char* ext = action == InteractAction::Dialogue ? ".hbdialogue" : ".hbcutscene";
-            if (ImGui::BeginCombo("Asset", asset.empty() ? "(none)" : asset.c_str())) {
-                if (ImGui::Selectable("(none)", asset.empty())) asset.clear();
-                for (const std::string& a : ListAssetsByExt(ext))
-                    if (ImGui::Selectable(a.c_str(), a == asset)) asset = a;
-                ImGui::EndCombo();
-            }
+            std::string apick;
+            if (AssetPicker("Asset", asset, ext, uaf::AssetType::Unknown, apick)) asset = apick;
         } else if (action == InteractAction::SetFlag) {
             char fb[64];
             std::snprintf(fb, sizeof(fb), "%s", flag.c_str());
@@ -7711,7 +7821,7 @@ void Editor::DrawSchematicEditor(Engine& engine) {
         if (!p.empty()) OpenSchematic(p);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Open")) ImGui::OpenPopup("##schemopen");
+    if (ImGui::Button("Open")) { assetPickerSearch_[0] = '\0'; ImGui::OpenPopup("##schemopen"); }
     ImGui::SameLine();
     ImGui::BeginDisabled(editedSchematic_.empty());
     if (ImGui::Button(schematicDirty_ ? "Save*" : "Save")) SaveSchematic();
@@ -7728,9 +7838,15 @@ void Editor::DrawSchematicEditor(Engine& engine) {
     }
 
     if (ImGui::BeginPopup("##schemopen")) {
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::InputTextWithHint("##search", "search...", assetPickerSearch_,
+                                 sizeof(assetPickerSearch_));
+        ImGui::Separator();
         bool any = false;
         for (const std::string& rel : ListAssetsByExt(".hbschem")) {
             any = true;
+            if (!AssetSearchMatch(rel)) continue;
             if (ImGui::Selectable(rel.c_str())) {
                 OpenSchematic(Project::Active().AssetsDir() / rel);
                 ImGui::CloseCurrentPopup();
@@ -8438,8 +8554,6 @@ void Editor::OpenCutscene(Engine& engine, const std::filesystem::path& path) {
     csScroll_ = 0.0f;
     csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
     csDragKey_ = csDragPlayhead_ = false;
-    csAudioChoices_ = ListAssetsByExt(".uaf", uaf::AssetType::Audio);
-    csDialogueChoices_ = ListAssetsByExt(".hbdialogue");
     cutsceneFocus_ = true;
     panelOpen_[Panel_CutsceneTimeline] = true;
 }
@@ -8483,11 +8597,18 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
             if (!p.empty()) OpenCutscene(engine, p);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Open")) ImGui::OpenPopup("##csopen");
+        if (ImGui::Button("Open")) { assetPickerSearch_[0] = '\0'; ImGui::OpenPopup("##csopen"); }
         if (ImGui::BeginPopup("##csopen")) {
-            for (const std::string& rel : ListAssetsByExt(".hbcutscene"))
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            ImGui::SetNextItemWidth(240.0f);
+            ImGui::InputTextWithHint("##search", "search...", assetPickerSearch_,
+                                     sizeof(assetPickerSearch_));
+            ImGui::Separator();
+            for (const std::string& rel : ListAssetsByExt(".hbcutscene")) {
+                if (!AssetSearchMatch(rel)) continue;
                 if (ImGui::Selectable(rel.c_str()))
                     OpenCutscene(engine, Project::Active().AssetsDir() / rel);
+            }
             ImGui::EndPopup();
         }
         ImGui::End();
@@ -8518,11 +8639,18 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         if (!p.empty()) OpenCutscene(engine, p);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Open")) ImGui::OpenPopup("##csopen");
+    if (ImGui::Button("Open")) { assetPickerSearch_[0] = '\0'; ImGui::OpenPopup("##csopen"); }
     if (ImGui::BeginPopup("##csopen")) {
-        for (const std::string& rel : ListAssetsByExt(".hbcutscene"))
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::InputTextWithHint("##search", "search...", assetPickerSearch_,
+                                 sizeof(assetPickerSearch_));
+        ImGui::Separator();
+        for (const std::string& rel : ListAssetsByExt(".hbcutscene")) {
+            if (!AssetSearchMatch(rel)) continue;
             if (ImGui::Selectable(rel.c_str()))
                 OpenCutscene(engine, Project::Active().AssetsDir() / rel);
+        }
         ImGui::EndPopup();
     }
     ImGui::SameLine();
@@ -8929,19 +9057,14 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         ImGui::SeparatorText("Dialogue Marker");
         bool ed = false;
         ed |= ImGui::DragFloat("Time", &m.time, 0.02f, 0.0f, dur);
-        ImGui::SetNextItemWidth(200.0f);
-        if (ImGui::BeginCombo("Dialogue", m.dialogue.empty() ? "(none)" : m.dialogue.c_str())) {
-            if (ImGui::Selectable("(none)", m.dialogue.empty())) { m.dialogue.clear(); ed = true; }
-            for (const std::string& c : csDialogueChoices_)
-                if (ImGui::Selectable(c.c_str(), c == m.dialogue)) { m.dialogue = c; ed = true; }
-            ImGui::EndCombo();
+        std::string mpick; // searchable pickers for the cutscene dialogue/voiceline
+        if (AssetPicker("Dialogue", m.dialogue, ".hbdialogue", uaf::AssetType::Unknown, mpick)) {
+            m.dialogue = mpick;
+            ed = true;
         }
-        ImGui::SetNextItemWidth(200.0f);
-        if (ImGui::BeginCombo("Voiceline", m.voiceline.empty() ? "(none)" : m.voiceline.c_str())) {
-            if (ImGui::Selectable("(none)", m.voiceline.empty())) { m.voiceline.clear(); ed = true; }
-            for (const std::string& c : csAudioChoices_)
-                if (ImGui::Selectable(c.c_str(), c == m.voiceline)) { m.voiceline = c; ed = true; }
-            ImGui::EndCombo();
+        if (AssetPicker("Voiceline", m.voiceline, ".uaf", uaf::AssetType::Audio, mpick)) {
+            m.voiceline = mpick;
+            ed = true;
         }
         if (ImGui::Button("Delete")) {
             cs.dialogue.erase(cs.dialogue.begin() + csSelIndex_); csSelKind_ = -1; markDirty();
@@ -9003,6 +9126,18 @@ void Editor::DrawMusicEditor(Engine& engine) {
     };
 
     // --- Asset + save ---------------------------------------------------------
+    // Searchable open of an existing graph; the text field still types a new save path.
+    {
+        std::string mpick;
+        if (AssetPicker("Open (.hbmusic)", musicEditPath_, ".hbmusic", uaf::AssetType::Unknown, mpick,
+                        nullptr) &&
+            !mpick.empty()) {
+            musicEditPath_ = mpick;
+            if (auto g = assets::LoadMusicGraph(assets / mpick)) musicEdit_ = *g;
+            musicStateSel_ = 0;
+            musicLayerSel_ = -1;
+        }
+    }
     editStr("Asset (.hbmusic)", musicEditPath_);
     ImGui::SameLine();
     if (ImGui::Button("Save")) {
@@ -9065,8 +9200,10 @@ void Editor::DrawMusicEditor(Engine& engine) {
         if (i > 0) ImGui::SameLine();
         const bool sel = musicStateSel_ == i;
         if (sel) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        if (ImGui::Button((musicEdit_.states[i].name + "##st" + std::to_string(i)).c_str()))
+        if (ImGui::Button((musicEdit_.states[i].name + "##st" + std::to_string(i)).c_str())) {
             musicStateSel_ = i;
+            musicLayerSel_ = -1; // don't carry a stale layer selection to the new state
+        }
         if (sel) ImGui::PopStyleColor();
     }
 
@@ -9083,44 +9220,160 @@ void Editor::DrawMusicEditor(Engine& engine) {
         }
         ImGui::SetNextItemWidth(90.0f);
         ImGui::DragFloat("BPM", &st.bpm, 0.5f, 1.0f, 400.0f, "%.0f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90.0f);
+        ImGui::DragInt("Beats/Bar", &st.beatsPerBar, 0.1f, 1, 16);
 
-        ImGui::TextDisabled("Layers (looping stems):");
-        int layerRemove = -1;
-        for (int li = 0; li < static_cast<int>(st.layers.size()); ++li) {
-            MusicLayer& L = st.layers[static_cast<usize>(li)];
-            ImGui::PushID(li);
-            editStr("##lname", L.name, 110.0f);
-            ImGui::SameLine();
-            // Asset: type the path, or drag a .uaf from the Assets panel onto it.
-            editStr("##lasset", L.asset, 180.0f);
+        // ---- DAW arrangement view: layers as horizontal lanes over a bar/beat
+        // grid. Lane fill height = the layer's live gain, so the adaptive mix is
+        // legible; a red playhead ticks musical time while previewing. Wheel =
+        // zoom (cursor-time locked), middle-drag = pan, left-click a lane = select,
+        // click the ruler = scrub. ----
+        const f32 bpm = glm::max(st.bpm, 1.0f);
+        const int bpb = glm::clamp(st.beatsPerBar, 1, 16);
+        const f32 beatLen = 60.0f / bpm;
+        const f32 barLen = beatLen * static_cast<f32>(bpb);
+        const f32 loopLen = barLen * 8.0f; // visualized loop length (cosmetic)
+        const int lanes = static_cast<int>(st.layers.size());
+        const float kHeaderW = 150.0f, kRowH = 26.0f, kRulerH = 20.0f;
+        const float canvasH = kRulerH + static_cast<float>(glm::max(lanes, 1)) * kRowH + 6.0f;
+
+        ImGui::BeginChild("##musictl", ImVec2(0, canvasH), ImGuiChildFlags_Borders,
+                          ImGuiWindowFlags_NoScrollWithMouse);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 p0 = ImGui::GetCursorScreenPos();
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const float laneX0 = p0.x + kHeaderW;
+        const float laneX1 = p0.x + avail.x;
+        const float lanesW = glm::max(laneX1 - laneX0, 10.0f);
+        const auto timeToX = [&](f32 t) { return laneX0 + (t - musicScroll_) * musicZoom_; };
+        const auto xToTime = [&](float x) {
+            return musicScroll_ + (x - laneX0) / glm::max(musicZoom_, 1.0f);
+        };
+
+        ImGuiIO& io = ImGui::GetIO();
+        ImGui::SetCursorScreenPos(ImVec2(laneX0, p0.y));
+        ImGui::InvisibleButton("##mtlgrid", ImVec2(lanesW, canvasH));
+        const bool hov = ImGui::IsItemHovered();
+        if (hov && io.MouseWheel != 0.0f) {
+            const f32 tAt = xToTime(io.MousePos.x);
+            musicZoom_ = glm::clamp(musicZoom_ * (io.MouseWheel > 0.0f ? 1.15f : 1.0f / 1.15f),
+                                    8.0f, 2000.0f);
+            musicScroll_ = tAt - (io.MousePos.x - laneX0) / musicZoom_;
+        }
+        if (hov && ImGui::IsMouseDragging(ImGuiMouseButton_Middle))
+            musicScroll_ -= io.MouseDelta.x / glm::max(musicZoom_, 1.0f);
+        musicScroll_ = glm::max(musicScroll_, 0.0f);
+        if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            if (io.MousePos.y < p0.y + kRulerH) {
+                musicEditTime_ = glm::max(xToTime(io.MousePos.x), 0.0f);
+            } else {
+                const int lane = static_cast<int>((io.MousePos.y - (p0.y + kRulerH)) / kRowH);
+                if (lane >= 0 && lane < lanes) musicLayerSel_ = lane;
+            }
+        }
+
+        // Advance the playhead while auditioning (wraps over the loop).
+        if (musicPreviewing_) {
+            musicEditTime_ += io.DeltaTime;
+            if (musicEditTime_ > loopLen) musicEditTime_ = std::fmod(musicEditTime_, loopLen);
+        }
+
+        // Backgrounds: ruler strip + header column.
+        dl->AddRectFilled(p0, ImVec2(p0.x + avail.x, p0.y + kRulerH), IM_COL32(30, 30, 38, 255));
+        dl->AddRectFilled(ImVec2(p0.x, p0.y + kRulerH), ImVec2(laneX0, p0.y + canvasH),
+                          IM_COL32(24, 24, 30, 255));
+        // Bar lines + labels, lighter beat subdivisions.
+        const f32 tRight = musicScroll_ + lanesW / glm::max(musicZoom_, 1.0f);
+        for (int b = glm::max(static_cast<int>(glm::floor(musicScroll_ / barLen)), 0);; ++b) {
+            const f32 bt = static_cast<f32>(b) * barLen;
+            if (bt > tRight) break;
+            const float x = timeToX(bt);
+            dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p0.y + canvasH), IM_COL32(80, 80, 95, 180));
+            char lbl[16];
+            std::snprintf(lbl, sizeof(lbl), "%d", b + 1);
+            dl->AddText(ImVec2(x + 3.0f, p0.y + 3.0f), IM_COL32(180, 180, 195, 255), lbl);
+            for (int be = 1; be < bpb; ++be) {
+                const float bx = timeToX(bt + static_cast<f32>(be) * beatLen);
+                dl->AddLine(ImVec2(bx, p0.y + kRulerH), ImVec2(bx, p0.y + canvasH),
+                            IM_COL32(55, 55, 68, 120));
+            }
+        }
+        // Lanes.
+        for (int li = 0; li < lanes; ++li) {
+            const MusicLayer& L = st.layers[static_cast<usize>(li)];
+            const float ly0 = p0.y + kRulerH + static_cast<float>(li) * kRowH;
+            const float ly1 = ly0 + kRowH - 2.0f;
+            dl->AddLine(ImVec2(p0.x, ly0), ImVec2(laneX1, ly0), IM_COL32(50, 50, 60, 150));
+            dl->AddText(ImVec2(p0.x + 6.0f, ly0 + 5.0f), IM_COL32(220, 220, 230, 255),
+                        L.name.empty() ? "(layer)" : L.name.c_str());
+            f32 gain = L.volume;
+            if (!L.parameter.empty()) {
+                const f32 pv = audio.MusicParameterValue(L.parameter);
+                const f32 t = (std::fabs(L.paramHi - L.paramLo) < 1e-5f)
+                                  ? (pv >= L.paramLo ? 1.0f : 0.0f)
+                                  : glm::smoothstep(L.paramLo, L.paramHi, pv);
+                gain = L.volume * t;
+            }
+            const float bx0 = glm::max(timeToX(0.0f), laneX0);
+            const float bx1 = glm::min(timeToX(loopLen), laneX1);
+            if (bx1 > bx0) {
+                const ImU32 col =
+                    L.parameter.empty() ? IM_COL32(70, 130, 200, 235) : IM_COL32(150, 110, 210, 235);
+                const float fillH = (kRowH - 6.0f) * glm::clamp(gain, 0.0f, 1.0f);
+                dl->AddRectFilled(ImVec2(bx0, ly1 - fillH), ImVec2(bx1, ly1), col, 3.0f);
+                const bool selLane = musicLayerSel_ == li;
+                dl->AddRect(ImVec2(bx0, ly0 + 2.0f), ImVec2(bx1, ly1),
+                            selLane ? IM_COL32(255, 255, 255, 255) : IM_COL32(90, 90, 105, 180), 3.0f,
+                            0, selLane ? 2.0f : 1.0f);
+            }
+        }
+        // Playhead.
+        const float px = timeToX(musicEditTime_);
+        if (px >= laneX0 && px <= laneX1)
+            dl->AddLine(ImVec2(px, p0.y), ImVec2(px, p0.y + canvasH), IM_COL32(240, 80, 80, 255), 2.0f);
+        ImGui::EndChild();
+
+        // Selected-layer inspector.
+        musicLayerSel_ = glm::clamp(musicLayerSel_, -1, lanes - 1);
+        if (musicLayerSel_ >= 0 && musicLayerSel_ < lanes) {
+            MusicLayer& L = st.layers[static_cast<usize>(musicLayerSel_)];
+            ImGui::PushID(2000 + musicLayerSel_);
+            editStr("Layer name", L.name, 160.0f);
+            {
+                std::string spick; // searchable stem picker (drag-drop still works)
+                if (AssetPicker("Stem (.uaf)", L.asset, ".uaf", uaf::AssetType::Audio, spick))
+                    L.asset = spick;
+            }
             AssetDropTarget(".uaf", uaf::AssetType::Unknown,
                             [&](const std::filesystem::path& src) { L.asset = src.generic_string(); });
-            ImGui::SameLine();
-            ImGui::SetNextItemWidth(90.0f);
-            ImGui::SliderFloat("vol##l", &L.volume, 0.0f, 1.5f, "%.2f");
-            ImGui::SameLine();
-            if (ImGui::SmallButton("X##l")) layerRemove = li;
-            // Parameter binding: fades this layer in over [lo, hi] of the parameter.
-            ImGui::SetNextItemWidth(120.0f);
-            if (ImGui::BeginCombo("param##l", L.parameter.empty() ? "(always on)" : L.parameter.c_str())) {
+            ImGui::SliderFloat("Volume", &L.volume, 0.0f, 1.5f, "%.2f");
+            if (ImGui::BeginCombo("Parameter",
+                                  L.parameter.empty() ? "(always on)" : L.parameter.c_str())) {
                 if (ImGui::Selectable("(always on)", L.parameter.empty())) L.parameter.clear();
                 for (const MusicParameter& p : musicEdit_.parameters)
                     if (ImGui::Selectable(p.name.c_str(), p.name == L.parameter)) L.parameter = p.name;
                 ImGui::EndCombo();
             }
             if (!L.parameter.empty()) {
+                ImGui::SetNextItemWidth(90.0f);
+                ImGui::DragFloat("Fade lo", &L.paramLo, 0.01f);
                 ImGui::SameLine();
-                ImGui::SetNextItemWidth(80.0f);
-                ImGui::DragFloat("lo##l", &L.paramLo, 0.01f);
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80.0f);
-                ImGui::DragFloat("hi##l", &L.paramHi, 0.01f);
+                ImGui::SetNextItemWidth(90.0f);
+                ImGui::DragFloat("Fade hi", &L.paramHi, 0.01f);
             }
-            ImGui::Separator();
+            if (ImGui::SmallButton("Remove Layer")) {
+                st.layers.erase(st.layers.begin() + musicLayerSel_);
+                musicLayerSel_ = -1;
+            }
             ImGui::PopID();
+        } else {
+            ImGui::TextDisabled("Click a lane to edit its layer.");
         }
-        if (layerRemove >= 0) st.layers.erase(st.layers.begin() + layerRemove);
-        if (ImGui::Button("Add Layer")) st.layers.push_back(MusicLayer{});
+        if (ImGui::Button("Add Layer")) {
+            st.layers.push_back(MusicLayer{});
+            musicLayerSel_ = static_cast<int>(st.layers.size()) - 1;
+        }
         ImGui::PopID();
     }
 
@@ -9266,6 +9519,24 @@ void Editor::DrawAudioMixer(Engine& engine) {
             newBusName[0] = '\0';
             rebuild();
         }
+    }
+
+    // Spatial occlusion: geometry attenuates + muffles 3D sources (multi-ray so
+    // sound leaks through openings). Applied live from the project each frame.
+    ImGui::SeparatorText("Spatial Occlusion");
+    {
+        AudioOcclusionSettings& o = settings.occlusion;
+        bool changed = ImGui::Checkbox("Occlusion enabled", &o.enabled);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Walls attenuate + low-pass 3D sources; openings let sound\n"
+                              "leak through. Casts rays against physics colliders in-game.");
+        ImGui::BeginDisabled(!o.enabled);
+        changed |= ImGui::SliderInt("Rays (gap leakage)", &o.rays, 1, 12);
+        changed |= ImGui::SliderFloat("Attenuation floor", &o.attenuation, 0.0f, 1.0f, "%.2f");
+        changed |= ImGui::SliderFloat("Muffle cutoff (Hz)", &o.cutoffHz, 200.0f, 8000.0f, "%.0f");
+        changed |= ImGui::SliderFloat("Gap spread (m)", &o.spread, 0.0f, 4.0f, "%.2f");
+        ImGui::EndDisabled();
+        if (changed) Project::Active().Save();
     }
     ImGui::End();
 }
@@ -9476,6 +9747,16 @@ std::vector<std::string> Editor::ListAssetsByExt(const char* extension,
     return out;
 }
 
+bool Editor::AssetSearchMatch(const std::string& rel) const {
+    if (assetPickerSearch_[0] == '\0') return true;
+    const auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    return lower(rel).find(lower(assetPickerSearch_)) != std::string::npos;
+}
+
 bool Editor::AssetPicker(const char* label, const std::string& current, const char* extension,
                          uaf::AssetType uafType, std::string& out, const char* noneLabel) {
     bool changed = false;
@@ -9501,14 +9782,8 @@ bool Editor::AssetPicker(const char* label, const std::string& current, const ch
                 changed = true;
                 ImGui::CloseCurrentPopup();
             }
-            const auto lower = [](std::string s) {
-                std::transform(s.begin(), s.end(), s.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                return s;
-            };
-            const std::string needle = lower(assetPickerSearch_);
             for (const std::string& rel : ListAssetsByExt(extension, uafType)) {
-                if (!needle.empty() && lower(rel).find(needle) == std::string::npos) continue;
+                if (!AssetSearchMatch(rel)) continue;
                 if (ImGui::Selectable(rel.c_str(), rel == current)) {
                     out = rel;
                     changed = true;
@@ -11542,6 +11817,12 @@ void Editor::DrawSelectionOutline(Scene& scene, Renderer& renderer) {
         const ImU32 col = z->active ? IM_COL32(80, 230, 120, 235)
                                     : IM_COL32(80, 200, 230, 200);
         drawBox(m, -z->halfExtents, z->halfExtents, col, 1.5f);
+    }
+    // Music zone volume (magenta = active, purple = idle).
+    if (const MusicZone* mz = reg.try_get<MusicZone>(selected_)) {
+        const ImU32 col = mz->active ? IM_COL32(230, 90, 220, 235)
+                                     : IM_COL32(170, 90, 220, 200);
+        drawBox(m, -mz->halfExtents, mz->halfExtents, col, 1.5f);
     }
     // Camera spline path (control points + connecting lines).
     if (const CameraSpline* sp = reg.try_get<CameraSpline>(selected_)) {

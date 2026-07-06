@@ -347,6 +347,19 @@ struct AudioSource {
     u32 voiceId = kNoVoice; // managed by AudioSystem; reset to re-create
 };
 
+// Marks an entity as a DIALOGUE ACTOR: a speaking character whose voice lines
+// emit 3D from its world position instead of flat 2D. When a dialogue Line's
+// `speaker` matches this actor's `speaker`, the clip plays positionally from here
+// (with `bus`/distance). Speaker-name -> entity binding also falls back to any
+// entity whose Name matches the speaker (a "General" 3D voice with no explicit
+// component); this component is the explicit override for precise bus/range.
+struct DialogueActor {
+    std::string speaker;          // dialogue speaker name this actor voices ("" = its Name)
+    std::string bus = "Dialogue"; // voice mixer bus ("" = Master)
+    f32 minDistance = 1.0f;       // full volume inside this radius
+    f32 maxDistance = 35.0f;      // silent beyond
+};
+
 // Plays skeletal animation clips on a skinned MeshInstance entity. The
 // TARGET skeleton comes from the entity's own mesh asset (MeshRef
 // "uaf:<rel>#<n>"); `sourceAsset` optionally RETARGETS clips authored in
@@ -493,6 +506,24 @@ struct CameraZone {
     CameraComponent settings;
 
     bool active = false;         // runtime state (set by cam::Update)
+};
+
+// A world volume that drives the ADAPTIVE MUSIC when the player enters it (FMOD-
+// style "zones"): an oriented box (the entity's world Transform places/rotates/
+// scales it, halfExtents are local). On the frame the player enters the highest-
+// priority enabled zone, it crossfades the music to `musicState` and/or sets a
+// music `parameter`. Author a large low-priority "base" zone covering the level
+// plus smaller high-priority zones (Combat, Boss) so leaving one re-enters the
+// base. Reference states/parameters by name from the project's music graph.
+struct MusicZone {
+    glm::vec3 halfExtents{8.0f};  // local box half-size (scaled by world scale)
+    std::string musicState;       // crossfade to this state on enter ("" = leave state)
+    std::string parameter;        // optional music parameter to set on enter ("" = none)
+    f32 parameterValue = 1.0f;    // value the parameter is set to on enter
+    f32 fadeSeconds = -1.0f;      // crossfade seconds (-1 = graph default)
+    int priority = 0;             // higher wins when zones overlap
+    bool enabled = true;
+    bool active = false;          // runtime state (set by the engine's music-zone update)
 };
 
 // A path of WORLD-space control points a Spline-mode camera travels along (a

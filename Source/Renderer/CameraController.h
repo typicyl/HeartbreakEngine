@@ -27,6 +27,11 @@ public:
     // Captures the live camera (prevents a snap when taking over from orbit).
     void SyncFrom(const Camera& camera);
 
+    // Frames a bounding sphere: keeps the current view direction but dollies the
+    // camera back so the sphere fits, then takes control (disables auto-orbit) and
+    // drives the camera immediately. Used by the editor's "F = frame selection".
+    void Focus(Renderer& renderer, const glm::vec3& center, f32 radius);
+
     bool IsFlying() const { return flying_; }
 
 private:
