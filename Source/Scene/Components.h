@@ -389,6 +389,34 @@ struct Animator {
     bool rootTrackValid = false;     // lastRootPos primed (no first-frame jump)
 };
 
+// ROOT of a MODULAR CHARACTER: a character built from swappable PARTS (head,
+// torso, upper-arm, ...) that all skin to ONE shared skeleton. The root owns the
+// single Animator (one pose/palette per frame) + a MeshRef to the skeleton-bearing
+// .uaf (with an INVALID-mesh MeshInstance so it poses but draws nothing), and this
+// component records the active loadout. Each active part is a child entity tagged
+// SkinnedPartRef -> this root, borrowing the root's palette in CollectDrawItems.
+// Seams stay solid because the .hbchar build canonicalizes seam vertices so all
+// parts skin bit-identically at the boundary. See Assets/CharacterAsset + docs.
+struct Character {
+    std::string asset;                       // .hbchar path (relative to Assets/)
+    // slot name -> active variant id ("" = the slot is empty/hidden this loadout).
+    std::unordered_map<std::string, std::string> activeVariant;
+    std::string loadout;                     // current named loadout ("" = custom)
+    // Runtime: slot -> the child part entity currently spawned (null = none).
+    // Rebuilt whenever the loadout changes; NOT serialized.
+    std::unordered_map<std::string, entt::entity> liveParts;
+};
+
+// Tags a mesh entity as a PART of a modular Character: instead of owning an
+// Animator, it BORROWS the character root's Animator.palette at draw time (one
+// shared pose for every part). Its local Transform must stay identity - skinning
+// is authored in the shared skeleton's model space.
+struct SkinnedPartRef {
+    entt::entity character = entt::null; // the Character root entity
+    std::string slot;                    // which slot this part fills
+    std::string variant;                 // which variant id it is
+};
+
 // Keyframe animation of the entity's LOCAL Transform (TRS keys, linear /
 // slerp interpolation). Driven by anim::Update; edited in the Timeline panel.
 struct AnimationTrack {

@@ -6,6 +6,7 @@
 //
 // Usage: HeartbreakEditor [--d3d12 | --vulkan] [--width N] [--height N]
 //                         [--validation] [--model <path>]
+#include "Assets/SeamWeld.h"
 #include "Core/JobSystem.h"
 #include "Core/Window.h"
 #include "Editor/Editor.h"
@@ -16,6 +17,7 @@
 #include "Renderer/Renderer.h"
 #include "Scene/Scene.h"
 
+#include <cstring>
 #include <filesystem>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -31,6 +33,16 @@
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 int main(int argc, char** argv) {
+    // --test-seamweld: run the modular-rig seam-weld bit-identity proof (headless,
+    // no GPU/window) and exit. Used by CI / the build discipline.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--test-seamweld") == 0) {
+            const bool ok = hbe::weld::SelfTest();
+            std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+    }
+
     hbe::EngineConfig config = hbe::ParseCommandLine(argc, argv);
     config.title = L"Heartbreak Editor";
 

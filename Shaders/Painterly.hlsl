@@ -115,6 +115,10 @@ float4 PSMain(FSOutput input) : SV_Target {
     float3 cSum[8];
     float nSum[8], n2Sum[8], wSum[8];
     [unroll] for (int s = 0; s < 8; ++s) { cSum[s] = 0; nSum[s] = 0; n2Sum[s] = 0; wSum[s] = 0; }
+    // Track how much of the ellipse survived the silhouette edge-stop: near a hard
+    // edge most taps are killed, leaving each sector a tiny, noisy sample -> the
+    // grainy rim. We blend back to the crisp original there (below).
+    float spatialSum = 0.0f, edgeSum = 0.0f;
     const float kSector = 8.0f / 6.2831853f;
     // Strong baseline even at edgeKeep 0 (a hill silhouette against sky needs it);
     // edgeKeep raises it further for stricter lost-and-found edges.
@@ -151,7 +155,10 @@ float4 PSMain(FSOutput input) : SV_Target {
                 const float ds = SamplePost(gInput2, suv).r;
                 wEdge = exp(-depthEdge * abs(ds - dc));
             }
-            const float w = exp(-2.0f * r2) * wEdge + 1e-5f;
+            const float sw = exp(-2.0f * r2);
+            const float w = sw * wEdge + 1e-5f;
+            spatialSum += sw;
+            edgeSum += sw * wEdge;
             const float nl = NLuma(c);
             const int sec = clamp((int)floor((atan2(e.y, e.x) + kPI) * kSector), 0, 7);
             cSum[sec] += c * w;
@@ -174,6 +181,14 @@ float4 PSMain(FSOutput input) : SV_Target {
         outW += vw;
     }
     painted = outW > 1e-5f ? painted / outW : orig;
+
+    // Silhouette de-speckle: `edgeFrac` is the share of the ellipse that survived
+    // the edge-stop. On a thin band at a hard silhouette (hill against sky) it drops
+    // toward 0 - only a few noisy taps remain per sector, which is the grainy rim.
+    // Fall back to the crisp original there (also keeps silhouettes sharp); flat
+    // interiors keep edgeFrac~1 and stay fully painted, so nothing else is softened.
+    const float edgeFrac = spatialSum > 1e-5f ? saturate(edgeSum / spatialSum) : 1.0f;
+    painted = lerp(orig, painted, smoothstep(0.25f, 0.6f, edgeFrac));
 
     float3 col = lerp(orig, painted, strength);
 

@@ -13,7 +13,9 @@
 #include "Editor/Importer.h"
 #include "Editor/MeshThumbnail.h"
 #include "Engine/CutscenePlayer.h"
+#include "Assets/CharacterBuild.h" // modular-character seam-weld build (Character Editor)
 #include "Game/GameSystems.h" // reset/restore story state (flags/objectives) around Play mode
+#include "Scene/CharacterSystem.h" // instantiate/swap modular characters
 #include "Engine/Engine.h"
 #include "Physics/PhysicsWorld.h"
 #include "Scene/AnimationSystem.h"
@@ -361,6 +363,8 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_CutsceneTimeline] = false; // opened when editing a cutscene
         panelOpen_[Panel_DialogueEditor] = false;   // opened when editing a dialogue
         panelOpen_[Panel_InputIcons] = false;        // opened from the Window menu on demand
+        panelOpen_[Panel_Objectives] = false;        // task-goal browser, opened on demand
+        panelOpen_[Panel_CharacterEditor] = false;   // modular-rig authoring, opened on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -637,6 +641,8 @@ void Editor::BuildUI(Engine& engine) {
     DrawSchematicEditor(engine);
     DrawDialogueEditor(engine);
     DrawInputIconsPanel(engine);
+    DrawObjectives(engine);       // task-goal browser (Window > Objectives)
+    DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
     DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
     DrawSelectionOutline(scene, renderer);
     DrawNavOverlay(scene, renderer);
@@ -691,7 +697,8 @@ void Editor::DrawWindowMenu() {
         "Asset Viewer", "Project Settings", "Post Process", "Navigation",
         "Streaming",    "Stats",      "Timeline",    "Scenes",
         "Audio Mixer",  "Assets",     "Art Editor",
-        "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input"};
+        "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
+        "Objectives", "Character Editor"};
     if (artMode_) {
         // Artist build: only the painting-relevant panels are listed/reachable.
         static const Panel kArtPanels[] = {Panel_Viewport, Panel_ArtEditor,
@@ -5045,6 +5052,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             reg.emplace<TriggerVolume>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
+        if (!reg.all_of<Character>(sel) && ImGui::MenuItem("Character (Modular Rig)")) {
+            PushUndo(scene);
+            reg.emplace<Character>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
         if (!reg.all_of<ParticleEmitter>(sel) && ImGui::BeginMenu("Particle Emitter")) {
             const auto addEmitter = [&](ParticleEmitter em) {
                 PushUndo(scene);
@@ -7052,14 +7064,12 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
     if (Checkpoint* cp = reg.try_get<Checkpoint>(sel)) {
         const SectionState s = ComponentSection("Checkpoint");
         if (s.open) {
-            char idb[64], ob[128], cb[64];
+            char idb[64], ob[128];
             std::snprintf(idb, sizeof(idb), "%s", cp->id.c_str());
             if (ImGui::InputText("Id", idb, sizeof(idb))) cp->id = idb;
             std::snprintf(ob, sizeof(ob), "%s", cp->setObjective.c_str());
             if (ImGui::InputText("Set objective (HUD text)", ob, sizeof(ob))) cp->setObjective = ob;
-            std::snprintf(cb, sizeof(cb), "%s", cp->completesObjective.c_str());
-            if (ImGui::InputText("Completes objective (id)", cb, sizeof(cb)))
-                cp->completesObjective = cb;
+            ObjectiveIdPicker("Completes objective (id)", cp->completesObjective, scene);
             ImGui::DragFloat3("Trigger half-extents", glm::value_ptr(cp->halfExtents), 0.1f, 0.0f,
                               1000.0f);
             ImGui::Checkbox("Trigger on player enter", &cp->triggerOnEnter);
@@ -7093,16 +7103,12 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             if (ImGui::InputText("Flag", fb, sizeof(fb))) flag = fb;
             ImGui::DragFloat("Set to", &flagValue, 0.1f);
         } else if (action == InteractAction::SetObjective) {
-            char fb[64];
-            std::snprintf(fb, sizeof(fb), "%s", flag.c_str());
-            if (ImGui::InputText("Objective id", fb, sizeof(fb))) flag = fb;
+            ObjectiveIdPicker("Objective id", flag, scene);
             char tb[128];
             std::snprintf(tb, sizeof(tb), "%s", text.c_str());
             if (ImGui::InputText("Objective text", tb, sizeof(tb))) text = tb;
         } else if (action == InteractAction::CompleteObjective) {
-            char fb[64];
-            std::snprintf(fb, sizeof(fb), "%s", flag.c_str());
-            if (ImGui::InputText("Objective id", fb, sizeof(fb))) flag = fb;
+            ObjectiveIdPicker("Objective id", flag, scene);
         }
     };
 
@@ -7142,6 +7148,61 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<TriggerVolume>(sel);
+        }
+    }
+
+    // --- Character (modular rig: swappable parts on one shared skeleton) ---------
+    if (Character* ch = reg.try_get<Character>(sel)) {
+        const SectionState s = ComponentSection("Character (Modular Rig)");
+        if (s.open) {
+            const std::filesystem::path assets =
+                Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+            std::string pick;
+            if (AssetPicker("Definition (.hbchar)", ch->asset, ".hbchar", uaf::AssetType::Unknown,
+                            pick))
+                ch->asset = pick;
+            if (ch->asset.empty()) {
+                ImGui::TextDisabled("Assign a .hbchar, or author one in Window > Character Editor.");
+            } else if (const auto ca = assets::LoadCharacter(assets / ch->asset)) {
+                const char* cur = ch->loadout.empty() ? "(defaults)" : ch->loadout.c_str();
+                if (ImGui::BeginCombo("Loadout", cur)) {
+                    if (ImGui::Selectable("(defaults)", ch->loadout.empty()))
+                        character::SetLoadout(scene, renderer, sel, assets, "");
+                    for (const CharacterLoadout& lo : ca->loadouts)
+                        if (ImGui::Selectable(lo.name.c_str(), ch->loadout == lo.name))
+                            character::SetLoadout(scene, renderer, sel, assets, lo.name);
+                    ImGui::EndCombo();
+                }
+                if (ImGui::Button("Build & Preview"))
+                    character::Instantiate(scene, renderer, sel, assets);
+                ImGui::SameLine();
+                if (ImGui::Button("Clear Parts")) character::ClearParts(scene, sel);
+                // Per-slot variant override (equip/unequip a single piece live).
+                if (!ca->slots.empty()) ImGui::SeparatorText("Slots");
+                for (const CharacterSlot& sl : ca->slots) {
+                    const auto vit = ch->activeVariant.find(sl.name);
+                    const std::string curV = vit != ch->activeVariant.end() ? vit->second : "";
+                    ImGui::PushID(sl.name.c_str());
+                    if (ImGui::BeginCombo(sl.name.c_str(), curV.empty() ? "(hidden)" : curV.c_str())) {
+                        if (ImGui::Selectable("(hidden)", curV.empty()))
+                            character::SetSlotVariant(scene, renderer, sel, assets, sl.name, "");
+                        for (const CharacterVariant& v : ca->variants) {
+                            if (v.slot != sl.name) continue;
+                            if (ImGui::Selectable(v.id.c_str(), curV == v.id))
+                                character::SetSlotVariant(scene, renderer, sel, assets, sl.name, v.id);
+                        }
+                        ImGui::EndCombo();
+                    }
+                    ImGui::PopID();
+                }
+            } else {
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "Cannot load '%s'.", ch->asset.c_str());
+            }
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            character::ClearParts(scene, sel);
+            reg.remove<Character>(sel);
         }
     }
 
@@ -9796,6 +9857,418 @@ bool Editor::AssetPicker(const char* label, const std::string& current, const ch
     }
     ImGui::PopID();
     return changed;
+}
+
+// --- Objectives browser ------------------------------------------------------
+// Objectives ("task goals") aren't stored in a central list - they emerge from
+// Checkpoints, Interactable/Trigger actions and Schematic nodes. This scans the
+// loaded scene/level for every reference, groups by objective id, and records a
+// jumpable source entity for each so the developer can find + navigate to them.
+void Editor::RebuildObjectiveIndex(Scene& scene) {
+    objectives_.clear();
+    entt::registry& reg = scene.Registry();
+
+    // Small N (dozens): linear find-or-create keyed by objective id.
+    const auto entry = [&](const std::string& id) -> ObjectiveInfo& {
+        for (ObjectiveInfo& o : objectives_)
+            if (o.id == id) return o;
+        objectives_.push_back(ObjectiveInfo{});
+        objectives_.back().id = id;
+        return objectives_.back();
+    };
+    // An empty id is a misconfiguration that never produces a usable objective at
+    // runtime (SetObjective/CompleteObjective callers all guard on a non-empty id),
+    // so it is never indexed - keeps the panel and the picker list consistent.
+    const auto addSet = [&](const std::string& id, const std::string& text, entt::entity e,
+                            std::string label) {
+        if (id.empty()) return;
+        ObjectiveInfo& o = entry(id);
+        o.hasSetter = true;
+        if (o.text.empty() && !text.empty()) o.text = text;
+        o.sources.push_back({e, std::move(label), true});
+    };
+    const auto addComplete = [&](const std::string& id, entt::entity e, std::string label) {
+        if (id.empty()) return;
+        ObjectiveInfo& o = entry(id);
+        o.hasCompleter = true;
+        o.sources.push_back({e, std::move(label), false});
+    };
+
+    // Checkpoints: reaching one SetObjective(cp.id, setObjective) and/or completes
+    // completesObjective (see game::UpdateCheckpoints). So cp.id IS the objective id.
+    for (const entt::entity e : reg.view<Checkpoint>()) {
+        const Checkpoint& cp = reg.get<Checkpoint>(e);
+        // Mirror game::UpdateCheckpoints exactly: a checkpoint only fires its
+        // objectives when it triggers on enter AND has a non-empty id (the
+        // programmatic ReachCheckpoint path does not touch objectives at all).
+        if (!cp.triggerOnEnter || cp.id.empty()) continue;
+        const std::string name = "Checkpoint '" + cp.id + "'";
+        if (!cp.setObjective.empty()) addSet(cp.id, cp.setObjective, e, name);
+        if (!cp.completesObjective.empty()) addComplete(cp.completesObjective, e, name);
+    }
+
+    // Interactables + Trigger volumes: action SetObjective(flag,text)/CompleteObjective(flag).
+    const auto scanAction = [&](InteractAction action, const std::string& flag,
+                                const std::string& text, entt::entity e, const char* kind) {
+        if (action == InteractAction::SetObjective) addSet(flag, text, e, kind);
+        else if (action == InteractAction::CompleteObjective) addComplete(flag, e, kind);
+    };
+    for (const entt::entity e : reg.view<Interactable>()) {
+        const Interactable& ia = reg.get<Interactable>(e);
+        scanAction(ia.action, ia.flag, ia.text, e, "Interactable");
+    }
+    for (const entt::entity e : reg.view<TriggerVolume>()) {
+        const TriggerVolume& tv = reg.get<TriggerVolume>(e);
+        scanAction(tv.action, tv.flag, tv.text, e, "Trigger Volume");
+    }
+
+    // Schematic graphs referenced by the scene: load each unique .hbschem once and
+    // pull Set/Complete Objective node literals (pin 1 = Id, pin 2 = Text).
+    if (Project::HasActive()) {
+        const std::filesystem::path assets = Project::Active().AssetsDir();
+        std::vector<std::string> scanned;
+        for (const entt::entity e : reg.view<SchematicComponent>()) {
+            const SchematicComponent& sc = reg.get<SchematicComponent>(e);
+            if (sc.asset.empty()) continue;
+            bool seen = false;
+            for (const std::string& s : scanned)
+                if (s == sc.asset) { seen = true; break; }
+            if (seen) continue;
+            scanned.push_back(sc.asset);
+
+            schematic::Graph g;
+            if (!schematic::LoadGraph(assets / sc.asset, g)) continue;
+            const std::string label = "Schematic " + sc.asset;
+            for (const schematic::Node& n : g.nodes) {
+                const auto lit = [&](usize i) -> std::string {
+                    return (i < n.literals.size() &&
+                            n.literals[i].type == schematic::PinType::String)
+                               ? n.literals[i].s : std::string();
+                };
+                if (n.type == schematic::NodeType::SetObjective)
+                    addSet(lit(1), lit(2), e, label);
+                else if (n.type == schematic::NodeType::CompleteObjective)
+                    addComplete(lit(1), e, label);
+            }
+        }
+    }
+
+    std::sort(objectives_.begin(), objectives_.end(),
+              [](const ObjectiveInfo& a, const ObjectiveInfo& b) { return a.id < b.id; });
+}
+
+bool Editor::ObjectiveIdPicker(const char* label, std::string& value, Scene& scene) {
+    bool changed = false;
+    // Scope by the address of the edited field, not the label: two pickers with the
+    // same label (an entity with both an Interactable AND a TriggerVolume objective
+    // action) would otherwise collide on the shared "##objpick" popup id.
+    ImGui::PushID(&value);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%s", value.c_str());
+    ImGui::SetNextItemWidth(-140.0f); // room for the Pick button + label
+    if (ImGui::InputText("##objid", buf, sizeof(buf))) {
+        value = buf;
+        changed = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Pick")) {
+        assetPickerSearch_[0] = '\0';
+        RebuildObjectiveIndex(scene); // fresh list of ids to choose from
+        ImGui::OpenPopup("##objpick");
+    }
+    ImGui::SameLine();
+    ImGui::TextUnformatted(label);
+
+    if (ImGui::BeginPopup("##objpick")) {
+        ImGui::SetNextItemWidth(220.0f);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::InputTextWithHint("##search", "search...", assetPickerSearch_,
+                                 sizeof(assetPickerSearch_));
+        ImGui::Separator();
+        if (ImGui::BeginChild("##objlist", ImVec2(260.0f, 220.0f))) {
+            bool any = false;
+            for (const ObjectiveInfo& o : objectives_) {
+                if (o.id.empty()) continue;
+                if (!AssetSearchMatch(o.id) && !AssetSearchMatch(o.text)) continue;
+                any = true;
+                const std::string lbl = o.text.empty() ? o.id : (o.id + "  -  " + o.text);
+                if (ImGui::Selectable(lbl.c_str(), o.id == value)) {
+                    value = o.id;
+                    changed = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            if (!any) ImGui::TextDisabled("No objectives defined in this scene.");
+        }
+        ImGui::EndChild();
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+void Editor::DrawObjectives(Engine& engine) {
+    if (!panelOpen_[Panel_Objectives]) return;
+    if (!ImGui::Begin("Objectives", &panelOpen_[Panel_Objectives])) {
+        ImGui::End();
+        return;
+    }
+    Scene& scene = engine.GetScene();
+    if (ImGui::IsWindowAppearing()) RebuildObjectiveIndex(scene);
+
+    if (ImGui::Button("Refresh")) RebuildObjectiveIndex(scene);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##objsearch", "search tasks by id or text...", objectiveSearch_,
+                             sizeof(objectiveSearch_));
+
+    const auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    const std::string q = lower(objectiveSearch_);
+    const auto match = [&](const ObjectiveInfo& o) {
+        if (q.empty()) return true;
+        return lower(o.id).find(q) != std::string::npos ||
+               lower(o.text).find(q) != std::string::npos;
+    };
+
+    int shown = 0;
+    for (const ObjectiveInfo& o : objectives_)
+        if (match(o)) ++shown;
+    ImGui::TextDisabled("%d task%s in the loaded scene/level%s", shown, shown == 1 ? "" : "s",
+                        objectives_.empty() ? " (Refresh after loading a scene)" : "");
+    ImGui::Separator();
+
+    if (ImGui::BeginChild("##objscroll")) {
+        for (const ObjectiveInfo& o : objectives_) {
+            if (!match(o)) continue;
+            std::string header = o.id.empty() ? "(no id)" : o.id;
+            if (!o.text.empty()) header += "  -  " + o.text;
+            ImGui::PushID(&o);
+            if (ImGui::TreeNodeEx(header.c_str(), ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (o.hasCompleter && !o.hasSetter)
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                                       "completed but never set in this scene");
+                else if (o.hasSetter && !o.hasCompleter)
+                    ImGui::TextColored(ImVec4(0.85f, 0.8f, 0.4f, 1.0f),
+                                       "set but never completed in this scene");
+                for (usize i = 0; i < o.sources.size(); ++i) {
+                    const ObjectiveSource& src = o.sources[i];
+                    ImGui::PushID(static_cast<int>(i));
+                    ImGui::BulletText("%s  [%s]", src.label.c_str(), src.sets ? "sets" : "completes");
+                    if (src.entity != entt::null && scene.Registry().valid(src.entity)) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Select")) selected_ = src.entity;
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("Frame")) {
+                            selected_ = src.entity;
+                            FrameSelected(engine);
+                        }
+                    }
+                    ImGui::PopID();
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+    ImGui::End();
+}
+
+// --- Character Editor: author a .hbchar (slots / variants / loadouts) + weld ----
+void Editor::DrawCharacterEditor(Engine& engine) {
+    if (!panelOpen_[Panel_CharacterEditor]) return;
+    if (!ImGui::Begin("Character Editor", &panelOpen_[Panel_CharacterEditor])) {
+        ImGui::End();
+        return;
+    }
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("Open a project first.");
+        ImGui::End();
+        return;
+    }
+    const std::filesystem::path assets = Project::Active().AssetsDir();
+
+    // "uaf:<rel>#<n>" <-> (rel, submesh) helpers for the part-mesh pickers.
+    const auto splitUaf = [](const std::string& s, std::string& rel, int& sub) {
+        rel.clear();
+        sub = 0;
+        if (s.rfind("uaf:", 0) != 0) return;
+        std::string rest = s.substr(4);
+        if (const usize h = rest.find_last_of('#'); h != std::string::npos) {
+            sub = std::atoi(rest.c_str() + h + 1);
+            rest = rest.substr(0, h);
+        }
+        rel = rest;
+    };
+    const auto joinUaf = [](const std::string& rel, int sub) {
+        return rel.empty() ? std::string() : ("uaf:" + rel + "#" + std::to_string(sub));
+    };
+
+    // --- Toolbar: New / Open / Save --------------------------------------------
+    if (ImGui::Button("New")) {
+        charEdit_ = CharacterAsset{};
+        charEditRel_ = "Characters/NewCharacter.hbchar";
+        charBuilt_ = false;
+    }
+    ImGui::SameLine();
+    {
+        std::string openPick;
+        if (AssetPicker("Open", charEditRel_.empty() ? std::string("(none)") : charEditRel_,
+                        assets::kCharacterExtension, uaf::AssetType::Unknown, openPick)) {
+            if (const auto loaded = assets::LoadCharacter(assets / openPick)) {
+                charEdit_ = *loaded;
+                charEditRel_ = openPick;
+                charBuilt_ = false;
+            }
+        }
+    }
+    char relBuf[256];
+    std::snprintf(relBuf, sizeof(relBuf), "%s", charEditRel_.c_str());
+    ImGui::SetNextItemWidth(280.0f);
+    if (ImGui::InputText("Path (rel Assets/)", relBuf, sizeof(relBuf))) charEditRel_ = relBuf;
+    ImGui::SameLine();
+    if (ImGui::Button("Save") && !charEditRel_.empty()) {
+        if (assets::SaveCharacter(assets / charEditRel_, charEdit_))
+            hbe::character::ClearCache(); // re-weld next instantiate
+    }
+    ImGui::Separator();
+
+    // --- Skeleton (shared rig that drives every part) --------------------------
+    {
+        std::string skRel;
+        int skSub = 0;
+        splitUaf(charEdit_.skeleton, skRel, skSub);
+        std::string p;
+        if (AssetPicker("Skeleton (.uaf rig)", skRel.empty() ? std::string("(none)") : skRel,
+                        ".uaf", uaf::AssetType::Mesh, p))
+            charEdit_.skeleton = joinUaf(p, 0);
+    }
+
+    // --- Slots ------------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Slots", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int removeSlot = -1;
+        for (int i = 0; i < static_cast<int>(charEdit_.slots.size()); ++i) {
+            ImGui::PushID(i);
+            char nameBuf[64];
+            std::snprintf(nameBuf, sizeof(nameBuf), "%s", charEdit_.slots[i].name.c_str());
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::InputText("##slot", nameBuf, sizeof(nameBuf))) charEdit_.slots[i].name = nameBuf;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("X")) removeSlot = i;
+            ImGui::PopID();
+        }
+        if (removeSlot >= 0) charEdit_.slots.erase(charEdit_.slots.begin() + removeSlot);
+        if (ImGui::Button("+ Add Slot")) charEdit_.slots.push_back({"slot", {}});
+    }
+
+    // --- Variants ---------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Variants", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int removeVar = -1;
+        for (int i = 0; i < static_cast<int>(charEdit_.variants.size()); ++i) {
+            CharacterVariant& v = charEdit_.variants[i];
+            ImGui::PushID(1000 + i);
+            char idBuf[64];
+            std::snprintf(idBuf, sizeof(idBuf), "%s", v.id.c_str());
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::InputText("id", idBuf, sizeof(idBuf))) v.id = idBuf;
+            ImGui::SameLine();
+            if (ImGui::BeginCombo("slot", v.slot.empty() ? "(pick)" : v.slot.c_str())) {
+                for (const CharacterSlot& sl : charEdit_.slots)
+                    if (ImGui::Selectable(sl.name.c_str(), v.slot == sl.name)) v.slot = sl.name;
+                ImGui::EndCombo();
+            }
+            // part mesh: .uaf picker + submesh spinner
+            std::string mrel;
+            int msub = 0;
+            splitUaf(v.mesh, mrel, msub);
+            std::string mp;
+            if (AssetPicker("Mesh", mrel.empty() ? std::string("(none)") : mrel, ".uaf",
+                            uaf::AssetType::Mesh, mp))
+                v.mesh = joinUaf(mp, msub);
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(80.0f);
+            if (ImGui::InputInt("submesh", &msub)) {
+                if (msub < 0) msub = 0;
+                v.mesh = joinUaf(mrel, msub);
+            }
+            int mode = static_cast<int>(v.seamMode);
+            ImGui::SetNextItemWidth(140.0f);
+            if (ImGui::Combo("seam", &mode, "Continuous\0Overlap\0"))
+                v.seamMode = static_cast<SeamMode>(glm::clamp(mode, 0, 1));
+            ImGui::SameLine();
+            ImGui::Checkbox("default", &v.isDefault);
+            std::string matp;
+            if (AssetPicker("Material", v.material.empty() ? std::string("(mesh's own)") : v.material,
+                            ".hbmat", uaf::AssetType::Unknown, matp))
+                v.material = matp;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove Variant")) removeVar = i;
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (removeVar >= 0) charEdit_.variants.erase(charEdit_.variants.begin() + removeVar);
+        if (ImGui::Button("+ Add Variant")) charEdit_.variants.push_back({});
+    }
+
+    // --- Loadouts ---------------------------------------------------------------
+    if (ImGui::CollapsingHeader("Loadouts")) {
+        int removeLo = -1;
+        for (int i = 0; i < static_cast<int>(charEdit_.loadouts.size()); ++i) {
+            CharacterLoadout& lo = charEdit_.loadouts[i];
+            ImGui::PushID(2000 + i);
+            char nameBuf[64];
+            std::snprintf(nameBuf, sizeof(nameBuf), "%s", lo.name.c_str());
+            ImGui::SetNextItemWidth(160.0f);
+            if (ImGui::InputText("name", nameBuf, sizeof(nameBuf))) lo.name = nameBuf;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Remove Loadout")) removeLo = i;
+            for (const CharacterSlot& sl : charEdit_.slots) {
+                const auto it = lo.slots.find(sl.name);
+                const std::string cur = it != lo.slots.end() ? it->second : "";
+                ImGui::PushID(sl.name.c_str());
+                if (ImGui::BeginCombo(sl.name.c_str(), cur.empty() ? "(hidden)" : cur.c_str())) {
+                    if (ImGui::Selectable("(hidden)", cur.empty())) lo.slots[sl.name] = "";
+                    for (const CharacterVariant& v : charEdit_.variants) {
+                        if (v.slot != sl.name) continue;
+                        if (ImGui::Selectable(v.id.c_str(), cur == v.id)) lo.slots[sl.name] = v.id;
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::PopID();
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (removeLo >= 0) charEdit_.loadouts.erase(charEdit_.loadouts.begin() + removeLo);
+        if (ImGui::Button("+ Add Loadout")) charEdit_.loadouts.push_back({"loadout", {}});
+    }
+
+    // --- Build & seam report (the solidity safety net) --------------------------
+    ImGui::Separator();
+    if (ImGui::Button("Build & Check Seams")) {
+        const assets::BuiltCharacter b = assets::BuildCharacter(assets, charEdit_);
+        charBuilt_ = b.ok;
+        charBuildStats_ = b.stats;
+    }
+    if (charBuilt_) {
+        ImGui::Text("%u seam group(s), %u verts welded.", charBuildStats_.groups,
+                    charBuildStats_.weldedVertices);
+        if (charBuildStats_.openBoundary > 0)
+            ImGui::TextColored(ImVec4(0.9f, 0.75f, 0.3f, 1),
+                               "%u open-boundary vert(s): a hem, or adjacent rings that don't line "
+                               "up (drift risk).",
+                               charBuildStats_.openBoundary);
+        else
+            ImGui::TextColored(ImVec4(0.4f, 0.85f, 0.4f, 1), "All boundaries paired - seams solid.");
+        if (charBuildStats_.nonManifoldEdges > 0)
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%u non-manifold edge(s) (check the mesh).",
+                               charBuildStats_.nonManifoldEdges);
+    }
+    ImGui::End();
 }
 
 namespace {

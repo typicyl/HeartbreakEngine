@@ -9,6 +9,7 @@
 #include "Renderer/Renderer.h"
 #include "Project/Project.h"
 #include "Scene/AnimationSystem.h"
+#include "Scene/CharacterSystem.h"
 #include "Scene/PaintSystem.h"
 #include "Scene/PostSettingsSerialization.h"
 #include "Scene/Scene.h"
@@ -198,6 +199,10 @@ json BuildSceneJson(const Scene& scene,
         // into the .hbsave (they'd reload as permanent, tag-less, un-clearable UI).
         if (reg.try_get<DialogueChoiceButton>(e)) return;
         if (reg.all_of<InteractPromptTag>(e)) return; // transient interaction prompt UI (empty tag)
+        // Modular-character parts are respawned from the .hbchar by character::
+        // Instantiate on load, so they are never serialized (else they'd double up
+        // as static bind-pose meshes alongside the freshly-spawned ones).
+        if (reg.all_of<SkinnedPartRef>(e)) return;
         if (include && !include(e)) return; // not part of the scene being saved
         const u32 key = static_cast<u32>(e);
         if (indexOf.find(key) == indexOf.end()) {
@@ -667,6 +672,15 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                               {"playing", an->playing},
                               {"rootMotion", an->rootMotion}};
         }
+        // Modular-character root: the .hbchar + active loadout. Parts are NOT
+        // serialized (regenerated on load). Key is "characterRig" to avoid the
+        // CharacterController's "character" key.
+        if (const Character* ch = reg.try_get<Character>(e)) {
+            json av = json::object();
+            for (const auto& [slot, variant] : ch->activeVariant) av[slot] = variant;
+            je["characterRig"] = {{"asset", ch->asset}, {"loadout", ch->loadout},
+                                  {"activeVariant", std::move(av)}};
+        }
         if (const AnimationTrack* a = reg.try_get<AnimationTrack>(e)) {
             json keys = json::array();
             for (const auto& k : a->keys) {
@@ -974,6 +988,14 @@ void ParseSceneJson(const json& root, SceneData& out) {
             ce.strength = it->value("strength", ce.strength);
             ce.offset = Vec3(it->value("offset", json()), ce.offset);
             ce.enabled = it->value("enabled", ce.enabled);
+        }
+        if (auto it = je.find("characterRig"); it != je.end()) {
+            d.hasCharacterRig = true;
+            d.characterRig.asset = it->value("asset", "");
+            d.characterRig.loadout = it->value("loadout", "");
+            if (const auto av = it->find("activeVariant"); av != it->end() && av->is_object())
+                for (const auto& [slot, variant] : av->items())
+                    d.characterRig.activeVariant[slot] = variant.get<std::string>();
         }
         if (auto it = je.find("character"); it != je.end()) {
             d.hasCharacter = true;
@@ -1673,7 +1695,9 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
 
         if (d.hasTransform) reg.emplace<Transform>(e, d.transform);
 
-        if (d.hasMesh && !d.meshSource.empty()) {
+        // A modular-character ROOT never draws (its MeshRef only provides the
+        // skeleton for posing); character::Instantiate sets that up + spawns parts.
+        if (d.hasMesh && !d.meshSource.empty() && !d.hasCharacterRig) {
             MeshInstance mi;
             mi.baseColor = d.baseColor;
             mi.metallic = d.metallic;
@@ -1769,6 +1793,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasCheckpoint) reg.emplace<Checkpoint>(e, d.checkpoint);
         if (d.hasInteractable) reg.emplace<Interactable>(e, d.interactable);
         if (d.hasTrigger) reg.emplace<TriggerVolume>(e, d.trigger);
+        if (d.hasCharacterRig) reg.emplace<Character>(e, d.characterRig); // parts spawned post-load
         if (d.hasCamera) reg.emplace<CameraComponent>(e, d.camera);
         if (d.hasCameraZone) reg.emplace<CameraZone>(e, d.cameraZone);
         if (d.hasMusicZone) reg.emplace<MusicZone>(e, d.musicZone);
@@ -1889,6 +1914,28 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
     }
     if (anyUI && Project::HasActive()) {
         ui::PreloadUIAssets(scene, renderer, Project::Active().AssetsDir());
+    }
+
+    // Modular characters: now that every entity + parent link exists, spawn each
+    // root's loadout parts (welded from its .hbchar). Snapshot the roots first -
+    // character::Instantiate creates child entities, which would invalidate a live
+    // view. Only freshly-loaded roots (no live parts yet) are built, so an additive
+    // load over an already-assembled character leaves it untouched.
+    if (Project::HasActive()) {
+        const fs::path assetsDir = Project::Active().AssetsDir();
+        std::vector<entt::entity> charRoots;
+        for (const entt::entity e : reg.view<Character>())
+            if (reg.get<Character>(e).liveParts.empty()) charRoots.push_back(e);
+        for (const entt::entity e : charRoots)
+            character::Instantiate(scene, renderer, e, assetsDir);
+    } else {
+        // No active project -> assets can't resolve (same assumption as UI-preload /
+        // probe-load above). Don't fail silently: a Character root would otherwise
+        // load with no parts + no skeleton binding.
+        for (const entt::entity e : reg.view<Character>())
+            if (reg.get<Character>(e).liveParts.empty())
+                HBE_WARN("Character '{}' not assembled: no active project to resolve its assets.",
+                         reg.get<Character>(e).asset);
     }
 
     HBE_INFO("Scene: instantiated {} entities ({}).", data.entities.size(),

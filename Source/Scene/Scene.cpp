@@ -98,19 +98,28 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         else
             item.prevTransform = item.transform;
         curWorld_[e] = item.transform;
-        // Skeletal: the Animator's palette (built by anim::UpdateSkeletal this
-        // frame) lives in component storage, stable for the frame.
-        if (const Animator* an = registry_.try_get<Animator>(e);
+        // Skeletal: resolve which entity OWNS the pose for this draw. A modular-
+        // character PART (SkinnedPartRef) borrows its Character root's single shared
+        // Animator.palette - one pose drives every part, which is also what makes the
+        // seam weld bit-exact (all parts read the same palette). A plain skinned
+        // entity has no SkinnedPartRef, so poseOwner == e (unchanged behaviour).
+        entt::entity poseOwner = e;
+        if (const SkinnedPartRef* pr = registry_.try_get<SkinnedPartRef>(e);
+            pr && registry_.valid(pr->character))
+            poseOwner = pr->character;
+        if (const Animator* an = registry_.try_get<Animator>(poseOwner);
             an && !an->palette.empty()) {
             item.bones = an->palette.data();
             item.boneCount = static_cast<u32>(an->palette.size());
-            // Previous-frame palette for skinned motion vectors. Only use it
-            // when the joint count matches (clip/rig changes invalidate it);
-            // the cached vector stays alive through this frame's DrawScene.
-            if (auto pit = prevPalette_.find(e);
+            // Previous-frame palette for skinned motion vectors, keyed by the POSE
+            // OWNER (root) so every part that borrows it shares one history and it is
+            // independent of entity iteration order. Only use it when the joint count
+            // matches (clip/rig changes invalidate it). Recorded once per frame
+            // (try_emplace) - multiple parts of one character must not each re-copy it.
+            if (auto pit = prevPalette_.find(poseOwner);
                 pit != prevPalette_.end() && pit->second.size() == an->palette.size())
                 item.prevBones = pit->second.data();
-            curPalette_[e] = an->palette;
+            curPalette_.try_emplace(poseOwner, an->palette);
         }
         item.baseColor = instance.baseColor;
         item.metallic = instance.metallic;

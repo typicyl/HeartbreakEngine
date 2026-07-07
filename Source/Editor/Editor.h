@@ -5,7 +5,9 @@
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
 #include "Dialogue/DialogueGraph.h" // branching-dialogue graph editor
+#include "Assets/CharacterAsset.h"
 #include "Assets/MaterialAsset.h"
+#include "Assets/SeamWeld.h"
 #include "Assets/UAF.h"
 #include "Core/Types.h"
 #include "Navigation/GridNav.h"
@@ -634,6 +636,7 @@ private:
         Panel_Scenes, Panel_AudioMixer, Panel_Assets,
         Panel_ArtEditor, Panel_SchematicEditor, Panel_Music,
         Panel_CutsceneTimeline, Panel_DialogueEditor, Panel_InputIcons,
+        Panel_Objectives, Panel_CharacterEditor,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
@@ -764,6 +767,41 @@ private:
     // -- Streaming world (load + inspect cells; engine streams around camera) ------
     void DrawStreaming(Engine& engine);
     std::string streamStatus_;
+
+    // -- Objectives browser (searchable index of task goals in the loaded scene) ---
+    // Objectives ("task goals") are runtime strings (id + HUD text) that emerge from
+    // Checkpoints, Interactable/Trigger actions and Schematic nodes rather than a
+    // central authored list. This panel scans the loaded scene/level for every
+    // objective referenced, groups by id, and lets the developer jump to each source.
+    struct ObjectiveSource {
+        entt::entity entity = entt::null; // owning entity (jumpable); null if none
+        std::string label;                // e.g. "Checkpoint 'gate'", "Interactable", "Schematic foo.hbschem"
+        bool sets = false;                // sets the objective (else completes it)
+    };
+    struct ObjectiveInfo {
+        std::string id;                        // objective id (grouping key)
+        std::string text;                      // representative HUD text (first setter with text)
+        std::vector<ObjectiveSource> sources;  // every place it is set/completed
+        bool hasSetter = false;                // something SetObjective's it
+        bool hasCompleter = false;             // something CompleteObjective's it
+    };
+    std::vector<ObjectiveInfo> objectives_;  // built by RebuildObjectiveIndex (sorted by id)
+    char objectiveSearch_[128] = {};         // panel + picker filter text
+    // Rebuilds objectives_ from the loaded scene registry (Checkpoint/Interactable/
+    // TriggerVolume) + the .hbschem graphs referenced by its SchematicComponents.
+    void RebuildObjectiveIndex(Scene& scene);
+    void DrawObjectives(Engine& engine);     // the dockable browser panel
+
+    // -- Character Editor (modular-rig .hbchar authoring) ------------------------
+    CharacterAsset charEdit_;          // the .hbchar currently being authored
+    std::string charEditRel_;          // its path relative to Assets/ ("" = new/unsaved)
+    weld::Stats charBuildStats_{};     // last seam-weld "Build & report" result
+    bool charBuilt_ = false;           // charBuildStats_ is valid
+    int charEditSubmesh_ = 0;          // submesh spinner shared by the variant mesh picker
+    void DrawCharacterEditor(Engine& engine);
+    // An objective-id field: free-typing InputText + a "Pick" popup of existing ids
+    // (searchable). Returns true when `value` changed. Used by the narrative inspectors.
+    bool ObjectiveIdPicker(const char* label, std::string& value, Scene& scene);
 
     bool hubMode_ = false;
     bool artMode_ = false;     // painting-focused layout (HeartbreakArtEditor.exe)

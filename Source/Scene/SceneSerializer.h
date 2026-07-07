@@ -139,6 +139,8 @@ struct EntityData {
     Interactable interactable;
     bool hasTrigger = false;
     TriggerVolume trigger;
+    bool hasCharacterRig = false; // modular-rig Character (distinct from CharacterController)
+    Character characterRig;
 
     // Runtime-only tags carried by in-memory snapshots (play mode, undo/redo) so
     // a Replace restore preserves which scene/level-layer each entity belongs to.
