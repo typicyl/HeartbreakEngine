@@ -99,6 +99,15 @@ public:
     // Editor viewport (scene rendered into an ImGui panel).
     void SetViewportSize(u32 width, u32 height);
     u64  ViewportTextureId();
+    // Reads the offscreen viewport color back to CPU as canonical RGBA8 (top row
+    // first). Blocking; editor-only. Returns false when unsupported / not ready.
+    // The offline movie render captures each frame through this.
+    bool ReadbackViewportColor(std::vector<u8>& outRGBA, u32& w, u32& h);
+
+    // Per-pass GPU profiler: enable to log a per-pass GPU-time breakdown every ~2s
+    // (--gpuprofile / dev menu). ~1-3 ms/frame while active. See IRenderDevice.
+    void SetGpuProfileEnabled(bool enable);
+    bool GpuProfileActive() const;
 
     // Editor asset preview: an independent mini-scene (orbiting mesh preview)
     // rendered before the main scene each frame. The editor submits a view +

@@ -140,6 +140,16 @@ cbuffer ObjectConstants : register(b1)
     uint     gInstanced;
     uint     gInstanceBase; // first instance's slot in gInstances (in instances)
     uint2    _padInstanced;
+    // Facial blendshapes: gMorphTexIndex (0 = none) is a bindless RGBA16F delta
+    // atlas - width = vertex count, one ROW per target = xyz position delta. The VS
+    // adds gMorphCount active targets (their atlas rows in gMorphTargets, weights in
+    // gMorphWeights) into the vertex BEFORE skinning. Zero-init (the C++ ObjectCB
+    // default) keeps every non-morph draw byte-identical.
+    uint     gMorphTexIndex;
+    uint     gMorphCount;
+    uint2    _padMorph;
+    uint4    gMorphTargets[2]; // 8 active atlas rows
+    float4   gMorphWeights[2]; // 8 active weights (parallel to gMorphTargets)
 };
 
 // Per-frame joint palettes (every skinned draw appends its global*inverseBind

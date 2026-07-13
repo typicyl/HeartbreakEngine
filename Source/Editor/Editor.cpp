@@ -15,7 +15,9 @@
 #include "Engine/CutscenePlayer.h"
 #include "Assets/CharacterBuild.h" // modular-character seam-weld build (Character Editor)
 #include "Game/GameSystems.h" // reset/restore story state (flags/objectives) around Play mode
+#include "Game/SpawnSystem.h" // ClearPrefabCache on project switch
 #include "Scene/CharacterSystem.h" // instantiate/swap modular characters
+#include "Scene/FacialSystem.h" // ClearEnvelopeCache on project switch
 #include "Engine/Engine.h"
 #include "Physics/PhysicsWorld.h"
 #include "Scene/AnimationSystem.h"
@@ -365,6 +367,7 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_InputIcons] = false;        // opened from the Window menu on demand
         panelOpen_[Panel_Objectives] = false;        // task-goal browser, opened on demand
         panelOpen_[Panel_CharacterEditor] = false;   // modular-rig authoring, opened on demand
+        panelOpen_[Panel_MovieRender] = false;        // trailer render, opened on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -644,6 +647,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
     DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
+    DrawMovieRender(engine);      // trailer render (ticks the job; pins the viewport last)
     DrawSelectionOutline(scene, renderer);
     DrawNavOverlay(scene, renderer);
     UpdateTerrainTool(engine); // terrain sculpt brush (consumes the click below)
@@ -698,7 +702,7 @@ void Editor::DrawWindowMenu() {
         "Streaming",    "Stats",      "Timeline",    "Scenes",
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
-        "Objectives", "Character Editor"};
+        "Objectives", "Character Editor", "Movie Render"};
     if (artMode_) {
         // Artist build: only the painting-relevant panels are listed/reachable.
         static const Panel kArtPanels[] = {Panel_Viewport, Panel_ArtEditor,
@@ -5052,10 +5056,27 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             reg.emplace<TriggerVolume>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
+        if (!reg.all_of<Spawner>(sel) && ImGui::MenuItem("Spawner")) {
+            PushUndo(scene);
+            reg.emplace<Spawner>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<Encounter>(sel) && ImGui::MenuItem("Encounter")) {
+            PushUndo(scene);
+            reg.emplace<Encounter>(sel);
+        }
         if (!reg.all_of<Character>(sel) && ImGui::MenuItem("Character (Modular Rig)")) {
             PushUndo(scene);
             reg.emplace<Character>(sel);
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<MorphState>(sel) && ImGui::MenuItem("Morph State (Blendshapes)")) {
+            PushUndo(scene);
+            reg.emplace<MorphState>(sel);
+        }
+        if (!reg.all_of<FacialAnimator>(sel) && ImGui::MenuItem("Facial Animator")) {
+            PushUndo(scene);
+            reg.emplace<FacialAnimator>(sel);
         }
         if (!reg.all_of<ParticleEmitter>(sel) && ImGui::BeginMenu("Particle Emitter")) {
             const auto addEmitter = [&](ParticleEmitter em) {
@@ -5115,6 +5136,27 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (!reg.all_of<CharacterController>(sel) && ImGui::MenuItem("Character Controller")) {
             PushUndo(scene);
             reg.emplace<CharacterController>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<Health>(sel) && ImGui::MenuItem("Health (Combat)")) {
+            PushUndo(scene);
+            reg.emplace<Health>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel); // needs a world spot to be hit
+        }
+        if (!reg.all_of<Weapon>(sel) && ImGui::MenuItem("Weapon (Combat)")) {
+            PushUndo(scene);
+            reg.emplace<Weapon>(sel);
+        }
+        if (!reg.all_of<AIPerception>(sel) && ImGui::MenuItem("AI Perception")) {
+            PushUndo(scene);
+            reg.emplace<AIPerception>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<AIBehavior>(sel) && ImGui::MenuItem("AI Behavior")) {
+            PushUndo(scene);
+            reg.emplace<AIBehavior>(sel);
+            if (!reg.all_of<NavigationAgent>(sel)) reg.emplace<NavigationAgent>(sel); // AI drives nav
+            if (!reg.all_of<AIPerception>(sel)) reg.emplace<AIPerception>(sel);        // + senses
             if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
         if (!reg.all_of<IKConstraint>(sel) && ImGui::MenuItem("IK Constraint")) {
@@ -6190,6 +6232,351 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
+    // --- Health (combat) -----------------------------------------------------
+    if (Health* h = reg.try_get<Health>(sel)) {
+        const SectionState s = ComponentSection("Health");
+        if (s.open) {
+            ImGui::DragFloat("Max", &h->max, 1.0f, 1.0f, 1000000.0f, "%.0f");
+            undoOnActivate();
+            ImGui::DragFloat("Current", &h->current, 1.0f, 0.0f, h->max, "%.0f");
+            undoOnActivate();
+            int fac = static_cast<int>(h->faction);
+            if (ImGui::Combo("Faction", &fac,
+                             "Neutral\0Player\0Enemy\0Ally\0Faction 4\0Faction 5\0")) {
+                PushUndo(scene);
+                h->faction = static_cast<Faction>(fac);
+            }
+            ImGui::DragFloat("Regen /s", &h->regenRate, 0.1f, 0.0f, 1000.0f, "%.1f");
+            undoOnActivate();
+            ImGui::DragFloat("Regen delay", &h->regenDelay, 0.1f, 0.0f, 60.0f, "%.1f s");
+            undoOnActivate();
+            ImGui::DragFloat("Hit i-frames", &h->hitInvuln, 0.01f, 0.0f, 5.0f, "%.2f s");
+            undoOnActivate();
+            bool inv = h->invincible;
+            if (ImGui::Checkbox("Invincible", &inv)) { PushUndo(scene); h->invincible = inv; }
+            ImGui::SameLine();
+            bool ff = h->friendlyFire;
+            if (ImGui::Checkbox("Friendly fire", &ff)) { PushUndo(scene); h->friendlyFire = ff; }
+            ImGui::Separator();
+            ImGui::TextDisabled("On death (zero-script reactions):");
+            char b[160];
+            std::snprintf(b, sizeof(b), "%s", h->onDeathFlag.c_str());
+            if (ImGui::InputText("Set flag", b, sizeof(b))) h->onDeathFlag = b;
+            ImGui::DragFloat("Flag value", &h->onDeathFlagValue, 0.1f, -100000.0f, 100000.0f, "%.2f");
+            undoOnActivate();
+            std::snprintf(b, sizeof(b), "%s", h->onDeathObjective.c_str());
+            if (ImGui::InputText("Complete objective", b, sizeof(b))) h->onDeathObjective = b;
+            std::snprintf(b, sizeof(b), "%s", h->deathTag.c_str());
+            if (ImGui::InputText("Death tag (OnDeath filter)", b, sizeof(b))) h->deathTag = b;
+            ImGui::DragInt("Death anim clip", &h->deathClip, 0.1f, -1, 128);
+            undoOnActivate();
+            ImGui::TextDisabled("Faction-based: same faction = friendly. Hurt by weapons /\n"
+                                "combat::ApplyDamage / the Apply Damage schematic node.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<Health>(sel);
+        }
+    }
+
+    // --- Weapon (combat) -----------------------------------------------------
+    if (Weapon* w = reg.try_get<Weapon>(sel)) {
+        const SectionState s = ComponentSection("Weapon");
+        if (s.open) {
+            int kind = static_cast<int>(w->kind);
+            if (ImGui::Combo("Kind", &kind, "Hitscan\0Melee\0Projectile (reserved)\0")) {
+                PushUndo(scene);
+                w->kind = static_cast<Weapon::Kind>(kind);
+            }
+            ImGui::DragFloat("Damage", &w->damage, 0.5f, 0.0f, 100000.0f, "%.1f");
+            undoOnActivate();
+            ImGui::DragFloat("Range", &w->range, 0.5f, 0.1f, 1000.0f, "%.1f m");
+            undoOnActivate();
+            ImGui::DragFloat("Fire rate", &w->fireRate, 0.1f, 0.1f, 30.0f, "%.1f /s");
+            undoOnActivate();
+            ImGui::DragFloat("AoE radius", &w->radius, 0.1f, 0.0f, 50.0f, "%.1f m");
+            undoOnActivate();
+            ImGui::DragFloat("Knockback", &w->impulse, 0.1f, 0.0f, 100.0f, "%.1f");
+            undoOnActivate();
+            if (w->kind == Weapon::Kind::Melee) {
+                ImGui::DragFloat("Melee arc", &w->meleeArc, 1.0f, 1.0f, 180.0f, "%.0f deg");
+                undoOnActivate();
+            } else {
+                ImGui::DragFloat("Hit radius", &w->hitRadius, 0.02f, 0.05f, 5.0f, "%.2f m");
+                undoOnActivate();
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("Ammo (Max ammo < 0 = infinite):");
+            ImGui::DragInt("Max ammo", &w->maxAmmo, 0.2f, -1, 999);
+            undoOnActivate();
+            ImGui::DragInt("Ammo", &w->ammo, 0.2f, 0, 999);
+            undoOnActivate();
+            ImGui::DragInt("Reserve", &w->reserve, 0.5f, 0, 9999);
+            undoOnActivate();
+            ImGui::DragFloat("Reload time", &w->reloadTime, 0.05f, 0.0f, 10.0f, "%.2f s");
+            undoOnActivate();
+            ImGui::TextDisabled("Player's Weapon fires from the camera on attack; AI\n"
+                                "fires at hostiles it can see.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<Weapon>(sel);
+        }
+    }
+
+    // --- AI Perception (senses) ----------------------------------------------
+    if (AIPerception* p = reg.try_get<AIPerception>(sel)) {
+        const SectionState s = ComponentSection("AI Perception");
+        if (s.open) {
+            ImGui::DragFloat("Sight range", &p->sightRange, 0.2f, 0.0f, 200.0f, "%.1f m");
+            undoOnActivate();
+            ImGui::DragFloat("Sight FOV", &p->sightFovDeg, 1.0f, 1.0f, 360.0f, "%.0f deg");
+            undoOnActivate();
+            ImGui::DragFloat("Eye height", &p->eyeHeight, 0.02f, 0.0f, 4.0f, "%.2f m");
+            undoOnActivate();
+            ImGui::DragFloat("Hearing radius", &p->hearingRadius, 0.2f, 0.0f, 100.0f, "%.1f m");
+            undoOnActivate();
+            ImGui::DragFloat("Gain rate", &p->gainRate, 0.05f, 0.0f, 20.0f, "%.2f /s");
+            undoOnActivate();
+            ImGui::DragFloat("Decay rate", &p->decayRate, 0.05f, 0.0f, 20.0f, "%.2f /s");
+            undoOnActivate();
+            ImGui::DragFloat("Detect threshold", &p->detectThreshold, 0.02f, 0.05f, 1.0f, "%.2f");
+            undoOnActivate();
+            ImGui::DragFloat("Lose-sight grace", &p->loseSightGrace, 0.05f, 0.0f, 5.0f, "%.2f s");
+            undoOnActivate();
+            ImGui::Separator();
+            ImGui::Text("Awareness %.2f  %s", p->awareness, p->canSeeTarget ? "(sees target)" : "");
+            ImGui::TextDisabled("Senses the nearest HOSTILE Health entity. Pair with AI Behavior.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<AIPerception>(sel);
+        }
+    }
+
+    // --- AI Behavior (FSM brain) ---------------------------------------------
+    if (AIBehavior* b = reg.try_get<AIBehavior>(sel)) {
+        const SectionState s = ComponentSection("AI Behavior");
+        if (s.open) {
+            if (!reg.all_of<AIPerception>(sel) || !reg.all_of<NavigationAgent>(sel)) {
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 180, 80, 255));
+                ImGui::TextWrapped("Needs AI Perception + Navigation Agent to sense and move.");
+                ImGui::PopStyleColor();
+            }
+            const char* states[] = {"Idle",   "Patrol", "Investigate", "Chase",
+                                    "Attack", "Search", "Flee",        "Dead"};
+            ImGui::Text("State: %s", states[glm::clamp(static_cast<int>(b->state), 0, 7)]);
+            ImGui::DragFloat("Attack range", &b->attackRange, 0.1f, 0.0f, 50.0f, "%.1f m");
+            undoOnActivate();
+            ImGui::DragFloat("Melee damage", &b->attackDamage, 0.5f, 0.0f, 1000.0f, "%.1f");
+            undoOnActivate();
+            ImGui::DragFloat("Melee interval", &b->attackInterval, 0.05f, 0.05f, 10.0f, "%.2f s");
+            undoOnActivate();
+            bool uw = b->useWeapon;
+            if (ImGui::Checkbox("Fire Weapon if present", &uw)) { PushUndo(scene); b->useWeapon = uw; }
+            ImGui::DragFloat("Investigate time", &b->investigateTime, 0.1f, 0.0f, 60.0f, "%.1f s");
+            undoOnActivate();
+            ImGui::DragFloat("Search time", &b->searchTime, 0.1f, 0.0f, 60.0f, "%.1f s");
+            undoOnActivate();
+            ImGui::DragFloat("Flee HP fraction", &b->fleeHealthFrac, 0.01f, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            bool sa = b->startAlerted;
+            if (ImGui::Checkbox("Start alerted", &sa)) { PushUndo(scene); b->startAlerted = sa; }
+            ImGui::Separator();
+            int pm = static_cast<int>(b->patrolMode);
+            if (ImGui::Combo("Patrol mode", &pm, "Loop\0Ping-pong\0Once\0")) {
+                PushUndo(scene);
+                b->patrolMode = static_cast<u8>(pm);
+            }
+            ImGui::DragFloat("Wait at point", &b->waitAtPoint, 0.05f, 0.0f, 30.0f, "%.2f s");
+            undoOnActivate();
+            ImGui::Text("Patrol points: %d", static_cast<int>(b->patrolPoints.size()));
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Add at entity")) {
+                PushUndo(scene);
+                glm::vec3 at(0.0f);
+                if (Transform* t = reg.try_get<Transform>(sel)) at = t->position;
+                b->patrolPoints.push_back(at);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Clear")) {
+                PushUndo(scene);
+                b->patrolPoints.clear();
+            }
+            for (usize i = 0; i < b->patrolPoints.size(); ++i) {
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::DragFloat3("##wp", &b->patrolPoints[i].x, 0.1f);
+                undoOnActivate();
+                ImGui::PopID();
+            }
+            ImGui::TextDisabled("Enemy = AI Perception + AI Behavior + Nav Agent + Health\n"
+                                "(faction Enemy) + optional Weapon.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<AIBehavior>(sel);
+        }
+    }
+
+    // --- Spawner (enemy/NPC spawning) ----------------------------------------
+    if (Spawner* sp = reg.try_get<Spawner>(sel)) {
+        const SectionState s = ComponentSection("Spawner");
+        if (s.open) {
+            char b[192];
+            std::snprintf(b, sizeof(b), "%s", sp->prefab.c_str());
+            if (ImGui::InputText("Prefab (.hbprefab)", b, sizeof(b))) sp->prefab = b;
+            std::snprintf(b, sizeof(b), "%s", sp->spawnerId.c_str());
+            if (ImGui::InputText("Spawner id", b, sizeof(b))) sp->spawnerId = b;
+            std::snprintf(b, sizeof(b), "%s", sp->encounterId.c_str());
+            if (ImGui::InputText("Encounter id", b, sizeof(b))) sp->encounterId = b;
+            int cnt = static_cast<int>(sp->count);
+            if (ImGui::DragInt("Count", &cnt, 0.2f, 1, 999)) {
+                PushUndo(scene);
+                sp->count = static_cast<u32>(glm::max(1, cnt));
+            }
+            ImGui::DragFloat("Scatter radius", &sp->radius, 0.1f, 0.0f, 100.0f, "%.1f m");
+            undoOnActivate();
+            int tr = static_cast<int>(sp->trigger);
+            if (ImGui::Combo("Trigger", &tr, "Player in volume\0Story flag\0Manual/schematic\0")) {
+                PushUndo(scene);
+                sp->trigger = static_cast<Spawner::Trigger>(tr);
+            }
+            if (sp->trigger == Spawner::Trigger::Volume) {
+                ImGui::DragFloat3("Half extents", &sp->halfExtents.x, 0.1f, 0.0f, 500.0f);
+                undoOnActivate();
+            }
+            std::snprintf(b, sizeof(b), "%s", sp->requiredFlag.c_str());
+            if (ImGui::InputText("Required flag", b, sizeof(b))) sp->requiredFlag = b;
+            int ma = static_cast<int>(sp->maxAlive);
+            if (ImGui::DragInt("Max alive (0=uncapped)", &ma, 0.2f, 0, 999)) {
+                PushUndo(scene);
+                sp->maxAlive = static_cast<u32>(glm::max(0, ma));
+            }
+            int rs = static_cast<int>(sp->respawn);
+            if (ImGui::Combo("Respawn", &rs, "Once\0Continuous\0")) {
+                PushUndo(scene);
+                sp->respawn = static_cast<Spawner::Respawn>(rs);
+            }
+            if (sp->respawn == Spawner::Respawn::Continuous) {
+                ImGui::DragFloat("Respawn delay", &sp->respawnDelay, 0.1f, 0.0f, 120.0f, "%.1f s");
+                undoOnActivate();
+            }
+            if (ImGui::SmallButton("Spawn now")) sp->spawnRequested = true;
+            ImGui::SameLine();
+            ImGui::TextDisabled("(runtime debug)");
+            ImGui::TextDisabled("Instantiates the prefab on trigger. The prefab should carry\n"
+                                "Health + AI Perception/Behavior + Nav Agent for a combat NPC.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<Spawner>(sel);
+        }
+    }
+
+    // --- Encounter (staged fight) --------------------------------------------
+    if (Encounter* en = reg.try_get<Encounter>(sel)) {
+        const SectionState s = ComponentSection("Encounter");
+        if (s.open) {
+            char b[192];
+            std::snprintf(b, sizeof(b), "%s", en->id.c_str());
+            if (ImGui::InputText("Encounter id", b, sizeof(b))) en->id = b;
+            bool sa = en->startActive;
+            if (ImGui::Checkbox("Start active", &sa)) { PushUndo(scene); en->startActive = sa; }
+            int ca = static_cast<int>(en->clearedAction);
+            if (ImGui::Combo("On cleared", &ca,
+                             "Dialogue\0Cutscene\0Set Flag\0Set Objective\0Complete Objective\0None\0")) {
+                PushUndo(scene);
+                en->clearedAction = static_cast<InteractAction>(ca);
+            }
+            if (en->clearedAction == InteractAction::Dialogue ||
+                en->clearedAction == InteractAction::Cutscene) {
+                std::snprintf(b, sizeof(b), "%s", en->clearedAsset.c_str());
+                if (ImGui::InputText("Asset", b, sizeof(b))) en->clearedAsset = b;
+            } else if (en->clearedAction != InteractAction::None) {
+                std::snprintf(b, sizeof(b), "%s", en->clearedFlag.c_str());
+                if (ImGui::InputText("Flag / Objective id", b, sizeof(b))) en->clearedFlag = b;
+                if (en->clearedAction == InteractAction::SetFlag) {
+                    ImGui::DragFloat("Flag value", &en->clearedFlagValue, 0.1f);
+                    undoOnActivate();
+                }
+                if (en->clearedAction == InteractAction::SetObjective) {
+                    std::snprintf(b, sizeof(b), "%s", en->clearedText.c_str());
+                    if (ImGui::InputText("Objective text", b, sizeof(b))) en->clearedText = b;
+                }
+            }
+            std::snprintf(b, sizeof(b), "%s", en->requiredFlag.c_str());
+            if (ImGui::InputText("Required flag (gate)", b, sizeof(b))) en->requiredFlag = b;
+            const char* st[] = {"Idle", "Active", "Cleared"};
+            ImGui::Text("State: %s   Alive: %u", st[glm::clamp(static_cast<int>(en->state), 0, 2)],
+                        en->aliveCount);
+            ImGui::TextDisabled("Groups Spawners by matching Encounter id; clears when all\n"
+                                "spawned members die, then fires the action.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<Encounter>(sel);
+        }
+    }
+
+    // --- Morph State (blendshape weights) ------------------------------------
+    if (MorphState* mo = reg.try_get<MorphState>(sel)) {
+        const SectionState s = ComponentSection("Morph State");
+        if (s.open) {
+            if (!mo->targetNames.empty()) {
+                for (const std::string& name : mo->targetNames)
+                    ImGui::SliderFloat(name.c_str(), &mo->weights[name], 0.0f, 1.0f);
+            } else {
+                for (auto& kv : mo->weights)
+                    ImGui::SliderFloat(kv.first.c_str(), &kv.second, 0.0f, 1.0f);
+                static char addBuf[64] = "";
+                ImGui::InputText("##addmorph", addBuf, sizeof(addBuf));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Add channel") && addBuf[0]) {
+                    mo->weights[addBuf] = 0.0f;
+                    addBuf[0] = '\0';
+                }
+            }
+            ImGui::TextDisabled("Blendshape weights (0..1). Resolved from the mesh's morph\n"
+                                "targets; drives GPU vertex deformation before skinning.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<MorphState>(sel);
+        }
+    }
+
+    // --- Facial Animator (lip-sync + blink + expression) ---------------------
+    if (FacialAnimator* fa = reg.try_get<FacialAnimator>(sel)) {
+        const SectionState s = ComponentSection("Facial Animator");
+        if (s.open) {
+            char b[64];
+            ImGui::Checkbox("Lip-sync", &fa->lipSync);
+            std::snprintf(b, sizeof(b), "%s", fa->jawTarget.c_str());
+            if (ImGui::InputText("Jaw target", b, sizeof(b))) fa->jawTarget = b;
+            ImGui::DragFloat("Jaw strength", &fa->jawStrength, 0.02f, 0.0f, 2.0f);
+            ImGui::DragFloat("Jaw attack", &fa->jawAttack, 0.5f, 0.0f, 100.0f);
+            ImGui::DragFloat("Jaw release", &fa->jawRelease, 0.5f, 0.0f, 100.0f);
+            ImGui::Separator();
+            ImGui::Checkbox("Auto blink", &fa->autoBlink);
+            std::snprintf(b, sizeof(b), "%s", fa->blinkL.c_str());
+            if (ImGui::InputText("Blink L", b, sizeof(b))) fa->blinkL = b;
+            std::snprintf(b, sizeof(b), "%s", fa->blinkR.c_str());
+            if (ImGui::InputText("Blink R", b, sizeof(b))) fa->blinkR = b;
+            ImGui::DragFloat2("Blink interval", &fa->blinkMin, 0.1f, 0.1f, 30.0f, "%.1f s");
+            ImGui::DragFloat("Blink duration", &fa->blinkDuration, 0.01f, 0.02f, 1.0f, "%.2f s");
+            ImGui::Separator();
+            std::snprintf(b, sizeof(b), "%s", fa->expression.c_str());
+            if (ImGui::InputText("Expression preset", b, sizeof(b))) fa->expression = b;
+            ImGui::DragFloat("Expression weight", &fa->expressionWeight, 0.02f, 0.0f, 1.0f);
+            ImGui::TextDisabled("Drives the head's Morph State. Lip-sync tracks the\n"
+                                "speaking dialogue line's audio amplitude.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<FacialAnimator>(sel);
+        }
+    }
+
     // --- IK Constraint (two-bone inverse kinematics) -------------------------
     if (IKConstraint* ik = reg.try_get<IKConstraint>(sel)) {
         const SectionState s = ComponentSection("IK Constraint");
@@ -7088,11 +7475,13 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
     // --- Interaction (Interactable objects/NPCs + box Trigger Volumes) ----------
     // Shared "what happens" editor used by both components.
     const auto drawInteractAction = [&](InteractAction& action, std::string& asset,
-                                        std::string& flag, f32& flagValue, std::string& text) {
+                                        std::string& flag, f32& flagValue, std::string& text,
+                                        std::string& itemId, u32& itemCount, std::string& pickupId) {
         int ai = static_cast<int>(action);
-        if (ImGui::Combo("Action", &ai,
-                         "Dialogue\0Cutscene\0Set Flag\0Set Objective\0Complete Objective\0None\0"))
-            action = static_cast<InteractAction>(glm::clamp(ai, 0, 5));
+        if (ImGui::Combo(
+                "Action", &ai,
+                "Dialogue\0Cutscene\0Set Flag\0Set Objective\0Complete Objective\0None\0Grant Item\0"))
+            action = static_cast<InteractAction>(glm::clamp(ai, 0, 6));
         if (action == InteractAction::Dialogue || action == InteractAction::Cutscene) {
             const char* ext = action == InteractAction::Dialogue ? ".hbdialogue" : ".hbcutscene";
             std::string apick;
@@ -7109,6 +7498,17 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             if (ImGui::InputText("Objective text", tb, sizeof(tb))) text = tb;
         } else if (action == InteractAction::CompleteObjective) {
             ObjectiveIdPicker("Objective id", flag, scene);
+        } else if (action == InteractAction::GrantItem) {
+            char ib[96];
+            std::snprintf(ib, sizeof(ib), "%s", itemId.c_str());
+            if (ImGui::InputText("Item id", ib, sizeof(ib))) itemId = ib;
+            int cnt = static_cast<int>(itemCount);
+            if (ImGui::DragInt("Count", &cnt, 0.2f, 1, 999)) itemCount = static_cast<u32>(glm::max(1, cnt));
+            char pkb[96];
+            std::snprintf(pkb, sizeof(pkb), "%s", pickupId.c_str());
+            if (ImGui::InputText("Pickup id (unique)", pkb, sizeof(pkb))) pickupId = pkb;
+            ImGui::TextDisabled("Grants the item, then removes the pickup permanently\n"
+                                "(survives save + level reload via a picked.<id> flag).");
         }
     };
 
@@ -7118,7 +7518,8 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             char pb[96];
             std::snprintf(pb, sizeof(pb), "%s", ia->prompt.c_str());
             if (ImGui::InputText("Prompt ([E] ...)", pb, sizeof(pb))) ia->prompt = pb;
-            drawInteractAction(ia->action, ia->asset, ia->flag, ia->flagValue, ia->text);
+            drawInteractAction(ia->action, ia->asset, ia->flag, ia->flagValue, ia->text, ia->itemId,
+                               ia->itemCount, ia->pickupId);
             ImGui::DragFloat("Range (m)", &ia->range, 0.1f, 0.2f, 50.0f);
             ImGui::Checkbox("Once", &ia->once);
             char rb[64];
@@ -7136,7 +7537,8 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
     if (TriggerVolume* tv = reg.try_get<TriggerVolume>(sel)) {
         const SectionState s = ComponentSection("Trigger Volume");
         if (s.open) {
-            drawInteractAction(tv->action, tv->asset, tv->flag, tv->flagValue, tv->text);
+            drawInteractAction(tv->action, tv->asset, tv->flag, tv->flagValue, tv->text, tv->itemId,
+                               tv->itemCount, tv->pickupId);
             ImGui::DragFloat3("Box half-extents", glm::value_ptr(tv->halfExtents), 0.1f, 0.0f,
                               1000.0f);
             ImGui::Checkbox("Once", &tv->once);
@@ -10271,6 +10673,87 @@ void Editor::DrawCharacterEditor(Engine& engine) {
     ImGui::End();
 }
 
+// --- Movie Render: offline trailer -> .mp4 (video + audio) ---------------------
+void Editor::DrawMovieRender(Engine& engine) {
+    // Tick a running render every frame (even if the panel is hidden) so it finishes.
+    // The job pins the viewport size + fixed dt each tick; running this LAST in BuildUI
+    // means its size wins over the Viewport panel for the offscreen render.
+    if (movieActive_) {
+        movieJob_.Tick(engine);
+        if (movieJob_.Finished()) {
+            movieActive_ = false;
+            if (!movieJob_.SceneSnapshot().empty()) // undo the cutscene's destructive posing
+                RestoreSnapshot(engine, movieJob_.SceneSnapshot());
+            movieJob_.Stop(engine); // restore real-time dt
+            buildResult_ = "Movie render: " + movieJob_.Status();
+        }
+    }
+
+    if (!panelOpen_[Panel_MovieRender]) return;
+    if (!ImGui::Begin("Movie Render", &panelOpen_[Panel_MovieRender])) {
+        ImGui::End();
+        return;
+    }
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("Open a project first.");
+        ImGui::End();
+        return;
+    }
+    const std::filesystem::path assets = Project::Active().AssetsDir();
+    ImGui::TextDisabled("Render a cinematic to .mp4 (H.264 video + AAC audio).");
+
+    std::string pick;
+    if (AssetPicker("Cutscene", movieCutscene_.empty() ? std::string("(current scene)") : movieCutscene_,
+                    ".hbcutscene", uaf::AssetType::Unknown, pick, "(current scene)"))
+        movieCutscene_ = pick;
+    if (movieCutscene_.empty())
+        ImGui::DragFloat("Duration (s)", &movieDuration_, 0.1f, 0.1f, 3600.0f);
+    if (AssetPicker("Music", movieMusic_.empty() ? std::string("(none)") : movieMusic_, ".uaf",
+                    uaf::AssetType::Audio, pick, "(none)"))
+        movieMusic_ = pick;
+
+    ImGui::Separator();
+    int res[2] = {movieW_, movieH_};
+    if (ImGui::InputInt2("Resolution", res)) {
+        movieW_ = glm::max(16, res[0]);
+        movieH_ = glm::max(16, res[1]);
+    }
+    ImGui::DragInt("FPS", &movieFps_, 1, 1, 120);
+    ImGui::DragInt("Warm-up frames", &movieWarmup_, 1, 0, 120);
+    ImGui::InputText("Output (.mp4, rel project)", movieOutPath_, sizeof(movieOutPath_));
+    ImGui::Separator();
+
+    if (movieActive_) {
+        ImGui::ProgressBar(movieJob_.Progress(), ImVec2(-1.0f, 0.0f));
+        ImGui::TextUnformatted(movieJob_.Status().c_str());
+        if (ImGui::Button("Cancel")) movieJob_.Cancel();
+        if (const u64 tex = engine.GetRenderer().ViewportTextureId()) // live preview
+            ImGui::Image(static_cast<ImTextureID>(tex), ImVec2(320.0f, 180.0f));
+    } else {
+        const bool ready = movieW_ > 0 && movieH_ > 0 && movieFps_ > 0 && movieOutPath_[0] != '\0';
+        if (!ready) ImGui::BeginDisabled();
+        if (ImGui::Button("Render", ImVec2(120.0f, 0.0f))) {
+            std::filesystem::path out = Project::Active().Root() / movieOutPath_;
+            if (out.extension() != ".mp4") out += ".mp4";
+            movie::MovieConfig cfg;
+            cfg.cutsceneRel = movieCutscene_;
+            cfg.musicRel = movieMusic_;
+            cfg.outputFile = out;
+            cfg.width = static_cast<u32>(movieW_);
+            cfg.height = static_cast<u32>(movieH_);
+            cfg.fps = static_cast<u32>(movieFps_);
+            cfg.warmupFrames = static_cast<u32>(movieWarmup_);
+            cfg.duration = movieDuration_;
+            movieJob_.Start(engine, assets, cfg);
+            movieActive_ = movieJob_.Active();
+            if (!movieActive_) buildResult_ = "Movie render: " + movieJob_.Status();
+        }
+        if (!ready) ImGui::EndDisabled();
+        ImGui::TextDisabled("Renders offscreen at the authored 'High' look.");
+    }
+    ImGui::End();
+}
+
 namespace {
 const char* FormatName(u32 format) {
     switch (static_cast<rhi::Format>(format)) {
@@ -12060,6 +12543,9 @@ void Editor::AddRecentProject(const std::filesystem::path& hbproj) {
 }
 
 void Editor::OnProjectChanged() {
+    // Process-wide gameplay caches key by asset path -> invalidate on project switch.
+    spawn::ClearPrefabCache();
+    facial::ClearEnvelopeCache();
     // Asset browser / viewer / scene-list state belongs to the previous project.
     assets_.clear();
     assetsScanned_ = false;

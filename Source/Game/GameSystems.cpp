@@ -9,6 +9,7 @@
 #include <glm/glm.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
@@ -21,6 +22,8 @@ namespace {
 std::vector<Objective> g_objectives;
 std::unordered_set<std::string> g_reached;
 std::unordered_map<std::string, f32> g_flags; // global story variables (persisted)
+std::unordered_map<std::string, u32> g_items; // inventory item id -> count (persisted)
+std::string g_equippedWeapon;                 // equipped item id ("" = none)
 bool g_saveRequested = false;
 std::string g_saveId;
 // Deferred adaptive-music commands (drained by the engine).
@@ -35,6 +38,9 @@ std::string g_cutscene;                // latest requested `.hbcutscene` (rel. A
 bool g_cutscenePending = false;
 // Deferred UI panel commands (drained by the engine, in order).
 std::vector<UICommand> g_uiCommands;
+std::vector<DeathRec> g_deaths; // combat deaths, drained into the OnDeath event
+std::vector<Noise> g_noises;    // live AI-audible sounds (TTL-aged)
+std::vector<SpottedRec> g_spotted; // AI "spotted" edges, drained into OnSpotPlayer
 } // namespace
 
 void SetMusicState(const std::string& state) {
@@ -101,6 +107,43 @@ bool ConsumeUICommand(UICommand& out) {
     out = std::move(g_uiCommands.front());
     g_uiCommands.erase(g_uiCommands.begin());
     return true;
+}
+
+void QueueDeath(const DeathRec& rec) { g_deaths.push_back(rec); }
+bool ConsumeDeath(DeathRec& out) {
+    if (g_deaths.empty()) return false;
+    out = std::move(g_deaths.front());
+    g_deaths.erase(g_deaths.begin());
+    return true;
+}
+
+void EmitNoise(const glm::vec3& pos, f32 loudness) {
+    Noise n;
+    n.pos = pos;
+    n.loudness = std::max(0.0f, loudness);
+    n.ttl = 0.3f; // linger a few frames so every AGENT observes it
+    g_noises.push_back(n);
+}
+const std::vector<Noise>& Noises() { return g_noises; }
+void TickNoises(f32 dt) {
+    for (Noise& n : g_noises) n.ttl -= dt;
+    g_noises.erase(std::remove_if(g_noises.begin(), g_noises.end(),
+                                  [](const Noise& n) { return n.ttl <= 0.0f; }),
+                   g_noises.end());
+}
+
+void QueueSpotted(const SpottedRec& rec) { g_spotted.push_back(rec); }
+bool ConsumeSpotted(SpottedRec& out) {
+    if (g_spotted.empty()) return false;
+    out = std::move(g_spotted.front());
+    g_spotted.erase(g_spotted.begin());
+    return true;
+}
+
+void ClearTransientQueues() {
+    g_deaths.clear();
+    g_noises.clear();
+    g_spotted.clear();
 }
 
 void SetFlag(const std::string& name, f32 value) {
@@ -187,6 +230,31 @@ void UpdateCheckpoints(Scene& scene) {
     }
 }
 
+void AddItem(const std::string& id, u32 count) {
+    if (id.empty() || count == 0) return;
+    g_items[id] += count;
+}
+bool RemoveItem(const std::string& id, u32 count) {
+    auto it = g_items.find(id);
+    if (it == g_items.end() || it->second < count) return false;
+    it->second -= count;
+    if (it->second == 0) {
+        g_items.erase(it); // keep the map clean (like flags)
+        if (g_equippedWeapon == id) g_equippedWeapon.clear(); // no longer owned
+    }
+    return true;
+}
+u32 ItemCount(const std::string& id) {
+    auto it = g_items.find(id);
+    return it != g_items.end() ? it->second : 0u;
+}
+bool HasItem(const std::string& id, u32 count) { return ItemCount(id) >= count; }
+const std::unordered_map<std::string, u32>& Items() { return g_items; }
+void EquipWeapon(const std::string& id) {
+    if (id.empty() || g_items.count(id) > 0) g_equippedWeapon = id; // must own it
+}
+const std::string& EquippedWeapon() { return g_equippedWeapon; }
+
 std::string SerializeState() {
     nlohmann::json j;
     nlohmann::json& objs = j["objectives"] = nlohmann::json::array();
@@ -196,6 +264,9 @@ std::string SerializeState() {
     for (const std::string& id : g_reached) cps.push_back(id);
     nlohmann::json& fl = j["flags"] = nlohmann::json::object();
     for (const auto& [name, value] : g_flags) fl[name] = value;
+    nlohmann::json& items = j["items"] = nlohmann::json::object();
+    for (const auto& [id, n] : g_items) items[id] = n;
+    j["equipped"] = g_equippedWeapon;
     return j.dump();
 }
 
@@ -212,6 +283,10 @@ void DeserializeState(const std::string& json) {
         if (const auto fit = j.find("flags"); fit != j.end() && fit->is_object())
             for (const auto& [name, value] : fit->items())
                 if (value.is_number()) g_flags[name] = value.get<f32>(); // skip null/string (corrupt)
+        if (const auto iit = j.find("items"); iit != j.end() && iit->is_object())
+            for (const auto& [id, value] : iit->items())
+                if (value.is_number_unsigned()) g_items[id] = value.get<u32>();
+        g_equippedWeapon = j.value("equipped", std::string());
     } catch (const std::exception& e) {
         HBE_WARN("game: failed to parse save state: {}", e.what());
     }
@@ -221,6 +296,8 @@ void Reset() {
     g_objectives.clear();
     g_reached.clear();
     g_flags.clear();
+    g_items.clear();
+    g_equippedWeapon.clear();
     g_saveRequested = false;
     g_saveId.clear();
     g_musicStatePending = false;
@@ -235,6 +312,9 @@ void Reset() {
     g_cutscene.clear();
     g_cutscenePending = false;
     g_uiCommands.clear();
+    g_deaths.clear();
+    g_noises.clear();
+    g_spotted.clear();
 }
 
 } // namespace hbe::game

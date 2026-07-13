@@ -29,6 +29,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -243,7 +244,24 @@ struct ObjectCB {
     // GPU instancing (matches gInstanced/gInstanceBase in Common.hlsli). Zero-init
     // keeps every single draw byte-compatible with the pre-instancing ABI.
     u32 instanced = 0; u32 instanceBase = 0; u32 _padInst0 = 0; u32 _padInst1 = 0;
+    // Facial blendshapes (must match the gMorph* block in Common.hlsli). Zero-init
+    // keeps every non-morph draw byte-compatible.
+    u32 morphTexIndex = 0; u32 morphCount = 0; u32 _padMorph0 = 0; u32 _padMorph1 = 0;
+    glm::uvec4 morphTargets[2] = {glm::uvec4(0), glm::uvec4(0)};
+    glm::vec4  morphWeights[2] = {glm::vec4(0.0f), glm::vec4(0.0f)};
 };
+
+// Copies a DrawItem's blendshape fields into the object CB (bindless atlas index +
+// up to 8 active target rows/weights). morphTexIndex 0 = no morphs.
+inline void FillMorphCB(ObjectCB& ocb, const DrawItem& it) {
+    if (it.morphTexture.index == 0u) return; // no morphs (the common case) -> zero-init defaults
+    ocb.morphTexIndex = it.morphTexture.index;
+    ocb.morphCount = it.morphCount < 8u ? it.morphCount : 8u;
+    for (u32 m = 0; m < 8u; ++m) {
+        ocb.morphTargets[m >> 2][m & 3] = it.morphTargets[m];
+        ocb.morphWeights[m >> 2][m & 3] = it.morphWeights[m];
+    }
+}
 
 u32 BytesPerPixel(Format f) {
     switch (f) {
@@ -296,6 +314,15 @@ public:
     TextureHandle CreateUITarget(u32 width, u32 height) override;
     void DrawUIToTexture(TextureHandle target, const UIVertex* vertices, u32 count) override;
 
+    // GPU profiler toggle: MUST live OUTSIDE #if HBE_EDITOR - the per-pass breakdown is a
+    // RUNTIME diagnostic (the shipped game is what the player profiles), so the override has
+    // to exist in the runtime build or the call dispatches to the no-op base default.
+    void SetGpuProfileEnabled(bool enable) override {
+        gpuProfileRequested_ = enable;
+        gpuProfile_ = enable && gpuProfileAvail_;
+    }
+    bool GpuProfileActive() const override { return gpuProfile_; }
+
 #if HBE_EDITOR
     bool SupportsUI() const override { return true; }
     bool InitUI(void* nativeWindowHandle) override;
@@ -305,6 +332,7 @@ public:
 
     void ResizeViewport(u32 width, u32 height) override { pendingVpW_ = width; pendingVpH_ = height; }
     u64 GetViewportTextureId() override { return viewportReady_ ? offscreenSrvGpu_.ptr : 0; }
+    bool ReadbackViewportColor(std::vector<u8>& outRGBA, u32& w, u32& h) override;
     u64 GetTextureUIHandle(TextureHandle handle) override;
 
     void ResizePreview(u32 width, u32 height) override {
@@ -354,6 +382,24 @@ private:
     u32 width_ = 0;
     u32 height_ = 0;
     DXGI_FORMAT swapFormat_ = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    // -- Per-pass GPU profiler (timestamp queries; opt-in via SetGpuProfileEnabled) --
+    // A mark records the GPU clock at a pass boundary; consecutive marks' delta = that
+    // pass's GPU time. Resolved into a per-frame readback buffer, read back a few frames
+    // later (when the slot's fence has signalled), logged every ~2s. Vulkan twin: kMaxGpuMarks.
+    static constexpr u32 kMaxGpuMarks = 40;
+    void GpuMark(const char* name);
+    ComPtr<ID3D12QueryHeap> gpuQueryHeap_;
+    ComPtr<ID3D12Resource>  gpuReadback_[kMaxBackBuffers]; // READBACK heap, kMaxGpuMarks u64
+    const char* gpuNames_[kMaxBackBuffers][kMaxGpuMarks]{};
+    u32  gpuCount_ = 0;                       // marks written into the current frame
+    u32  gpuCountSlot_[kMaxBackBuffers]{};    // marks resolved in each slot
+    bool gpuValidSlot_[kMaxBackBuffers]{};    // slot has resolved data to read
+    u64  gpuFreq_ = 0;                        // timestamp ticks per second (0 = unsupported)
+    u32  gpuFrameCounter_ = 0;
+    bool gpuProfile_ = false;                 // ACTIVE this run (marks written + read back)
+    bool gpuProfileAvail_ = false;            // heap + buffers created
+    bool gpuProfileRequested_ = false;        // runtime toggle target
     HWND hwnd_ = nullptr;
     bool vsync_ = true;            // Present interval 1 vs 0 (uncapped)
     bool tearingSupported_ = false; // DXGI_FEATURE_PRESENT_ALLOW_TEARING
@@ -642,6 +688,9 @@ private:
     bool offscreenSrvAllocated_ = false;
     D3D12_GPU_DESCRIPTOR_HANDLE offscreenSrvGpu_{};
     bool viewportReady_ = false;
+    ComPtr<ID3D12Resource> readbackBuffer_; // CPU-readable copy of offscreenColor_ (movie render)
+    u64 readbackSize_ = 0;
+    u64 readbackRowPitch_ = 0; // pitch the buffer was sized for (differs between resolutions)
 
     // -- Editor asset preview (independent mini-scene: HDR pass + tonemap) ---
 #if HBE_EDITOR
@@ -807,6 +856,30 @@ bool D3D12Device::Initialize(const RenderDeviceDesc& desc) {
         return false;
     }
 
+    // Per-pass GPU profiler: a timestamp query heap + one READBACK buffer per frame slot.
+    // Created whenever the queue can timestamp; ACTIVATION is a runtime toggle
+    // (SetGpuProfileEnabled) so the marks/readback only cost their ~1-3 ms/frame when a
+    // --gpuprofile / dev-menu diagnosis run asks for them. Mirrors the Vulkan profiler.
+    if (SUCCEEDED(queue_->GetTimestampFrequency(&gpuFreq_)) && gpuFreq_ > 0) {
+        D3D12_QUERY_HEAP_DESC qhd{};
+        qhd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        qhd.Count = kMaxGpuMarks;
+        if (SUCCEEDED(device_->CreateQueryHeap(&qhd, IID_PPV_ARGS(&gpuQueryHeap_)))) {
+            const D3D12_HEAP_PROPERTIES rb = HeapProps(D3D12_HEAP_TYPE_READBACK);
+            const D3D12_RESOURCE_DESC rd = BufferDesc(kMaxGpuMarks * sizeof(u64));
+            gpuProfileAvail_ = true;
+            for (u32 i = 0; i < backBufferCount_; ++i) {
+                if (FAILED(device_->CreateCommittedResource(
+                        &rb, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST,
+                        nullptr, IID_PPV_ARGS(&gpuReadback_[i])))) {
+                    gpuProfileAvail_ = false;
+                    break;
+                }
+            }
+            gpuProfile_ = gpuProfileAvail_ && gpuProfileRequested_; // honor a pre-init request
+        }
+    }
+
     // Scene-rendering resources. Failure here is non-fatal: the device falls
     // back to a clear-only loop (SupportsSceneRendering() stays false).
     if (!CreateDepthResources(width_, height_)) {
@@ -879,6 +952,7 @@ void D3D12Device::BeginFrame() {
     constantHead_ = 0;
     boneHead_ = 0;
     instanceHead_ = 0;
+    if (gpuProfile_) { gpuCount_ = 0; GpuMark("start"); } // GPU profiler: frame origin
     uiWorldVertexHead_ = 0; // world-UI canvases bump-allocate here across the frame
 
     if (!viewportReady_) {
@@ -904,6 +978,7 @@ void D3D12Device::BeginFrame() {
 }
 
 void D3D12Device::ClearBackBuffer(f32 r, f32 g, f32 b, f32 a) {
+    GpuMark("shadow"); // GPU profiler: delta start->here = the cascaded shadow pass
     const f32 color[4] = {r, g, b, a};
     if (postReady_) {
         // Begin the HDR scene pass; the post stack resolves to the final
@@ -973,11 +1048,20 @@ void D3D12Device::ClearBackBuffer(f32 r, f32 g, f32 b, f32 a) {
 }
 
 void D3D12Device::EndFrame() {
+    GpuMark("ui"); // GPU profiler: delta scene->here = the UI/ImGui overlay pass
     if (!viewportReady_) {
         auto toPresent = TransitionBarrier(backBuffers_[frameIndex_].Get(),
                                            D3D12_RESOURCE_STATE_RENDER_TARGET,
                                            D3D12_RESOURCE_STATE_PRESENT);
         cmdList_->ResourceBarrier(1, &toPresent);
+    }
+    // GPU profiler: resolve this frame's timestamps into its readback buffer (before the
+    // command list closes). Read back a few frames later in MoveToNextFrame (fence-safe).
+    if (gpuProfile_ && gpuCount_ >= 2) {
+        cmdList_->ResolveQueryData(gpuQueryHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0,
+                                   gpuCount_, gpuReadback_[frameIndex_].Get(), 0);
+        gpuCountSlot_[frameIndex_] = gpuCount_;
+        gpuValidSlot_[frameIndex_] = true;
     }
     // In viewport mode RenderUI already left the swapchain in PRESENT.
     cmdList_->Close();
@@ -1028,6 +1112,37 @@ void D3D12Device::MoveToNextFrame() {
         ::WaitForSingleObjectEx(fenceEvent_, INFINITE, FALSE);
     }
     fenceValues_[frameIndex_] = currentValue + 1;
+
+    // GPU profiler: this slot's fence has now signalled, so the timestamps it resolved
+    // (framesInFlight ago) are readable. Map, compute per-pass deltas, log ~every 2s.
+    if (gpuProfile_ && gpuValidSlot_[frameIndex_] && gpuCountSlot_[frameIndex_] >= 2 &&
+        gpuFreq_ > 0 && gpuReadback_[frameIndex_]) {
+        const u32 n = gpuCountSlot_[frameIndex_];
+        const D3D12_RANGE rr{0, n * sizeof(u64)};
+        void* mapped = nullptr;
+        if (SUCCEEDED(gpuReadback_[frameIndex_]->Map(0, &rr, &mapped)) && mapped) {
+            u64 t[kMaxGpuMarks];
+            std::memcpy(t, mapped, n * sizeof(u64));
+            const D3D12_RANGE wr{0, 0};
+            gpuReadback_[frameIndex_]->Unmap(0, &wr);
+            if (++gpuFrameCounter_ >= 180) { // ~2s at 90 FPS
+                gpuFrameCounter_ = 0;
+                const f64 toMs = 1000.0 / static_cast<f64>(gpuFreq_);
+                char buf[512];
+                int off = std::snprintf(buf, sizeof(buf), "[D3D12 GPU] total %.2f ms |",
+                                        static_cast<f64>(t[n - 1] - t[0]) * toMs);
+                for (u32 i = 1; i < n && off > 0 && off < static_cast<int>(sizeof(buf)) - 24;
+                     ++i) {
+                    const f64 ms = static_cast<f64>(t[i] - t[i - 1]) * toMs;
+                    off += std::snprintf(buf + off, sizeof(buf) - off, " %s %.2f",
+                                         gpuNames_[frameIndex_][i] ? gpuNames_[frameIndex_][i]
+                                                                   : "?",
+                                         ms);
+                }
+                HBE_INFO("{}", buf);
+            }
+        }
+    }
 }
 
 void D3D12Device::WaitForGpuIdle() {
@@ -1037,6 +1152,16 @@ void D3D12Device::WaitForGpuIdle() {
     fence_->SetEventOnCompletion(wait, fenceEvent_);
     ::WaitForSingleObjectEx(fenceEvent_, INFINITE, FALSE);
     fenceValues_[frameIndex_] = wait + 1;
+}
+
+// Records the GPU clock at this point in the command stream (one timestamp query).
+// The delta to the previous mark = the GPU time of the pass that just finished. No-op
+// unless the profiler is active and there's room; names are kept per frame slot.
+void D3D12Device::GpuMark(const char* name) {
+    if (!gpuProfile_ || gpuCount_ >= kMaxGpuMarks || !cmdList_) return;
+    gpuNames_[frameIndex_][gpuCount_] = name;
+    cmdList_->EndQuery(gpuQueryHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuCount_);
+    ++gpuCount_;
 }
 
 void D3D12Device::Resize(u32 width, u32 height) {
@@ -2460,6 +2585,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(ssrPSO_.Get(), ssr_.Get(), rtvAt(8 + kBloomMaxMips), sceneW_, sceneH_, cb);
         hdrInput = slotSsr_;
     }
+    GpuMark("ssr");
 
     // --- Screen-space GI: gathered at REDUCED res, then upscaled + added over the
     //     full-res HDR. The SSGI shader outputs the GI term only (a=1); ApplyHalfRes
@@ -2485,6 +2611,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(applyPSO_.Get(), ssgi_.Get(), rtvAt(14 + kBloomMaxMips), sceneW_, sceneH_, ap);
         hdrInput = slotSsgi_;
     }
+    GpuMark("ssgi");
 
     // --- Volumetric fog: marched at HALF res (inscatter+transmittance), then upscaled
     //     + applied over the full-res HDR (scene*transmittance + inscatter). Fog is
@@ -2521,6 +2648,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                      ap);
         hdrInput = slotVol_;
     }
+    GpuMark("fog");
 
     // --- Volumetric particles: raymarch the density/temperature volume (half res),
     //     lit + self-shadowed + blackbody-emissive, then composite over the HDR
@@ -2564,6 +2692,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         cmdList_->ResourceBarrier(1, &toUav);
     }
+    GpuMark("volparticles");
 
     // --- Painterly: repaint the lit HDR as edge-aware brush strokes ----------
     // Skipped when the true 3D surface-stroke renderer is active (no double-paint).
@@ -2586,6 +2715,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(painterlyPSO_.Get(), painterly_.Get(), rtvAt(15 + kBloomMaxMips), sceneW_,
                      sceneH_, cb);
         hdrInput = slotPainterly_;
+        GpuMark("kuwahara");
 
         // Collect world-anchored censors once (shared by the stroke pass + the
         // composite below). The shader does a 3D sphere test, so no projection here.
@@ -2670,6 +2800,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
             cmdList_->ResourceBarrier(1, &toSRV);
         }
+        GpuMark("strokes");
 
         // Dynamic-layer composite: restore crisp lit colour over the painterly where the
         // forward HDR alpha mask = 1 (player / NPCs / interactables), so dynamic objects
@@ -2691,6 +2822,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(compositePSO_.Get(), painterlyComp_.Get(), rtvAt(16 + kBloomMaxMips),
                      sceneW_, sceneH_, comp);
         hdrInput = slotPainterlyComp_;
+        GpuMark("composite");
     }
 
     // --- SSAO + blur (half res) --------------------------------------------
@@ -2712,6 +2844,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(ssaoBlurPSO_.Get(), ssaoBlur_.Get(), rtvAt(2), ssaoW_, ssaoH_, blur);
         aoSlot = slotSsaoBlur_;
     }
+    GpuMark("ssao");
 
     // --- Bloom pyramid -------------------------------------------------------
     f32 bloomMix = 0.0f;
@@ -2741,6 +2874,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         }
         bloomMix = ps.bloomIntensity;
     }
+    GpuMark("bloom");
 
     // --- Auto-exposure: average luminance + temporal adaptation (1x1) --------
     u32 lumSlot = 0; // 0 = off; tonemap then uses manual exposure only
@@ -2759,6 +2893,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         adaptIndex_ = prev;
         adaptValid_ = true;
     }
+    GpuMark("exposure");
 
     // --- Tonemap composite -> LDR -------------------------------------------
     {
@@ -2777,6 +2912,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.params2 = {0.0f, 0.0f, 0.0f, 0.0f}; // tonemap's built-in smear off
         DrawPostPass(tonemapPSO_.Get(), ldr_.Get(), rtvAt(3), sceneW_, sceneH_, cb);
     }
+    GpuMark("tonemap");
 
     // --- TAA resolve -> history ---------------------------------------------
     // Reproject last frame's accumulation into this frame (via depth + the
@@ -2801,6 +2937,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         taaHistoryIndex_ = prev; // next frame writes the other target
         taaHistoryValid_ = true;
     }
+    GpuMark("taa");
 
     // --- Depth of field -> dof_ ---------------------------------------------
     // Gathers a depth-driven bokeh disk over the resolved colour.
@@ -2814,6 +2951,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(dofPSO_.Get(), dof_.Get(), rtvAt(6 + kBloomMaxMips), sceneW_, sceneH_, cb);
         finalInput = slotDof_;
     }
+    GpuMark("dof");
 
     // --- Motion blur -> motionBlur_ -----------------------------------------
     if (view.post.motionBlurEnabled && motionBlurReady_) {
@@ -2827,6 +2965,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                      sceneH_, cb);
         finalInput = slotMotionBlur_;
     }
+    GpuMark("mblur");
 
     // --- FXAA -> final target (viewport texture or swapchain) ---------------
     {
@@ -2868,6 +3007,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         // The final target stays bound: the UI overlay and (in viewport mode)
         // RenderUI's RT->SRV transition both expect exactly this state.
     }
+    GpuMark("fxaa");
 }
 
 void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u32 count) {
@@ -3382,6 +3522,7 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
             ocb.albedoIndex = it.albedoTexture.index;
             ocb.normalIndex = it.normalTexture.index;
             ocb.mrIndex = it.mrTexture.index;
+            FillMorphCB(ocb, it); // facial blendshapes (bindless delta atlas)
             ocb.aoIndex = it.aoTexture.index;
             ocb.flags = it.materialFlags;
             ocb.subsurfaceColor = it.subsurfaceColor;
@@ -3538,7 +3679,9 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         }
     }
 
+    GpuMark("scene"); // GPU profiler: delta shadow->here = the HDR forward pass (geo+sky+particles)
     // HDR resolve: SSAO -> bloom -> tonemap -> FXAA into the final target.
+    // (Per-pass GpuMarks inside break the post cost down: ssr/ssgi/fog/kuwahara/...)
     if (postReady_) {
         RunPostStack(view);
     }
@@ -3965,6 +4108,98 @@ bool D3D12Device::CreateViewportTarget(u32 w, u32 h) {
     return true;
 }
 
+bool D3D12Device::ReadbackViewportColor(std::vector<u8>& outRGBA, u32& w, u32& h) {
+    if (!viewportReady_ || !offscreenColor_) return false;
+    w = vpW_;
+    h = vpH_;
+
+    // 256B-aligned row footprint of the offscreen color (subresource 0).
+    const D3D12_RESOURCE_DESC rd = offscreenColor_->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+    UINT numRows = 0;
+    UINT64 rowSize = 0, total = 0;
+    device_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &numRows, &rowSize, &total);
+
+    // A READBACK-heap buffer sized to the footprint (grown as needed, reused). Also
+    // reallocate when the 256B-aligned row pitch changes (some resolutions share a
+    // total but differ in pitch - reusing would de-pad at the wrong stride).
+    if (!readbackBuffer_ || readbackSize_ < total || readbackRowPitch_ != fp.Footprint.RowPitch) {
+        readbackBuffer_.Reset();
+        const D3D12_HEAP_PROPERTIES rb = HeapProps(D3D12_HEAP_TYPE_READBACK);
+        D3D12_RESOURCE_DESC bd{};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = total;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device_->CreateCommittedResource(&rb, D3D12_HEAP_FLAG_NONE, &bd,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(&readbackBuffer_))))
+            return false;
+        readbackSize_ = total;
+        readbackRowPitch_ = fp.Footprint.RowPitch;
+    }
+
+    // Copy offscreenColor_ -> readback buffer on the shared upload list (serialized
+    // after this frame's draws on queue_); blocking wait (offline, slow is fine).
+    uploadAlloc_->Reset();
+    uploadList_->Reset(uploadAlloc_.Get(), nullptr);
+    auto toCopy = TransitionBarrier(offscreenColor_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+    uploadList_->ResourceBarrier(1, &toCopy);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = readbackBuffer_.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = offscreenColor_.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    uploadList_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    auto toSRV = TransitionBarrier(offscreenColor_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    uploadList_->ResourceBarrier(1, &toSRV);
+    uploadList_->Close();
+    ID3D12CommandList* lists[] = {uploadList_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    const u64 fv = ++uploadFenceValue_;
+    queue_->Signal(uploadFence_.Get(), fv);
+    if (uploadFence_->GetCompletedValue() < fv) {
+        uploadFence_->SetEventOnCompletion(fv, uploadEvent_);
+        ::WaitForSingleObjectEx(uploadEvent_, INFINITE, FALSE);
+    }
+
+    // Map + de-pad rows (RowPitch is 256B-aligned, != w*4 at odd widths).
+    void* mapped = nullptr;
+    D3D12_RANGE readRange{0, static_cast<SIZE_T>(total)};
+    if (FAILED(readbackBuffer_->Map(0, &readRange, &mapped))) return false;
+    outRGBA.resize(static_cast<usize>(w) * h * 4);
+    const u8* srcBytes = static_cast<const u8*>(mapped);
+    const u64 pitch = fp.Footprint.RowPitch;
+    const bool bgra = rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                      rd.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    for (u32 y = 0; y < h; ++y) {
+        const u8* srow = srcBytes + y * pitch;
+        u8* drow = outRGBA.data() + static_cast<usize>(y) * w * 4;
+        if (bgra) {
+            for (u32 x = 0; x < w; ++x) {
+                drow[x * 4 + 0] = srow[x * 4 + 2]; // R <- B
+                drow[x * 4 + 1] = srow[x * 4 + 1];
+                drow[x * 4 + 2] = srow[x * 4 + 0]; // B <- R
+                drow[x * 4 + 3] = srow[x * 4 + 3];
+            }
+        } else {
+            std::memcpy(drow, srow, static_cast<usize>(w) * 4); // R8G8B8A8 -> canonical RGBA
+        }
+    }
+    const D3D12_RANGE noWrite{0, 0};
+    readbackBuffer_->Unmap(0, &noWrite);
+    return true;
+}
+
 bool D3D12Device::CreatePreviewTargets(u32 w, u32 h) {
     if (w == 0 || h == 0 || !imguiSrvHeap_ || !postPipelinesReady_) return false;
     const D3D12_HEAP_PROPERTIES def = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
@@ -4150,6 +4385,7 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
             ocb.albedoIndex = it.albedoTexture.index;
             ocb.normalIndex = it.normalTexture.index;
             ocb.mrIndex = it.mrTexture.index;
+            FillMorphCB(ocb, it); // facial blendshapes (bindless delta atlas)
             ocb.aoIndex = it.aoTexture.index;
             ocb.flags = it.materialFlags;
             ocb.subsurfaceColor = it.subsurfaceColor;

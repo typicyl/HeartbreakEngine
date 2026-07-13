@@ -10,6 +10,7 @@
 #include "Core/Log.h"
 #include "Core/Window.h"
 #include "Game/GameSystems.h"
+#include "Game/GameplaySystems.h"
 #include "Physics/PhysicsWorld.h"
 #include "Assets/MusicGraph.h"
 #include "Project/Project.h"
@@ -30,6 +31,7 @@
 #include "UI/UIWorld.h"
 #include "Renderer/Renderer.h"
 #include "RHI/RHIFactory.h"
+#include "Scene/FacialSystem.h"
 #include "Scene/Scene.h"
 
 #include <nlohmann/json.hpp>
@@ -130,10 +132,17 @@ void ApplyGraphicsPreset(rhi::PostSettings& p, int preset) {
     // full-res painterly intact. Painterly is untouched (it's the art style).
     p.dofEnabled = 0;
     p.ssaoEnabled = 0;
+    // Shadows are "the dominant DAYTIME GPU cost" (see Common.hlsli ShadowFactor): each
+    // cascade re-rasterizes every caster (cost = cascades x casters, a per-draw descriptor
+    // bind on Vulkan). Drop the 4th (farthest, coarsest) cascade at Medium - the split
+    // scheme redistributes over 3 slices in Scene::MakeView so the full shadow DISTANCE is
+    // kept, only distant shadows get slightly coarser. ~25% off the whole shadow pass.
+    p.shadowCascades = 3;
     if (preset >= 2) { // Low: minimal post; TAA falls back to cheap FXAA
         p.ssrEnabled = 0;
         p.dofEnabled = 0;
         p.ssaoEnabled = 0;
+        p.shadowCascades = 2; // half the shadow-render cost; distant shadows softer
         if (p.taaEnabled) {
             p.taaEnabled = 0;
             p.fxaaEnabled = 1;
@@ -469,6 +478,12 @@ int Engine::Run(const EngineConfig& configIn) {
     }
     HBE_INFO("Graphics backend selected: {} ({} option(s) in the boot order).",
              rhi::ToString(config.api), backendOrder.size());
+    if (config.gpuProfile) {
+        renderer.SetGpuProfileEnabled(true); // --gpuprofile: per-pass GPU breakdown
+        HBE_INFO("GPU profiler requested (--gpuprofile): device active={}. Per-pass timings "
+                 "log every ~2s (~1-3 ms/frame; diagnosis only).",
+                 renderer.GpuProfileActive() ? 1 : 0);
+    }
 
     Input input;
     window.SetInputSink(&input);
@@ -572,6 +587,13 @@ int Engine::Run(const EngineConfig& configIn) {
         userSettingsDir_ = UserSettings::ResolveDir(
             gn.empty() ? Project::Active().Settings().name : gn);
         userSettings_.Load(userSettingsDir_); // keeps defaults if absent
+        // Always log the loaded preset: a SAVED usersettings.json silently overrides the
+        // shipped default, which once hid that a player was running the full High stack
+        // while every "Medium" optimization was tuned around a preset they weren't on.
+        static const char* kPresetNames[] = {"High", "Medium", "Low"};
+        const int gp = glm::clamp(userSettings_.graphicsPreset, 0, 2);
+        HBE_INFO("User settings loaded: graphics preset {} ({}){}", gp, kPresetNames[gp],
+                 onInit_ ? " - editor shows the authored look regardless" : "");
         audio.SetBusVolume("Master", userSettings_.masterVolume);
         audio.SetCaptionsEnabled(userSettings_.captionsEnabled);
         SyncActionMap(); // action defaults (project) + rebind overrides (user settings)
@@ -782,6 +804,8 @@ int Engine::Run(const EngineConfig& configIn) {
     auto last = clock::now();
     auto fpsLast = last;
     u32 fpsFrames = 0;
+    // Per-window CPU phase timers (ms accumulated; averaged + reset each Perf report).
+    f64 accGpMs = 0.0, accFacialMs = 0.0, accRenderMs = 0.0;
     std::vector<rhi::UIVertex> uiVertices; // reused each frame
     std::vector<ui::WorldUIBatch> worldUIBatches;      // world-canvas triangles (reused)
     std::vector<Renderer::WorldUIDraw> worldUIDraws;   // -> renderer, one frame each
@@ -815,7 +839,10 @@ int Engine::Run(const EngineConfig& configIn) {
         dtSmooth = (dtSmooth <= 0.0f) ? rawDt : glm::mix(dtSmooth, rawDt, 0.2f);
         dt_ = dtSmooth; // REAL frame time (FPS display); dev game-speed doesn't skew it
         // Dev menu game-speed / pause scales the simulation delta (1.0 in ship builds).
-        const f32 dt = dtSmooth * devTimeScale_;
+        // The offline MOVIE RENDER overrides the SIMULATION delta with a fixed dt=1/fps
+        // (deterministic frame-stepping) - but ONLY dt, never dt_, so caption/loading
+        // clocks (which use dt_) are not time-warped.
+        const f32 dt = (renderFixedDt_ > 0.0f) ? renderFixedDt_ : (dtSmooth * devTimeScale_);
 
         // Periodic FPS report.
         if (++fpsFrames >= 1) {
@@ -833,6 +860,10 @@ int Engine::Run(const EngineConfig& configIn) {
                          1000.0f * winMaxDt, winJank, rs.drawn, rs.total, rs.culled,
                          rs.instancedDraws, rs.totalInstances, us.elements, us.verts,
                          us.textLayouts, us.mapRebuilds);
+                HBE_INFO("  CPU phases (avg/frame): gameplay {:.2f} ms | facial {:.2f} ms | "
+                         "renderScene-submit {:.2f} ms",
+                         accGpMs / fpsFrames, accFacialMs / fpsFrames, accRenderMs / fpsFrames);
+                accGpMs = accFacialMs = accRenderMs = 0.0;
                 winMaxDt = 0.0f;
                 winJank = 0;
                 if (streamingWorld.Active()) {
@@ -909,6 +940,14 @@ int Engine::Run(const EngineConfig& configIn) {
         if (physics.IsRunning()) anim::UpdateMotionMatching(scene, assetsDir, dt);
         // Skeletal animation: advance Animators and rebuild joint palettes.
         anim::UpdateSkeletal(scene, assetsDir, dt);
+        // Facial: lip-sync + blink + expression -> MorphState.weights (consumed by
+        // CollectDrawItems -> the vertex shader's pre-skin morph accumulation). Play/
+        // runtime only: in edit mode it would overwrite authored MorphState weights.
+        {
+            const auto _pt = clock::now();
+            if (physics.IsRunning()) facial::Update(scene, dt);
+            accFacialMs += std::chrono::duration<f64, std::milli>(clock::now() - _pt).count();
+        }
 
         // The project's canvas configuration (scale mode + reference size).
         ui::CanvasConfig uiConfig;
@@ -985,6 +1024,16 @@ int Engine::Run(const EngineConfig& configIn) {
         if (physics.IsRunning())
             character::Update(scene, input, dt, renderer.GetCamera().Forward());
         physics.Update(scene, dt);
+        // Gameplay band: AI + spawning/encounters + combat + player fire. Runs
+        // after physics (fresh positions for line-of-sight and hit tests) and
+        // BEFORE nav::UpdateAgents so an AI-set NavigationAgent target steers the
+        // same frame (no one-frame lag).
+        {
+            const auto _pt = clock::now();
+            if (physics.IsRunning())
+                gameplay::Update(scene, physics, renderer, input, renderer.GetCamera(), dt);
+            accGpMs += std::chrono::duration<f64, std::milli>(clock::now() - _pt).count();
+        }
         // NavigationAgents steer along real-time grid A* paths while the
         // simulation runs (play mode in the editor; always in the runtime). The
         // grid auto-rebuilds from static geometry (no bake) and re-plans around
@@ -1305,6 +1354,9 @@ int Engine::Run(const EngineConfig& configIn) {
         // into the scene/volume exposure (which stays author-driven).
         if (!onInit_) {
             ApplyGraphicsPreset(scene.Environment().post, userSettings_.graphicsPreset);
+            if (config.forceShadowCascades > 0) // TEMP perf A/B: override the preset
+                scene.Environment().post.shadowCascades =
+                    static_cast<u32>(config.forceShadowCascades);
             renderer.SetUserExposureScale(
                 std::exp2(userSettings_.brightness * 2.0f - 1.0f)); // 0.5x..2x, 0.5=neutral
         }
@@ -1322,7 +1374,11 @@ int Engine::Run(const EngineConfig& configIn) {
         // Day/night: advance the time of day and drive the sun + ambient so the
         // analytic sky and scene lighting move together (no-op unless dynamicSky).
         UpdateDayNight(scene, dt);
-        renderer.RenderScene(scene, dt);
+        {
+            const auto _pt = clock::now();
+            renderer.RenderScene(scene, dt);
+            accRenderMs += std::chrono::duration<f64, std::milli>(clock::now() - _pt).count();
+        }
     }
 
     if (settingsDirty_) { userSettings_.Save(userSettingsDir_); settingsDirty_ = false; }
@@ -1354,6 +1410,7 @@ void Engine::LoadLevel(const std::filesystem::path& base) {
     // tear down the narrative runtime first (mirrors LoadGame/FlowMainMenu).
     ResetDialogueRuntime();
     ClearCutscene();
+    game::ClearTransientQueues(); // don't let a queued death/noise/spot fire into the new level
     // Switching: unload the current level (UI / other scenes stay resident).
     if (currentLevel_->Loaded()) currentLevel_->Unload(*scene_);
     currentLevel_->SetBase(base);
@@ -1666,7 +1723,10 @@ void Engine::SubstituteUITokens(f32 progress) {
     std::string logTail;
     bool logFetched = false;
     scene_->Registry().view<UIElement>().each([&](UIElement& el) {
-        if (el.text.find('{') == std::string::npos) { el.runtimeText.clear(); return; }
+        if (el.text.find('{') == std::string::npos) {
+            if (!el.runtimeText.empty()) el.runtimeText.clear();
+            return;
+        }
         std::string t = el.text;
         replaceAll(t, "{backend}", backend);
         replaceAll(t, "{gpu}", gpu);
@@ -1674,12 +1734,22 @@ void Engine::SubstituteUITokens(f32 progress) {
         replaceAll(t, "{version}", version);
         replaceAll(t, "{progress}", pct);
         replaceAll(t, "{objective}", game::CurrentObjectiveText()); // HUD task goal
+        replaceAll(t, "{equipped}", game::EquippedWeapon());        // selected weapon id
+        // {item:<id>} -> current inventory count of that item (scavenge HUD).
+        for (usize p = t.find("{item:"); p != std::string::npos; p = t.find("{item:", p)) {
+            const usize end = t.find('}', p);
+            if (end == std::string::npos) break;
+            const std::string id = t.substr(p + 6, end - (p + 6));
+            const std::string val = std::to_string(game::ItemCount(id));
+            t.replace(p, end - p + 1, val);
+            p += val.size();
+        }
         if (t.find("{log}") != std::string::npos) {
             // Only the single latest line (real-time status), per design.
             if (!logFetched) { logTail = RecentLog(1); logFetched = true; }
             replaceAll(t, "{log}", logTail);
         }
-        el.runtimeText = std::move(t);
+        if (el.runtimeText != t) el.runtimeText = std::move(t); // only on change (skip re-layout)
     });
 }
 
@@ -2133,6 +2203,9 @@ void Engine::EnterDialogueNode(u32 nodeId) {
                     if (actor == entt::null)
                         for (const entt::entity ne : reg.view<Name>())
                             if (reg.get<Name>(ne).value == n->speaker) { actor = ne; break; }
+                    // Drive the speaker's mouth from this line's audio amplitude.
+                    if (actor != entt::null && !n->clip.empty())
+                        facial::StartLipSync(*scene_, actor, assets, n->clip);
                     if (actor != entt::null && reg.all_of<Transform>(actor)) {
                         const glm::vec3 pos = glm::vec3(scene_->WorldMatrix(actor)[3]);
                         spatial = audio_->PlayUAFAt(assets / n->clip, pos, bus, minD, maxD, !hasText);
@@ -2318,23 +2391,48 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
     // Dispatch an action through the deferred game:: queues (identical to a schematic
     // firing it). Returns true if it started a blocking convo/cutscene.
     const auto fire = [&](InteractAction a, const std::string& asset, const std::string& flag,
-                          f32 val, const std::string& text) -> bool {
+                          f32 val, const std::string& text, const std::string& itemId,
+                          u32 itemCount, const std::string& pickupId) -> bool {
         switch (a) {
             case InteractAction::Dialogue: if (!asset.empty()) game::PlayDialogue(asset); break;
             case InteractAction::Cutscene: if (!asset.empty()) game::PlayCutscene(asset); break;
             case InteractAction::SetFlag: game::SetFlag(flag, val); break;
             case InteractAction::SetObjective: if (!flag.empty()) game::SetObjective(flag, text); break;
             case InteractAction::CompleteObjective: if (!flag.empty()) game::CompleteObjective(flag); break;
+            case InteractAction::GrantItem:
+                if (!itemId.empty()) {
+                    game::AddItem(itemId, itemCount);
+                    // Authoritative "gone" state: a persistent flag (survives save/load
+                    // AND a full level reload, unlike the scene snapshot alone).
+                    if (!pickupId.empty()) game::SetFlag("picked." + pickupId, 1.0f);
+                }
+                break;
             case InteractAction::None: default: break;
         }
         return a == InteractAction::Dialogue || a == InteractAction::Cutscene;
     };
 
+    // Remove pickups already collected this playthrough (the picked.<id> flag). Runs
+    // each frame but is cheap; destroys on the first frame after a reload/level load.
+    {
+        std::vector<entt::entity> picked;
+        for (const entt::entity e : reg.view<Interactable>()) {
+            const Interactable& ia = reg.get<Interactable>(e);
+            if (ia.action == InteractAction::GrantItem && !ia.pickupId.empty() &&
+                game::GetFlag("picked." + ia.pickupId) != 0.0f)
+                picked.push_back(e);
+        }
+        for (const entt::entity e : picked)
+            if (reg.valid(e)) reg.destroy(e);
+    }
+
     // Box triggers: fire on the ENTER edge.
     for (const entt::entity e : reg.view<TriggerVolume>()) {
         TriggerVolume& tv = reg.get<TriggerVolume>(e);
         if ((tv.once && tv.fired) ||
-            (!tv.requiredFlag.empty() && game::GetFlag(tv.requiredFlag) == 0.0f)) {
+            (!tv.requiredFlag.empty() && game::GetFlag(tv.requiredFlag) == 0.0f) ||
+            (tv.action == InteractAction::GrantItem && !tv.pickupId.empty() &&
+             game::GetFlag("picked." + tv.pickupId) != 0.0f)) { // pickup already taken
             tv.inside = false;
             continue;
         }
@@ -2346,7 +2444,8 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
         tv.inside = inside;
         if (enter) {
             tv.fired = true;
-            if (fire(tv.action, tv.asset, tv.flag, tv.flagValue, tv.text)) {
+            if (fire(tv.action, tv.asset, tv.flag, tv.flagValue, tv.text, tv.itemId, tv.itemCount,
+                     tv.pickupId)) {
                 HideInteractPrompt();
                 return; // a trigger started a convo/cutscene - stop here this frame
             }
@@ -2461,7 +2560,8 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
     const bool press = input_ && actionMap_.Pressed(*input_, "Interact");
     if (press) {
         Interactable& ia = reg.get<Interactable>(best);
-        fire(ia.action, ia.asset, ia.flag, ia.flagValue, ia.text);
+        fire(ia.action, ia.asset, ia.flag, ia.flagValue, ia.text, ia.itemId, ia.itemCount,
+             ia.pickupId);
         ia.fired = true;
         HideInteractPrompt();
     }
@@ -2599,6 +2699,9 @@ void Engine::UpdateGameFlow(f32 dt) {
         // Ease gameplay in from the fade-to-black the loading transition left behind.
         if (fadeAlpha_ > 0.0f)
             fadeAlpha_ = glm::max(fadeAlpha_ - dt / kGameFadeInDur, 0.0f);
+        // Refresh live HUD tokens each frame so {objective}, {item:<id>} and {equipped}
+        // reflect current game state (they were previously resolved only on load).
+        SubstituteUITokens(1.0f);
         // Free-cursor policy: any menu panel over the HUD (Settings/Pause - pushed
         // by a button OR a schematic UI node) frees the cursor for point-and-click
         // (including world-space pages); back on the HUD relocks mouse-look.
@@ -2690,6 +2793,10 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
         } else if (arg == "--stress-shared" && i + 1 < argc) {
             config.stressCount = static_cast<u32>(std::stoul(argv[++i]));
             config.stressShared = true; // one shared mesh (sort/instancing rig)
+        } else if (arg == "--shadowcascades" && i + 1 < argc) {
+            config.forceShadowCascades = std::stoi(argv[++i]); // TEMP perf A/B
+        } else if (arg == "--gpuprofile") {
+            config.gpuProfile = true; // per-pass GPU timestamp breakdown (both backends)
         } else if (arg == "--world" && i + 1 < argc) {
             config.worldPath = argv[++i];
         } else if (arg == "--worldtest") {

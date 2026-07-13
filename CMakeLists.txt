@@ -40,6 +40,7 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/CameraSystem.cpp"
     "Source/Scene/CharacterController.cpp"
     "Source/Scene/CharacterSystem.cpp"
+    "Source/Scene/FacialSystem.cpp"
     "Source/Scene/TerrainSystem.cpp"
     "Source/Scene/PaintSystem.cpp"
     "Source/Scene/ParticleSystem.cpp"
@@ -55,7 +56,12 @@ set(HBE_NAV_SOURCES
     "Source/Navigation/GridNav.cpp")
 
 set(HBE_GAME_SOURCES
-    "Source/Game/GameSystems.cpp")
+    "Source/Game/GameSystems.cpp"
+    "Source/Game/CombatSystem.cpp"
+    "Source/Game/AISystem.cpp"
+    "Source/Game/SpawnSystem.cpp"
+    "Source/Game/InventorySystem.cpp"
+    "Source/Game/GameplaySystems.cpp")
 
 set(HBE_AUDIO_SOURCES
     "Source/Audio/AudioSystem.cpp")
@@ -102,7 +108,10 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/Importer.cpp"
     "Source/Editor/MeshThumbnail.cpp"
-    "Source/Editor/stb_image_impl.cpp")
+    "Source/Editor/MovieRender.cpp"
+    "Source/Editor/MovieEncoder.cpp"
+    "Source/Editor/stb_image_impl.cpp"
+    "Source/Editor/stb_image_write_impl.cpp")
 
 # Core sources common to both the runtime and editor libraries.
 set(HBE_RUNTIME_SOURCES
@@ -186,7 +195,8 @@ function(hbe_configure_engine_lib tgt is_editor)
     if(is_editor)
         target_link_libraries(${tgt} PUBLIC imgui)
         # comdlg32 = file dialogs, ole32 = IFileDialog folder picker (COM).
-        target_link_libraries(${tgt} PRIVATE comdlg32 ole32)
+        # mf* = Media Foundation H.264 .mp4 encode/decode (offline movie render).
+        target_link_libraries(${tgt} PRIVATE comdlg32 ole32 mfplat mfreadwrite mfuuid mf)
     endif()
 endfunction()
 

@@ -128,6 +128,43 @@ struct Gen {
                        "if (_f || _el.action != _n) return; _f = true; _o = " + std::string(expr) +
                        "; }); return _o; }())";
             }
+            case NodeType::IsAlive:
+                return "Value::Bool(combat::IsAlive(ctx.scene, BakedEnt(" + IN(0) + ", ctx.self)))";
+            case NodeType::GetHealth:
+                return "([&]() -> Value { const Health* _h = ctx.scene.Registry().try_get<Health>(BakedEnt(" +
+                       IN(0) + ", ctx.self)); return Value::Float(_h ? (" +
+                       (outPin == 1 ? std::string("_h->max") : std::string("_h->current")) +
+                       ") : 0.0f); }())";
+            case NodeType::OnDeath:
+                return outPin == 2
+                           ? "(ctx.eventInstigator != entt::null ? "
+                             "Value::Ent(static_cast<u32>(ctx.eventInstigator)) : Value::Ent(0xFFFFFFFFu))"
+                           : "(ctx.eventDeathTag ? Value::Str(*ctx.eventDeathTag) : Value::Str(\"\"))";
+            case NodeType::IsPlayerVisible:
+                return "([&]() -> Value { const AIPerception* _p = "
+                       "ctx.scene.Registry().try_get<AIPerception>(BakedEnt(" + IN(0) +
+                       ", ctx.self)); return Value::Bool(_p && _p->canSeeTarget); }())";
+            case NodeType::GetAwareness:
+                return "([&]() -> Value { const AIPerception* _p = "
+                       "ctx.scene.Registry().try_get<AIPerception>(BakedEnt(" + IN(0) +
+                       ", ctx.self)); return Value::Float(_p ? _p->awareness : 0.0f); }())";
+            case NodeType::OnSpotPlayer:
+                return outPin == 2
+                           ? "(ctx.eventSpotTarget != entt::null ? "
+                             "Value::Ent(static_cast<u32>(ctx.eventSpotTarget)) : Value::Ent(0xFFFFFFFFu))"
+                           : "(ctx.eventSpotter != entt::null ? "
+                             "Value::Ent(static_cast<u32>(ctx.eventSpotter)) : Value::Ent(0xFFFFFFFFu))";
+            case NodeType::AliveCount:
+                return "([&]() -> Value { f32 _c = 0.0f; const std::string _id = (" + IN(0) +
+                       ").s; for (auto _e : ctx.scene.Registry().view<Encounter>()) "
+                       "if (ctx.scene.Registry().get<Encounter>(_e).id == _id) { "
+                       "_c = static_cast<f32>(ctx.scene.Registry().get<Encounter>(_e).aliveCount); break; } "
+                       "return Value::Float(_c); }())";
+            case NodeType::HasItem:
+                return "Value::Bool(game::HasItem((" + IN(0) +
+                       ").s, static_cast<u32>(glm::max(0.0f, BakedF(" + IN(1) + ")))))";
+            case NodeType::ItemCount:
+                return "Value::Float(static_cast<f32>(game::ItemCount((" + IN(0) + ").s)))";
             default: return "Value{}";
         }
     }
@@ -198,6 +235,86 @@ struct Gen {
                 break;
             case NodeType::CompleteObjective:
                 out += "        game::CompleteObjective((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::ApplyDamage:
+                out += "        { combat::DamageEvent _ev; _ev.target = BakedEnt(" + IN(1) +
+                       ", ctx.self); _ev.instigator = ctx.self; _ev.amount = BakedF(" + IN(2) +
+                       "); combat::ApplyDamage(ctx.scene, _ev, nullptr); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::Kill:
+                out += "        combat::Kill(ctx.scene, BakedEnt(" + IN(1) + ", ctx.self));\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::Heal:
+                out += "        combat::Heal(ctx.scene, BakedEnt(" + IN(1) + ", ctx.self), BakedF(" +
+                       IN(2) + "));\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetHealth:
+                out += "        { if (Health* _h = ctx.scene.Registry().try_get<Health>(BakedEnt(" +
+                       IN(1) + ", ctx.self))) { _h->current = glm::clamp(BakedF(" + IN(2) +
+                       "), 0.0f, _h->max); if (_h->current <= 0.0f) _h->alive = false; "
+                       "else if (!_h->alive) { _h->alive = true; _h->deathDispatched = false; } } }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetInvulnerable:
+                out += "        { if (Health* _h = ctx.scene.Registry().try_get<Health>(BakedEnt(" +
+                       IN(1) + ", ctx.self))) _h->invincible = BakedB(" + IN(2) + "); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetAIState:
+                out += "        { if (AIBehavior* _b = ctx.scene.Registry().try_get<AIBehavior>(BakedEnt(" +
+                       IN(1) + ", ctx.self))) _b->state = AIStateFromName((" + IN(2) + ").s); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetAlert:
+                out += "        { if (AIPerception* _p = "
+                       "ctx.scene.Registry().try_get<AIPerception>(BakedEnt(" + IN(1) +
+                       ", ctx.self))) _p->awareness = glm::clamp(BakedF(" + IN(2) + "), 0.0f, 1.0f); }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SpawnGroup:
+                out += "        { const std::string _id = (" + IN(1) +
+                       ").s; for (auto _e : ctx.scene.Registry().view<Spawner>()) "
+                       "if (ctx.scene.Registry().get<Spawner>(_e).spawnerId == _id) "
+                       "ctx.scene.Registry().get<Spawner>(_e).spawnRequested = true; }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::DespawnAll:
+                out += "        { const std::string _id = (" + IN(1) +
+                       ").s; for (auto _e : ctx.scene.Registry().view<Spawner>()) "
+                       "if (ctx.scene.Registry().get<Spawner>(_e).encounterId == _id) "
+                       "ctx.scene.Registry().get<Spawner>(_e).despawnRequested = true; }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::GrantItem:
+                out += "        game::AddItem((" + IN(1) +
+                       ").s, static_cast<u32>(glm::max(0.0f, BakedF(" + IN(2) + "))));\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::RemoveItem:
+                out += "        game::RemoveItem((" + IN(1) +
+                       ").s, static_cast<u32>(glm::max(0.0f, BakedF(" + IN(2) + "))));\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::EquipWeapon:
+                out += "        game::EquipWeapon((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetMorphWeight:
+                out += "        { if (MorphState* _m = facial::ResolveMorphTarget(ctx.scene, BakedEnt(" +
+                       IN(1) + ", ctx.self))) { const std::string _n = (" + IN(2) +
+                       ").s; if (!_n.empty()) _m->weights[_n] = glm::clamp(BakedF(" + IN(3) +
+                       "), 0.0f, 1.0f); } }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::PlayFacialExpression:
+                out += "        { if (FacialAnimator* _f = "
+                       "ctx.scene.Registry().try_get<FacialAnimator>(BakedEnt(" + IN(1) +
+                       ", ctx.self))) { _f->expression = (" + IN(2) +
+                       ").s; _f->expressionWeight = glm::clamp(BakedF(" + IN(3) + "), 0.0f, 1.0f); } }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetMusicState:
@@ -311,6 +428,28 @@ std::string TranspileGraph(const Graph& g, const std::string& fnName) {
     const std::string clickedBody = uiBody(NodeType::EventUIClicked);
     const std::string changedBody = uiBody(NodeType::EventUIChanged);
 
+    // Combat deaths: every OnDeath node fires, gated on its Tag filter vs the payload.
+    std::string deathBody;
+    for (const Node& n : g.nodes) {
+        if (n.type != NodeType::OnDeath) continue;
+        stack.clear();
+        std::string chain;
+        gen.EmitExec(chain, n.id, 0, stack, 0);
+        const std::string filter = gen.EmitInput(n.id, 0, 0);
+        deathBody += "        { const std::string _flt = (" + filter +
+                     ").s; if (ctx.eventDeathTag && (_flt.empty() || *ctx.eventDeathTag == _flt)) {\n";
+        deathBody += chain;
+        deathBody += "        } }\n";
+    }
+
+    // OnSpotPlayer: no filter (the engine only invokes it on the spotter's graph).
+    std::string spotBody;
+    for (const Node& n : g.nodes) {
+        if (n.type != NodeType::OnSpotPlayer) continue;
+        stack.clear();
+        gen.EmitExec(spotBody, n.id, 0, stack, 0);
+    }
+
     std::string s;
     s += "static void " + fnName + "(CompiledContext& ctx, NodeType evt) {\n";
     s += "    (void)ctx;\n";
@@ -331,6 +470,14 @@ std::string TranspileGraph(const Graph& g, const std::string& fnName) {
     s += changedBody;
     s += "        break;\n";
     s += "    }\n";
+    s += "    case NodeType::OnDeath: {\n";
+    s += deathBody;
+    s += "        break;\n";
+    s += "    }\n";
+    s += "    case NodeType::OnSpotPlayer: {\n";
+    s += spotBody;
+    s += "        break;\n";
+    s += "    }\n";
     s += "    default: break;\n";
     s += "    }\n";
     s += "}\n";
@@ -344,7 +491,9 @@ std::string TranspileUnit(const std::vector<std::pair<std::string, Graph>>& grap
     s += "// runtime so graphs run as machine code instead of the interpreter.\n";
     s += "#include \"Schematic/SchematicSystem.h\"\n";
     s += "#include \"Game/GameSystems.h\"\n";
+    s += "#include \"Game/CombatSystem.h\"\n";
     s += "#include \"Scene/Components.h\"\n";
+    s += "#include \"Scene/FacialSystem.h\"\n";
     s += "#include \"Scene/Scene.h\"\n";
     s += "#include \"Core/Input.h\"\n";
     s += "#include \"Core/Log.h\"\n";

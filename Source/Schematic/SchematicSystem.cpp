@@ -3,9 +3,11 @@
 
 #include "Core/Input.h"
 #include "Core/Log.h"
+#include "Game/CombatSystem.h"
 #include "Game/GameSystems.h"
 #include "Project/Project.h"
 #include "Scene/Components.h"
+#include "Scene/FacialSystem.h"
 #include "Scene/Scene.h"
 #include "Schematic/Schematic.h"
 
@@ -108,6 +110,31 @@ public:
         }
     }
 
+    // Combat deaths fire EVERY OnDeath node whose Tag filter matches (empty = any),
+    // mirroring RunEventUI. The Tag + Instigator data outputs read the payload below.
+    void RunEventDeath(const game::DeathRec& rec) {
+        evtDeathTag_ = rec.tag;
+        evtInstigator_ = rec.instigator;
+        for (const Node& n : g_.nodes) {
+            if (n.type != NodeType::OnDeath) continue;
+            dataCache_.clear();
+            const std::string filter = EvalInput(n.id, 0, 0).s;
+            if (filter.empty() || filter == rec.tag) Follow(n.id, 0, 0);
+        }
+    }
+
+    // Fires every OnSpotPlayer node (the engine only invokes this on the spotter's
+    // own graph, so no filter is needed). Spotter + Target read the payload below.
+    void RunEventSpotted(const game::SpottedRec& rec) {
+        evtSpotter_ = rec.spotter;
+        evtSpotTarget_ = rec.target;
+        for (const Node& n : g_.nodes) {
+            if (n.type != NodeType::OnSpotPlayer) continue;
+            dataCache_.clear();
+            Follow(n.id, 0, 0);
+        }
+    }
+
 private:
     const Graph& g_;
     Scene& scene_;
@@ -121,6 +148,12 @@ private:
     f32 evtValue_ = 0.0f;
     bool evtToggled_ = false;
     f32 evtSelected_ = 0.0f;
+    // Payload of the death event currently firing (RunEventDeath).
+    std::string evtDeathTag_;
+    u32 evtInstigator_ = 0xFFFFFFFFu;
+    // Payload of the spotted event currently firing (RunEventSpotted).
+    u32 evtSpotter_ = 0xFFFFFFFFu;
+    u32 evtSpotTarget_ = 0xFFFFFFFFu;
 
     entt::entity Resolve(const Value& v) const {
         if (v.type == PinType::Entity && v.entity != 0xFFFFFFFFu)
@@ -211,6 +244,41 @@ private:
                 }
                 return out;
             }
+            case NodeType::IsAlive:
+                return Value::Bool(combat::IsAlive(scene_, Resolve(EvalInput(n.id, 0, d))));
+            case NodeType::GetHealth: {
+                const Health* h = scene_.Registry().try_get<Health>(Resolve(EvalInput(n.id, 0, d)));
+                return Value::Float(h ? (outPin == 1 ? h->max : h->current) : 0.0f);
+            }
+            case NodeType::OnDeath: // Tag(pin1) + Instigator(pin2) payload (while firing)
+                return outPin == 2 ? Value::Ent(evtInstigator_) : Value::Str(evtDeathTag_);
+            case NodeType::IsPlayerVisible: {
+                const AIPerception* p =
+                    scene_.Registry().try_get<AIPerception>(Resolve(EvalInput(n.id, 0, d)));
+                return Value::Bool(p && p->canSeeTarget);
+            }
+            case NodeType::GetAwareness: {
+                const AIPerception* p =
+                    scene_.Registry().try_get<AIPerception>(Resolve(EvalInput(n.id, 0, d)));
+                return Value::Float(p ? p->awareness : 0.0f);
+            }
+            case NodeType::OnSpotPlayer: // Spotter(pin1) + Target(pin2) payload
+                return outPin == 2 ? Value::Ent(evtSpotTarget_) : Value::Ent(evtSpotter_);
+            case NodeType::AliveCount: {
+                const std::string id = EvalInput(n.id, 0, d).s;
+                f32 count = 0.0f;
+                for (auto ee : scene_.Registry().view<Encounter>())
+                    if (scene_.Registry().get<Encounter>(ee).id == id) {
+                        count = static_cast<f32>(scene_.Registry().get<Encounter>(ee).aliveCount);
+                        break;
+                    }
+                return Value::Float(count);
+            }
+            case NodeType::HasItem:
+                return Value::Bool(game::HasItem(EvalInput(n.id, 0, d).s,
+                                                 static_cast<u32>(glm::max(0.0f, InF(n.id, 1, d)))));
+            case NodeType::ItemCount:
+                return Value::Float(static_cast<f32>(game::ItemCount(EvalInput(n.id, 0, d).s)));
             default: return {};
         }
     }
@@ -280,6 +348,99 @@ private:
                 game::CompleteObjective(EvalInput(n.id, 1, 0).s);
                 Follow(n.id, 0, depth);
                 break;
+            case NodeType::ApplyDamage: {
+                combat::DamageEvent ev;
+                ev.target = Resolve(EvalInput(n.id, 1, 0));
+                ev.instigator = self_;
+                ev.amount = InF(n.id, 2, 0);
+                combat::ApplyDamage(scene_, ev, nullptr); // no knockback from script
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::Kill:
+                combat::Kill(scene_, Resolve(EvalInput(n.id, 1, 0)));
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::Heal:
+                combat::Heal(scene_, Resolve(EvalInput(n.id, 1, 0)), InF(n.id, 2, 0));
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::SetHealth: {
+                if (Health* h = scene_.Registry().try_get<Health>(Resolve(EvalInput(n.id, 1, 0)))) {
+                    h->current = glm::clamp(InF(n.id, 2, 0), 0.0f, h->max);
+                    if (h->current <= 0.0f) h->alive = false;
+                    else if (!h->alive) { h->alive = true; h->deathDispatched = false; } // revive
+                }
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::SetInvulnerable: {
+                if (Health* h = scene_.Registry().try_get<Health>(Resolve(EvalInput(n.id, 1, 0))))
+                    h->invincible = InB(n.id, 2, 0);
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::SetAIState: {
+                if (AIBehavior* b = scene_.Registry().try_get<AIBehavior>(Resolve(EvalInput(n.id, 1, 0))))
+                    b->state = AIStateFromName(EvalInput(n.id, 2, 0).s);
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::SetAlert: {
+                if (AIPerception* p =
+                        scene_.Registry().try_get<AIPerception>(Resolve(EvalInput(n.id, 1, 0))))
+                    p->awareness = glm::clamp(InF(n.id, 2, 0), 0.0f, 1.0f);
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::SpawnGroup: {
+                const std::string id = EvalInput(n.id, 1, 0).s;
+                for (auto se : scene_.Registry().view<Spawner>())
+                    if (scene_.Registry().get<Spawner>(se).spawnerId == id)
+                        scene_.Registry().get<Spawner>(se).spawnRequested = true;
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::DespawnAll: {
+                const std::string id = EvalInput(n.id, 1, 0).s;
+                for (auto se : scene_.Registry().view<Spawner>())
+                    if (scene_.Registry().get<Spawner>(se).encounterId == id)
+                        scene_.Registry().get<Spawner>(se).despawnRequested = true;
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::GrantItem:
+                game::AddItem(EvalInput(n.id, 1, 0).s,
+                              static_cast<u32>(glm::max(0.0f, InF(n.id, 2, 0))));
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::RemoveItem:
+                game::RemoveItem(EvalInput(n.id, 1, 0).s,
+                                 static_cast<u32>(glm::max(0.0f, InF(n.id, 2, 0))));
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::EquipWeapon:
+                game::EquipWeapon(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
+            case NodeType::SetMorphWeight: {
+                if (MorphState* ms =
+                        facial::ResolveMorphTarget(scene_, Resolve(EvalInput(n.id, 1, 0)))) {
+                    const std::string name = EvalInput(n.id, 2, 0).s;
+                    if (!name.empty()) ms->weights[name] = glm::clamp(InF(n.id, 3, 0), 0.0f, 1.0f);
+                }
+                Follow(n.id, 0, depth);
+                break;
+            }
+            case NodeType::PlayFacialExpression: {
+                if (FacialAnimator* fa =
+                        scene_.Registry().try_get<FacialAnimator>(Resolve(EvalInput(n.id, 1, 0)))) {
+                    fa->expression = EvalInput(n.id, 2, 0).s;
+                    fa->expressionWeight = glm::clamp(InF(n.id, 3, 0), 0.0f, 1.0f);
+                }
+                Follow(n.id, 0, depth);
+                break;
+            }
             case NodeType::SetMusicState:
                 game::SetMusicState(EvalInput(n.id, 1, 0).s);
                 Follow(n.id, 0, depth);
@@ -404,6 +565,15 @@ void Update(Scene& scene, Input& input, f32 dt, bool playing) {
         uiEvents.push_back(std::move(rec));
     });
 
+    // Combat deaths flagged since the last tick (combat::Update queues them): drain
+    // ONCE here, then fan each out to every graph's OnDeath event below. Draining
+    // unconditionally means the queue can't grow when no graph is listening.
+    std::vector<game::DeathRec> deaths;
+    { game::DeathRec d; while (game::ConsumeDeath(d)) deaths.push_back(std::move(d)); }
+    // AI "spotted the player" edges: drained once, fired only on the SPOTTER's graph.
+    std::vector<game::SpottedRec> spots;
+    { game::SpottedRec s; while (game::ConsumeSpotted(s)) spots.push_back(s); }
+
     for (const entt::entity e : reg.view<SchematicComponent>()) {
         SchematicComponent& sc = reg.get<SchematicComponent>(e);
         for (auto& [id, t] : sc.timers)
@@ -426,6 +596,22 @@ void Update(Scene& scene, Input& input, f32 dt, bool playing) {
                 if (rec.changed) fn(ctx, NodeType::EventUIChanged);
             }
             ctx.eventAction = nullptr;
+            for (const game::DeathRec& d : deaths) { // OnDeath, payload in ctx
+                ctx.eventDeathTag = &d.tag;
+                ctx.eventInstigator = d.instigator != 0xFFFFFFFFu
+                                          ? static_cast<entt::entity>(d.instigator)
+                                          : entt::null;
+                fn(ctx, NodeType::OnDeath);
+            }
+            ctx.eventDeathTag = nullptr;
+            for (const game::SpottedRec& sp : spots) { // OnSpotPlayer on the spotter only
+                if (sp.spotter != static_cast<u32>(e)) continue;
+                ctx.eventSpotter = static_cast<entt::entity>(sp.spotter);
+                ctx.eventSpotTarget = sp.target != 0xFFFFFFFFu
+                                          ? static_cast<entt::entity>(sp.target)
+                                          : entt::null;
+                fn(ctx, NodeType::OnSpotPlayer);
+            }
             continue;
         }
 
@@ -442,6 +628,9 @@ void Update(Scene& scene, Input& input, f32 dt, bool playing) {
             if (rec.clicked) vm.RunEventUI(NodeType::EventUIClicked, rec);
             if (rec.changed) vm.RunEventUI(NodeType::EventUIChanged, rec);
         }
+        for (const game::DeathRec& d : deaths) vm.RunEventDeath(d);
+        for (const game::SpottedRec& sp : spots)
+            if (sp.spotter == static_cast<u32>(e)) vm.RunEventSpotted(sp);
     }
 }
 

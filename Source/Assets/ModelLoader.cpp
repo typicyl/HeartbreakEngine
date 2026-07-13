@@ -134,6 +134,30 @@ MeshData ConvertMesh(const aiMesh* src, const aiScene* scene, bool flipV) {
         mesh.vertices.push_back(v);
     }
 
+    // Blendshapes / morph targets: aiAnimMesh holds ABSOLUTE morphed positions;
+    // subtract the base to get per-vertex deltas (parallel to mesh.vertices). The
+    // vertex-count guard skips any target Assimp remapped out of lockstep (the
+    // classic JoinIdenticalVertices morph-import footgun).
+    for (u32 k = 0; k < src->mNumAnimMeshes; ++k) {
+        const aiAnimMesh* am = src->mAnimMeshes[k];
+        if (!am || am->mNumVertices != src->mNumVertices || !am->mVertices) continue;
+        MorphTarget mt;
+        mt.name = am->mName.length ? std::string(am->mName.C_Str()) : ("morph_" + std::to_string(k));
+        mt.posDelta.resize(src->mNumVertices);
+        for (u32 i = 0; i < src->mNumVertices; ++i)
+            mt.posDelta[i] = {am->mVertices[i].x - src->mVertices[i].x,
+                              am->mVertices[i].y - src->mVertices[i].y,
+                              am->mVertices[i].z - src->mVertices[i].z};
+        if (am->mNormals && src->mNormals) {
+            mt.nrmDelta.resize(src->mNumVertices);
+            for (u32 i = 0; i < src->mNumVertices; ++i)
+                mt.nrmDelta[i] = {am->mNormals[i].x - src->mNormals[i].x,
+                                  am->mNormals[i].y - src->mNormals[i].y,
+                                  am->mNormals[i].z - src->mNormals[i].z};
+        }
+        mesh.morphTargets.push_back(std::move(mt));
+    }
+
     mesh.indices.reserve(static_cast<usize>(src->mNumFaces) * 3);
     for (u32 f = 0; f < src->mNumFaces; ++f) {
         const aiFace& face = src->mFaces[f];

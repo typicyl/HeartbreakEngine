@@ -10,7 +10,10 @@
 
 #include "Core/Types.h"
 
+#include <glm/glm.hpp>
+
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace hbe {
@@ -40,6 +43,21 @@ std::string CurrentObjectiveText();
 void SetFlag(const std::string& name, f32 value);
 f32 GetFlag(const std::string& name);
 bool HasFlag(const std::string& name);
+
+// --- Inventory (per-playthrough item counts) --------------------------------
+// A global item id -> count store (the scavenge/craft backbone), sitting beside
+// the story flags: it rides the same .hbsave SerializeState/DeserializeState and
+// New-Game Reset lifecycle. Items are free-form string ids (a future .hbitems
+// catalog can add display names/icons/caps). `Craft`-style recipes compose from
+// HasItem + RemoveItem + AddItem (e.g. a crafting-bench schematic).
+void AddItem(const std::string& id, u32 count = 1);
+bool RemoveItem(const std::string& id, u32 count = 1); // false if fewer than `count`
+u32  ItemCount(const std::string& id);
+bool HasItem(const std::string& id, u32 count = 1);
+const std::unordered_map<std::string, u32>& Items();
+// Selected/equipped weapon (an item id) - the seam a future combat loadout reads.
+void EquipWeapon(const std::string& id); // "" = unequip; no-op if not owned
+const std::string& EquippedWeapon();
 
 // --- Checkpoints ------------------------------------------------------------
 // Marks `id` reached (idempotent). When `requestSave`, flags a save the engine
@@ -97,6 +115,47 @@ struct UICommand {
 };
 void QueueUICommand(UICommand cmd);
 bool ConsumeUICommand(UICommand& out);
+
+// --- Combat deaths (deferred) -----------------------------------------------
+// combat::Update flags a kill; the engine drains this each frame and fans it out
+// to the schematic OnDeath event (like a UI event to every listener). `tag` is the
+// Health.deathTag (or the entity Name); `entity`/`instigator` are entt bits.
+struct DeathRec {
+    std::string tag;
+    u32 entity = 0xFFFFFFFFu;
+    u32 instigator = 0xFFFFFFFFu;
+};
+void QueueDeath(const DeathRec& rec);
+bool ConsumeDeath(DeathRec& out); // FIFO
+
+// --- AI noise bus (hearing) -------------------------------------------------
+// A world-space sound the AI can hear (footstep, gunshot, thrown prop). `loudness`
+// scales a listener's hearing radius; the noise lingers a short TTL so every AI
+// agent (which tick at one call site) observes it regardless of frame ordering.
+// Multi-listener: Noises() returns ALL live noises; not persisted.
+struct Noise {
+    glm::vec3 pos{0.0f};
+    f32 loudness = 1.0f;
+    f32 ttl = 0.0f;
+};
+void EmitNoise(const glm::vec3& pos, f32 loudness = 1.0f);
+const std::vector<Noise>& Noises();
+void TickNoises(f32 dt); // ages + expires noises; call once per frame
+
+// --- AI "spotted the player" event (deferred) -------------------------------
+// ai::Update flags the rising edge where an agent's awareness first crosses its
+// detect threshold; the engine drains this into the schematic OnSpotPlayer event.
+struct SpottedRec {
+    u32 spotter = 0xFFFFFFFFu; // the AI entity
+    u32 target = 0xFFFFFFFFu;  // who it spotted
+};
+void QueueSpotted(const SpottedRec& rec);
+bool ConsumeSpotted(SpottedRec& out);
+
+// Clears the transient per-frame gameplay event queues (deaths / noises / spotted)
+// WITHOUT touching the persistent run state. Call on a mid-play level switch so an
+// event queued right before the switch can't fire into the freshly-loaded level.
+void ClearTransientQueues();
 
 // --- Run-state save/load (objectives + checkpoints) -------------------------
 // The SCENE snapshot is saved by the engine; this is just the gameplay bookkeeping.

@@ -94,6 +94,14 @@ struct EngineConfig {
     bool forceMotionBlur = false;
     bool forceSsr = false;
     bool forceAutoExposure = false;
+    // TEMP (perf measurement): --shadowcascades N overrides the preset's active
+    // cascade count (1..4) every frame, so 4-vs-2 shadow cost can be A/B'd on one
+    // machine. 0 = off (use the preset). Remove after tuning.
+    int forceShadowCascades = 0;
+    // --gpuprofile: enable the per-pass GPU timestamp profiler at boot (both backends).
+    // Logs "[<API> GPU] total X ms | shadow .. | scene .. | ..." every ~2s so the frame's
+    // dominant pass is visible. ~1-3 ms/frame while on, so it's opt-in (diagnosis only).
+    bool gpuProfile = false;
 
     // Navigation smoke test: route the grid A* pathfinder around a static + a
     // dynamic obstacle and walk an agent to the goal, then exit.
@@ -127,6 +135,12 @@ public:
 
     // Runs the engine to completion. Returns a process exit code.
     int Run(const EngineConfig& config);
+
+    // Offline MOVIE RENDER: force a FIXED simulation delta (= 1/fps) so playback is
+    // deterministic and frame-stepped regardless of real framerate. Only the sim
+    // delta is affected (not the wall-clock dt_ used by caption/loading timers).
+    // Pass <= 0 to restore real-time. Set by the editor's movie render job.
+    void SetRenderFixedDt(f32 dt) { renderFixedDt_ = dt; }
 
     Window&       GetWindow()   { return *window_; }
     Renderer&     GetRenderer() { return *renderer_; }
@@ -351,6 +365,7 @@ private:
     std::vector<std::filesystem::path> devLevels_;      // level bases (cached on open)
     int  devMenuSel_ = 0;                               // selected row
     f32  devTimeScale_ = 1.0f;                          // game speed (0 = paused)
+    f32  renderFixedDt_ = -1.0f;                        // movie render: fixed sim dt (<0 = off)
     int  devSkyRestore_ = -1;                           // authored dynamicSky before a dev time force (-1 = not forced by the menu)
     void RebuildDevMenu();                              // populate devItems_
     void DevMenuScanLevels();                           // fill devLevels_ (on open)

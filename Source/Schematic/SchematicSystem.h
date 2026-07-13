@@ -48,6 +48,13 @@ struct CompiledContext {
     f32 eventValue = 0.0f;                    // slider value at the change
     bool eventToggled = false;                // toggle state at the change
     f32 eventSelected = 0.0f;                 // selector index at the change
+    // OnDeath event payload (set only while firing NodeType::OnDeath; defaulted so
+    // previously baked units + aggregate-init sites stay source-compatible).
+    const std::string* eventDeathTag = nullptr; // Health.deathTag (or entity Name)
+    entt::entity eventInstigator = entt::null;   // who dealt the killing blow
+    // OnSpotPlayer payload (set only while firing NodeType::OnSpotPlayer).
+    entt::entity eventSpotter = entt::null;      // the AI that spotted someone
+    entt::entity eventSpotTarget = entt::null;   // who it spotted
 };
 using CompiledFn = void (*)(CompiledContext& ctx, NodeType evt);
 

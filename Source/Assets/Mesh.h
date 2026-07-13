@@ -50,12 +50,23 @@ struct Material {
     std::string materialAsset;
 };
 
+// One named blendshape / morph target: per-vertex position (+ optional normal)
+// deltas PARALLEL to MeshData::vertices. Stored out-of-band so the fixed 72-byte
+// Vertex layout (and every input layout / .uaf) stays byte-compatible. Applied on
+// the GPU before skinning: morphedPos = pos + sum(weight_i * posDelta_i).
+struct MorphTarget {
+    std::string name;                // "jawOpen", "viseme_AA", "smile", "blink_L"
+    std::vector<glm::vec3> posDelta; // size == vertices.size()
+    std::vector<glm::vec3> nrmDelta; // size == vertices.size() (may be empty)
+};
+
 // One drawable submesh: interleaved vertices + 32-bit indices + a material.
 struct MeshData {
     std::vector<Vertex> vertices;
     std::vector<u32>    indices;
     Material            material;
     std::string         name;
+    std::vector<MorphTarget> morphTargets; // blendshapes (empty for most meshes)
 
     u32 VertexCount() const { return static_cast<u32>(vertices.size()); }
     u32 IndexCount()  const { return static_cast<u32>(indices.size()); }

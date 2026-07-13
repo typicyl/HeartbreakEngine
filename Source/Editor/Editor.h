@@ -9,6 +9,7 @@
 #include "Assets/MaterialAsset.h"
 #include "Assets/SeamWeld.h"
 #include "Assets/UAF.h"
+#include "Editor/MovieRender.h"
 #include "Core/Types.h"
 #include "Navigation/GridNav.h"
 #include "Renderer/CameraController.h"
@@ -636,7 +637,7 @@ private:
         Panel_Scenes, Panel_AudioMixer, Panel_Assets,
         Panel_ArtEditor, Panel_SchematicEditor, Panel_Music,
         Panel_CutsceneTimeline, Panel_DialogueEditor, Panel_InputIcons,
-        Panel_Objectives, Panel_CharacterEditor,
+        Panel_Objectives, Panel_CharacterEditor, Panel_MovieRender,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
@@ -791,6 +792,16 @@ private:
     // TriggerVolume) + the .hbschem graphs referenced by its SchematicComponents.
     void RebuildObjectiveIndex(Scene& scene);
     void DrawObjectives(Engine& engine);     // the dockable browser panel
+
+    // -- Movie Render (offline trailer -> .mp4, video + audio) -------------------
+    movie::MovieJob movieJob_;
+    bool movieActive_ = false;               // a render is running (ticked each frame)
+    std::string movieCutscene_;              // .hbcutscene rel ("" = current scene)
+    std::string movieMusic_;                 // optional background-music asset rel
+    char movieOutPath_[512] = "Trailers/trailer.mp4"; // rel to project root
+    int movieW_ = 1920, movieH_ = 1080, movieFps_ = 30, movieWarmup_ = 12;
+    float movieDuration_ = 5.0f;             // seconds (current-scene mode)
+    void DrawMovieRender(Engine& engine);
 
     // -- Character Editor (modular-rig .hbchar authoring) ------------------------
     CharacterAsset charEdit_;          // the .hbchar currently being authored

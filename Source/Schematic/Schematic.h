@@ -82,6 +82,34 @@ enum class NodeType : u16 {
     PlayVoiceline,   // exec in + Asset(string .uaf) -> exec (one-shot line + caption)
     PlayDialogue,    // exec in + Asset(string .hbdialogue) -> exec (runs a conversation)
     PlayCutscene,    // exec in + Asset(string .hbcutscene) -> exec (runs a cinematic)
+    // --- Combat (append-only: node types are serialized) ----------------------
+    ApplyDamage,     // exec + Target(Entity) + Amount(float) -> exec
+    Kill,            // exec + Target(Entity) -> exec (instant, bypasses i-frames)
+    Heal,            // exec + Target(Entity) + Amount(float) -> exec
+    SetHealth,       // exec + Target(Entity) + Value(float) -> exec
+    SetInvulnerable, // exec + Target(Entity) + On(bool) -> exec
+    GetHealth,       // Target(Entity) -> Current(float) + Max(float)   (pure)
+    IsAlive,         // Target(Entity) -> Alive(bool)                    (pure)
+    OnDeath,         // Tag(string filter; ""=any) -> exec + Tag + Instigator(Entity)
+    // --- AI (append-only) -----------------------------------------------------
+    SetAIState,      // exec + Target(Entity) + State(string) -> exec
+    SetAlert,        // exec + Target(Entity) + Alert(float 0..1) -> exec
+    IsPlayerVisible, // Target(Entity) -> Visible(bool)     (pure)
+    GetAwareness,    // Target(Entity) -> Awareness(float)  (pure)
+    OnSpotPlayer,    // (fires on the spotter's graph) -> exec + Spotter + Target(Entity)
+    // --- Spawning / encounters (append-only) ----------------------------------
+    SpawnGroup,      // exec + SpawnerId(string) -> exec (request a burst)
+    DespawnAll,      // exec + EncounterId(string) -> exec (destroy the group)
+    AliveCount,      // EncounterId(string) -> Count(float)   (pure)
+    // --- Inventory (append-only) ----------------------------------------------
+    GrantItem,       // exec + Id(string) + Count(float) -> exec
+    RemoveItem,      // exec + Id(string) + Count(float) -> exec
+    HasItem,         // Id(string) + Count(float) -> Has(bool)   (pure)
+    ItemCount,       // Id(string) -> Count(float)               (pure)
+    EquipWeapon,     // exec + Id(string) -> exec
+    // --- Facial / blendshapes (append-only) -----------------------------------
+    SetMorphWeight,       // exec + Target(Entity) + Name(string) + Weight(float) -> exec
+    PlayFacialExpression, // exec + Target(Entity) + Preset(string) + Weight(float) -> exec
     Count
 };
 

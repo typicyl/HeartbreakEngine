@@ -345,6 +345,17 @@ u64 Renderer::ViewportTextureId() {
     return device_ ? device_->GetViewportTextureId() : 0;
 }
 
+bool Renderer::ReadbackViewportColor(std::vector<u8>& outRGBA, u32& w, u32& h) {
+    return device_ && device_->ReadbackViewportColor(outRGBA, w, h);
+}
+
+void Renderer::SetGpuProfileEnabled(bool enable) {
+    if (device_) device_->SetGpuProfileEnabled(enable);
+}
+bool Renderer::GpuProfileActive() const {
+    return device_ && device_->GpuProfileActive();
+}
+
 void Renderer::SetPreviewSize(u32 width, u32 height) {
     if (device_) device_->ResizePreview(width, height);
 }

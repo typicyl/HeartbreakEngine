@@ -111,6 +111,59 @@ std::array<NodeDesc, static_cast<usize>(NodeType::Count)> BuildCatalog() {
                                  {EXEC, {"Asset", P::String}}, {EXEC}});
     set(NodeType::PlayCutscene, {"Play Cutscene", "Cinematic",
                                  {EXEC, {"Asset", P::String}}, {EXEC}});
+    // Combat: faction-based health/damage. Entity inputs default to Self when unwired.
+    set(NodeType::ApplyDamage, {"Apply Damage", "Combat",
+                                {EXEC, {"Target", P::Entity}, {"Amount", P::Float}}, {EXEC}});
+    set(NodeType::Kill, {"Kill", "Combat", {EXEC, {"Target", P::Entity}}, {EXEC}});
+    set(NodeType::Heal, {"Heal", "Combat",
+                         {EXEC, {"Target", P::Entity}, {"Amount", P::Float}}, {EXEC}});
+    set(NodeType::SetHealth, {"Set Health", "Combat",
+                              {EXEC, {"Target", P::Entity}, {"Value", P::Float}}, {EXEC}});
+    set(NodeType::SetInvulnerable, {"Set Invulnerable", "Combat",
+                                    {EXEC, {"Target", P::Entity}, {"On", P::Bool}}, {EXEC}});
+    set(NodeType::GetHealth, {"Get Health", "Combat", {{"Target", P::Entity}},
+                              {{"Current", P::Float}, {"Max", P::Float}}});
+    set(NodeType::IsAlive, {"Is Alive", "Combat", {{"Target", P::Entity}}, {{"Alive", P::Bool}}});
+    set(NodeType::OnDeath, {"On Death", "Combat", {{"Tag", P::String}},
+                            {EXEC, {"Tag", P::String}, {"Instigator", P::Entity}}});
+    // AI: perception + behavior. Entity inputs default to Self when unwired.
+    set(NodeType::SetAIState, {"Set AI State", "AI",
+                               {EXEC, {"Target", P::Entity}, {"State", P::String}}, {EXEC}});
+    set(NodeType::SetAlert, {"Set Alert", "AI",
+                             {EXEC, {"Target", P::Entity}, {"Alert", P::Float}}, {EXEC}});
+    set(NodeType::IsPlayerVisible, {"Is Player Visible", "AI", {{"Target", P::Entity}},
+                                    {{"Visible", P::Bool}}});
+    set(NodeType::GetAwareness, {"Get Awareness", "AI", {{"Target", P::Entity}},
+                                 {{"Awareness", P::Float}}});
+    set(NodeType::OnSpotPlayer, {"On Spot Player", "AI", {},
+                                 {EXEC, {"Spotter", P::Entity}, {"Target", P::Entity}}});
+    // Spawning / encounters.
+    set(NodeType::SpawnGroup, {"Spawn Group", "Spawning",
+                               {EXEC, {"Spawner Id", P::String}}, {EXEC}});
+    set(NodeType::DespawnAll, {"Despawn All", "Spawning",
+                               {EXEC, {"Encounter Id", P::String}}, {EXEC}});
+    set(NodeType::AliveCount, {"Alive Count", "Spawning", {{"Encounter Id", P::String}},
+                               {{"Count", P::Float}}});
+    // Inventory: item counts + equip. Ids are free-form (a future .hbitems catalog
+    // adds names/icons/caps). Crafting composes from HasItem + RemoveItem + GrantItem.
+    set(NodeType::GrantItem, {"Grant Item", "Inventory",
+                              {EXEC, {"Id", P::String}, {"Count", P::Float}}, {EXEC}});
+    set(NodeType::RemoveItem, {"Remove Item", "Inventory",
+                               {EXEC, {"Id", P::String}, {"Count", P::Float}}, {EXEC}});
+    set(NodeType::HasItem, {"Has Item", "Inventory",
+                            {{"Id", P::String}, {"Count", P::Float}}, {{"Has", P::Bool}}});
+    set(NodeType::ItemCount, {"Item Count", "Inventory", {{"Id", P::String}},
+                              {{"Count", P::Float}}});
+    set(NodeType::EquipWeapon, {"Equip Weapon", "Inventory", {EXEC, {"Id", P::String}}, {EXEC}});
+    // Facial: drive blendshape channels + expression presets.
+    set(NodeType::SetMorphWeight, {"Set Morph Weight", "Facial",
+                                   {EXEC, {"Target", P::Entity}, {"Name", P::String},
+                                    {"Weight", P::Float}},
+                                   {EXEC}});
+    set(NodeType::PlayFacialExpression, {"Play Facial Expression", "Facial",
+                                         {EXEC, {"Target", P::Entity}, {"Preset", P::String},
+                                          {"Weight", P::Float}},
+                                         {EXEC}});
     return c;
 }
 } // namespace
@@ -149,6 +202,25 @@ Value DefaultLiteral(NodeType t, u32 inPin, PinType pt) {
     if (t == NodeType::PlayVoiceline && inPin == 1) return Value::Str("Voice/line.uaf");
     if (t == NodeType::PlayDialogue && inPin == 1) return Value::Str("Dialogue/scene.hbdialogue");
     if (t == NodeType::PlayCutscene && inPin == 1) return Value::Str("Cutscenes/intro.hbcutscene");
+    if (t == NodeType::ApplyDamage && inPin == 2) return Value::Float(25.0f);
+    if (t == NodeType::Heal && inPin == 2) return Value::Float(25.0f);
+    if (t == NodeType::SetHealth && inPin == 2) return Value::Float(100.0f);
+    if (t == NodeType::SetInvulnerable && inPin == 2) return Value::Bool(true);
+    if (t == NodeType::SetAIState && inPin == 2) return Value::Str("Chase");
+    if (t == NodeType::SetAlert && inPin == 2) return Value::Float(1.0f);
+    if (t == NodeType::SpawnGroup && inPin == 1) return Value::Str("Spawner1");
+    if (t == NodeType::DespawnAll && inPin == 1) return Value::Str("Encounter1");
+    if (t == NodeType::AliveCount && inPin == 0) return Value::Str("Encounter1");
+    if ((t == NodeType::GrantItem || t == NodeType::RemoveItem) && inPin == 1) return Value::Str("rag");
+    if ((t == NodeType::GrantItem || t == NodeType::RemoveItem) && inPin == 2) return Value::Float(1.0f);
+    if (t == NodeType::HasItem && inPin == 0) return Value::Str("rag");
+    if (t == NodeType::HasItem && inPin == 1) return Value::Float(1.0f);
+    if (t == NodeType::ItemCount && inPin == 0) return Value::Str("rag");
+    if (t == NodeType::EquipWeapon && inPin == 1) return Value::Str("pistol");
+    if (t == NodeType::SetMorphWeight && inPin == 2) return Value::Str("jawOpen");
+    if (t == NodeType::SetMorphWeight && inPin == 3) return Value::Float(1.0f);
+    if (t == NodeType::PlayFacialExpression && inPin == 2) return Value::Str("smile");
+    if (t == NodeType::PlayFacialExpression && inPin == 3) return Value::Float(1.0f);
     switch (pt) {
         case PinType::Bool:   return Value::Bool(false);
         case PinType::Vec3:   return Value::Vec3({0.0f, 0.0f, 0.0f});

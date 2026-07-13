@@ -80,6 +80,10 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
     // the per-entity walk entirely when nothing is hidden (the common case).
     const auto* hiddenStore = registry_.storage<EditorHidden>();
     const bool cullHidden = editorView_ && hiddenStore && hiddenStore->size() > 0;
+    // Skip the per-draw blendshape lookup entirely when no entity has a MorphState
+    // (the common case) - same idiom as cullHidden above.
+    const auto* morphStore = registry_.storage<MorphState>();
+    const bool anyMorph = morphStore && morphStore->size() > 0;
 
     auto view = registry_.view<const Transform, const MeshInstance>();
     out.reserve(out.size() + view.size_hint());
@@ -135,6 +139,25 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         item.subsurfaceRadius = instance.subsurfaceRadius;
         item.thicknessTexture = instance.thicknessTexture;
         item.materialFlags = instance.materialFlags;
+        // Facial blendshapes: fill the top-8 active channels from a resolved MorphState
+        // (channel name -> atlas row via targetNames; weights from the driver/schematic).
+        // The atlas is uploaded once at spawn (SceneSerializer::Instantiate resolve).
+        if (anyMorph) {
+            if (const MorphState* mo = registry_.try_get<MorphState>(e);
+                mo && mo->resolved && mo->morphTexture.IsValid() && !mo->targetNames.empty()) {
+                item.morphTexture = mo->morphTexture;
+                item.morphVertexCount = mo->vertexCount;
+                u32 n = 0;
+                for (usize r = 0; r < mo->targetNames.size() && n < 8u; ++r) {
+                    const auto wit = mo->weights.find(mo->targetNames[r]);
+                    if (wit == mo->weights.end() || wit->second <= 1e-3f) continue;
+                    item.morphTargets[n] = static_cast<u32>(r);
+                    item.morphWeights[n] = wit->second;
+                    ++n;
+                }
+                item.morphCount = n;
+            }
+        }
         // Dynamic-layer objects (player / NPCs / interactables) are exempt from the
         // painterly finish so they stand out crisp against the painted static world.
         // Tag them here; the forward pass writes the flag into HDR alpha and a post
@@ -480,11 +503,18 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         const f32 shadowFar =
             glm::clamp(sceneRadius * 2.5f, camNear + 1.0f,
                        glm::min(camera.FarPlane(), maxShadow));
+        // Quality preset drives how many cascades we actually render (High = 4 =
+        // authored; Medium = 3; Low = 2). The split scheme is computed over the ACTIVE
+        // count so the full shadowDistance is still covered by whatever cascades remain -
+        // fewer slices just means each spans more depth (coarser distant shadows), NOT a
+        // shorter shadow range. Directly scales the shadow render pass (cascades x casters).
+        const u32 activeCascades =
+            glm::clamp(env_.post.shadowCascades, 1u, rhi::kMaxShadowCascades);
         const f32 lambda = 0.75f;
         f32 splits[rhi::kMaxShadowCascades + 1];
         splits[0] = camNear;
-        for (u32 i = 1; i <= rhi::kMaxShadowCascades; ++i) {
-            const f32 p = static_cast<f32>(i) / rhi::kMaxShadowCascades;
+        for (u32 i = 1; i <= activeCascades; ++i) {
+            const f32 p = static_cast<f32>(i) / static_cast<f32>(activeCascades);
             const f32 logSplit = camNear * std::pow(shadowFar / camNear, p);
             const f32 uniSplit = camNear + (shadowFar - camNear) * p;
             splits[i] = lambda * logSplit + (1.0f - lambda) * uniSplit;
@@ -495,7 +525,7 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         const f32 tanHalfFovX = tanHalfFovY * camera.Aspect();
         constexpr f32 kCascadeTileDim = 2048.0f; // one tile of the 4096 atlas
 
-        for (u32 ci = 0; ci < rhi::kMaxShadowCascades; ++ci) {
+        for (u32 ci = 0; ci < activeCascades; ++ci) {
             // Light-space AABB of this slice's eight frustum corners.
             glm::vec3 lsMin(1e30f), lsMax(-1e30f);
             for (int c = 0; c < 8; ++c) {
@@ -527,7 +557,7 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
             v.cascadeViewProj[ci] = lightProj * lightView;
             v.cascadeSplits[static_cast<int>(ci)] = splits[ci + 1];
         }
-        v.cascadeCount = rhi::kMaxShadowCascades;
+        v.cascadeCount = activeCascades;
         v.shadowsEnabled = 1;
     }
     return v;

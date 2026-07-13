@@ -1120,6 +1120,9 @@ enum class InteractAction : u8 {
     SetObjective,       // game::SetObjective(flag, text)   (flag = objective id)
     CompleteObjective,  // game::CompleteObjective(flag)
     None,               // no-op
+    // APPEND-ONLY: the action is serialized as a numeric index, so new actions go
+    // AFTER None or old scenes silently reinterpret their action id.
+    GrantItem,          // game::AddItem(itemId, itemCount) + mark the pickup picked
 };
 
 // A world object / NPC the player can interact with. While the player is within
@@ -1138,6 +1141,11 @@ struct Interactable {
     f32 range = 2.5f;                // interact distance (world units)
     bool once = false;               // fire only the first time
     std::string requiredFlag;        // gate: interactable only while this flag != 0 (empty = always)
+    // GrantItem action: grant `itemCount` of `itemId`, then permanently remove the
+    // pickup via a "picked.<pickupId>" flag (survives save/load AND level reload).
+    std::string itemId;
+    u32         itemCount = 1;
+    std::string pickupId;
     bool fired = false;              // runtime: already activated (honours `once`)
 };
 
@@ -1153,6 +1161,9 @@ struct TriggerVolume {
     glm::vec3 halfExtents{2.0f, 2.0f, 2.0f}; // box around the Transform
     bool once = true;
     std::string requiredFlag;
+    std::string itemId;               // GrantItem action (see Interactable)
+    u32         itemCount = 1;
+    std::string pickupId;
     bool fired = false;               // runtime: already fired (honours `once`)
     bool inside = false;              // runtime: player was inside last frame (enter-edge detect)
 };
@@ -1166,6 +1177,284 @@ struct Checkpoint {
     bool saveOnReach = true;      // write a checkpoint save when reached
     bool once = true;             // fire only the first time
     bool reached = false;         // runtime cache (authoritative set is in game::)
+};
+
+// --- Combat -----------------------------------------------------------------
+// A team id. Damage rules are DERIVED, not stored: same faction = friendly
+// (blocked unless the target allows friendlyFire), different = hostile. Neutral
+// never initiates and is never a valid AI target, but can still be hurt by
+// scripted/environmental damage. Flat enum (like SceneKind/InteractAction) so the
+// editor shows a combo and it round-trips as a u32 cast.
+enum class Faction : u8 { Neutral = 0, Player, Enemy, Ally, Faction4, Faction5 };
+
+// Are `a` and `b` hostile? Used by BOTH AI target selection and damage filtering.
+// Neutral is never hostile; the Player and their Ally companions are on one side;
+// any other cross-faction pair is hostile.
+inline bool Hostile(Faction a, Faction b) {
+    if (a == Faction::Neutral || b == Faction::Neutral || a == b) return false;
+    const bool aFriendly = a == Faction::Player || a == Faction::Ally;
+    const bool bFriendly = b == Faction::Player || b == Faction::Ally;
+    if (aFriendly && bFriendly) return false; // Player + Ally fight together
+    return true;
+}
+
+// Makes an entity DAMAGEABLE. Shared by the player and every enemy/NPC - combat is
+// faction-based, not type-based. combat::ApplyDamage mutates this; combat::Update
+// ticks regen + the invuln timer and fires the one-shot death dispatch on the
+// alive->dead edge (mirrors how Checkpoint fires once). Runtime fields are not
+// written to the .hbscene source (they ARE snapshotted into the .hbsave).
+struct Health {
+    f32     max     = 100.0f;
+    f32     current = 100.0f;
+    Faction faction = Faction::Enemy;
+
+    // Regen: after `regenDelay` s without taking damage, heal `regenRate` hp/s up
+    // to max. 0 rate = no regen (typical enemy; the player often regens).
+    f32 regenRate  = 0.0f;
+    f32 regenDelay = 5.0f;
+
+    // Invulnerability. `hitInvuln` grants i-frames per successful hit (debounces
+    // multi-ray/overlap doubles); `invincible` is a hard flag (god-mode / scripted
+    // cutscene immunity) that never expires.
+    f32  hitInvuln  = 0.0f;
+    bool invincible = false;
+    bool friendlyFire = false; // allow same-faction damage TO this entity
+
+    // Zero-script death reactions (fire once on death, like Checkpoint):
+    std::string onDeathFlag;        // game::SetFlag(onDeathFlag, onDeathFlagValue)
+    f32         onDeathFlagValue = 1.0f;
+    std::string onDeathObjective;   // game::CompleteObjective(onDeathObjective)
+    std::string deathTag;           // matched by the OnDeath schematic event ("" = Name)
+    i32         deathClip = -1;      // Animator clip to switch to on death (-1 = none)
+
+    // Runtime (not serialized to source; snapshotted for saves).
+    bool alive           = true;
+    bool deathDispatched = false;  // guards the one-shot death dispatch
+    f32  invulnTimer     = 0.0f;   // seconds of i-frames remaining
+    f32  sinceDamage     = 1e9f;   // seconds since last damage (regen delay gate)
+    entt::entity lastAttacker = entt::null; // most recent instigator (OnDeath output)
+};
+
+// An attack capability carried by an actor (player or AI), like CharacterController
+// is a movement capability. combat::TryFire consults it: Hitscan does a two-step
+// trace (wall occlusion via PhysicsWorld::Raycast + ray-vs-sphere over Health
+// entities, since characters are bodyless capsules); Melee sweeps a forward arc.
+// All hits go through combat::ApplyDamage so faction/invuln rules always hold.
+struct Weapon {
+    enum class Kind : u8 { Hitscan, Melee, Projectile /*reserved*/ };
+
+    Kind kind     = Kind::Hitscan;
+    f32  damage   = 25.0f;
+    f32  range    = 50.0f;  // hitscan trace length / melee reach (m)
+    f32  fireRate = 3.0f;   // shots per second (cooldown = 1/rate)
+    f32  radius   = 0.0f;   // >0 = radial/AoE at the hit point
+    f32  impulse  = 4.0f;   // knockback impulse along the hit direction
+    f32  meleeArc = 45.0f;  // melee half-angle (deg) of the forward sweep
+    f32  hitRadius = 0.5f;  // ray-vs-sphere radius used when testing targets
+
+    // Ammo (maxAmmo < 0 = infinite, e.g. fists / AI).
+    i32 maxAmmo    = 12;
+    i32 ammo       = 12;
+    i32 reserve    = 60;
+    f32 reloadTime = 1.5f;
+
+    // Runtime (not serialized): cooldown + reload countdowns.
+    f32 cooldown  = 0.0f;
+    f32 reloading = 0.0f;
+};
+
+// --- AI ---------------------------------------------------------------------
+// The senses. ai::Update fills the runtime block each tick from a sight cone
+// (range + FOV + eye-height, occluded by a PhysicsWorld::Raycast) plus a hearing
+// radius fed by the game:: noise bus, integrating an awareness meter that decays
+// when the target is lost. Targets are the nearest HOSTILE Health entity (faction).
+struct AIPerception {
+    // Sight (authored).
+    f32 sightRange    = 18.0f;   // max view distance (m)
+    f32 sightFovDeg   = 100.0f;  // full horizontal cone angle
+    f32 eyeHeight     = 1.6f;    // eye offset above the Transform origin
+    f32 loseSightGrace = 0.5f;   // s of continuous no-LoS before "lost" (anti-flicker)
+
+    // Hearing (authored).
+    f32 hearingRadius = 12.0f;   // base radius; a noise's loudness scales it
+
+    // Awareness (authored tuning).
+    f32 gainRate  = 1.5f;        // awareness/s while target sensed (scaled by proximity)
+    f32 decayRate = 0.4f;        // awareness/s while target unsensed
+    f32 detectThreshold = 1.0f;  // awareness at which the target is "spotted"
+
+    // Runtime (not serialized).
+    f32 awareness      = 0.0f;             // 0..1 detection meter
+    bool canSeeTarget  = false;            // LoS + in cone THIS tick
+    f32 timeSinceSeen  = 999.0f;           // s since last positive sight
+    entt::entity knownTarget = entt::null; // nearest sensed hostile
+    glm::vec3 lastKnownPos{0.0f};          // where the target was last sensed
+    bool hasLastKnownPos = false;
+    glm::vec3 heardPos{0.0f};              // most recent qualifying noise
+    bool heardSomething = false;
+};
+
+// AI behavior states. Idle/Patrol are calm; Investigate/Search are alerted-but-
+// unsure; Chase/Attack are engaged; Flee is retreating; Dead is terminal.
+enum class AIState : u8 { Idle = 0, Patrol, Investigate, Chase, Attack, Search, Flee, Dead };
+
+// Parses an AIState from its name (schematic SetAIState node); unknown -> Idle.
+inline AIState AIStateFromName(const std::string& s) {
+    if (s == "Patrol") return AIState::Patrol;
+    if (s == "Investigate") return AIState::Investigate;
+    if (s == "Chase") return AIState::Chase;
+    if (s == "Attack") return AIState::Attack;
+    if (s == "Search") return AIState::Search;
+    if (s == "Flee") return AIState::Flee;
+    if (s == "Dead") return AIState::Dead;
+    return AIState::Idle;
+}
+
+// The brain. A compact hand-rolled FSM. ai::Update reads AIPerception + Health,
+// picks the next state, and writes the NavigationAgent target + fires the Weapon /
+// melee via combat::. Locomotion animates automatically from the agent's velocity
+// (motion matching), so the AI does no animation itself.
+struct AIBehavior {
+    AIState state = AIState::Idle;
+
+    // Authored tuning.
+    f32  attackRange    = 2.0f;   // enter Attack within this of the target (melee)
+    f32  attackDamage   = 20.0f;  // per melee hit (weaponless fallback)
+    f32  attackInterval = 1.2f;   // s between melee hits (weaponless fallback)
+    f32  investigateTime = 6.0f;  // s to inspect a noise before giving up
+    f32  searchTime     = 8.0f;   // s to sweep last-known-pos before de-escalating
+    f32  fleeHealthFrac = 0.0f;   // flee below this HP fraction (0 = never)
+    bool startAlerted   = false;  // spawn already Chasing (scripted encounters)
+    bool useWeapon      = true;   // if the entity has a Weapon, fire it instead of melee
+
+    // Patrol: inline world-space waypoints (empty = stand at Idle). Mode 0=loop,
+    // 1=ping-pong, 2=once-then-idle. Kept inline (not an entity ref) so it
+    // serializes trivially as an array of points.
+    std::vector<glm::vec3> patrolPoints;
+    u8  patrolMode  = 0;
+    f32 waitAtPoint = 1.5f;
+
+    // Runtime (not serialized).
+    f32 stateTime      = 0.0f;   // s in the current state
+    f32 attackCooldown = 0.0f;   // s until the next melee hit is allowed
+    u32 patrolIndex    = 0;
+    bool patrolForward = true;
+    f32 waitTimer      = 0.0f;   // pause countdown at a waypoint
+    AIState prevState  = AIState::Idle; // edge-detect for OnSpotPlayer
+    bool spawnApplied  = false;  // startAlerted handled once
+};
+
+// --- Spawning / encounters --------------------------------------------------
+// A spawn point/group. On its trigger it instantiates `prefab` (a .hbprefab, rel
+// Assets/) `count` times on a disc of `radius` about the Transform, tags each root
+// Spawned{encounterId, spawnerId}, throttles to `maxAlive`, and refills per
+// `respawn`. Runtime fields persist ONLY under runtimeTags (like TriggerVolume) so
+// a save keeps the fired/spawned state but an authored .hbscene starts un-triggered.
+struct Spawner {
+    std::string prefab;      // .hbprefab path rel Assets/ (the authored NPC)
+    std::string encounterId; // Encounter.id this feeds ("" = standalone)
+    std::string spawnerId;   // unique name for schematic SpawnGroup targeting
+
+    u32 count  = 3;          // instances per burst
+    f32 radius = 4.0f;       // disc radius the burst scatters over
+
+    enum class Trigger : u8 { Volume = 0, Flag, Manual };
+    Trigger trigger = Trigger::Volume;
+    glm::vec3   halfExtents{6.0f}; // Volume-mode box (player enter-edge)
+    std::string requiredFlag;      // Flag-mode gate + universal availability gate
+
+    u32 maxAlive = 0;        // 0 = uncapped; else never exceed this many alive
+    enum class Respawn : u8 { Once = 0, Continuous };
+    Respawn respawn = Respawn::Once;
+    f32 respawnDelay = 5.0f; // seconds between Continuous refill checks
+
+    // Runtime (serialized only under runtimeTags).
+    bool activated       = false; // trigger fired at least once
+    bool inside          = false; // Volume enter-edge (mirrors TriggerVolume.inside)
+    bool spawnRequested  = false; // schematic SpawnGroup / manual burst
+    bool despawnRequested = false; // schematic DespawnAll
+    u32  spawnedTotal    = 0;     // lifetime instances emitted
+    f32  respawnCooldown = 0.0f;
+};
+
+// Orchestrates a staged encounter: groups Spawners by matching encounterId, tallies
+// live members by scanning Spawned tags (stable across the .hbsave Replace, unlike
+// entt handles), and fires a completion InteractAction when cleared (spawned then
+// all dead). Completion reuses the InteractAction dispatch so "cleared -> SetFlag /
+// Objective / Dialogue / Cutscene" gates progression with no new plumbing.
+struct Encounter {
+    std::string id;              // unique; Spawners + Spawned tags reference it
+    bool startActive = false;    // armed at load (else armed by flag/schematic)
+
+    InteractAction clearedAction = InteractAction::SetFlag;
+    std::string clearedAsset;    // Dialogue/Cutscene
+    std::string clearedFlag;     // SetFlag name / Objective id
+    f32         clearedFlagValue = 1.0f;
+    std::string clearedText;     // SetObjective text
+    std::string requiredFlag;    // availability gate
+
+    // Runtime (serialized only under runtimeTags).
+    enum class State : u8 { Idle = 0, Active, Cleared };
+    State state = State::Idle;
+    u32  aliveCount = 0;        // recomputed each tick from Spawned tags
+    bool everHadAlive = false;  // saw >=1 alive member (so alive==0 => cleared)
+    bool clearedEdge = false;   // set the frame it clears
+    bool activateRequested = false; // schematic/flag arm request
+};
+
+// Runtime membership tag stamped on the ROOT of every spawned instance. Ties it to
+// its spawner + encounter by STRING id. Serialized under runtimeTags; absent from
+// authored .hbscene files.
+struct Spawned {
+    std::string encounterId;
+    std::string spawnerId;
+};
+
+// --- Facial / blendshapes ---------------------------------------------------
+// Low-level blendshape channel weights on the entity that owns the morph mesh (the
+// head part in a modular rig, or a whole-face single mesh). facial::Update and the
+// SetMorphWeight schematic node write `weights`; Scene::CollectDrawItems resolves
+// channel names -> morph-atlas rows and fills the top-8 non-zero into the DrawItem
+// so the vertex shader accumulates them before skinning.
+struct MorphState {
+    std::unordered_map<std::string, f32> weights; // channel name -> 0..1
+
+    // Resolve cache (not serialized): filled once from the mesh's morph target list.
+    rhi::TextureHandle morphTexture;              // bindless delta atlas
+    u32 vertexCount = 0;
+    std::vector<std::string> targetNames;         // atlas row order
+    bool resolved = false;
+};
+
+// Higher-level face driver: amplitude-envelope lip-sync + timed eye-blink + an
+// expression preset, all writing into the target MorphState each frame. On a
+// modular rig it sits on the Character root and drives the live head part's
+// MorphState; on a single-mesh character it sits on the same entity.
+struct FacialAnimator {
+    bool lipSync = true;
+    std::string jawTarget = "jawOpen";
+    f32 jawStrength = 1.0f;
+    f32 jawAttack   = 25.0f; // per-second rise toward the envelope
+    f32 jawRelease  = 12.0f; // per-second fall
+
+    bool autoBlink = true;
+    std::string blinkL = "blink_L";
+    std::string blinkR = "blink_R";
+    f32 blinkMin = 2.5f, blinkMax = 6.0f, blinkDuration = 0.12f;
+
+    std::string expression;      // active preset name ("" = neutral)
+    f32 expressionWeight = 1.0f;
+
+    // Runtime (not serialized).
+    std::vector<f32> env;    // lip-sync amplitude envelope of the current line
+    f32 envRate = 60.0f;     // envelope samples/sec
+    f32 envTime = 1e9f;      // seconds since the line started (>= env end = idle)
+    f32 jawCur = 0.0f;
+    f32 blinkTimer = 0.0f;
+    f32 blinkPhase = -1.0f;  // >=0 while a blink pulse plays
+    u32 rng = 0;             // per-entity PRNG (seeded from entity id)
+    bool seeded = false;
+    std::vector<std::string> driven; // channels written last frame (cleared when idle)
 };
 
 } // namespace hbe

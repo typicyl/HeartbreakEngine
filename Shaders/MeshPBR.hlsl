@@ -13,6 +13,7 @@ struct VSInput
     float2 uv         : TEXCOORD0;
     uint4  joints     : BLENDINDICES; // skeleton joint indices
     float4 weights    : BLENDWEIGHT;  // all zero on static meshes
+    uint   vertexId   : SV_VertexID;  // morph delta atlas addressing
 };
 
 struct VSOutput
@@ -60,6 +61,23 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
     float3 nrmOS = input.normalOS;
     float3 tanOS = input.tangentOS.xyz;
     float3 prevPosOS = input.positionOS; // skinned with the previous palette
+
+    // Facial blendshapes: add each active target's weighted position delta into the
+    // vertex BEFORE skinning. Sampler-free .Load() (texelFetch) is bit-exact and
+    // valid in the VS on both backends. gMorphTexIndex == 0 -> no morphs (skipped,
+    // so non-morph draws are untouched). Deltas apply to prevPos too (no spurious
+    // motion-vector from the morph itself; acceptable for slow facial motion).
+    if (gMorphTexIndex != 0u && gMorphCount != 0u)
+    {
+        [loop] for (uint m = 0u; m < gMorphCount; ++m)
+        {
+            uint   row = gMorphTargets[m >> 2u][m & 3u];
+            float  w   = gMorphWeights[m >> 2u][m & 3u];
+            float3 d   = gTextures[gMorphTexIndex].Load(int3(int(input.vertexId), int(row), 0)).xyz;
+            posOS     += w * d;
+            prevPosOS += w * d;
+        }
+    }
 
     // GPU instancing: instanced runs replace the object CB's transforms with
     // this instance's slice of gInstances (3 matrices per instance). Single

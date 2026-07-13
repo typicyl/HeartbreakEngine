@@ -294,6 +294,16 @@ struct PostSettings {
     // always-off field so old scene files with this key still load). Hand painting
     // (Art Editor) is the painterly path now.
     u32 painterly3D = 0;
+
+    // Shadow quality: number of cascaded-shadow-map slices actually rendered (and
+    // sampled). The atlas is always allocated at its full 4x4k / 2x2 layout, but only
+    // the first `shadowCascades` tiles are drawn each frame - so this directly scales
+    // the shadow RENDER cost (each cascade re-rasterizes every caster: cost is
+    // cascades x casters, and on Vulkan each is a per-draw descriptor bind). The split
+    // scheme is recomputed over the ACTIVE count in Scene::MakeView, so fewer cascades
+    // still cover the full shadowDistance - just coarser per slice. Preset-driven
+    // (High = 4 = the authored look; Medium/Low reduce it). Clamped to [1, kMaxShadowCascades].
+    u32 shadowCascades = 4;
 };
 
 // Per-frame view + lighting environment.
@@ -499,6 +509,17 @@ struct DrawItem {
     // scene passes must skip it). Same markers drive BOTH passes, so the
     // per-index shadow<->scene coupling becomes per-run and stays consistent.
     u32 instanceRun = 1;
+
+    // Facial blendshapes: `morphTexture` is a bindless RGBA16F delta atlas
+    // (width = vertex count, one ROW per morph target = xyz position delta). The VS
+    // accumulates `morphCount` active targets - their atlas rows in `morphTargets`,
+    // weights in `morphWeights` - into the vertex BEFORE skinning. The defaults
+    // (invalid texture / count 0) leave every non-morph draw byte-identical.
+    TextureHandle morphTexture;
+    u32 morphVertexCount = 0;
+    u32 morphCount = 0;
+    u32 morphTargets[8] = {};
+    f32 morphWeights[8] = {};
 };
 
 // One vertex of the in-game UI overlay. Positions are in NDC (the UI system
@@ -669,6 +690,21 @@ public:
     virtual void ResizeViewport(u32 /*width*/, u32 /*height*/) {}
     // Backend-specific ImGui texture id for the offscreen color (0 = none).
     virtual u64 GetViewportTextureId() { return 0; }
+    // Reads the offscreen viewport color (the final tonemapped+FXAA frame) back to
+    // CPU as tightly-packed canonical RGBA8 (top row first). Blocking; editor-only
+    // (needs the offscreen target). Returns false when unsupported / not ready.
+    // Used by the offline movie render to capture frames.
+    virtual bool ReadbackViewportColor(std::vector<u8>& /*outRGBA*/, u32& /*w*/, u32& /*h*/) {
+        return false;
+    }
+
+    // -- Per-pass GPU profiler (timestamp queries). Off by default; enable at runtime
+    //    (--gpuprofile or the dev menu) to log a per-pass GPU-time breakdown every ~2s -
+    //    the tool for finding which pass dominates a frame WITHOUT an external capture.
+    //    Costs ~1-3 ms/frame while active (the timestamp marks serialise the pipeline),
+    //    so it stays opt-in. No-op on backends without timestamp support.
+    virtual void SetGpuProfileEnabled(bool /*enable*/) {}
+    virtual bool GpuProfileActive() const { return false; }
 
     // -- Editor asset preview: a SECOND independent offscreen scene (the
     //    orbiting mesh preview of the Asset Viewer, a la Unreal's static-mesh

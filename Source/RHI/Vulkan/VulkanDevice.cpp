@@ -199,7 +199,24 @@ struct ObjectUBO {
     // GPU instancing (matches gInstanced/gInstanceBase in Common.hlsli). Zero-init
     // keeps every single draw byte-compatible with the pre-instancing ABI.
     u32 instanced = 0; u32 instanceBase = 0; u32 _padInst0 = 0; u32 _padInst1 = 0;
+    // Facial blendshapes (must match the gMorph* block in Common.hlsli). Zero-init
+    // keeps every non-morph draw byte-compatible.
+    u32 morphTexIndex = 0; u32 morphCount = 0; u32 _padMorph0 = 0; u32 _padMorph1 = 0;
+    glm::uvec4 morphTargets[2] = {glm::uvec4(0), glm::uvec4(0)};
+    glm::vec4  morphWeights[2] = {glm::vec4(0.0f), glm::vec4(0.0f)};
 };
+
+// Copies a DrawItem's blendshape fields into the object UBO (bindless atlas index +
+// up to 8 active target rows/weights). morphTexIndex 0 = no morphs.
+inline void FillMorphUBO(ObjectUBO& ocb, const DrawItem& it) {
+    if (it.morphTexture.index == 0u) return; // no morphs (the common case) -> zero-init defaults
+    ocb.morphTexIndex = it.morphTexture.index;
+    ocb.morphCount = it.morphCount < 8u ? it.morphCount : 8u;
+    for (u32 m = 0; m < 8u; ++m) {
+        ocb.morphTargets[m >> 2][m & 3] = it.morphTargets[m];
+        ocb.morphWeights[m >> 2][m & 3] = it.morphWeights[m];
+    }
+}
 
 struct GpuTextureVk {
     VkImage image = VK_NULL_HANDLE;
@@ -258,6 +275,15 @@ public:
     TextureHandle CreateUITarget(u32 width, u32 height) override;
     void DrawUIToTexture(TextureHandle target, const UIVertex* vertices, u32 count) override;
 
+    // GPU profiler toggle: MUST live OUTSIDE #if HBE_EDITOR - the per-pass breakdown is a
+    // RUNTIME diagnostic, so the override has to exist in the runtime build or the call
+    // dispatches to the no-op base default (D3D12 twin has the same note).
+    void SetGpuProfileEnabled(bool enable) override {
+        gpuProfileRequested_ = enable;
+        gpuProfile_ = enable && gpuProfileAvail_;
+    }
+    bool GpuProfileActive() const override { return gpuProfile_; }
+
 #if HBE_EDITOR
     bool SupportsUI() const override { return true; }
     bool InitUI(void* nativeWindowHandle) override;
@@ -269,6 +295,7 @@ public:
     u64 GetViewportTextureId() override {
         return viewportReady_ ? reinterpret_cast<u64>(vpImguiTex_) : 0;
     }
+    bool ReadbackViewportColor(std::vector<u8>& outRGBA, u32& w, u32& h) override;
     u64 GetTextureUIHandle(TextureHandle handle) override;
 
     void ResizePreview(u32 width, u32 height) override {
@@ -505,7 +532,9 @@ private:
     bool gpuValid_[kMaxFramesInFlight]{};
     f64  gpuPeriodNs_ = 0.0;                  // ns per timestamp tick (0 = unsupported)
     u32  gpuFrameCounter_ = 0;
-    bool gpuProfile_ = false;
+    bool gpuProfile_ = false;          // ACTIVE this run (marks written + read back)
+    bool gpuProfileAvail_ = false;     // pool created (GPU supports timestamps)
+    bool gpuProfileRequested_ = false; // runtime toggle target (SetGpuProfileEnabled)
 
     bool postPipelinesReady_ = false; // render passes + pipelines + shaders
     bool postReady_ = false;          // targets sized and usable this frame
@@ -661,6 +690,10 @@ private:
     VkDescriptorSet vpImguiTex_ = VK_NULL_HANDLE;
     u32 vpW_ = 0, vpH_ = 0, pendingVpW_ = 0, pendingVpH_ = 0;
     bool viewportReady_ = false;
+    // Reused host-visible staging buffer for ReadbackViewportColor (movie render).
+    VkBuffer       readbackBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory readbackMem_ = VK_NULL_HANDLE;
+    VkDeviceSize   readbackSize_ = 0;
 
     // -- Editor asset preview (independent mini-scene: HDR pass + tonemap) ---
 #if HBE_EDITOR
@@ -1129,18 +1162,24 @@ bool VulkanDevice::CreateSyncAndCommands() {
     // builds (enough to miss a 120 Hz vsync deadline that DX12 - which has no profiler -
     // was hitting). Now it only runs with --validation. Disabled gracefully if the
     // device can't timestamp (period 0).
+    // The timestamp POOL is created whenever the GPU can timestamp; ACTIVATION (writing
+    // the per-pass marks + reading them back, which serialises the pipeline ~1-3 ms/frame)
+    // is a runtime toggle via SetGpuProfileEnabled - so a --gpuprofile run or the dev menu
+    // can turn it on for diagnosis WITHOUT paying the cost in a normal shipped frame, and
+    // WITHOUT needing --validation (which the KHRONOS layer may not even be present for).
     gpuPeriodNs_ = static_cast<f64>(deviceProps_.limits.timestampPeriod);
-    if (validation_ && gpuPeriodNs_ > 0.0) {
+    if (gpuPeriodNs_ > 0.0) {
         VkQueryPoolCreateInfo qpci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
         qpci.queryCount = kMaxGpuMarks;
-        gpuProfile_ = true;
+        gpuProfileAvail_ = true;
         for (u32 i = 0; i < framesInFlight_; ++i) {
             if (vkCreateQueryPool(device_, &qpci, nullptr, &gpuPool_[i]) != VK_SUCCESS) {
-                gpuProfile_ = false;
+                gpuProfileAvail_ = false;
                 break;
             }
         }
+        gpuProfile_ = gpuProfileAvail_ && gpuProfileRequested_; // honor a pre-init request
     }
     renderFinished_.resize(images_.size(), VK_NULL_HANDLE);
     for (auto& s : renderFinished_) {
@@ -4292,6 +4331,7 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         ocb.roughness = it.roughness;
         ocb.albedoIndex = it.albedoTexture.index;
         ocb.normalIndex = it.normalTexture.index;
+        FillMorphUBO(ocb, it); // facial blendshapes (bindless delta atlas)
         ocb.mrIndex = it.mrTexture.index;
         ocb.aoIndex = it.aoTexture.index;
         ocb.flags = it.materialFlags;
@@ -4918,7 +4958,93 @@ void VulkanDevice::DestroyViewportTarget() {
     if (vpDepthView_) { vkDestroyImageView(device_, vpDepthView_, nullptr); vpDepthView_ = VK_NULL_HANDLE; }
     if (vpDepth_) { vkDestroyImage(device_, vpDepth_, nullptr); vpDepth_ = VK_NULL_HANDLE; }
     if (vpDepthMem_) { vkFreeMemory(device_, vpDepthMem_, nullptr); vpDepthMem_ = VK_NULL_HANDLE; }
+    if (readbackBuffer_) { vkDestroyBuffer(device_, readbackBuffer_, nullptr); readbackBuffer_ = VK_NULL_HANDLE; }
+    if (readbackMem_) { vkFreeMemory(device_, readbackMem_, nullptr); readbackMem_ = VK_NULL_HANDLE; }
+    readbackSize_ = 0;
     viewportReady_ = false;
+}
+
+bool VulkanDevice::ReadbackViewportColor(std::vector<u8>& outRGBA, u32& w, u32& h) {
+    if (!viewportReady_ || vpColor_ == VK_NULL_HANDLE) return false;
+    w = vpW_;
+    h = vpH_;
+    const VkDeviceSize size = static_cast<VkDeviceSize>(w) * h * 4;
+
+    // Reuse the staging buffer across frames (grow as needed) - a movie render calls
+    // this every frame, so per-call alloc/free would churn device memory.
+    if (readbackBuffer_ == VK_NULL_HANDLE || readbackSize_ < size) {
+        if (readbackBuffer_) {
+            vkDestroyBuffer(device_, readbackBuffer_, nullptr);
+            vkFreeMemory(device_, readbackMem_, nullptr);
+            readbackBuffer_ = VK_NULL_HANDLE;
+        }
+        if (!CreateBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                          readbackBuffer_, readbackMem_))
+            return false;
+        readbackSize_ = size;
+    }
+    VkBuffer buf = readbackBuffer_;
+    VkDeviceMemory mem = readbackMem_;
+
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = commandPool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device_, &cbai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    const auto barrier = [&](VkImageLayout o, VkImageLayout n, VkAccessFlags sa, VkAccessFlags da,
+                             VkPipelineStageFlags ss, VkPipelineStageFlags ds) {
+        VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.oldLayout = o;
+        b.newLayout = n;
+        b.srcAccessMask = sa;
+        b.dstAccessMask = da;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = vpColor_;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, ss, ds, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    // The render pass leaves vpColor_ in SHADER_READ_ONLY_OPTIMAL.
+    barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkBufferImageCopy r{};
+    r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    r.imageExtent = {w, h, 1}; // tightly packed rows (bufferRowLength = 0)
+    vkCmdCopyImageToBuffer(cmd, vpColor_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &r);
+    barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
+
+    void* p = nullptr;
+    vkMapMemory(device_, mem, 0, size, 0, &p);
+    outRGBA.resize(static_cast<usize>(w) * h * 4);
+    const u8* s = static_cast<const u8*>(p);
+    const bool bgra =
+        (swapFormat_ == VK_FORMAT_B8G8R8A8_UNORM || swapFormat_ == VK_FORMAT_B8G8R8A8_SRGB);
+    const usize px = static_cast<usize>(w) * h;
+    for (usize i = 0; i < px; ++i) {
+        outRGBA[i * 4 + 0] = bgra ? s[i * 4 + 2] : s[i * 4 + 0]; // R
+        outRGBA[i * 4 + 1] = s[i * 4 + 1];                       // G
+        outRGBA[i * 4 + 2] = bgra ? s[i * 4 + 0] : s[i * 4 + 2]; // B
+        outRGBA[i * 4 + 3] = s[i * 4 + 3];                       // A
+    }
+    vkUnmapMemory(device_, mem);
+    return true; // buffer is retained (readbackBuffer_) for reuse; freed in DestroyViewportTarget
 }
 
 bool VulkanDevice::CreateViewportTarget(u32 w, u32 h) {
@@ -4935,7 +5061,10 @@ bool VulkanDevice::CreateViewportTarget(u32 w, u32 h) {
         ici.mipLevels = 1; ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_SRC_BIT: required so ReadbackViewportColor can copy this image to
+        // a host buffer for the offline movie render.
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VK_CHECK(vkCreateImage(device_, &ici, nullptr, &vpColor_), "vkCreateImage(vpColor)");
         VkMemoryRequirements req{};
@@ -5257,6 +5386,7 @@ void VulkanDevice::DrawPreviewScene(const SceneView& view, const DrawItem* items
         ocb.roughness = it.roughness;
         ocb.albedoIndex = it.albedoTexture.index;
         ocb.normalIndex = it.normalTexture.index;
+        FillMorphUBO(ocb, it); // facial blendshapes (bindless delta atlas)
         ocb.mrIndex = it.mrTexture.index;
         ocb.aoIndex = it.aoTexture.index;
         ocb.flags = it.materialFlags;

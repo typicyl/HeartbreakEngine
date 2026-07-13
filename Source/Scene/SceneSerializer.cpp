@@ -156,6 +156,42 @@ void FillColliderGeometry(RigidBody& rb, const std::string& meshSource, StagedAs
     rb.collisionIndices = md->indices;
 }
 
+// Builds + uploads a blendshape delta atlas for an entity's mesh, if that mesh has
+// morph targets available in `staged`. Layout: RGBA32F, width = vertex count, one
+// ROW per target (xyz = position delta). Fills `outNames` (atlas row order) and
+// `outVertexCount`; returns an invalid handle when there are no morphs. Only the
+// fresh-staged path resolves (a cached GPU mesh has no CPU MeshData here) - the
+// common single-instance/hero case; multi-instance/cached is a mesh-cache TODO.
+rhi::TextureHandle BuildMorphAtlas(Renderer& renderer, StagedAssets& staged,
+                                   const std::string& meshSource,
+                                   std::vector<std::string>& outNames, u32& outVertexCount) {
+    std::string rel;
+    u32 submesh = 0;
+    if (!SplitUafSource(meshSource, rel, submesh)) return {}; // prim:/non-uaf = no morphs
+    auto it = staged.models.find(rel);
+    if (it == staged.models.end() || submesh >= it->second.size()) return {};
+    const MeshData& md = it->second[submesh];
+    if (md.morphTargets.empty()) return {};
+    const u32 w = md.VertexCount();
+    const u32 h = static_cast<u32>(md.morphTargets.size());
+    if (w == 0) return {};
+    std::vector<glm::vec4> pix(static_cast<usize>(w) * h, glm::vec4(0.0f));
+    for (u32 t = 0; t < h; ++t) {
+        const MorphTarget& mt = md.morphTargets[t];
+        outNames.push_back(mt.name);
+        const usize n = std::min<usize>(mt.posDelta.size(), w);
+        for (usize v = 0; v < n; ++v)
+            pix[static_cast<usize>(t) * w + v] = glm::vec4(mt.posDelta[v], 0.0f);
+    }
+    rhi::TextureDesc desc;
+    desc.width = w;
+    desc.height = h;
+    desc.format = rhi::Format::R32G32B32A32_FLOAT;
+    desc.pixels = pix.data();
+    outVertexCount = w;
+    return renderer.UploadTexture(desc);
+}
+
 rhi::TextureHandle UploadStagedTexture(Renderer& renderer, uaf::Texture& tex,
                                        const char* name) {
     assets::GenerateMips(tex);
@@ -240,6 +276,15 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const ParticleEmitter>()) add(e);
     for (const entt::entity e : reg.view<const SchematicComponent>()) add(e);
     for (const entt::entity e : reg.view<const Checkpoint>()) add(e);
+    for (const entt::entity e : reg.view<const Health>()) add(e);
+    for (const entt::entity e : reg.view<const Weapon>()) add(e);
+    for (const entt::entity e : reg.view<const AIPerception>()) add(e);
+    for (const entt::entity e : reg.view<const AIBehavior>()) add(e);
+    for (const entt::entity e : reg.view<const Spawner>()) add(e);
+    for (const entt::entity e : reg.view<const Encounter>()) add(e);
+    for (const entt::entity e : reg.view<const Spawned>()) add(e);
+    for (const entt::entity e : reg.view<const MorphState>()) add(e);
+    for (const entt::entity e : reg.view<const FacialAnimator>()) add(e);
     for (const entt::entity e : reg.view<const Interactable>()) add(e);
     for (const entt::entity e : reg.view<const TriggerVolume>()) add(e);
 
@@ -367,6 +412,133 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                 {"saveOnReach", cp->saveOnReach},
                                 {"once", cp->once}};
         }
+        if (const Health* h = reg.try_get<Health>(e)) {
+            je["health"] = {{"max", h->max},
+                            {"current", h->current},
+                            {"faction", static_cast<u32>(h->faction)},
+                            {"regenRate", h->regenRate},
+                            {"regenDelay", h->regenDelay},
+                            {"hitInvuln", h->hitInvuln},
+                            {"invincible", h->invincible},
+                            {"friendlyFire", h->friendlyFire},
+                            {"onDeathFlag", h->onDeathFlag},
+                            {"onDeathFlagValue", h->onDeathFlagValue},
+                            {"onDeathObjective", h->onDeathObjective},
+                            {"deathTag", h->deathTag},
+                            {"deathClip", h->deathClip}};
+            // alive/deathDispatched are RUNTIME state: snapshots + .hbsave only, never
+            // the authored .hbscene (a play-test kill must not bake a dead enemy).
+            if (runtimeTags) {
+                je["health"]["alive"] = h->alive;
+                je["health"]["deathDispatched"] = h->deathDispatched;
+            }
+        }
+        if (const Weapon* w = reg.try_get<Weapon>(e)) {
+            je["weapon"] = {{"kind", static_cast<u32>(w->kind)},
+                            {"damage", w->damage},
+                            {"range", w->range},
+                            {"fireRate", w->fireRate},
+                            {"radius", w->radius},
+                            {"impulse", w->impulse},
+                            {"meleeArc", w->meleeArc},
+                            {"hitRadius", w->hitRadius},
+                            {"maxAmmo", w->maxAmmo},
+                            {"ammo", w->ammo},
+                            {"reserve", w->reserve},
+                            {"reloadTime", w->reloadTime}};
+        }
+        if (const AIPerception* p = reg.try_get<AIPerception>(e)) {
+            je["aiPerception"] = {{"sightRange", p->sightRange},
+                                  {"sightFovDeg", p->sightFovDeg},
+                                  {"eyeHeight", p->eyeHeight},
+                                  {"loseSightGrace", p->loseSightGrace},
+                                  {"hearingRadius", p->hearingRadius},
+                                  {"gainRate", p->gainRate},
+                                  {"decayRate", p->decayRate},
+                                  {"detectThreshold", p->detectThreshold}};
+            if (runtimeTags) { // live awareness restored by snapshots + .hbsave
+                je["aiPerception"]["awareness"] = p->awareness;
+                je["aiPerception"]["timeSinceSeen"] = p->timeSinceSeen;
+            }
+        }
+        if (const AIBehavior* b = reg.try_get<AIBehavior>(e)) {
+            nlohmann::json pts = nlohmann::json::array();
+            for (const glm::vec3& p : b->patrolPoints) pts.push_back(ToJson(p));
+            je["aiBehavior"] = {{"attackRange", b->attackRange},
+                                {"attackDamage", b->attackDamage},
+                                {"attackInterval", b->attackInterval},
+                                {"investigateTime", b->investigateTime},
+                                {"searchTime", b->searchTime},
+                                {"fleeHealthFrac", b->fleeHealthFrac},
+                                {"startAlerted", b->startAlerted},
+                                {"useWeapon", b->useWeapon},
+                                {"patrolMode", b->patrolMode},
+                                {"waitAtPoint", b->waitAtPoint},
+                                {"patrolPoints", pts}};
+            if (runtimeTags) { // FSM state restored mid-fight (also stops startAlerted re-firing)
+                je["aiBehavior"]["state"] = static_cast<u32>(b->state);
+                je["aiBehavior"]["patrolIndex"] = b->patrolIndex;
+                je["aiBehavior"]["patrolForward"] = b->patrolForward;
+                je["aiBehavior"]["spawnApplied"] = b->spawnApplied;
+            }
+        }
+        if (const Spawner* sp = reg.try_get<Spawner>(e)) {
+            je["spawner"] = {{"prefab", sp->prefab},
+                             {"encounterId", sp->encounterId},
+                             {"spawnerId", sp->spawnerId},
+                             {"count", sp->count},
+                             {"radius", sp->radius},
+                             {"trigger", static_cast<u32>(sp->trigger)},
+                             {"halfExtents", ToJson(sp->halfExtents)},
+                             {"requiredFlag", sp->requiredFlag},
+                             {"maxAlive", sp->maxAlive},
+                             {"respawn", static_cast<u32>(sp->respawn)},
+                             {"respawnDelay", sp->respawnDelay}};
+            if (runtimeTags) { // spawn progress: snapshots + .hbsave only
+                je["spawner"]["activated"] = sp->activated;
+                je["spawner"]["inside"] = sp->inside;
+                je["spawner"]["spawnedTotal"] = sp->spawnedTotal;
+                je["spawner"]["respawnCooldown"] = sp->respawnCooldown;
+            }
+        }
+        if (const Encounter* en = reg.try_get<Encounter>(e)) {
+            je["encounter"] = {{"id", en->id},
+                               {"startActive", en->startActive},
+                               {"clearedAction", static_cast<u32>(en->clearedAction)},
+                               {"clearedAsset", en->clearedAsset},
+                               {"clearedFlag", en->clearedFlag},
+                               {"clearedFlagValue", en->clearedFlagValue},
+                               {"clearedText", en->clearedText},
+                               {"requiredFlag", en->requiredFlag}};
+            if (runtimeTags) {
+                je["encounter"]["state"] = static_cast<u32>(en->state);
+                je["encounter"]["everHadAlive"] = en->everHadAlive;
+            }
+        }
+        if (const Spawned* sd = reg.try_get<Spawned>(e)) { // runtime-only membership tag
+            if (runtimeTags)
+                je["spawned"] = {{"encounterId", sd->encounterId}, {"spawnerId", sd->spawnerId}};
+        }
+        if (const MorphState* mo = reg.try_get<MorphState>(e)) {
+            nlohmann::json w = nlohmann::json::object();
+            for (const auto& [name, val] : mo->weights) w[name] = val; // authored/rest pose
+            je["morphState"] = {{"weights", w}};
+        }
+        if (const FacialAnimator* fa = reg.try_get<FacialAnimator>(e)) {
+            je["facialAnimator"] = {{"lipSync", fa->lipSync},
+                                    {"jawTarget", fa->jawTarget},
+                                    {"jawStrength", fa->jawStrength},
+                                    {"jawAttack", fa->jawAttack},
+                                    {"jawRelease", fa->jawRelease},
+                                    {"autoBlink", fa->autoBlink},
+                                    {"blinkL", fa->blinkL},
+                                    {"blinkR", fa->blinkR},
+                                    {"blinkMin", fa->blinkMin},
+                                    {"blinkMax", fa->blinkMax},
+                                    {"blinkDuration", fa->blinkDuration},
+                                    {"expression", fa->expression},
+                                    {"expressionWeight", fa->expressionWeight}};
+        }
         if (const Interactable* ia = reg.try_get<Interactable>(e)) {
             je["interactable"] = {{"action", static_cast<u32>(ia->action)},
                                   {"prompt", ia->prompt},
@@ -376,7 +548,10 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                   {"text", ia->text},
                                   {"range", ia->range},
                                   {"once", ia->once},
-                                  {"requiredFlag", ia->requiredFlag}};
+                                  {"requiredFlag", ia->requiredFlag},
+                                  {"itemId", ia->itemId},
+                                  {"itemCount", ia->itemCount},
+                                  {"pickupId", ia->pickupId}};
             // `fired` is RUNTIME state: persist it only in in-memory snapshots + the
             // .hbsave (runtimeTags), never the authored .hbscene - else play-testing
             // then Ctrl+S would bake a consumed-once state into the source scene.
@@ -390,7 +565,10 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                              {"text", tv->text},
                              {"halfExtents", ToJson(tv->halfExtents)},
                              {"once", tv->once},
-                             {"requiredFlag", tv->requiredFlag}};
+                             {"requiredFlag", tv->requiredFlag},
+                             {"itemId", tv->itemId},
+                             {"itemCount", tv->itemCount},
+                             {"pickupId", tv->pickupId}};
             // Runtime state (see Interactable above): `fired` persists "once"; `inside`
             // the enter-edge so a load-while-inside a repeating trigger doesn't re-fire.
             if (runtimeTags) {
@@ -854,11 +1032,148 @@ void ParseSceneJson(const json& root, SceneData& out) {
             cp.saveOnReach = it->value("saveOnReach", true);
             cp.once = it->value("once", true);
         }
+        if (auto it = je.find("health"); it != je.end()) {
+            d.hasHealth = true;
+            Health& h = d.health;
+            h.max = it->value("max", 100.0f);
+            h.current = it->value("current", h.max);
+            h.faction = static_cast<Faction>(glm::clamp(
+                it->value("faction", 0u), 0u, static_cast<u32>(Faction::Faction5)));
+            h.regenRate = it->value("regenRate", 0.0f);
+            h.regenDelay = it->value("regenDelay", 5.0f);
+            h.hitInvuln = it->value("hitInvuln", 0.0f);
+            h.invincible = it->value("invincible", false);
+            h.friendlyFire = it->value("friendlyFire", false);
+            h.onDeathFlag = it->value("onDeathFlag", "");
+            h.onDeathFlagValue = it->value("onDeathFlagValue", 1.0f);
+            h.onDeathObjective = it->value("onDeathObjective", "");
+            h.deathTag = it->value("deathTag", "");
+            h.deathClip = it->value("deathClip", -1);
+            h.alive = it->value("alive", true);                    // runtime (.hbsave)
+            h.deathDispatched = it->value("deathDispatched", false);
+        }
+        if (auto it = je.find("weapon"); it != je.end()) {
+            d.hasWeapon = true;
+            Weapon& w = d.weapon;
+            w.kind = static_cast<Weapon::Kind>(glm::clamp(
+                it->value("kind", 0u), 0u, static_cast<u32>(Weapon::Kind::Projectile)));
+            w.damage = it->value("damage", 25.0f);
+            w.range = it->value("range", 50.0f);
+            w.fireRate = it->value("fireRate", 3.0f);
+            w.radius = it->value("radius", 0.0f);
+            w.impulse = it->value("impulse", 4.0f);
+            w.meleeArc = it->value("meleeArc", 45.0f);
+            w.hitRadius = it->value("hitRadius", 0.5f);
+            w.maxAmmo = it->value("maxAmmo", 12);
+            w.ammo = it->value("ammo", w.maxAmmo);
+            w.reserve = it->value("reserve", 60);
+            w.reloadTime = it->value("reloadTime", 1.5f);
+        }
+        if (auto it = je.find("aiPerception"); it != je.end()) {
+            d.hasAIPerception = true;
+            AIPerception& p = d.aiPerception;
+            p.sightRange = it->value("sightRange", 18.0f);
+            p.sightFovDeg = it->value("sightFovDeg", 100.0f);
+            p.eyeHeight = it->value("eyeHeight", 1.6f);
+            p.loseSightGrace = it->value("loseSightGrace", 0.5f);
+            p.hearingRadius = it->value("hearingRadius", 12.0f);
+            p.gainRate = it->value("gainRate", 1.5f);
+            p.decayRate = it->value("decayRate", 0.4f);
+            p.detectThreshold = it->value("detectThreshold", 1.0f);
+            p.awareness = it->value("awareness", 0.0f);           // runtime (.hbsave)
+            p.timeSinceSeen = it->value("timeSinceSeen", 999.0f);
+        }
+        if (auto it = je.find("aiBehavior"); it != je.end()) {
+            d.hasAIBehavior = true;
+            AIBehavior& b = d.aiBehavior;
+            b.attackRange = it->value("attackRange", 2.0f);
+            b.attackDamage = it->value("attackDamage", 20.0f);
+            b.attackInterval = it->value("attackInterval", 1.2f);
+            b.investigateTime = it->value("investigateTime", 6.0f);
+            b.searchTime = it->value("searchTime", 8.0f);
+            b.fleeHealthFrac = it->value("fleeHealthFrac", 0.0f);
+            b.startAlerted = it->value("startAlerted", false);
+            b.useWeapon = it->value("useWeapon", true);
+            b.patrolMode = static_cast<u8>(it->value("patrolMode", 0u));
+            b.waitAtPoint = it->value("waitAtPoint", 1.5f);
+            if (auto pit = it->find("patrolPoints"); pit != it->end() && pit->is_array())
+                for (const auto& pj : *pit) b.patrolPoints.push_back(Vec3(pj, glm::vec3(0.0f)));
+            b.state = static_cast<AIState>(                        // runtime (.hbsave)
+                glm::clamp(it->value("state", 0u), 0u, static_cast<u32>(AIState::Dead)));
+            b.patrolIndex = it->value("patrolIndex", 0u);
+            b.patrolForward = it->value("patrolForward", true);
+            b.spawnApplied = it->value("spawnApplied", false);
+        }
+        if (auto it = je.find("spawner"); it != je.end()) {
+            d.hasSpawner = true;
+            Spawner& sp = d.spawner;
+            sp.prefab = it->value("prefab", "");
+            sp.encounterId = it->value("encounterId", "");
+            sp.spawnerId = it->value("spawnerId", "");
+            sp.count = it->value("count", 3u);
+            sp.radius = it->value("radius", 4.0f);
+            sp.trigger = static_cast<Spawner::Trigger>(glm::clamp(
+                it->value("trigger", 0u), 0u, static_cast<u32>(Spawner::Trigger::Manual)));
+            sp.halfExtents = Vec3(it->value("halfExtents", json{}), glm::vec3(6.0f));
+            sp.requiredFlag = it->value("requiredFlag", "");
+            sp.maxAlive = it->value("maxAlive", 0u);
+            sp.respawn = static_cast<Spawner::Respawn>(glm::clamp(
+                it->value("respawn", 0u), 0u, static_cast<u32>(Spawner::Respawn::Continuous)));
+            sp.respawnDelay = it->value("respawnDelay", 5.0f);
+            sp.activated = it->value("activated", false);       // runtime (.hbsave)
+            sp.inside = it->value("inside", false);
+            sp.spawnedTotal = it->value("spawnedTotal", 0u);
+            sp.respawnCooldown = it->value("respawnCooldown", 0.0f);
+        }
+        if (auto it = je.find("encounter"); it != je.end()) {
+            d.hasEncounter = true;
+            Encounter& en = d.encounter;
+            en.id = it->value("id", "");
+            en.startActive = it->value("startActive", false);
+            en.clearedAction = static_cast<InteractAction>(glm::clamp(
+                it->value("clearedAction", 2u), 0u, static_cast<u32>(InteractAction::None)));
+            en.clearedAsset = it->value("clearedAsset", "");
+            en.clearedFlag = it->value("clearedFlag", "");
+            en.clearedFlagValue = it->value("clearedFlagValue", 1.0f);
+            en.clearedText = it->value("clearedText", "");
+            en.requiredFlag = it->value("requiredFlag", "");
+            en.state = static_cast<Encounter::State>(glm::clamp(
+                it->value("state", 0u), 0u, static_cast<u32>(Encounter::State::Cleared)));
+            en.everHadAlive = it->value("everHadAlive", false);
+        }
+        if (auto it = je.find("spawned"); it != je.end()) {
+            d.hasSpawned = true;
+            d.spawned.encounterId = it->value("encounterId", "");
+            d.spawned.spawnerId = it->value("spawnerId", "");
+        }
+        if (auto it = je.find("morphState"); it != je.end()) {
+            d.hasMorphState = true;
+            if (auto wit = it->find("weights"); wit != it->end() && wit->is_object())
+                for (auto w = wit->begin(); w != wit->end(); ++w)
+                    if (w->is_number()) d.morphState.weights[w.key()] = w->get<f32>();
+        }
+        if (auto it = je.find("facialAnimator"); it != je.end()) {
+            d.hasFacialAnimator = true;
+            FacialAnimator& fa = d.facialAnimator;
+            fa.lipSync = it->value("lipSync", true);
+            fa.jawTarget = it->value("jawTarget", std::string("jawOpen"));
+            fa.jawStrength = it->value("jawStrength", 1.0f);
+            fa.jawAttack = it->value("jawAttack", 25.0f);
+            fa.jawRelease = it->value("jawRelease", 12.0f);
+            fa.autoBlink = it->value("autoBlink", true);
+            fa.blinkL = it->value("blinkL", std::string("blink_L"));
+            fa.blinkR = it->value("blinkR", std::string("blink_R"));
+            fa.blinkMin = it->value("blinkMin", 2.5f);
+            fa.blinkMax = it->value("blinkMax", 6.0f);
+            fa.blinkDuration = it->value("blinkDuration", 0.12f);
+            fa.expression = it->value("expression", "");
+            fa.expressionWeight = it->value("expressionWeight", 1.0f);
+        }
         if (auto it = je.find("interactable"); it != je.end()) {
             d.hasInteractable = true;
             Interactable& ia = d.interactable;
             ia.action = static_cast<InteractAction>(glm::clamp(
-                it->value("action", 0u), 0u, static_cast<u32>(InteractAction::None)));
+                it->value("action", 0u), 0u, static_cast<u32>(InteractAction::GrantItem)));
             ia.prompt = it->value("prompt", "Interact");
             ia.asset = it->value("asset", "");
             ia.flag = it->value("flag", "");
@@ -867,13 +1182,16 @@ void ParseSceneJson(const json& root, SceneData& out) {
             ia.range = it->value("range", 2.5f);
             ia.once = it->value("once", false);
             ia.requiredFlag = it->value("requiredFlag", "");
+            ia.itemId = it->value("itemId", "");
+            ia.itemCount = it->value("itemCount", 1u);
+            ia.pickupId = it->value("pickupId", "");
             ia.fired = it->value("fired", false); // persists "once" state across saves
         }
         if (auto it = je.find("trigger"); it != je.end()) {
             d.hasTrigger = true;
             TriggerVolume& tv = d.trigger;
             tv.action = static_cast<InteractAction>(glm::clamp(
-                it->value("action", 0u), 0u, static_cast<u32>(InteractAction::None)));
+                it->value("action", 0u), 0u, static_cast<u32>(InteractAction::GrantItem)));
             tv.asset = it->value("asset", "");
             tv.flag = it->value("flag", "");
             tv.flagValue = it->value("flagValue", 1.0f);
@@ -881,6 +1199,9 @@ void ParseSceneJson(const json& root, SceneData& out) {
             tv.halfExtents = Vec3(it->value("halfExtents", json{}), glm::vec3(2.0f));
             tv.once = it->value("once", true);
             tv.requiredFlag = it->value("requiredFlag", "");
+            tv.itemId = it->value("itemId", "");
+            tv.itemCount = it->value("itemCount", 1u);
+            tv.pickupId = it->value("pickupId", "");
             tv.fired = it->value("fired", false);   // runtime "once" state (present in .hbsave only)
             tv.inside = it->value("inside", false); // enter-edge state (avoids re-fire on load-inside)
         }
@@ -1791,6 +2112,30 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             reg.emplace<SchematicComponent>(e, std::move(sg));
         }
         if (d.hasCheckpoint) reg.emplace<Checkpoint>(e, d.checkpoint);
+        if (d.hasHealth) reg.emplace<Health>(e, d.health);
+        if (d.hasWeapon) reg.emplace<Weapon>(e, d.weapon);
+        if (d.hasAIPerception) reg.emplace<AIPerception>(e, d.aiPerception);
+        if (d.hasAIBehavior) reg.emplace<AIBehavior>(e, d.aiBehavior);
+        if (d.hasSpawner) reg.emplace<Spawner>(e, d.spawner);
+        if (d.hasEncounter) reg.emplace<Encounter>(e, d.encounter);
+        if (d.hasSpawned) reg.emplace<Spawned>(e, d.spawned);
+        if (d.hasMorphState) {
+            MorphState ms = d.morphState;
+            if (d.hasMesh) { // resolve the blendshape delta atlas from the mesh (fresh-staged)
+                std::vector<std::string> names;
+                u32 vtx = 0;
+                const rhi::TextureHandle atlas =
+                    BuildMorphAtlas(renderer, staged, d.meshSource, names, vtx);
+                if (atlas.IsValid()) {
+                    ms.morphTexture = atlas;
+                    ms.vertexCount = vtx;
+                    ms.targetNames = std::move(names);
+                    ms.resolved = true;
+                }
+            }
+            reg.emplace<MorphState>(e, std::move(ms));
+        }
+        if (d.hasFacialAnimator) reg.emplace<FacialAnimator>(e, d.facialAnimator);
         if (d.hasInteractable) reg.emplace<Interactable>(e, d.interactable);
         if (d.hasTrigger) reg.emplace<TriggerVolume>(e, d.trigger);
         if (d.hasCharacterRig) reg.emplace<Character>(e, d.characterRig); // parts spawned post-load
