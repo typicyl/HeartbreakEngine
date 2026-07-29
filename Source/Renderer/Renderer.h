@@ -135,6 +135,11 @@ public:
         u32 culled = 0; // rejected (off-screen); shadows still see the full list
         u32 instancedDraws = 0;  // instanced run heads this frame
         u32 totalInstances = 0;  // items covered by those runs
+        // Shadow submission after per-cascade culling. `shadowDraws` counts
+        // (item, cascade) pairs actually recorded; `shadowCulled` counts the pairs
+        // skipped. Before per-cascade culling this was always items x cascades.
+        u32 shadowDraws = 0;
+        u32 shadowCulled = 0;
     };
     const FrameStats& Stats() const { return stats_; }
     // Kill-switch (--nocull) for A/B comparison; culling is on by default.

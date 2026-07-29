@@ -34,7 +34,9 @@ bool UserSettings::Save(const std::filesystem::path& dir) const {
     j["masterVolume"] = masterVolume;
     j["graphicsPreset"] = graphicsPreset;
     j["brightness"] = brightness;
+    j["subtitlesEnabled"] = subtitlesEnabled;
     j["captionsEnabled"] = captionsEnabled;
+    j["speakerNames"] = speakerNames;
     {
         nlohmann::json binds = nlohmann::json::object();
         for (const auto& [name, b] : inputBindings)
@@ -63,6 +65,11 @@ bool UserSettings::Load(const std::filesystem::path& dir) {
     graphicsPreset = j.value("graphicsPreset", 1); // fresh install defaults to Medium (perf)
     brightness = j.value("brightness", 0.5f);
     captionsEnabled = j.value("captionsEnabled", false);
+    // Pre-split settings files only had "captionsEnabled", which gated dialogue
+    // too. Inherit it as the subtitle default so an existing player who turned
+    // captions ON keeps seeing dialogue; a fresh install gets subtitles on.
+    subtitlesEnabled = j.value("subtitlesEnabled", true);
+    speakerNames = j.value("speakerNames", true);
     inputBindings.clear();
     if (const auto it = j.find("inputBindings"); it != j.end() && it->is_object())
         for (const auto& [name, jb] : it->items())

@@ -18,6 +18,8 @@ set(HBE_CORE_SOURCES
     "Source/Core/Input_Win32.cpp")
 
 set(HBE_ASSET_SOURCES
+    "Source/Assets/AssetFormats.cpp"
+    "Source/Assets/Fracture.cpp"
     "Source/Assets/MeshGenerator.cpp"
     "Source/Assets/StrokeGen.cpp"
     "Source/Assets/ModelLoader.cpp"
@@ -37,6 +39,7 @@ set(HBE_ASSET_SOURCES
 set(HBE_SCENE_SOURCES
     "Source/Scene/Scene.cpp"
     "Source/Scene/AnimationSystem.cpp"
+    "Source/Scene/CameraRig.cpp"
     "Source/Scene/CameraSystem.cpp"
     "Source/Scene/CharacterController.cpp"
     "Source/Scene/CharacterSystem.cpp"
@@ -47,7 +50,8 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/Level.cpp"
     "Source/Scene/SceneSerializer.cpp"
     "Source/Scene/SceneStreamer.cpp"
-    "Source/Scene/StreamingWorld.cpp")
+    "Source/Scene/StreamingWorld.cpp"
+    "Source/Scene/WorldState.cpp")
 
 set(HBE_PHYSICS_SOURCES
     "Source/Physics/PhysicsWorld.cpp")
@@ -60,8 +64,15 @@ set(HBE_GAME_SOURCES
     "Source/Game/CombatSystem.cpp"
     "Source/Game/AISystem.cpp"
     "Source/Game/SpawnSystem.cpp"
+    "Source/Game/DestructionSystem.cpp"
     "Source/Game/InventorySystem.cpp"
     "Source/Game/GameplaySystems.cpp")
+
+# Module-stack VFX core (attribute model, compiler/validator, CPU kernels).
+# Runtime-side on purpose: the editor only authors these stacks, it does not own them.
+set(HBE_VFX_SOURCES
+    "Source/Vfx/VfxStack.cpp"
+    "Source/Vfx/VfxLegacy.cpp")
 
 set(HBE_AUDIO_SOURCES
     "Source/Audio/AudioSystem.cpp")
@@ -78,6 +89,7 @@ set(HBE_DIALOGUE_SOURCES
     "Source/Dialogue/DialogueGraph.cpp")
 
 set(HBE_UI_SOURCES
+    "Source/UI/Subtitles.cpp"
     "Source/UI/UISystem.cpp"
     "Source/UI/UIAnimation.cpp"
     "Source/UI/UIManager.cpp"
@@ -121,6 +133,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_PHYSICS_SOURCES}
     ${HBE_NAV_SOURCES}
     ${HBE_GAME_SOURCES}
+    ${HBE_VFX_SOURCES}
     ${HBE_AUDIO_SOURCES}
     ${HBE_PROJECT_SOURCES}
     ${HBE_SCHEMATIC_SOURCES}

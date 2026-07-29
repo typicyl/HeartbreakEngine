@@ -3,12 +3,15 @@
 #include "Engine/CutscenePlayer.h"
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
+#include "Assets/Fracture.h"      // --fracturetest smoke test
+#include "Assets/MeshGenerator.h" // GenerateCube for the fracture test
 #include "Assets/VFS.h"
 #include "Audio/AudioSystem.h"
 #include "Core/Input.h"
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
 #include "Core/Window.h"
+#include "Game/DestructionSystem.h"
 #include "Game/GameSystems.h"
 #include "Game/GameplaySystems.h"
 #include "Physics/PhysicsWorld.h"
@@ -23,6 +26,7 @@
 #include "Scene/TerrainSystem.h"
 #include "Scene/SceneSerializer.h"
 #include "Scene/StreamingWorld.h"
+#include "Scene/WorldState.h" // per-area revisit state (capture on exit, replay on entry)
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
 #include "UI/UIFocus.h"
@@ -339,6 +343,290 @@ int Engine::Run(const EngineConfig& configIn) {
     jobs::Initialize();
     HBE_INFO("Boot: job system ready.");
 
+    // Fracture smoke test: headless correctness check of the Voronoi fracture.
+    // Computational geometry compiles happily while producing garbage, so this
+    // asserts the INVARIANTS that actually matter:
+    //   * volume is CONSERVED (sum of chunk volumes ~= source volume) - the single
+    //     best signal that the half-space clipping is correct; a bad cap or a
+    //     dropped face shows up immediately as lost volume,
+    //   * every chunk is a closed non-empty mesh,
+    //   * adjacency is SYMMETRIC (if a touches b, b touches a),
+    //   * the result is deterministic for a fixed seed (same seed -> same volumes),
+    //   * it round-trips through .hbfrac unchanged.
+    if (config.fractureTest) {
+        int code = 0;
+        const MeshData cube = mesh::GenerateCube(2.0f); // 2x2x2 -> volume 8
+        constexpr f32 kSourceVolume = 8.0f;
+
+        const FracturePattern pats[] = {FracturePattern::Uniform, FracturePattern::Clustered,
+                                        FracturePattern::Radial, FracturePattern::Slabs};
+        for (const FracturePattern pat : pats) {
+            FractureSettings fs;
+            fs.pattern = pat;
+            fs.cellCount = 24;
+            fs.seed = 20260727u;
+            // Keep everything so volume must balance exactly. The aggressive-cull
+            // case below is what exercises the index remapping.
+            fs.minChunkVolumeFrac = 0.0f;
+            const auto res = assets::FractureMesh(cube, fs);
+            if (!res) {
+                HBE_ERROR("FractureTest[{}]: returned no asset.", FracturePatternName(pat));
+                code = 1;
+                continue;
+            }
+            f32 total = 0.0f;
+            usize emptyMeshes = 0;
+            for (const FractureChunk& c : res->chunks) {
+                total += c.volume;
+                if (c.mesh.Empty()) ++emptyMeshes;
+            }
+            const f32 err = std::abs(total - kSourceVolume) / kSourceVolume;
+            HBE_INFO("FractureTest[{}]: {} chunks, volume {:.4f}/{:.4f} (err {:.2f}%), "
+                     "{} empty meshes.",
+                     FracturePatternName(pat), res->chunks.size(), total, kSourceVolume,
+                     err * 100.0f, emptyMeshes);
+            // Voronoi cells of a box partition it exactly, so anything worse than
+            // 1% is a real clipping bug, not float noise.
+            if (err > 0.01f) {
+                HBE_ERROR("FractureTest[{}]: VOLUME NOT CONSERVED (err {:.2f}%).",
+                          FracturePatternName(pat), err * 100.0f);
+                code = 1;
+            }
+            if (emptyMeshes > 0) {
+                HBE_ERROR("FractureTest[{}]: {} chunk(s) produced empty geometry.",
+                          FracturePatternName(pat), emptyMeshes);
+                code = 1;
+            }
+            // Adjacency symmetry.
+            usize asym = 0;
+            for (usize i = 0; i < res->chunks.size(); ++i) {
+                for (const u32 nb : res->chunks[i].neighbours) {
+                    if (nb >= res->chunks.size()) { ++asym; continue; }
+                    const auto& back = res->chunks[nb].neighbours;
+                    if (std::find(back.begin(), back.end(), static_cast<u32>(i)) == back.end())
+                        ++asym;
+                }
+            }
+            if (asym > 0) {
+                HBE_ERROR("FractureTest[{}]: {} asymmetric adjacency link(s).",
+                          FracturePatternName(pat), asym);
+                code = 1;
+            }
+
+            // Determinism: the same seed must reproduce the same decomposition.
+            const auto again = assets::FractureMesh(cube, fs);
+            if (!again || again->chunks.size() != res->chunks.size()) {
+                HBE_ERROR("FractureTest[{}]: NOT DETERMINISTIC (chunk count differs).",
+                          FracturePatternName(pat));
+                code = 1;
+            }
+
+            // .hbfrac round-trip.
+            if (pat == FracturePattern::Uniform) {
+                const std::filesystem::path tmp =
+                    std::filesystem::temp_directory_path() / "hbe_fracture_test.hbfrac";
+                if (!assets::SaveFracture(tmp, *res)) {
+                    HBE_ERROR("FractureTest: SaveFracture failed.");
+                    code = 1;
+                } else if (const auto rt = assets::LoadFracture(tmp)) {
+                    f32 rtVol = 0.0f;
+                    for (const FractureChunk& c : rt->chunks) rtVol += c.volume;
+                    const bool same = rt->chunks.size() == res->chunks.size() &&
+                                      std::abs(rtVol - total) < 1e-3f;
+                    HBE_INFO("FractureTest: round-trip {} ({} chunks, volume {:.4f}).",
+                             same ? "OK" : "MISMATCH", rt->chunks.size(), rtVol);
+                    if (!same) code = 1;
+                    std::error_code rmEc;
+                    std::filesystem::remove(tmp, rmEc);
+                } else {
+                    HBE_ERROR("FractureTest: LoadFracture failed.");
+                    code = 1;
+                }
+            }
+        }
+        // --- The case the first version of this test could not catch ----------
+        // Adjacency is recorded against SITE ids but consumed as CHUNK indices,
+        // and those only coincide while EVERY cell survives. The checks above cull
+        // nothing, so they never exercised the remap. Force heavy cell death two
+        // ways - aggressive sliver culling, and a clustered pattern whose
+        // coincident sites kill cells outright - then re-assert symmetry and that
+        // every neighbour id is a valid, in-range, non-self chunk.
+        {
+            struct Case { const char* name; FracturePattern pat; f32 cull; u32 cells; };
+            const Case cases[] = {
+                {"aggressive-cull", FracturePattern::Uniform,   0.85f, 40},
+                {"clustered-dense", FracturePattern::Clustered, 0.60f, 64},
+                {"radial-dense",    FracturePattern::Radial,    0.70f, 64},
+            };
+            for (const Case& tc : cases) {
+                FractureSettings fs;
+                fs.pattern = tc.pat;
+                fs.cellCount = tc.cells;
+                fs.seed = 4242u;
+                fs.minChunkVolumeFrac = tc.cull; // culls most chunks -> index spaces diverge
+                const auto res = assets::FractureMesh(cube, fs);
+                if (!res) {
+                    HBE_ERROR("FractureTest[{}]: no asset.", tc.name);
+                    code = 1;
+                    continue;
+                }
+                usize bad = 0, asym = 0, self = 0;
+                for (usize i = 0; i < res->chunks.size(); ++i) {
+                    for (const u32 nb : res->chunks[i].neighbours) {
+                        if (nb >= res->chunks.size()) { ++bad; continue; }
+                        if (nb == i) { ++self; continue; }
+                        const auto& back = res->chunks[nb].neighbours;
+                        if (std::find(back.begin(), back.end(), static_cast<u32>(i)) ==
+                            back.end())
+                            ++asym;
+                    }
+                }
+                HBE_INFO("FractureTest[{}]: {} chunks kept, {} out-of-range, {} self-links, "
+                         "{} asymmetric.",
+                         tc.name, res->chunks.size(), bad, self, asym);
+                if (bad || asym || self) {
+                    HBE_ERROR("FractureTest[{}]: ADJACENCY CORRUPTED after chunk culling.",
+                              tc.name);
+                    code = 1;
+                }
+            }
+        }
+
+        // Settings must survive .hbfrac unchanged, or "re-fracture in the editor"
+        // silently reverts the artist's tuning.
+        {
+            FractureSettings fs;
+            fs.pattern = FracturePattern::Radial;
+            fs.cellCount = 18;
+            fs.seed = 99u;
+            fs.impactPoint = {0.25f, -0.5f, 0.75f};
+            fs.radialFalloff = 3.5f;
+            fs.slabAxis = {0.0f, 0.0f, 1.0f};
+            fs.slabBias = 7.0f;
+            fs.minChunkVolumeFrac = 0.125f;
+            const auto res = assets::FractureMesh(cube, fs);
+            const std::filesystem::path tmp =
+                std::filesystem::temp_directory_path() / "hbe_fracture_settings.hbfrac";
+            if (res && assets::SaveFracture(tmp, *res)) {
+                if (const auto rt = assets::LoadFracture(tmp)) {
+                    const FractureSettings& s = rt->settings;
+                    const bool same =
+                        s.pattern == fs.pattern && s.cellCount == fs.cellCount &&
+                        s.seed == fs.seed &&
+                        glm::distance(s.impactPoint, fs.impactPoint) < 1e-5f &&
+                        std::abs(s.radialFalloff - fs.radialFalloff) < 1e-5f &&
+                        glm::distance(s.slabAxis, fs.slabAxis) < 1e-5f &&
+                        std::abs(s.slabBias - fs.slabBias) < 1e-5f &&
+                        std::abs(s.minChunkVolumeFrac - fs.minChunkVolumeFrac) < 1e-5f;
+                    HBE_INFO("FractureTest: settings round-trip {}", same ? "OK" : "LOSSY");
+                    if (!same) code = 1;
+                } else {
+                    HBE_ERROR("FractureTest: settings round-trip load failed.");
+                    code = 1;
+                }
+                std::error_code rmEc;
+                std::filesystem::remove(tmp, rmEc);
+            }
+        }
+
+        HBE_INFO("FractureTest: {}", code == 0 ? "ALL PASS" : "FAILED");
+        jobs::Shutdown();
+        return code;
+    }
+
+    // Structural-integrity smoke test (headless): the support flood fill is the
+    // part of destruction most likely to be subtly wrong, and it is pure, so it can
+    // be proven without a GPU or a scene. Builds a fractured wall, anchors its base,
+    // and checks that severing the base actually drops what it was holding up.
+    if (config.destructionTest) {
+        int code = 0;
+        const MeshData wall = mesh::GenerateCube(4.0f);
+        FractureSettings fs;
+        fs.pattern = FracturePattern::Uniform;
+        fs.cellCount = 40;
+        fs.seed = 7u;
+        fs.minChunkVolumeFrac = 0.0f;
+        auto fracOpt = assets::FractureMesh(wall, fs);
+        if (!fracOpt) {
+            HBE_ERROR("DestructionTest: fracture failed.");
+            jobs::Shutdown();
+            return 1;
+        }
+        FractureAsset frac = std::move(*fracOpt);
+        const usize n = frac.chunks.size();
+
+        // Anchor the bottom layer, as an editor "anchor to ground" would.
+        const f32 baseY = frac.boundsMin.y + (frac.boundsMax.y - frac.boundsMin.y) * 0.25f;
+        usize anchors = 0;
+        for (FractureChunk& c : frac.chunks) {
+            c.anchored = c.centroid.y <= baseY;
+            if (c.anchored) ++anchors;
+        }
+
+        using CS = Destructible::ChunkState;
+        std::vector<u8> state(n, static_cast<u8>(CS::Intact));
+        std::vector<u8> sup;
+
+        // 1. Nothing broken: every chunk must be supported, or the graph is
+        //    disconnected and later results mean nothing.
+        destruction::ComputeSupport(frac, state, sup);
+        usize supported = 0;
+        for (const u8 s : sup) supported += s ? 1 : 0;
+        HBE_INFO("DestructionTest: {} chunks, {} anchored, {} supported when intact.", n,
+                 anchors, supported);
+        if (anchors == 0) {
+            HBE_ERROR("DestructionTest: no chunks anchored - test is vacuous.");
+            code = 1;
+        }
+        if (supported != n) {
+            HBE_WARN("DestructionTest: {} chunk(s) unreachable when intact (disconnected "
+                     "adjacency islands).", n - supported);
+        }
+
+        // 2. Sever every anchored chunk. With no anchors left, NOTHING may remain
+        //    supported - a floating wall is the classic destruction bug.
+        std::vector<u8> cut = state;
+        for (usize i = 0; i < n; ++i)
+            if (frac.chunks[i].anchored) cut[i] = static_cast<u8>(CS::Detached);
+        destruction::ComputeSupport(frac, cut, sup);
+        usize floating = 0;
+        for (usize i = 0; i < n; ++i)
+            if (sup[i]) ++floating;
+        HBE_INFO("DestructionTest: base severed -> {} chunk(s) still supported (want 0).",
+                 floating);
+        if (floating != 0) {
+            HBE_ERROR("DestructionTest: FLOATING GEOMETRY - support survived with no anchor.");
+            code = 1;
+        }
+
+        // 3. A detached chunk must not CONDUCT support. Anchor exactly one chunk,
+        //    detach it, and confirm nothing downstream stays up through the hole.
+        std::vector<u8> one(n, static_cast<u8>(CS::Intact));
+        for (usize i = 0; i < n; ++i) frac.chunks[i].anchored = (i == 0);
+        one[0] = static_cast<u8>(CS::Detached);
+        destruction::ComputeSupport(frac, one, sup);
+        usize leaked = 0;
+        for (const u8 s : sup) leaked += s ? 1 : 0;
+        HBE_INFO("DestructionTest: sole anchor detached -> {} supported (want 0).", leaked);
+        if (leaked != 0) {
+            HBE_ERROR("DestructionTest: support CONDUCTED THROUGH a detached chunk.");
+            code = 1;
+        }
+
+        // 4. Idempotence: re-running the solve must not change the answer (it is
+        //    called every time a break happens).
+        std::vector<u8> again;
+        destruction::ComputeSupport(frac, one, again);
+        if (again != sup) {
+            HBE_ERROR("DestructionTest: ComputeSupport is not deterministic.");
+            code = 1;
+        }
+
+        HBE_INFO("DestructionTest: {}", code == 0 ? "ALL PASS" : "FAILED");
+        jobs::Shutdown();
+        return code;
+    }
+
     // Navigation smoke test: a headless (no window/GPU) check of the real-time
     // grid A* pathfinder routing around static + dynamic obstacles.
     if (config.navTest) {
@@ -569,9 +857,15 @@ int Engine::Run(const EngineConfig& configIn) {
             uiManagerMode_ = true;
             flowActive_ = true;
             sceneBuilt = true; // UI-only overlay; the gameplay world loads on Play
+            // Keep the UI scene's authored post: this additive load does not apply
+            // it (correctly - additive must not clobber the world's environment),
+            // but the MENU is that scene, so its look is what should be on screen.
+            uiScenePost_ = uiData.post;
+            uiScenePostValid_ = true;
             if (!studioSplash) { // no splash: go straight to the initial (menu) panel
                 uiManager_.ShowInitial(scene);
                 gameState_ = GameState::MainMenu;
+                ApplyMenuPost();
             }
             HBE_INFO("Boot: persistent UI scene '{}' loaded ({} entities).",
                      Project::Active().Settings().uiScene, static_cast<u32>(uiEnts.size()));
@@ -595,7 +889,11 @@ int Engine::Run(const EngineConfig& configIn) {
         HBE_INFO("User settings loaded: graphics preset {} ({}){}", gp, kPresetNames[gp],
                  onInit_ ? " - editor shows the authored look regardless" : "");
         audio.SetBusVolume("Master", userSettings_.masterVolume);
-        audio.SetCaptionsEnabled(userSettings_.captionsEnabled);
+        // Enqueue captions when EITHER category is on; subtitle::Stack does the
+        // real per-kind gating (a Voiceline .uaf is speech, so it must reach the
+        // stack when only Subtitles is enabled).
+        audio.SetCaptionsEnabled(userSettings_.subtitlesEnabled ||
+                                 userSettings_.captionsEnabled);
         SyncActionMap(); // action defaults (project) + rebind overrides (user settings)
     }
 
@@ -630,11 +928,21 @@ int Engine::Run(const EngineConfig& configIn) {
     if (config.stressCount > 0) {
         scene::SpawnStress(scene, renderer, config.stressCount, config.stressShared);
     }
+    if (config.stressParticles > 0) {
+        scene::SpawnParticleStress(scene, config.stressParticles);
+    }
 
     if (config.forceDof) scene.Environment().post.dofEnabled = 1;
     if (config.forceMotionBlur) scene.Environment().post.motionBlurEnabled = 1;
     if (config.forceSsr) scene.Environment().post.ssrEnabled = 1;
     if (config.forceAutoExposure) scene.Environment().post.autoExposureEnabled = 1;
+    if (config.forcePainterly) {
+        rhi::PostSettings& p = scene.Environment().post;
+        p.painterlyEnabled = 1;
+        if (config.forcePainterlyRadius >= 0.0f) p.painterlyRadius = config.forcePainterlyRadius;
+        HBE_INFO("Painterly forced ON (stroke size {:.1f}, strokes {}).", p.painterlyRadius,
+                 p.painterlyStrokes ? "on" : "off");
+    }
 
     // World streaming (distance-based partition): a .hbworld manifest, or the
     // built-in smoke test (a line of cells the focus sweeps across). Loads run
@@ -820,6 +1128,17 @@ int Engine::Run(const EngineConfig& configIn) {
     f32 winMaxDt = 0.0f;                   // worst frame in the current report window
     u32 winJank = 0;                       // frames slower than 45 FPS this window
 
+    // --- Benchmark mode (--benchmark N) -------------------------------------
+    // Collect RAW per-frame times (never the smoothed dt - the EMA is for motion,
+    // and averaging away spikes is exactly the wrong thing when measuring).
+    std::vector<f32> benchFrameMs;
+    u64 benchFrameIndex = 0;
+    if (config.benchmarkFrames > 0) {
+        benchFrameMs.reserve(config.benchmarkFrames);
+        HBE_INFO("Benchmark: {} frames after {} warmup frames, vsync forced OFF.",
+                 config.benchmarkFrames, config.benchmarkWarmup);
+    }
+
     while (true) {
         // Roll input edge state, then pump: this frame's events land in `input`.
         input.NewFrame();
@@ -835,6 +1154,10 @@ int Engine::Run(const EngineConfig& configIn) {
         // value still feeds the stability counters below so spikes stay visible.
         winMaxDt = glm::max(winMaxDt, rawDt);
         if (rawDt > 1.0f / 45.0f) ++winJank;
+        // Benchmark records the TRUE delta: the clamp below exists to stop a hitch
+        // teleporting the simulation, but a measurement that clamps its own spikes
+        // is measuring the clamp.
+        const f32 trueFrameMs = rawDt * 1000.0f;
         rawDt = glm::clamp(rawDt, 0.0f, 0.1f); // <= 100 ms floor (never < 10 FPS of sim)
         dtSmooth = (dtSmooth <= 0.0f) ? rawDt : glm::mix(dtSmooth, rawDt, 0.2f);
         dt_ = dtSmooth; // REAL frame time (FPS display); dev game-speed doesn't skew it
@@ -843,6 +1166,19 @@ int Engine::Run(const EngineConfig& configIn) {
         // (deterministic frame-stepping) - but ONLY dt, never dt_, so caption/loading
         // clocks (which use dt_) are not time-warped.
         const f32 dt = (renderFixedDt_ > 0.0f) ? renderFixedDt_ : (dtSmooth * devTimeScale_);
+
+        // Benchmark sampling + termination. Uses the RAW delta, before clamping
+        // and smoothing, so a spike is recorded as a spike.
+        if (config.benchmarkFrames > 0) {
+            ++benchFrameIndex;
+            if (benchFrameIndex > config.benchmarkWarmup) {
+                benchFrameMs.push_back(trueFrameMs);
+                if (benchFrameMs.size() >= config.benchmarkFrames) {
+                    ReportBenchmark(benchFrameMs, renderer, config.benchmarkCsv);
+                    break; // falls into the normal shutdown path below the loop
+                }
+            }
+        }
 
         // Periodic FPS report.
         if (++fpsFrames >= 1) {
@@ -855,10 +1191,11 @@ int Engine::Run(const EngineConfig& configIn) {
                 const ui::UIFrameStats& us = uiCtx_.stats;
                 HBE_INFO("Perf: {:.1f} FPS avg ({:.2f} ms) | worst {:.1f} ms | {} jank "
                          "frame(s) <45 FPS | draws {}/{} ({} culled, {} runs x{} inst) | "
-                         "UI {} el {} verts {} txt {} maps",
+                         "shadow {} drawn/{} culled | UI {} el {} verts {} txt {} maps",
                          fpsFrames / elapsed, 1000.0f * elapsed / fpsFrames,
                          1000.0f * winMaxDt, winJank, rs.drawn, rs.total, rs.culled,
-                         rs.instancedDraws, rs.totalInstances, us.elements, us.verts,
+                         rs.instancedDraws, rs.totalInstances, rs.shadowDraws,
+                         rs.shadowCulled, us.elements, us.verts,
                          us.textLayouts, us.mapRebuilds);
                 HBE_INFO("  CPU phases (avg/frame): gameplay {:.2f} ms | facial {:.2f} ms | "
                          "renderScene-submit {:.2f} ms",
@@ -1024,6 +1361,11 @@ int Engine::Run(const EngineConfig& configIn) {
         if (physics.IsRunning())
             character::Update(scene, input, dt, renderer.GetCamera().Forward());
         physics.Update(scene, dt);
+        // Destruction runs immediately after physics so this frame's contacts are
+        // still queued: it is the only consumer of PhysicsWorld::PopContact, and a
+        // contact left undrained would be delivered a frame late (or dropped when
+        // the queue caps).
+        if (physics.IsRunning()) destruction::Update(scene, renderer, physics, dt);
         // Gameplay band: AI + spawning/encounters + combat + player fire. Runs
         // after physics (fresh positions for line-of-sight and hit tests) and
         // BEFORE nav::UpdateAgents so an AI-set NavigationAgent target steers the
@@ -1166,6 +1508,22 @@ int Engine::Run(const EngineConfig& configIn) {
                 // surfaces its baked "Speaker: caption" into the caption stack.
                 std::string va;
                 while (game::ConsumeVoiceline(va)) audio.PlayUAF(mAssets / va);
+                // Audio-less subtitles (cutscene narration, signage): straight
+                // into the one subtitle stack, formatted + gated like speech.
+                game::SubtitleReq sub;
+                while (game::ConsumeSubtitle(sub)) {
+                    subtitle::Line line;
+                    line.speaker = std::move(sub.speaker);
+                    line.text = std::move(sub.text);
+                    line.kind = subtitle::Kind::Dialogue;
+                    line.duration = sub.duration;
+                    line.priority = 20;
+                    PushSubtitle(std::move(line));
+                }
+                // Impulse camera shake (combat impacts, cutscene shake markers)
+                // into the live camera rig - one path for every shake source.
+                if (f32 trauma = 0.0f; game::ConsumeCameraShake(trauma))
+                    cam::AddShake(cameraState, trauma);
                 // Start a requested dialogue (a .hbdialogue graph): load it and
                 // enter its Start node (walks to the first Line/Choice).
                 std::string dlgPath;
@@ -1203,6 +1561,10 @@ int Engine::Run(const EngineConfig& configIn) {
                 }
                 UpdateCutscene(dt); // evaluate camera/anim/dialogue tracks
             }
+            // Duck the score while speech is on screen. A running conversation or
+            // any live subtitle counts - so a barked voiceline ducks too, not just
+            // scripted dialogue.
+            audio.SetMusicDucking(dialogueNode_ != 0 || !subtitles_.Empty());
             audio.UpdateMusic(dt);
         }
         // Drain deferred UI panel commands queued by schematic UI nodes (the engine
@@ -1230,7 +1592,8 @@ int Engine::Run(const EngineConfig& configIn) {
             if (!prevGameCamEnabled) cameraState.valid = false;
             const cam::RaycastFn camRay = [&physics](const glm::vec3& o, const glm::vec3& d,
                                                      f32 m) { return physics.Raycast(o, d, m); };
-            if (cam::Update(scene, renderer.GetCamera(), cameraState, dt, input, camRay)) {
+            if (cam::Update(scene, renderer.GetCamera(), cameraState, dt, input, camRay,
+                            renderer.GetCamera().Aspect())) {
                 renderer.SetOrbitEnabled(false); // the game camera owns the view
             }
         }
@@ -1411,10 +1774,17 @@ void Engine::LoadLevel(const std::filesystem::path& base) {
     ResetDialogueRuntime();
     ClearCutscene();
     game::ClearTransientQueues(); // don't let a queued death/noise/spot fire into the new level
-    // Switching: unload the current level (UI / other scenes stay resident).
-    if (currentLevel_->Loaded()) currentLevel_->Unload(*scene_);
+    // Switching: capture what the player changed in the area being left, unload it
+    // (UI / other scenes stay resident), then load the new one and replay whatever
+    // was captured there on a previous visit. Without this the level file always
+    // reloads in its AUTHORED state - looted crates refill, dead NPCs come back.
+    if (currentLevel_->Loaded()) {
+        world::CaptureArea(*scene_, world::AreaIdFromPath(currentLevel_->Base()));
+        currentLevel_->Unload(*scene_);
+    }
     currentLevel_->SetBase(base);
     currentLevel_->Load(*scene_, *renderer_, assets);
+    world::RestoreArea(*scene_, world::AreaIdFromPath(base));
 
     // No nav step: GridNav auto-rebuilds from the new static geometry each frame.
 }
@@ -1607,6 +1977,9 @@ void Engine::FlowMainMenu() {
     uiManager_.ShowInitial(*scene_);
     SetCursorLocked(false);
     gameState_ = GameState::MainMenu;
+    // Returning from gameplay: the level's post is still installed (this path
+    // unloads the world without a scene swap), so restore the menu's own look.
+    ApplyMenuPost();
     loadTimer_ = 0.0f;
 }
 
@@ -2008,6 +2381,8 @@ void Engine::SeedSettingsWidgets() {
         else if (el.action == "setting:brightness") el.value = userSettings_.brightness;
         else if (el.action == "setting:graphics") el.selected = userSettings_.graphicsPreset;
         else if (el.action == "setting:captions") el.toggled = userSettings_.captionsEnabled;
+        else if (el.action == "setting:subtitles") el.toggled = userSettings_.subtitlesEnabled;
+        else if (el.action == "setting:speakernames") el.toggled = userSettings_.speakerNames;
     });
 }
 
@@ -2024,7 +2399,16 @@ void Engine::ApplyChangedSettings() {
             userSettings_.graphicsPreset = el.selected; // applied to post each frame
         } else if (el.action == "setting:captions") {
             userSettings_.captionsEnabled = el.toggled;
-            if (audio_) audio_->SetCaptionsEnabled(el.toggled);
+            if (audio_)
+                audio_->SetCaptionsEnabled(userSettings_.subtitlesEnabled ||
+                                           userSettings_.captionsEnabled);
+        } else if (el.action == "setting:subtitles") {
+            userSettings_.subtitlesEnabled = el.toggled;
+            if (audio_)
+                audio_->SetCaptionsEnabled(userSettings_.subtitlesEnabled ||
+                                           userSettings_.captionsEnabled);
+        } else if (el.action == "setting:speakernames") {
+            userSettings_.speakerNames = el.toggled;
         } else {
             return;
         }
@@ -2032,45 +2416,108 @@ void Engine::ApplyChangedSettings() {
     });
 }
 
+void Engine::ReportBenchmark(std::vector<f32>& frameMs, const Renderer& renderer,
+                             const std::string& csvPath) {
+    if (frameMs.empty()) {
+        HBE_WARN("Benchmark: no frames sampled.");
+        return;
+    }
+    // Optional raw CSV first (before sorting destroys frame order).
+    if (!csvPath.empty()) {
+        std::ofstream csv(csvPath, std::ios::trunc);
+        if (csv) {
+            csv << "frame,ms\n";
+            for (usize i = 0; i < frameMs.size(); ++i) csv << i << ',' << frameMs[i] << '\n';
+            HBE_INFO("Benchmark: wrote {} frame times to '{}'.", frameMs.size(), csvPath);
+        } else {
+            HBE_WARN("Benchmark: could not write CSV '{}'.", csvPath);
+        }
+    }
+
+    f64 sum = 0.0;
+    for (const f32 ms : frameMs) sum += ms;
+    const f64 mean = sum / static_cast<f64>(frameMs.size());
+
+    std::vector<f32> sorted = frameMs;
+    std::sort(sorted.begin(), sorted.end());
+    const auto pct = [&sorted](f64 p) {
+        const usize i = static_cast<usize>(p * static_cast<f64>(sorted.size() - 1) + 0.5);
+        return sorted[std::min(i, sorted.size() - 1)];
+    };
+
+    // 1% LOW is reported as an FPS because that is the number a player feels;
+    // a good mean with a bad 1% low is a stuttery game that benchmarks well.
+    const f32 p50 = pct(0.50), p95 = pct(0.95), p99 = pct(0.99);
+    const f32 lowest1 = pct(0.99); // 99th percentile FRAME TIME == 1% low FPS
+
+    const Renderer::FrameStats& rs = renderer.Stats();
+    HBE_INFO("================ BENCHMARK ({} frames) ================", frameMs.size());
+    HBE_INFO("  mean   {:7.3f} ms  ({:6.1f} FPS)", mean, 1000.0 / std::max(mean, 1e-6));
+    HBE_INFO("  median {:7.3f} ms  ({:6.1f} FPS)", p50, 1000.0f / std::max(p50, 1e-6f));
+    HBE_INFO("  p95    {:7.3f} ms  ({:6.1f} FPS)", p95, 1000.0f / std::max(p95, 1e-6f));
+    HBE_INFO("  p99    {:7.3f} ms  ({:6.1f} FPS)   <- 1% low", p99,
+             1000.0f / std::max(lowest1, 1e-6f));
+    HBE_INFO("  min    {:7.3f} ms  |  max {:7.3f} ms", sorted.front(), sorted.back());
+    HBE_INFO("  draws  {}/{} ({} culled, {} runs x{} instances)", rs.drawn, rs.total, rs.culled,
+             rs.instancedDraws, rs.totalInstances);
+    HBE_INFO("  shadow {} draws submitted, {} (item,cascade) pairs culled", rs.shadowDraws,
+             rs.shadowCulled);
+#if defined(_DEBUG)
+    HBE_WARN("  *** DEBUG BUILD - CPU timings are NOT representative. ***");
+    HBE_WARN("  *** Measure with --config RelWithDebInfo or Release.   ***");
+#endif
+    HBE_INFO("=======================================================");
+}
+
+void Engine::PushSubtitle(subtitle::Line line) {
+    // The stack owns gating (speech vs non-speech), dedup and the line cap.
+    subtitles_.SetSettings(CurrentSubtitleSettings());
+    subtitles_.Push(std::move(line));
+}
+
 void Engine::PushCaption(const std::string& text, f32 seconds) {
-    if (text.empty()) return;
-    // Auto-derive a readable dwell from length when unspecified (~200 wpm).
-    const f32 dwell = seconds > 0.0f
-                          ? seconds
-                          : glm::clamp(1.8f + 0.05f * static_cast<f32>(text.size()),
-                                       2.5f, 9.0f);
-    captions_.push_back({text, dwell});
-    // Cap the visible stack so it never overflows the caption Label rect; the
-    // oldest line drops early if too many pile up at once.
-    constexpr usize kMaxCaptions = 4;
-    if (captions_.size() > kMaxCaptions)
-        captions_.erase(captions_.begin(), captions_.end() - kMaxCaptions);
+    subtitle::Line l;
+    l.text = text;
+    l.kind = subtitle::Kind::Dialogue;
+    l.duration = seconds;
+    l.priority = 10;
+    PushSubtitle(std::move(l));
+}
+
+void Engine::ApplyMenuPost() {
+    if (!uiScenePostValid_ || !scene_) return;
+    // The menu IS the UI scene, so it renders with that scene's authored post.
+    // Without this the menu inherited whatever was last stamped into the
+    // environment - at boot the PROJECT default, after gameplay the LEVEL's -
+    // neither of which the artist edits when authoring the menu, so the shipped
+    // menu could show effects (e.g. real brush strokes) that are switched OFF
+    // everywhere the artist can see them.
+    scene_->Environment().post = uiScenePost_;
+}
+
+subtitle::Settings Engine::CurrentSubtitleSettings() const {
+    subtitle::Settings s;
+    s.subtitles = userSettings_.subtitlesEnabled;
+    s.captions = userSettings_.captionsEnabled;
+    s.speakerNames = userSettings_.speakerNames;
+    return s;
 }
 
 void Engine::UpdateCaptions(f32 dt) {
     if (!scene_) return;
-    // Drain the audio system's queue (AudioSource voicelines only enqueue when
-    // captions are enabled, so that path already respects the accessibility
-    // toggle; the dialogue runner pushes directly via PushCaption).
+    subtitles_.SetSettings(CurrentSubtitleSettings());
+    // Drain the audio system's queue. Lines arrive STRUCTURED (speaker/text/kind),
+    // so the stack can gate a door-creak caption separately from a spoken line and
+    // format each correctly - both used to arrive as one pre-joined string.
     if (audio_) {
-        std::string cap;
-        while (audio_->PopCaption(cap)) PushCaption(cap, 0.0f);
+        subtitle::Line cap;
+        while (audio_->PopCaption(cap)) subtitles_.Push(std::move(cap));
     }
-    // Age out expired lines (each on its own timer).
-    for (ActiveCaption& c : captions_) c.timer -= dt;
-    captions_.erase(std::remove_if(captions_.begin(), captions_.end(),
-                                   [](const ActiveCaption& c) { return c.timer <= 0.0f; }),
-                    captions_.end());
-    // Build the multi-line block (oldest at top, newest at bottom) and drive the
-    // dedicated caption element (a Label with action "caption").
-    std::string block;
-    f32 longest = 0.0f;
-    for (const ActiveCaption& c : captions_) {
-        if (!block.empty()) block += '\n';
-        block += c.text;
-        longest = glm::max(longest, c.timer); // the last line to expire
-    }
-    const bool show = !captions_.empty();
+    subtitles_.Update(dt);
+    // Drive the dedicated caption element (a Label with action "caption").
+    const std::string& block = subtitles_.Composed();
+    const bool show = !subtitles_.Empty();
+    const f32 longest = subtitles_.LongestRemaining();
     scene_->Registry().view<UIElement>().each([&](UIElement& el) {
         if (el.action != "caption") return;
         el.visible = show;
@@ -2174,8 +2621,19 @@ void Engine::EnterDialogueNode(u32 nodeId) {
                 hold = glm::clamp(1.8f + 0.05f * static_cast<f32>(len), 2.5f, 9.0f);
             }
             hold = glm::max(hold, 0.25f);
-            if (hasText && userSettings_.captionsEnabled)
-                PushCaption(n->speaker.empty() ? n->text : n->speaker + ": " + n->text, hold);
+            // Structured push: speaker stays its own field so the stack formats it
+            // and the SUBTITLES setting gates it (a conversation line is speech and
+            // must not depend on the non-speech Closed Captions toggle, which is
+            // what the old `captionsEnabled` gate here did).
+            if (hasText) {
+                subtitle::Line line;
+                line.speaker = n->speaker;
+                line.text = n->text;
+                line.kind = subtitle::Kind::Dialogue;
+                line.duration = hold;
+                line.priority = 20; // conversation outranks barks and ambience
+                PushSubtitle(std::move(line));
+            }
             if (!n->clip.empty() && audio_ && !assets.empty()) {
                 // Dialogue actor: if an entity voices this line's speaker, play the
                 // clip 3D from its world position (explicit DialogueActor first, then
@@ -2201,7 +2659,7 @@ void Engine::EnterDialogueNode(u32 nodeId) {
                         }
                     }
                     if (actor == entt::null)
-                        for (const entt::entity ne : reg.view<Name>())
+                        for (const entt::entity ne : reg.view<Name>()) // NOLINT: needs a filtered match
                             if (reg.get<Name>(ne).value == n->speaker) { actor = ne; break; }
                     // Drive the speaker's mouth from this line's audio amplitude.
                     if (actor != entt::null && !n->clip.empty())
@@ -2286,7 +2744,7 @@ void Engine::ResetDialogueRuntime() {
     dialogueGraph_ = dlg::Graph{};
     ClearDialogueChoices(); // also clears dialogueChoiceActive_ + destroys choice buttons
     HideInteractPrompt();
-    captions_.clear();
+    subtitles_.Clear();
 }
 
 void Engine::SyncActionMap() {
@@ -2793,10 +3251,21 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
         } else if (arg == "--stress-shared" && i + 1 < argc) {
             config.stressCount = static_cast<u32>(std::stoul(argv[++i]));
             config.stressShared = true; // one shared mesh (sort/instancing rig)
+        } else if (arg == "--stress-particles" && i + 1 < argc) {
+            config.stressParticles = static_cast<u32>(std::stoul(argv[++i]));
         } else if (arg == "--shadowcascades" && i + 1 < argc) {
             config.forceShadowCascades = std::stoi(argv[++i]); // TEMP perf A/B
         } else if (arg == "--gpuprofile") {
             config.gpuProfile = true; // per-pass GPU timestamp breakdown (both backends)
+        } else if (arg == "--benchmark" && i + 1 < argc) {
+            config.benchmarkFrames = static_cast<u32>(std::stoul(argv[++i]));
+            // A present cap would measure the display, not the engine.
+            config.vsync = false;
+            config.vsyncExplicit = true;
+        } else if (arg == "--benchmark-warmup" && i + 1 < argc) {
+            config.benchmarkWarmup = static_cast<u32>(std::stoul(argv[++i]));
+        } else if (arg == "--benchmark-csv" && i + 1 < argc) {
+            config.benchmarkCsv = argv[++i];
         } else if (arg == "--world" && i + 1 < argc) {
             config.worldPath = argv[++i];
         } else if (arg == "--worldtest") {
@@ -2809,8 +3278,17 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.forceSsr = true;
         } else if (arg == "--autoexposure" || arg == "--autoexp") {
             config.forceAutoExposure = true;
+        } else if (arg == "--painterly") {
+            config.forcePainterly = true;
+            // Optional numeric argument: --painterly 7
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                config.forcePainterlyRadius = std::stof(argv[++i]);
         } else if (arg == "--navtest") {
             config.navTest = true;
+        } else if (arg == "--fracturetest") {
+            config.fractureTest = true;
+        } else if (arg == "--destructiontest") {
+            config.destructionTest = true;
         } else if (arg == "--play") {
             config.playOnBoot = true;
         } else if (arg == "--uiworldtest") {

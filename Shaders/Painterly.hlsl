@@ -58,6 +58,13 @@ float3 WarmCool(float3 c, float s) {
     return c * tint;
 }
 
+// 0 = the DIRECTIONAL BRUSH-STROKE filter (default: O(R) line integral, reads as
+//     dragged pigment). 1 = the legacy 8-sector anisotropic Kuwahara (O(R^2) disc
+//     gather, reads as rounded blobs) - kept for A/B and as a fallback.
+#ifndef HBE_PAINTERLY_KUWAHARA
+#define HBE_PAINTERLY_KUWAHARA 0
+#endif
+
 float4 PSMain(FSOutput input) : SV_Target {
     const float2 uv = input.positionCS.xy * gOutTexel;
     const float2 d = gInTexel; // 1 / sceneRes
@@ -111,6 +118,119 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float rAlong = clamp(px * (1.0f + a * 1.3f), 2.0f, 26.0f);
     const float rAcross = clamp(px * (1.0f - a * 0.55f), 1.5f, rAlong);
 
+    // Shared by BOTH filter paths (declared here so the #if below can use them):
+    // how much of the gather survived the silhouette edge-stop, and how strict
+    // that stop is. edgeKeep only scales the strictness, never disables it.
+    float spatialSum = 0.0f, edgeSum = 0.0f;
+    const float depthEdge = 700.0f * (0.35f + 0.65f * edgeKeep);
+
+#if !HBE_PAINTERLY_KUWAHARA
+    // =====================================================================
+    // DIRECTIONAL BRUSH-STROKE FILTER (default)
+    // =====================================================================
+    // Replaces the 8-sector anisotropic Kuwahara. Two reasons:
+    //
+    // 1. COST. Kuwahara gathers a (2*STEPS+1)^2 = 81-tap DISC and keeps four
+    //    8-element sector accumulators (~80 live floats). It is O(R^2) and was
+    //    the single most expensive pass in the frame (2.3 ms at 1080p).
+    //    Smearing ALONG one line is O(R): 2*TAPS+1 samples, no accumulator
+    //    arrays, no per-sector variance.
+    //
+    // 2. LOOK. A disc gather picks the flattest SECTOR, which produces rounded
+    //    isotropic MASSES - the "blobs". A brush stroke is not a blob: it is
+    //    pigment dragged along a direction. Integrating along the flow tangent
+    //    is literally that operation (a line-integral convolution), so the
+    //    result reads as a stroke without needing to fake one.
+    //
+    // The piece that makes it read as SEPARATE strokes rather than a smooth
+    // directional blur is QUANTISATION: the sampling line is snapped to a
+    // stroke lattice, so every pixel inside one stroke integrates the SAME
+    // line and lands on the same colour, producing a discrete mark with a
+    // visible edge against its neighbour. A continuous smear would just look
+    // like motion blur.
+    const float aniso = anis;
+
+    // COHERENCE: how much real orientation this pixel actually has. In a smooth
+    // gradient (sky) the structure tensor's trace is ~0, so `anis` and `phi` are
+    // essentially NOISE. Everything directional below is scaled by this, so flat
+    // regions get a smooth, near-isotropic mark instead of a confidently-wrong one.
+    const float coh = saturate(aniso * flow);
+
+    // Stroke frame. `along` is per-pixel and rotates freely, so a stroke needs a
+    // COHERENT frame or neighbouring pixels sample different distant points (that
+    // was the silhouette speckle). But a HARD angle snap is worse: it turns the
+    // noisy angle field of a smooth sky into large plateaus of one angle separated
+    // by hard boundaries - which is what read as blocky pixelation. So quantise
+    // FINELY and blend back toward the true tangent by coherence: coh~0 (flat) ->
+    // unquantised and smooth; coh~1 (a real form edge) -> snapped and coherent.
+    const float kTwoPi = 6.28318531f;
+    const float kAngSteps = 24.0f;
+    const float rawAng = atan2(along.y, along.x);
+    const float qAng = floor(rawAng * (kAngSteps / kTwoPi) + 0.5f) * (kTwoPi / kAngSteps);
+    const float useAng = lerp(rawAng, qAng, coh);
+    const float2 tangent = float2(cos(useAng), sin(useAng));
+    const float2 acrossQ = float2(-tangent.y, tangent.x);
+
+    // Stroke geometry. Length runs with the flow; strokes stay chunky in flat
+    // regions (where there is no orientation to follow) by falling back to a
+    // shorter, more isotropic mark instead of smearing an arbitrary direction.
+    const float strokeLen = px * lerp(0.55f, 1.6f, coh);
+    const float strokeWidth = max(px * 0.45f, 1.5f);
+    const float2 cellSize = float2(max(strokeLen, 1.0f), max(strokeWidth, 1.0f));
+
+    // SMOOTH pull toward the stroke spine, instead of snapping to a lattice cell.
+    // floor() is a STEP function: every cell boundary is a discontinuity, and that
+    // discontinuity IS the pixelation - anchoring only shrank its amplitude, it did
+    // not remove it. sin(2pi*frac) is periodic and C1-continuous, and vanishes at
+    // BOTH the spine and the boundary, so pigment still gathers along spines while
+    // neighbouring strokes blend into each other instead of tiling. Scaled by `coh`
+    // so smooth regions are not clustered at all.
+    const float2 sp = float2(dot(uv / d, tangent), dot(uv / d, acrossQ));
+    const float2 fc = frac(sp / cellSize);
+    const float2 pull = sin(kTwoPi * fc) * (cellSize / kTwoPi) * (0.55f * coh);
+    const float2 baseUv = uv + (pull.x * tangent + pull.y * acrossQ) * d;
+
+    // Line integral along the stroke. TAPS is a compile-time constant so the
+    // loop unrolls; the body has NO `continue` (that silently defeats [unroll]
+    // on the SPIR-V path - see the BrushStrokes/Painterly perf notes).
+    const int TAPS = 6;                       // 13 samples vs Kuwahara's 81
+    const float step = strokeLen / (float)(TAPS * 2 + 1);
+    // Seed with the shading pixel so a stroke can NEVER be composed entirely of
+    // samples from the other side of a silhouette, and so the mark softens into
+    // its own pixel instead of hard-edging against the neighbouring cell.
+    float3 acc = orig * 0.35f;
+    float accW = 0.35f;
+    [unroll(13)] for (int t = -TAPS; t <= TAPS; ++t) {
+        const float2 suv = baseUv + tangent * ((float)t * step) * d;
+        // Depth edge-stop, same intent as the Kuwahara version: never drag
+        // pigment across a silhouette, or bright sky bleeds onto ridge pixels.
+        const float ds = SamplePost(gInput2, suv).r;
+        const float wEdge = exp(-depthEdge * abs(ds - dc));
+        // Triangular weight: the centre of the stroke carries the most pigment,
+        // which is what gives a mark its loaded middle and dry ends.
+        // NO epsilon floor here - it used to make every weight equal when the
+        // edge-stop killed the whole line, so the result was an UNWEIGHTED mean of
+        // the wrong-side taps (full-strength sky on a terrain pixel) and the
+        // `orig` fallback below was dead code.
+        const float wt = (1.0f - abs((float)t) / (float)(TAPS + 1)) * wEdge;
+        acc += FetchHDR(gInput0, suv) * wt;
+        accW += wt;
+        spatialSum += 1.0f;
+        edgeSum += wEdge;
+    }
+    float3 painted = accW > 1e-4f ? acc / accW : orig;
+
+    // Bristle break-up ACROSS the stroke: a cheap 1D modulation of the value so
+    // the mark is not a flat slab of colour. This is the same idea as the
+    // stroke-detail term below but derived from the lattice, so it is free.
+    if (strokeDetail > 0.0f) {
+        const float bristle = frac(sp.y / max(strokeWidth, 1.0f) * 3.0f);
+        // Scaled by `coh` too: without it, turning Stroke texture up sprays
+        // high-frequency modulation across smooth skies where there is no stroke.
+        const float b = (bristle - 0.5f) * strokeDetail * 0.25f * coh;
+        painted *= 1.0f + b;
+    }
+#else
     // --- 8-sector anisotropic Kuwahara on a fixed unit-disc grid -------------
     float3 cSum[8];
     float nSum[8], n2Sum[8], wSum[8];
@@ -118,11 +238,9 @@ float4 PSMain(FSOutput input) : SV_Target {
     // Track how much of the ellipse survived the silhouette edge-stop: near a hard
     // edge most taps are killed, leaving each sector a tiny, noisy sample -> the
     // grainy rim. We blend back to the crisp original there (below).
-    float spatialSum = 0.0f, edgeSum = 0.0f;
+    // NOTE: spatialSum / edgeSum / depthEdge are declared ABOVE the #if - both
+    // filter paths report edge coverage through them.
     const float kSector = 8.0f / 6.2831853f;
-    // Strong baseline even at edgeKeep 0 (a hill silhouette against sky needs it);
-    // edgeKeep raises it further for stricter lost-and-found edges.
-    const float depthEdge = 700.0f * (0.35f + 0.65f * edgeKeep);
 
     // 9x9 grid (~64 disc taps). The Kuwahara output is smooth, so dropping from an
     // 11x11 grid is nearly invisible but ~1/3 cheaper. Each tap also samples ONE
@@ -133,13 +251,33 @@ float4 PSMain(FSOutput input) : SV_Target {
     // disc cull and the sector atan2 are all CELL-CONSTANT (same for every pixel),
     // so unrolling lets the compiler fold them to literals - ~64 atan2 + ~64 exp per
     // pixel vanish, and `sec` becomes a static index. Identical output, big ALU cut.
+    // CRITICAL - the unroll is load-bearing, and it must happen on BOTH backends.
+    // `sec` below indexes cSum/nSum/n2Sum/wSum. Unrolled, `sec` is a compile-time
+    // constant and those arrays stay in REGISTERS. Not unrolled, the index is
+    // dynamic and the compiler is forced to put all four arrays in scratch memory,
+    // turning every one of the ~64 taps into a local-memory read-modify-write.
+    //
+    // That is exactly what used to happen on Vulkan: DXC honoured [unroll] for
+    // DXIL (2705 instructions, 110 inlined samples, ZERO allocas) but NOT for
+    // SPIR-V (902 instructions, four `OpVariable ... Function` arrays), which made
+    // this pass ~2.5-3x slower on Vulkan than D3D12 for identical HLSL.
+    // The blocker was the `continue` below - rewriting it as a positive `if` lets
+    // the SPIR-V backend unroll too. Explicit trip counts make the intent
+    // unambiguous rather than relying on the compiler inferring the bound.
+    //
+    // If you touch this loop, re-verify with:
+    //   dxc -T ps_6_5 -E PSMain -spirv ... -Fo p.spv && spirv-dis p.spv | grep "OpVariable %_ptr_Function"
+    // Any Function-storage ARRAY there means the unroll broke and this pass just
+    // got several times slower on Vulkan.
     const int STEPS = 4;
     const float inv = 1.0f / STEPS;
-    [unroll] for (int gyi = -STEPS; gyi <= STEPS; ++gyi) {
-        [unroll] for (int gxi = -STEPS; gxi <= STEPS; ++gxi) {
+    [unroll(9)] for (int gyi = -STEPS; gyi <= STEPS; ++gyi) {
+        [unroll(9)] for (int gxi = -STEPS; gxi <= STEPS; ++gxi) {
             const float2 e = float2(gxi, gyi) * inv; // [-1,1]^2
             const float r2 = dot(e, e);
-            if (r2 > 1.0f) continue;
+            // Positive form (was `if (r2 > 1.0f) continue;`): identical maths, but
+            // the early-continue stopped DXC's SPIR-V backend from unrolling.
+            if (r2 <= 1.0f) {
             // Map the unit-disc sample to the oriented ellipse, in pixels.
             const float2 off = e.x * rAcross * across + e.y * rAlong * along;
             const float2 suv = uv + off * d;
@@ -165,6 +303,7 @@ float4 PSMain(FSOutput input) : SV_Target {
             nSum[sec] += nl * w;
             n2Sum[sec] += nl * nl * w;
             wSum[sec] += w;
+            } // r2 <= 1 (disc cull)
         }
     }
 
@@ -181,14 +320,19 @@ float4 PSMain(FSOutput input) : SV_Target {
         outW += vw;
     }
     painted = outW > 1e-5f ? painted / outW : orig;
+#endif // HBE_PAINTERLY_KUWAHARA
 
     // Silhouette de-speckle: `edgeFrac` is the share of the ellipse that survived
     // the edge-stop. On a thin band at a hard silhouette (hill against sky) it drops
     // toward 0 - only a few noisy taps remain per sector, which is the grainy rim.
     // Fall back to the crisp original there (also keeps silhouettes sharp); flat
     // interiors keep edgeFrac~1 and stay fully painted, so nothing else is softened.
+    // Band widened 0.25/0.6 -> 0.35/0.85: at a hard silhouette the PARTIAL-
+    // coverage pixels (a few surviving taps) were still being painted, and a
+    // handful of noisy taps is exactly what reads as speckle. Falling back
+    // further keeps the rim clean. Applies to both filter paths.
     const float edgeFrac = spatialSum > 1e-5f ? saturate(edgeSum / spatialSum) : 1.0f;
-    painted = lerp(orig, painted, smoothstep(0.25f, 0.6f, edgeFrac));
+    painted = lerp(orig, painted, smoothstep(0.35f, 0.85f, edgeFrac));
 
     float3 col = lerp(orig, painted, strength);
 

@@ -12,6 +12,7 @@
 #include "RHI/RHI.h"
 #include "Core/UserSettings.h" // per-user volume/graphics/brightness/captions
 #include "Core/InputActions.h" // data-driven actions + rebindable bindings
+#include "UI/Subtitles.h"  // the one subtitle / closed-caption stack
 #include "UI/UIManager.h" // persistent-UI-scene panel manager (game flow drives it)
 #include "UI/UISystem.h"  // ui::UIContext (cached layout/interaction state)
 
@@ -77,6 +78,7 @@ struct EngineConfig {
 
     // Spawns this many extra meshes for draw-call stress testing (0 = off).
     u32 stressCount = 0;
+    u32 stressParticles = 0;   // --stress-particles N: N live particles (fill rig)
     // --stress-shared: the stress meshes share ONE mesh (identical-mesh runs -
     // the measurement rig for draw sorting / IA-rebind skipping / instancing).
     bool stressShared = false;
@@ -94,6 +96,12 @@ struct EngineConfig {
     bool forceMotionBlur = false;
     bool forceSsr = false;
     bool forceAutoExposure = false;
+    // --painterly [radius]: force the painterly finish on (and optionally set the
+    // stroke size). The Kuwahara gather is O(radius^2) per pixel at full res, so
+    // being able to A/B it - and sweep the radius - from the command line is the
+    // only way to attribute frame cost to it honestly. <0 = leave it alone.
+    f32 forcePainterlyRadius = -1.0f;
+    bool forcePainterly = false;
     // TEMP (perf measurement): --shadowcascades N overrides the preset's active
     // cascade count (1..4) every frame, so 4-vs-2 shadow cost can be A/B'd on one
     // machine. 0 = off (use the preset). Remove after tuning.
@@ -103,9 +111,34 @@ struct EngineConfig {
     // dominant pass is visible. ~1-3 ms/frame while on, so it's opt-in (diagnosis only).
     bool gpuProfile = false;
 
+    // --benchmark <frames>: run exactly this many frames, then print a timing
+    // report and exit. 0 = off (normal interactive run).
+    //
+    // Optimization work is worthless without a repeatable number, and an
+    // interactive session is not one: it varies with window focus, mouse motion,
+    // how long you let it run, and whether a 2-second log window happened to
+    // straddle a hitch. This mode pins all of that down - forces vsync OFF (a
+    // present cap measures the display, not the engine), discards warmup frames
+    // so shader/PSO compilation and first-touch page faults do not pollute the
+    // sample, and reports a PERCENTILE distribution rather than an average
+    // (averages hide exactly the stutter that matters).
+    u32 benchmarkFrames = 0;
+    // Frames discarded before measurement starts (PSO warmup, streaming settle).
+    u32 benchmarkWarmup = 120;
+    // Optional CSV of per-frame times written at exit (for graphing / regression).
+    std::string benchmarkCsv;
+
     // Navigation smoke test: route the grid A* pathfinder around a static + a
     // dynamic obstacle and walk an agent to the goal, then exit.
     bool navTest = false;
+
+    // Fracture smoke test: headless Voronoi-fracture correctness check
+    // (volume conservation, adjacency symmetry, determinism, .hbfrac round-trip).
+    bool fractureTest = false;
+
+    // Runtime-destruction smoke test: activation, damage-driven detachment, and
+    // structural-support collapse, headless (no window/GPU).
+    bool destructionTest = false;
 
     // World-space UI smoke test: spawns a worldSpace UICanvas (a lit page with a
     // label + widgets) in the scene, exercising the canvas->texture->quad path.
@@ -237,10 +270,15 @@ public:
     // false.
     void SetUIKeyboardCaptured(bool on) { uiKeyboardExternal_ = on; }
 
-    // Push a subtitle/caption line onto the on-screen stack (used by the dialogue
-    // runner and game code). Pre-format the speaker in (e.g. "Nara: Hello");
-    // `seconds` <= 0 auto-derives a readable duration from the text length.
+    // Push a line onto the ONE subtitle/caption stack. Keep the speaker in its own
+    // field rather than pre-joining it - the stack formats per kind and gates
+    // speech (Subtitles) separately from non-speech (Closed Captions).
+    void PushSubtitle(subtitle::Line line);
+    // Convenience for plain speech with no speaker; `seconds` <= 0 auto-derives a
+    // readable duration from the text length.
     void PushCaption(const std::string& text, f32 seconds = 0.0f);
+    // The live subtitle stack (the editor's preview reads it).
+    const subtitle::Stack& Subtitles() const { return subtitles_; }
 
 private:
     Hook onInit_;
@@ -253,19 +291,26 @@ private:
     AudioSystem*  audio_ = nullptr;
     StreamingWorld* streamingWorld_ = nullptr;
     ui::UIManager uiManager_;       // persistent-UI-scene panel manager (when uiScene set)
+    // The UI scene's OWN authored post stack. The UI scene loads ADDITIVE (it has
+    // to - it coexists with gameplay), and an additive load deliberately does not
+    // touch the environment, so its authored look was being thrown away and the
+    // menu rendered with whatever SetupEnvironment last stamped: the PROJECT
+    // default. That silently diverges from the scene the artist is actually
+    // looking at in the editor. Captured on load, applied whenever the MENU is on
+    // screen (and only then - during gameplay the level's post owns the look).
+    rhi::PostSettings uiScenePost_;
+    bool uiScenePostValid_ = false;
+    void ApplyMenuPost(); // env.post <- uiScenePost_ (no-op when not captured)
     ui::UIContext uiCtx_;           // cached UI layout/interaction/text state
     bool uiManagerMode_ = false;    // true once a project uiScene is loaded + managed
     UserSettings userSettings_;              // per-user options (volume/graphics/brightness/captions)
     std::filesystem::path userSettingsDir_;  // where usersettings.json lives
     bool settingsDirty_ = false;             // pending user-settings save (flushed on Back/quit)
-    // Closed captions / subtitles: a STACK of active lines, each expiring on its
-    // own timer. Newest is appended last, so the "caption" Label (bottom-anchored)
-    // grows upward as lines arrive and drops them as they expire.
-    struct ActiveCaption {
-        std::string text;   // already formatted ("Speaker: line")
-        f32 timer = 0.0f;   // seconds remaining
-    };
-    std::vector<ActiveCaption> captions_;
+    // The ONE subtitle/closed-caption stack: dialogue lines, cutscene markers,
+    // schematic voicelines and .uaf audio captions all land here as structured
+    // subtitle::Line values. Bottom-anchored "caption" Label shows the composed
+    // block; each line expires on its own timer.
+    subtitle::Stack subtitles_;
     // Active dialogue (a .hbdialogue graph run by a schematic): the conversation
     // player walks the graph - Line nodes push captions + play clips, Choice nodes
     // spawn clickable buttons and branch, Condition/SetFlag read/write story flags.
@@ -281,6 +326,11 @@ private:
     bool cutsceneCamOwned_ = false;  // true while a cutscene has taken over the camera
     void SeedSettingsWidgets();  // fill "setting:*" widgets from userSettings_ (on Settings shown)
     void ApplyChangedSettings(); // read changed "setting:*" widgets -> apply live + mark dirty
+    // --benchmark: percentile report (mean/median/p95/1% low) + optional CSV.
+    // Percentiles, not an average: an average hides the stutter players feel.
+    static void ReportBenchmark(std::vector<f32>& frameMs, const Renderer& renderer,
+                                const std::string& csvPath);
+    subtitle::Settings CurrentSubtitleSettings() const; // from userSettings_
     void UpdateCaptions(f32 dt); // drain audio captions -> drive the "caption" UI element
     void UpdateDialogue(f32 dt); // step the active .hbdialogue graph (lines/choices/branches)
     void EnterDialogueNode(u32 nodeId); // process a node (chains through Condition/SetFlag)

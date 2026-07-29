@@ -165,6 +165,16 @@ struct Gen {
                        ").s, static_cast<u32>(glm::max(0.0f, BakedF(" + IN(1) + ")))))";
             case NodeType::ItemCount:
                 return "Value::Float(static_cast<f32>(game::ItemCount((" + IN(0) + ").s)))";
+            case NodeType::AreaVisitCount:
+                // Pin 1 = "First Visit" (visits <= 1), pin 0 = the raw count.
+                return outPin == 1
+                           ? "Value::Bool(world::Get().VisitCount(world::ResolveArea((" + IN(0) +
+                                 ").s)) <= 1u)"
+                           : "Value::Float(static_cast<f32>(world::Get().VisitCount("
+                             "world::ResolveArea((" + IN(0) + ").s))))";
+            case NodeType::GetAreaVar:
+                return "Value::Float(world::Get().GetVar(world::ResolveArea((" + IN(0) + ").s), (" +
+                       IN(1) + ").s))";
             default: return "Value{}";
         }
     }
@@ -315,6 +325,11 @@ struct Gen {
                        "ctx.scene.Registry().try_get<FacialAnimator>(BakedEnt(" + IN(1) +
                        ", ctx.self))) { _f->expression = (" + IN(2) +
                        ").s; _f->expressionWeight = glm::clamp(BakedF(" + IN(3) + "), 0.0f, 1.0f); } }\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
+            case NodeType::SetAreaVar:
+                out += "        world::Get().SetVar(world::ResolveArea((" + IN(1) + ").s), (" +
+                       IN(2) + ").s, BakedF(" + IN(3) + "));\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetMusicState:
@@ -495,6 +510,7 @@ std::string TranspileUnit(const std::vector<std::pair<std::string, Graph>>& grap
     s += "#include \"Scene/Components.h\"\n";
     s += "#include \"Scene/FacialSystem.h\"\n";
     s += "#include \"Scene/Scene.h\"\n";
+    s += "#include \"Scene/WorldState.h\"\n";
     s += "#include \"Core/Input.h\"\n";
     s += "#include \"Core/Log.h\"\n";
     s += "\n";

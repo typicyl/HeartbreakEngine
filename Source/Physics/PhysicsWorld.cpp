@@ -12,6 +12,7 @@
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
@@ -30,6 +31,8 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <deque>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -142,6 +145,89 @@ void DecomposeWorld(const glm::mat4& m, glm::vec3& pos, glm::quat& rot, glm::vec
 
 } // namespace
 
+// Queues significant collisions for the main thread.
+//
+// Jolt calls this from PHYSICS WORKER THREADS in the middle of a step, so it must
+// not touch the ECS or any engine state - it records body ids + geometry under a
+// mutex and the main thread resolves them to entities after Update() returns.
+// The impulse threshold is applied HERE so resting/sliding contacts (which fire
+// every frame for every stacked body) are discarded before they ever allocate.
+class ContactCollector final : public JPH::ContactListener {
+public:
+    struct Raw {
+        u32 bodyA = 0, bodyB = 0;
+        glm::vec3 point{0.0f};
+        glm::vec3 normal{0.0f};
+        f32 impulse = 0.0f;
+    };
+
+    void SetThreshold(f32 t) { threshold_ = t; }
+
+    void OnContactAdded(const JPH::Body& a, const JPH::Body& b,
+                        const JPH::ContactManifold& manifold,
+                        JPH::ContactSettings&) override {
+        Record(a, b, manifold);
+    }
+    // Deliberately NOT hooking OnContactPersisted: a resting stack re-fires it
+    // every step forever, which would flood the queue with non-events.
+
+private:
+    void Record(const JPH::Body& a, const JPH::Body& b, const JPH::ContactManifold& manifold) {
+        // Jolt does not hand the applied impulse to OnContactAdded (it has not been
+        // solved yet), so estimate the collision severity from the RELATIVE NORMAL
+        // VELOCITY scaled by the reduced mass - which is what an impulse is, and is
+        // stable regardless of timestep.
+        const JPH::Vec3 n = manifold.mWorldSpaceNormal;
+        const JPH::RVec3 p = manifold.GetWorldSpaceContactPointOn1(0);
+        const JPH::Vec3 va = a.GetLinearVelocity(), vb = b.GetLinearVelocity();
+        const f32 vRel = std::abs((va - vb).Dot(n));
+
+        const f32 invMa = a.GetMotionProperties() && !a.IsStatic()
+                              ? a.GetMotionProperties()->GetInverseMass() : 0.0f;
+        const f32 invMb = b.GetMotionProperties() && !b.IsStatic()
+                              ? b.GetMotionProperties()->GetInverseMass() : 0.0f;
+        const f32 invSum = invMa + invMb;
+        if (invSum <= 0.0f) return;              // static vs static: nothing to report
+        const f32 reducedMass = 1.0f / invSum;
+        const f32 impulse = vRel * reducedMass;
+        if (impulse < threshold_) return;        // cheap reject before any locking
+
+        Raw r;
+        r.bodyA = a.GetID().GetIndexAndSequenceNumber();
+        r.bodyB = b.GetID().GetIndexAndSequenceNumber();
+        r.point = {static_cast<f32>(p.GetX()), static_cast<f32>(p.GetY()),
+                   static_cast<f32>(p.GetZ())};
+        r.normal = {n.GetX(), n.GetY(), n.GetZ()};
+        r.impulse = impulse;
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Hard cap: a pile-up must never grow the queue without bound if the game
+        // stops draining it.
+        constexpr usize kMaxQueued = 512;
+        if (queue_.size() < kMaxQueued) queue_.push_back(r);
+    }
+
+public:
+    bool Pop(Raw& out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.empty()) return false;
+        out = queue_.front();
+        queue_.pop_front();
+        return true;
+    }
+    void Clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.clear();
+    }
+
+private:
+    std::mutex mutex_;
+    std::deque<Raw> queue_;
+    // Default is high enough that walking/resting never reports, but a thrown prop
+    // or a bullet does. Tuned in impulse units (kg*m/s).
+    f32 threshold_ = 2.0f;
+};
+
 struct PhysicsWorld::Impl {
     JPH::TempAllocatorImpl tempAlloc{10 * 1024 * 1024};
     JPH::JobSystemThreadPool jobs{
@@ -158,6 +244,7 @@ struct PhysicsWorld::Impl {
     std::unordered_map<u32, JPH::Ref<JPH::CharacterVirtual>> characters;
     std::unordered_map<u32, entt::entity> charToEntity;
     u32 nextCharId = 1;
+    ContactCollector contacts;
 
     Impl() {
         constexpr u32 kMaxBodies = 8192;
@@ -165,6 +252,14 @@ struct PhysicsWorld::Impl {
         constexpr u32 kMaxContacts = 4096;
         system.Init(kMaxBodies, 0, kMaxBodyPairs, kMaxContacts, bpLayers, objVsBp, objPair);
         system.SetGravity({0.0f, -9.81f, 0.0f});
+        system.SetContactListener(&contacts);
+    }
+
+    // bodyToEntity keys on GetIndexAndSequenceNumber(), matching what the
+    // collector records.
+    entt::entity EntityForBody(u32 bodyKey) const {
+        const auto it = bodyToEntity.find(bodyKey);
+        return it != bodyToEntity.end() ? it->second : entt::entity{entt::null};
     }
 };
 
@@ -189,6 +284,9 @@ void PhysicsWorld::Clear() {
     impl_->bodyToEntity.clear();
     impl_->characters.clear(); // Refs free the CharacterVirtuals (no system body)
     impl_->charToEntity.clear();
+    // Queued contacts reference bodies that no longer exist; dropping them here
+    // stops a scene reload from delivering impacts into the new world.
+    impl_->contacts.Clear();
     accumulator_ = 0.0f;
 }
 
@@ -212,6 +310,20 @@ void PhysicsWorld::AddImpulse(Scene& scene, entt::entity e, const glm::vec3& imp
     bi.ActivateBody(body);
 }
 
+void PhysicsWorld::AddImpulseAtPoint(Scene& scene, entt::entity e, const glm::vec3& impulse,
+                                     const glm::vec3& worldPoint) {
+    if (!impl_) return;
+    const RigidBody* rb = scene.Registry().try_get<RigidBody>(e);
+    if (!rb || rb->bodyId == RigidBody::kInvalidBody) return;
+    JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    const JPH::BodyID body(rb->bodyId);
+    // Off-centre impulse: Jolt derives the resulting torque from the offset to the
+    // centre of mass, so debris driven from the real impact point tumbles.
+    bi.AddImpulse(body, JPH::Vec3(impulse.x, impulse.y, impulse.z),
+                  JPH::RVec3(worldPoint.x, worldPoint.y, worldPoint.z));
+    bi.ActivateBody(body);
+}
+
 f32 PhysicsWorld::Raycast(const glm::vec3& origin, const glm::vec3& dir, f32 maxDist) const {
     if (!impl_ || maxDist <= 0.0f) return maxDist;
     const JPH::RRayCast ray{ToJph(origin), ToJph(dir) * maxDist};
@@ -220,6 +332,54 @@ f32 PhysicsWorld::Raycast(const glm::vec3& origin, const glm::vec3& dir, f32 max
         return result.mFraction * maxDist; // mFraction in [0,1] along the ray
     }
     return maxDist;
+}
+
+PhysicsWorld::RayHit PhysicsWorld::RaycastDetailed(const glm::vec3& origin, const glm::vec3& dir,
+                                                   f32 maxDist) const {
+    RayHit out;
+    if (!impl_ || maxDist <= 0.0f) return out;
+    const glm::vec3 unit = glm::length(dir) > 1e-6f ? glm::normalize(dir) : glm::vec3(0, 0, -1);
+    const JPH::RRayCast ray{ToJph(origin), ToJph(unit) * maxDist};
+    JPH::RayCastResult result;
+    if (!impl_->system.GetNarrowPhaseQuery().CastRay(ray, result)) return out;
+
+    out.hit = true;
+    out.distance = result.mFraction * maxDist;
+    out.point = origin + unit * out.distance;
+    out.entity = impl_->EntityForBody(result.mBodyID.GetIndexAndSequenceNumber());
+    // The surface normal needs the body locked - it is queried off the shape at the
+    // hit sub-shape, which requires the body to stay alive for the duration.
+    const JPH::BodyLockInterfaceLocking& lockIface = impl_->system.GetBodyLockInterface();
+    JPH::BodyLockRead lock(lockIface, result.mBodyID);
+    if (lock.Succeeded()) {
+        const JPH::Body& body = lock.GetBody();
+        const JPH::Vec3 n = body.GetWorldSpaceSurfaceNormal(result.mSubShapeID2, ToJph(out.point));
+        out.normal = {n.GetX(), n.GetY(), n.GetZ()};
+    }
+    return out;
+}
+
+void PhysicsWorld::SetContactReportThreshold(f32 impulse) {
+    if (impl_) impl_->contacts.SetThreshold(glm::max(impulse, 0.0f));
+}
+
+bool PhysicsWorld::PopContact(ContactEvent& out) {
+    if (!impl_) return false;
+    ContactCollector::Raw raw;
+    // Resolve body -> entity HERE on the main thread; a contact whose bodies have
+    // since been destroyed is skipped rather than reported with a dangling handle.
+    while (impl_->contacts.Pop(raw)) {
+        const entt::entity a = impl_->EntityForBody(raw.bodyA);
+        const entt::entity b = impl_->EntityForBody(raw.bodyB);
+        if (a == entt::null && b == entt::null) continue; // neither side is an entity
+        out.a = a;
+        out.b = b;
+        out.point = raw.point;
+        out.normal = raw.normal;
+        out.impulse = raw.impulse;
+        return true;
+    }
+    return false;
 }
 
 void PhysicsWorld::Update(Scene& scene, f32 dt) {

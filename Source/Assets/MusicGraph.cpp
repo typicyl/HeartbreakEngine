@@ -7,6 +7,35 @@
 
 #include <fstream>
 
+namespace hbe {
+
+const char* SyncName(MusicSync s) {
+    switch (s) {
+        case MusicSync::Immediate: return "Immediate";
+        case MusicSync::Beat:      return "Next beat";
+        case MusicSync::Bar:       return "Next bar";
+        case MusicSync::TwoBars:   return "Next 2 bars";
+        case MusicSync::FourBars:  return "Next 4 bars";
+    }
+    return "Immediate";
+}
+
+f32 SyncInterval(MusicSync s, f32 bpm, int beatsPerBar) {
+    if (s == MusicSync::Immediate) return 0.0f;
+    const f32 beat = 60.0f / std::max(bpm, 1.0f);
+    const f32 bar = beat * static_cast<f32>(std::max(beatsPerBar, 1));
+    switch (s) {
+        case MusicSync::Beat:     return beat;
+        case MusicSync::Bar:      return bar;
+        case MusicSync::TwoBars:  return bar * 2.0f;
+        case MusicSync::FourBars: return bar * 4.0f;
+        case MusicSync::Immediate: break;
+    }
+    return 0.0f;
+}
+
+} // namespace hbe
+
 namespace hbe::assets {
 
 using json = nlohmann::json;
@@ -14,9 +43,12 @@ using json = nlohmann::json;
 bool SaveMusicGraph(const std::filesystem::path& path, const MusicGraph& g) {
     json j;
     j["type"] = "musicGraph";
-    j["version"] = 1;
+    j["version"] = 2; // v2: per-state sync + dialogue ducking
     j["defaultFade"] = g.defaultFade;
     j["initialState"] = g.initialState;
+    j["duckDecibels"] = g.duckDecibels;
+    j["duckAttack"] = g.duckAttack;
+    j["duckRelease"] = g.duckRelease;
 
     json params = json::array();
     for (const MusicParameter& p : g.parameters) {
@@ -41,6 +73,7 @@ bool SaveMusicGraph(const std::filesystem::path& path, const MusicGraph& g) {
         states.push_back({{"name", s.name},
                           {"bpm", s.bpm},
                           {"beatsPerBar", s.beatsPerBar},
+                          {"sync", static_cast<int>(s.sync)},
                           {"layers", std::move(layers)}});
     }
     j["states"] = std::move(states);
@@ -71,6 +104,9 @@ std::optional<MusicGraph> LoadMusicGraph(const std::filesystem::path& path) {
     MusicGraph g;
     g.defaultFade = j.value("defaultFade", 2.0f);
     g.initialState = j.value("initialState", "");
+    g.duckDecibels = std::max(j.value("duckDecibels", 0.0f), 0.0f);
+    g.duckAttack = std::max(j.value("duckAttack", 0.15f), 0.0f);
+    g.duckRelease = std::max(j.value("duckRelease", 0.60f), 0.0f);
     if (const auto it = j.find("parameters"); it != j.end() && it->is_array()) {
         for (const json& jp : *it) {
             MusicParameter p;
@@ -87,6 +123,10 @@ std::optional<MusicGraph> LoadMusicGraph(const std::filesystem::path& path) {
             s.name = js.value("name", "State");
             s.bpm = js.value("bpm", 120.0f);
             s.beatsPerBar = js.value("beatsPerBar", 4);
+            // v1 graphs switched instantly; keep that as the default so an
+            // existing score's timing does not change under the author.
+            s.sync = static_cast<MusicSync>(
+                std::clamp(js.value("sync", static_cast<int>(MusicSync::Immediate)), 0, 4));
             if (const auto lit = js.find("layers"); lit != js.end() && lit->is_array()) {
                 for (const json& jl : *lit) {
                     MusicLayer l;

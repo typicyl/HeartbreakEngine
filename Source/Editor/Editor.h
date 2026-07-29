@@ -161,6 +161,9 @@ private:
         bool isFont = false;
         bool isDialogue = false;
         bool isCutscene = false;
+        bool isMusic = false;      // .hbmusic adaptive-music graph
+        bool isCharacter = false;  // .hbchar modular-character rig
+        bool isUIAnim = false;     // .hbuianim UI animation clip
         u64  thumbId = 0;       // ImGui texture id (textures only; 0 = icon)
         bool thumbTried = false;
     };
@@ -407,6 +410,7 @@ private:
     // live viewport preview (evaluates cutscene::Evaluate into the scene/camera).
     std::filesystem::path editedCutscenePath_;   // file backing editedCutscene_
     bool cutsceneFocus_ = false;                 // request panel focus next frame
+    cam::CinematicState csRig_;                  // preview-only rig state (handheld/breathing noise)
     f32 csZoom_ = 90.0f;                          // pixels per second
     f32 csScroll_ = 0.0f;                         // seconds at the lane's left edge
     // Selected item: kind 0=camera key, 1=transform key, 2=clip marker,

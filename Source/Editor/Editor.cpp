@@ -1,6 +1,7 @@
 // Editor/Editor.cpp
 #include "Editor/Editor.h"
 
+#include "Assets/AssetFormats.h"
 #include "Assets/AssetLoader.h"
 #include "Assets/MeshGenerator.h"
 #include "Assets/UAF.h"
@@ -65,6 +66,9 @@
 #include <utility>
 
 namespace hbe {
+
+// Defined further down; the asset browser needs it long before that point.
+std::string AssetRelPath(const std::filesystem::path& abs);
 
 namespace {
 // Splits a TRS matrix back into a Transform (no shear support).
@@ -2551,6 +2555,18 @@ void Editor::RefreshAssets() {
             item.isCutscene = true;
             item.label = entry.path().stem().string();
             item.typeName = "Cutscene";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbmusic") {
+            item.isMusic = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "Music Graph";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbchar") {
+            item.isCharacter = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "Character";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbuianim") {
+            item.isUIAnim = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "UI Animation";
         } else if (entry.is_regular_file() && entry.path().extension() == ".uaf") {
             const uaf::AssetType type = uaf::PeekType(entry.path()); // header only
             item.isMesh = (type == uaf::AssetType::Mesh);
@@ -2812,7 +2828,24 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
         else if (item.isPrefab) InstantiatePrefab(engine, item.path);
         else if (item.isMesh) SpawnMeshAsset(scene, renderer, item.path);
         else if (item.isAudio) engine.GetAudio().PlayUAF(item.path);
-        else if (item.isAudioEvent) {
+        else if (item.isMusic) {
+            // Open the graph in the Music panel (was: double-click did nothing).
+            if (auto g = assets::LoadMusicGraph(item.path)) {
+                musicEdit_ = *g;
+                musicEditPath_ = AssetRelPath(item.path);
+                panelOpen_[Panel_Music] = true;
+                ImGui::SetWindowFocus("Music");
+            }
+        } else if (item.isCharacter) {
+            // Open the rig in the Character Editor (was: double-click did nothing).
+            if (const auto loaded = assets::LoadCharacter(item.path)) {
+                charEdit_ = *loaded;
+                charEditRel_ = AssetRelPath(item.path);
+                charBuilt_ = false;
+                panelOpen_[Panel_CharacterEditor] = true;
+                ImGui::SetWindowFocus("Character Editor");
+            }
+        } else if (item.isAudioEvent) {
             if (const auto ev = assets::LoadAudioEvent(item.path)) {
                 engine.GetAudio().PostEvent(*ev, Project::Active().AssetsDir());
             }
@@ -3003,9 +3036,11 @@ void Editor::DrawAssetBrowser(Engine& engine) {
             wchar_t file[2048] = {};
             OPENFILENAMEW ofn{};
             ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrFilter =
-                L"Assets\0*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.hdr;*.gltf;*.glb;*.obj;*.fbx;*.wav;*.ttf;*.otf\0"
-                L"All files\0*.*\0";
+            // Generated from the format registry, so the dialog always offers
+            // exactly what importer::IsSupportedSource accepts. The old literal had
+            // silently fallen behind and hid .psd/.gif/.dae/.ply/.mp3/.flac.
+            const std::wstring filter = assets::BuildImportDialogFilter();
+            ofn.lpstrFilter = filter.c_str();
             ofn.lpstrFile = file;
             ofn.nMaxFile = static_cast<DWORD>(std::size(file));
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
@@ -4836,7 +4871,93 @@ void DrawCameraBehaviour(entt::registry& reg, CameraComponent& cam, Snap&& snap)
                 undoOnActivate();
                 ImGui::DragFloat("Wall Padding", &cam.collisionPadding, 0.01f, 0.0f, 5.0f);
                 undoOnActivate();
+                ImGui::DragFloat("Return Speed", &cam.collisionReturnSpeed, 0.1f, 0.0f, 40.0f,
+                                 "%.1f m/s");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("How fast the boom extends back out after a wall clears.\n"
+                                      "Pulling IN is always instant (or the camera clips through);\n"
+                                      "easing back out is what stops the shot snapping at corners.\n"
+                                      "0 = instant return.");
+                undoOnActivate();
             }
+        }
+
+        // --- Cinematic rig ---------------------------------------------------
+        if (ImGui::TreeNode("Cinematic")) {
+            cam::CinematicSettings& cs = cam.cinematic;
+            ImGui::TextDisabled("Layered on the settled pose: operator motion and");
+            ImGui::TextDisabled("composition. All amounts 0 = exactly the raw pose.");
+
+            bool hh = cs.handheld;
+            if (ImGui::Checkbox("Handheld", &hh)) { snap(); cs.handheld = hh; }
+            if (cs.handheld) {
+                ImGui::Indent();
+                ImGui::DragFloat("Position##hh", &cs.handheldPosAmount, 0.001f, 0.0f, 0.5f,
+                                 "%.3f m");
+                undoOnActivate();
+                ImGui::DragFloat("Rotation##hh", &cs.handheldRotAmount, 0.01f, 0.0f, 10.0f,
+                                 "%.2f deg");
+                undoOnActivate();
+                ImGui::DragFloat("Frequency##hh", &cs.handheldFrequency, 0.01f, 0.0f, 8.0f,
+                                 "%.2f Hz");
+                undoOnActivate();
+                ImGui::SliderFloat("Roll##hh", &cs.handheldRoll, 0.0f, 2.0f);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Roll gain. Roll is what sells 'handheld' -\n"
+                                      "yaw/pitch alone read as a floating tripod.");
+                undoOnActivate();
+                ImGui::SliderFloat("Sharpness##hh", &cs.handheldSharpness, 0.0f, 1.0f);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Adds a faster detail octave: higher = more nervous.");
+                undoOnActivate();
+                ImGui::Unindent();
+            }
+
+            bool br = cs.breathing;
+            if (ImGui::Checkbox("Breathing", &br)) { snap(); cs.breathing = br; }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Slow lung sway, independent of Handheld -\n"
+                                  "a locked-off shot that is still alive.");
+            if (cs.breathing) {
+                ImGui::Indent();
+                ImGui::DragFloat("Amount##br", &cs.breathAmount, 0.001f, 0.0f, 0.2f, "%.3f m");
+                undoOnActivate();
+                ImGui::DragFloat("Rate##br", &cs.breathRate, 0.01f, 0.02f, 2.0f, "%.2f Hz");
+                undoOnActivate();
+                ImGui::Unindent();
+            }
+
+            bool fr = cs.framing;
+            if (ImGui::Checkbox("Framing", &fr)) { snap(); cs.framing = fr; }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Re-aims so the target sits off-centre.\n"
+                                  "+/-0.33 X puts it on a rule-of-thirds line;\n"
+                                  "positive Y lifts it, leaving headroom below.");
+            if (cs.framing) {
+                ImGui::Indent();
+                ImGui::SliderFloat("Screen X", &cs.framingX, -1.0f, 1.0f);
+                undoOnActivate();
+                ImGui::SliderFloat("Screen Y", &cs.framingY, -1.0f, 1.0f);
+                undoOnActivate();
+                if (ImGui::SmallButton("Thirds L")) { snap(); cs.framingX = -0.33f; }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Centre")) { snap(); cs.framingX = 0.0f; }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Thirds R")) { snap(); cs.framingX = 0.33f; }
+                ImGui::SliderFloat("Lead Room", &cs.leadAmount, 0.0f, 2.0f);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Shifts framing AGAINST the target's motion so it\n"
+                                      "has empty screen to move into.");
+                undoOnActivate();
+                if (cs.leadAmount > 0.0f) {
+                    ImGui::DragFloat("Lead at Speed", &cs.leadSpeed, 0.1f, 0.1f, 40.0f, "%.1f m/s");
+                    undoOnActivate();
+                }
+                ImGui::DragFloat("Framing Damping", &cs.framingDamping, 0.1f, 0.0f, 30.0f);
+                undoOnActivate();
+                ImGui::Unindent();
+            }
+            ImGui::TreePop();
         }
         if (m == Mode::ThirdPerson) {
             bool pl = cam.playerLook;
@@ -5651,8 +5772,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
     if (ParticleEmitter* pe = reg.try_get<ParticleEmitter>(sel)) {
         const SectionState s = ComponentSection("Particle Emitter");
         if (s.open) {
-            ImGui::TextDisabled("Live: %d / %u", static_cast<int>(pe->pool.size()),
-                                pe->maxParticles);
+            ImGui::TextDisabled("Live: %u / %u", pe->pool.count, pe->maxParticles);
             // Apply a preset: bulk-replaces authored params, keeps the live pool.
             {
                 const char* kTemplates = "Fire\0Smoke\0Dust\0Rain\0Leaves\0Explosion\0Sparks\0Magic\0"
@@ -5663,8 +5783,24 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 if (ImGui::Combo("Template", &pick, kTemplates) && pick >= 0) {
                     PushUndo(scene);
                     ParticleEmitter t = particle::MakeTemplate(static_cast<particle::Template>(pick));
-                    t.pool = std::move(pe->pool); // existing particles keep simulating
-                    t.rngState = pe->rngState;
+                    // Carry the pool and the compiled stack across so the preset does
+                    // not thrash allocations, and carry the RNG stream so the effect
+                    // does not visibly re-roll. But the EMISSION WINDOW must start
+                    // fresh: emitterAge/burstFired belong to the emitter that was
+                    // running, not to the preset being applied. Keeping them would mean
+                    // a one-shot preset (Explosion, Sparks, Volumetric Explosion) lands
+                    // on an emitter whose burst already fired and whose non-looping
+                    // duration window expired long ago - so the hero effect would emit
+                    // nothing at all. stackSignature stays too; ParticleSystem
+                    // recompiles by itself if the preset changed the cap or a module
+                    // flag, and that path now re-arms the window as well.
+                    t.pool = std::move(pe->pool);
+                    t.stack = std::move(pe->stack);
+                    t.state = pe->state;
+                    t.state.emitterAge = 0.0f;
+                    t.state.burstFired = false;
+                    t.state.wasEmitting = false;
+                    t.stackSignature = pe->stackSignature;
                     *pe = std::move(t);
                     pe->textureResolved = false;
                 }
@@ -5728,6 +5864,68 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Buoyancy + Vortex together make a mushroom cloud: hot gas rises "
                                   "and the front rolls outward into a cap.");
+
+            // --- VFX module stack -------------------------------------------
+            // Everything above is simulated by the compatibility modules, which are
+            // verbatim copies of the old fixed loop. Each toggle here swaps one of
+            // them for a real module. They are OFF by default so an emitter authored
+            // before the module stack stays bit-identical until someone opts in - see
+            // Scene/ParticleSystem.h.
+            ImGui::SeparatorText("Modules (opt-in)");
+            bool curl = pe->useCurlNoise;
+            if (ImGui::Checkbox("Curl noise force", &curl)) {
+                PushUndo(scene);
+                pe->useCurlNoise = curl;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Divergence-free swirl (the curl of a sine potential), so "
+                                  "particles rotate instead of piling into sinks the way the "
+                                  "Turbulence field above does. Runs alongside it.");
+            if (pe->useCurlNoise) {
+                ImGui::SliderFloat("Curl strength", &pe->curlStrength, 0.0f, 8.0f);
+                undoOnActivate();
+                ImGui::SliderFloat("Curl frequency", &pe->curlFrequency, 0.05f, 4.0f);
+                undoOnActivate();
+            }
+            bool xdrag = pe->expDrag;
+            if (ImGui::Checkbox("Exponential drag", &xdrag)) {
+                PushUndo(scene);
+                pe->expDrag = xdrag;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Uses exp(-drag*dt) for the Drag slider instead of "
+                                  "max(0, 1 - drag*dt). Same look at 30/60/144 Hz; the old "
+                                  "form is framerate-dependent and slams particles to a dead "
+                                  "stop on a frame hitch at high drag. Changes how existing "
+                                  "emitters settle, which is why it is opt-in.");
+            bool simCol = pe->simulateColor;
+            if (ImGui::Checkbox("Per-particle color", &simCol)) {
+                PushUndo(scene);
+                pe->simulateColor = simCol;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Simulates Color as a real particle attribute, driven by the "
+                                  "Start/End colors below. Variance 0 looks identical; above 0 "
+                                  "each particle keeps its own brightness for life, which the "
+                                  "render-time ramp cannot express.");
+            if (pe->simulateColor) {
+                ImGui::SliderFloat("Color variance", &pe->colorVariance, 0.0f, 1.0f);
+                undoOnActivate();
+            }
+            bool simSz = pe->simulateSize;
+            if (ImGui::Checkbox("Per-particle size", &simSz)) {
+                PushUndo(scene);
+                pe->simulateSize = simSz;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Simulates Size as a real particle attribute, driven by the "
+                                  "Start/End sizes below. Variance 0 looks identical; above 0 "
+                                  "each particle gets its own stable scale.");
+            if (pe->simulateSize) {
+                ImGui::SliderFloat("Size variance", &pe->sizeVariance, 0.0f, 1.0f);
+                undoOnActivate();
+            }
+
             ImGui::SeparatorText("Look (over life)");
             ImGui::ColorEdit4("Start color", glm::value_ptr(pe->startColor),
                               ImGuiColorEditFlags_AlphaBar); undoOnActivate();
@@ -8786,8 +8984,10 @@ std::filesystem::path Editor::PrefabSourcePath(const std::string& rel) const {
 }
 
 // Stores `abs` relative to the project's Assets dir (portable, matching how the
-// serializer expects the PrefabInstance source); falls back to the filename.
-static std::string PrefabRelPath(const std::filesystem::path& abs) {
+// serializer expects asset refs such as PrefabInstance::source); falls back to
+// the filename. Forward-declared near the top of this file - the asset browser
+// uses it too, well before this definition.
+std::string AssetRelPath(const std::filesystem::path& abs) {
     if (!Project::HasActive()) return abs.filename().generic_string();
     std::error_code ec;
     const std::filesystem::path rel =
@@ -8830,7 +9030,7 @@ std::filesystem::path Editor::CreatePrefabFromSelection(Scene& scene,
     }
     out.write(frag.data(), static_cast<std::streamsize>(frag.size()));
     out.close();
-    reg.emplace_or_replace<PrefabInstance>(selected_, PrefabInstance{PrefabRelPath(p)});
+    reg.emplace_or_replace<PrefabInstance>(selected_, PrefabInstance{AssetRelPath(p)});
     assetsDirty_ = true;
     return p;
 }
@@ -8845,7 +9045,7 @@ void Editor::InstantiatePrefab(Engine& engine, const std::filesystem::path& path
     Scene& scene = engine.GetScene();
     if (selected_ != entt::null && scene.Registry().valid(selected_))
         scene.Registry().emplace_or_replace<PrefabInstance>(selected_,
-                                                            PrefabInstance{PrefabRelPath(path)});
+                                                            PrefabInstance{AssetRelPath(path)});
 }
 
 void Editor::ApplyPrefabInstance(Engine& engine, entt::entity root) {
@@ -9125,6 +9325,8 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
             std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
         }
         std::stable_sort(cs.dialogue.begin(), cs.dialogue.end(), byTime);
+        std::stable_sort(cs.shakes.begin(), cs.shakes.end(), byTime);
+        std::stable_sort(cs.subtitles.begin(), cs.subtitles.end(), byTime);
         if (assets::SaveCutscene(editedCutscenePath_, cs)) {
             editedCutsceneDirty_ = false;
             assetsDirty_ = true;
@@ -9192,7 +9394,11 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     constexpr float kRulerH = 22.0f;
     constexpr float kDiaR = 6.0f;
     const int animCount = static_cast<int>(cs.animTracks.size());
-    const int laneCount = animCount + 2; // camera + tracks + dialogue
+    // Lane order: camera, anim tracks..., dialogue, shake, subtitles.
+    const int laneDialogue = 1 + animCount;
+    const int laneShake = 2 + animCount;
+    const int laneSubs = 3 + animCount;
+    const int laneCount = animCount + 4;
 
     const float inspectorH = 176.0f;
     ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -9281,8 +9487,12 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
                     selT ? IM_COL32(255, 235, 180, 255) : IM_COL32(180, 200, 220, 255),
                     label.c_str());
     }
-    dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(laneCount - 1) - 7.0f),
+    dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(laneDialogue) - 7.0f),
                 IM_COL32(200, 170, 210, 255), "Dialogue");
+    dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(laneShake) - 7.0f),
+                IM_COL32(235, 130, 120, 255), "Shake");
+    dl->AddText(ImVec2(p0.x + 6.0f, laneCenterY(laneSubs) - 7.0f),
+                IM_COL32(150, 210, 200, 255), "Subtitles");
 
     // Key rendering + hit-testing. Collect the nearest key under the cursor on a
     // left press so we can select/drag it.
@@ -9335,10 +9545,39 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     // Dialogue markers.
     for (int i = 0; i < static_cast<int>(cs.dialogue.size()); ++i) {
         const float x = timeToX(cs.dialogue[static_cast<usize>(i)].time);
-        const float y = laneCenterY(laneCount - 1);
+        const float y = laneCenterY(laneDialogue);
         const bool sel = csSelKind_ == 3 && csSelIndex_ == i;
         drawDiamond(x, y, IM_COL32(200, 150, 220, 255), sel);
         consider(3, -1, i, x, y);
+    }
+    // Shake impulses: bar height shows trauma, so the lane reads at a glance.
+    for (int i = 0; i < static_cast<int>(cs.shakes.size()); ++i) {
+        const CutsceneShakeMarker& m = cs.shakes[static_cast<usize>(i)];
+        const float x = timeToX(m.time);
+        const float y = laneCenterY(laneShake);
+        const bool sel = csSelKind_ == 5 && csSelIndex_ == i;
+        const float h = 3.0f + glm::clamp(m.trauma, 0.0f, 1.0f) * (kRowH * 0.40f);
+        dl->AddRectFilled(ImVec2(x - 2.5f, y - h), ImVec2(x + 2.5f, y + h),
+                          IM_COL32(235, 120, 110, 255), 1.0f);
+        if (sel)
+            dl->AddRect(ImVec2(x - 4.0f, y - h - 1.5f), ImVec2(x + 4.0f, y + h + 1.5f),
+                        IM_COL32(255, 255, 255, 255), 1.0f, 0, 1.5f);
+        consider(5, -1, i, x, y);
+    }
+    // Subtitle markers: a bar spanning the line's on-screen dwell, so overlaps
+    // (two lines fighting for the same screen time) are visible while authoring.
+    for (int i = 0; i < static_cast<int>(cs.subtitles.size()); ++i) {
+        const CutsceneSubtitleMarker& m = cs.subtitles[static_cast<usize>(i)];
+        const float x = timeToX(m.time);
+        const float y = laneCenterY(laneSubs);
+        const bool sel = csSelKind_ == 6 && csSelIndex_ == i;
+        const f32 dwell = m.duration > 0.0f ? m.duration
+                                            : subtitle::Stack::AutoDuration(m.text);
+        const float x2 = timeToX(m.time + dwell);
+        dl->AddRectFilled(ImVec2(x, y - 5.0f), ImVec2(glm::max(x2, x + 2.0f), y + 5.0f),
+                          IM_COL32(90, 150, 145, 190), 2.0f);
+        drawDiamond(x, y, IM_COL32(150, 220, 210, 255), sel);
+        consider(6, -1, i, x, y);
     }
     dl->PopClipRect();
 
@@ -9393,6 +9632,12 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         } else if (csSelKind_ == 3 && csSelIndex_ < static_cast<int>(cs.dialogue.size())) {
             cs.dialogue[static_cast<usize>(csSelIndex_)].time = nt;
             csSelIndex_ = reorder(cs.dialogue, csSelIndex_);
+        } else if (csSelKind_ == 5 && csSelIndex_ < static_cast<int>(cs.shakes.size())) {
+            cs.shakes[static_cast<usize>(csSelIndex_)].time = nt;
+            csSelIndex_ = reorder(cs.shakes, csSelIndex_);
+        } else if (csSelKind_ == 6 && csSelIndex_ < static_cast<int>(cs.subtitles.size())) {
+            cs.subtitles[static_cast<usize>(csSelIndex_)].time = nt;
+            csSelIndex_ = reorder(cs.subtitles, csSelIndex_);
         }
         markDirty();
     }
@@ -9448,11 +9693,28 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
                 csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
                 markDirty();
             }
-        } else if (ctxLane == laneCount - 1) {
+        } else if (ctxLane == laneDialogue) {
             if (ImGui::MenuItem("Add dialogue marker here")) {
                 cs.dialogue.push_back(CutsceneDialogueMarker{ctxTime, "", ""});
                 csSelKind_ = 3; csSelTrack_ = -1;
                 csSelIndex_ = reorder(cs.dialogue, static_cast<int>(cs.dialogue.size()) - 1);
+                markDirty();
+            }
+        } else if (ctxLane == laneShake) {
+            if (ImGui::MenuItem("Add shake here")) {
+                cs.shakes.push_back(CutsceneShakeMarker{ctxTime, 0.5f});
+                csSelKind_ = 5; csSelTrack_ = -1;
+                csSelIndex_ = reorder(cs.shakes, static_cast<int>(cs.shakes.size()) - 1);
+                markDirty();
+            }
+        } else if (ctxLane == laneSubs) {
+            if (ImGui::MenuItem("Add subtitle here")) {
+                CutsceneSubtitleMarker m;
+                m.time = ctxTime;
+                m.text = "New line";
+                cs.subtitles.push_back(std::move(m));
+                csSelKind_ = 6; csSelTrack_ = -1;
+                csSelIndex_ = reorder(cs.subtitles, static_cast<int>(cs.subtitles.size()) - 1);
                 markDirty();
             }
         }
@@ -9471,6 +9733,56 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         ed |= ImGui::DragFloat3("Aim", glm::value_ptr(k.aim), 0.05f);
         ed |= ImGui::DragFloat("FOV", &k.fov, 0.2f, 10.0f, 170.0f);
         ed |= ImGui::Checkbox("Hard cut", &k.cut);
+
+        // Ease shapes the move INTO this key from the previous one.
+        {
+            int e = static_cast<int>(k.ease);
+            if (ImGui::Combo("Ease in", &e, "Linear\0Ease In\0Ease Out\0Ease In-Out\0Hold\0")) {
+                k.ease = static_cast<CutsceneEase>(glm::clamp(e, 0, 4));
+                ed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Curve used to reach THIS key from the previous one.\n"
+                                  "Ease In-Out is the default cinematic move;\n"
+                                  "Hold freezes the previous pose until this key.");
+        }
+        ed |= ImGui::DragFloat("Roll", &k.roll, 0.2f, -180.0f, 180.0f, "%.1f deg");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Dutch angle: tilts the horizon about the view axis.");
+
+        // Aim target: track a moving actor instead of a fixed world point.
+        {
+            std::string tgt;
+            if (EntityNameCombo("Aim at entity", reg, k.aimTarget, 1, tgt)) {
+                k.aimTarget = tgt;
+                ed = true;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Track a moving actor instead of the static Aim point.\n"
+                                  "Empty = use Aim.");
+            if (!k.aimTarget.empty()) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear##aimtgt")) { k.aimTarget.clear(); ed = true; }
+            }
+        }
+
+        // Focus (rack focus). -1 = auto: focus on whatever the key aims at.
+        if (ImGui::TreeNode("Focus (depth of field)")) {
+            bool autoFocus = k.focusDistance <= 0.0f;
+            if (ImGui::Checkbox("Auto (focus the aim point)", &autoFocus)) {
+                k.focusDistance = autoFocus ? -1.0f : glm::length(k.aim - k.position);
+                ed = true;
+            }
+            if (!autoFocus)
+                ed |= ImGui::DragFloat("Distance", &k.focusDistance, 0.05f, 0.01f, 10000.0f,
+                                       "%.2f m");
+            ed |= ImGui::DragFloat("Range", &k.focusRange, 0.05f, 0.01f, 500.0f, "%.2f m");
+            ed |= ImGui::DragFloat("Aperture", &k.aperture, 0.1f, 0.0f, 64.0f);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Max blur outside the sharp band.\n0 = leave the scene's DoF alone.");
+            ImGui::TreePop();
+        }
+
         if (ImGui::Button("Set from viewport camera")) {
             k.position = vcam.Position(); k.aim = vcam.Position() + vcam.Forward() * 5.0f;
             k.fov = glm::degrees(vcam.FovY()); ed = true;
@@ -9532,7 +9844,72 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         if (ImGui::Button("Delete")) {
             cs.dialogue.erase(cs.dialogue.begin() + csSelIndex_); csSelKind_ = -1; markDirty();
         } else if (ed) { csSelIndex_ = reorder(cs.dialogue, csSelIndex_); markDirty(); }
+    } else if (csSelKind_ == 5 && csSelIndex_ >= 0 &&
+               csSelIndex_ < static_cast<int>(cs.shakes.size())) {
+        CutsceneShakeMarker& m = cs.shakes[static_cast<usize>(csSelIndex_)];
+        ImGui::SeparatorText("Camera Shake");
+        bool ed = false;
+        ed |= ImGui::DragFloat("Time", &m.time, 0.02f, 0.0f, dur);
+        ed |= ImGui::SliderFloat("Trauma", &m.trauma, 0.0f, 1.0f);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Impulse strength. Decays over ~1s and is squared on\n"
+                              "use, so small hits stay subtle and big ones land hard.");
+        if (ImGui::Button("Delete")) {
+            cs.shakes.erase(cs.shakes.begin() + csSelIndex_); csSelKind_ = -1; markDirty();
+        } else if (ed) { csSelIndex_ = reorder(cs.shakes, csSelIndex_); markDirty(); }
+    } else if (csSelKind_ == 6 && csSelIndex_ >= 0 &&
+               csSelIndex_ < static_cast<int>(cs.subtitles.size())) {
+        CutsceneSubtitleMarker& m = cs.subtitles[static_cast<usize>(csSelIndex_)];
+        ImGui::SeparatorText("Subtitle");
+        bool ed = false;
+        ed |= ImGui::DragFloat("Time", &m.time, 0.02f, 0.0f, dur);
+        char sp[128];
+        std::snprintf(sp, sizeof(sp), "%s", m.speaker.c_str());
+        if (ImGui::InputText("Speaker", sp, sizeof(sp))) { m.speaker = sp; ed = true; }
+        char tx[512];
+        std::snprintf(tx, sizeof(tx), "%s", m.text.c_str());
+        if (ImGui::InputTextMultiline("Text", tx, sizeof(tx), ImVec2(-1.0f, 52.0f))) {
+            m.text = tx;
+            ed = true;
+        }
+        ed |= ImGui::DragFloat("Duration", &m.duration, 0.05f, 0.0f, 60.0f, "%.2f s");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("0 = auto from text length (~200 wpm).\nCurrent: %.2fs",
+                              static_cast<double>(subtitle::Stack::AutoDuration(m.text)));
+        if (ImGui::Button("Delete")) {
+            cs.subtitles.erase(cs.subtitles.begin() + csSelIndex_); csSelKind_ = -1; markDirty();
+        } else if (ed) { csSelIndex_ = reorder(cs.subtitles, csSelIndex_); markDirty(); }
     } else {
+        // Nothing selected: expose the cutscene-wide rig here rather than hiding
+        // it behind another panel - it is a property of the whole shot.
+        ImGui::SeparatorText("Cutscene Camera Rig");
+        ImGui::TextDisabled("Layered over the keyframed move, so a motion-control");
+        ImGui::TextDisabled("path can still feel like it was operated by a person.");
+        cam::CinematicSettings& rig = cs.cinematic;
+        if (ImGui::Checkbox("Handheld##cs", &rig.handheld)) markDirty();
+        if (rig.handheld) {
+            ImGui::Indent();
+            if (ImGui::DragFloat("Position##csh", &rig.handheldPosAmount, 0.001f, 0.0f, 0.5f,
+                                 "%.3f m")) markDirty();
+            if (ImGui::DragFloat("Rotation##csh", &rig.handheldRotAmount, 0.01f, 0.0f, 10.0f,
+                                 "%.2f deg")) markDirty();
+            if (ImGui::DragFloat("Frequency##csh", &rig.handheldFrequency, 0.01f, 0.0f, 8.0f,
+                                 "%.2f Hz")) markDirty();
+            if (ImGui::SliderFloat("Roll##csh", &rig.handheldRoll, 0.0f, 2.0f)) markDirty();
+            if (ImGui::SliderFloat("Sharpness##csh", &rig.handheldSharpness, 0.0f, 1.0f))
+                markDirty();
+            ImGui::Unindent();
+        }
+        if (ImGui::Checkbox("Breathing##cs", &rig.breathing)) markDirty();
+        if (rig.breathing) {
+            ImGui::Indent();
+            if (ImGui::DragFloat("Amount##csb", &rig.breathAmount, 0.001f, 0.0f, 0.2f, "%.3f m"))
+                markDirty();
+            if (ImGui::DragFloat("Rate##csb", &rig.breathRate, 0.01f, 0.02f, 2.0f, "%.2f Hz"))
+                markDirty();
+            ImGui::Unindent();
+        }
+        ImGui::Separator();
         ImGui::TextDisabled("Select a keyframe to edit it, or a track label to set its target.");
         ImGui::TextDisabled("Scroll = zoom  -  middle-drag = pan  -  drag the ruler to scrub.");
         ImGui::TextDisabled("Right-click a lane to add keys. Entities are targeted by Name.");
@@ -9553,6 +9930,20 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
             if (cutsceneEditTime_ >= cs.duration) csPlaying_ = false; // hold on the last frame
         }
         cutscene::Evaluate(cs, cutsceneEditTime_, scene, cam, /*applyCamera=*/true);
+        // Apply the cutscene's own rig on top, so the preview shows the shot as it
+        // will actually play rather than the bare keyframed path.
+        if (cs.cinematic.handheld || cs.cinematic.breathing) {
+            cam::CinematicPose pose;
+            pose.position = cam.Position();
+            pose.forward = cam.Forward();
+            pose.up = glm::vec3(0.0f, 1.0f, 0.0f);
+            // Preview advances only while playing; a scrub holds the rig still so
+            // dragging the playhead doesn't churn the noise.
+            const f32 rigDt = csPlaying_ ? io.DeltaTime : 0.0f;
+            cam::Apply(pose, csRig_, cs.cinematic, rigDt, pose.position, false,
+                       glm::degrees(cam.FovY()), cam.Aspect());
+            cam.LookAt(pose.position, pose.position + pose.forward, pose.up);
+        }
     }
 }
 
@@ -9615,6 +10006,34 @@ void Editor::DrawMusicEditor(Engine& engine) {
         }
     }
     ImGui::SliderFloat("Default fade (s)", &musicEdit_.defaultFade, 0.0f, 10.0f, "%.1f");
+
+    // --- Dialogue ducking (graph-wide) ---------------------------------------
+    if (ImGui::TreeNode("Dialogue ducking")) {
+        ImGui::TextDisabled("Pulls the score down while speech is on screen so");
+        ImGui::TextDisabled("lines stay intelligible. 0 dB = off.");
+        ImGui::SliderFloat("Depth (dB)", &musicEdit_.duckDecibels, 0.0f, 24.0f, "%.1f dB");
+        ImGui::SliderFloat("Attack (s)", &musicEdit_.duckAttack, 0.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Fast: speech starts abruptly.");
+        ImGui::SliderFloat("Release (s)", &musicEdit_.duckRelease, 0.0f, 3.0f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Slow: a quick release pumps audibly between lines.");
+        ImGui::TreePop();
+    }
+
+    // Live transition status: quantized switches wait for a musical boundary, so
+    // show what is queued rather than leaving the author wondering why nothing
+    // happened when they clicked a state.
+    {
+        std::string pending;
+        f32 inSeconds = 0.0f;
+        if (audio.MusicTransitionPending(pending, inSeconds)) {
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.35f, 1.0f), "Queued: %s in %.2fs",
+                               pending.empty() ? "(stop)" : pending.c_str(),
+                               static_cast<double>(inSeconds));
+        }
+    }
+
     // Initial state (played when the game starts).
     if (ImGui::BeginCombo("Start state", musicEdit_.initialState.c_str())) {
         for (const MusicState& s : musicEdit_.states)
@@ -9686,6 +10105,24 @@ void Editor::DrawMusicEditor(Engine& engine) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90.0f);
         ImGui::DragInt("Beats/Bar", &st.beatsPerBar, 0.1f, 1, 16);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130.0f);
+        {
+            int sy = static_cast<int>(st.sync);
+            if (ImGui::Combo("Leave on", &sy,
+                             "Immediate\0Next beat\0Next bar\0Next 2 bars\0Next 4 bars\0"))
+                st.sync = static_cast<MusicSync>(glm::clamp(sy, 0, 4));
+            if (ImGui::IsItemHovered()) {
+                const f32 wait = SyncInterval(st.sync, st.bpm, st.beatsPerBar);
+                ImGui::SetTooltip(
+                    "When a switch AWAY from this state is allowed to happen.\n"
+                    "Switching mid-phrase sounds like a mistake; waiting for the\n"
+                    "next boundary is what makes the score feel composed.\n"
+                    "Boundary every %.2fs at %.0f BPM. Worst-case wait: %.2fs.",
+                    static_cast<double>(wait), static_cast<double>(st.bpm),
+                    static_cast<double>(wait));
+            }
+        }
 
         // ---- DAW arrangement view: layers as horizontal lanes over a bar/beat
         // grid. Lane fill height = the layer's live gain, so the adaptive mix is

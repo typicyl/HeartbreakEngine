@@ -1,6 +1,8 @@
 // Assets/UAP.cpp
 #include "Assets/UAP.h"
 
+#include "Assets/AssetFormats.h" // the single source of truth for packable types
+
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
 
@@ -75,14 +77,12 @@ void ScramblePath(std::string& s) {
 }
 
 bool IsPackableExtension(const fs::path& ext) {
-    // Every asset type the runtime loads through the VFS must be packable, or it
-    // goes missing in shipped builds: meshes/textures/fonts (.uaf), scenes
-    // (.hbscene), materials (.hbmat), Art Editor paint canvases (.hbpaint),
-    // audio events (.hbevent), visual-script graphs (.hbschem), branching dialogue
-    // (.hbdialogue), cutscenes (.hbcutscene) and adaptive-music graphs (.hbmusic).
-    return ext == ".uaf" || ext == ".hbscene" || ext == ".hbmat" ||
-           ext == ".hbpaint" || ext == ".hbevent" || ext == ".hbschem" ||
-           ext == ".hbdialogue" || ext == ".hbcutscene" || ext == ".hbmusic";
+    // Derived from the ONE registry (Assets/AssetFormats.cpp): every engine asset
+    // flagged runtimeLoaded is packable. This used to be a hand-written list that
+    // silently fell behind - .hbchar (modular characters), .hbprefab (everything a
+    // Spawner spawns), .hbuianim and .hbgi were all runtime-loaded but unpacked,
+    // so those features died in shipped builds with no error at all.
+    return assets::IsPackable(assets::NormalizeExtension(ext));
 }
 
 // Loads `path -> slot` assignments from the manifest (empty map if missing).
@@ -141,12 +141,26 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
     // separately and read from there when packing.
     std::map<std::string, u64> files; // sorted: new-slot assignment is stable
     std::unordered_map<std::string, fs::path> sourceOf; // virtualPath -> on-disk source
+    u64 scanned = 0; // regular files seen under rootDir (packable or not)
     for (const auto& it : fs::recursive_directory_iterator(rootDir, ec)) {
         if (!it.is_regular_file()) continue;
+        ++scanned;
         if (!IsPackableExtension(it.path().extension())) continue;
         const std::string rel = fs::relative(it.path(), rootDir, ec).generic_string();
         if (options.filter && !options.filter->count(rel)) continue;
         files[rel] = static_cast<u64>(fs::file_size(it.path(), ec));
+    }
+    // Guard: a populated Assets folder that contributes ZERO packable files means
+    // the extension test is broken, not that the project is empty. That exact
+    // failure once shipped a build containing only shaders + the project file -
+    // every scene silently missing, the game booting to an empty world with no
+    // error. Loud here beats a mystery at runtime.
+    if (scanned > 0 && files.empty()) {
+        HBE_ERROR("UAP: scanned {} file(s) under '{}' but NONE were packable. "
+                  "The packable-extension test is almost certainly broken - a shipped "
+                  "build would boot with no scenes or assets.",
+                  scanned, rootDir.string());
+        return std::nullopt;
     }
     if (options.extras) {
         for (const ExtraFile& e : *options.extras) {

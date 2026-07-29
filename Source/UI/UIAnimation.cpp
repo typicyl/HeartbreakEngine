@@ -1,6 +1,7 @@
 // UI/UIAnimation.cpp
 #include "UI/UIAnimation.h"
 
+#include "Assets/VFS.h"
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 
@@ -39,11 +40,14 @@ void ClearClipCache() {
 }
 
 bool LoadClip(const std::filesystem::path& path, UIClip& out) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
+    // Pack-aware, like every other runtime asset read: a shipped build has no
+    // loose .hbuianim on disk, only the mounted .uap packs. This used to be a raw
+    // ifstream, so every UIAnimator silently did nothing in a shipped game.
+    const std::optional<std::vector<u8>> bytes = vfs::ReadFile(path);
+    if (!bytes || bytes->empty()) return false;
     json j;
     try {
-        f >> j;
+        j = json::parse(bytes->begin(), bytes->end());
     } catch (const std::exception&) {
         return false;
     }

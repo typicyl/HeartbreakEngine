@@ -123,6 +123,8 @@ struct EntityData {
     ParticleEmitter particles;
     bool hasSchematic = false;
     std::string schematicAsset;
+    bool hasDestructible = false;
+    Destructible destructible;
     bool hasNavAgent = false;
     NavigationAgent navAgent;
     bool hasNavObstacle = false;

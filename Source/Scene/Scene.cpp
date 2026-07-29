@@ -35,6 +35,36 @@ Scene::Scene() {
     registry_.on_destroy<UICanvas>().connect<&Scene::OnUIStructural>(*this);
     registry_.on_construct<UIPanel>().connect<&Scene::OnUIStructural>(*this);
     registry_.on_destroy<UIPanel>().connect<&Scene::OnUIStructural>(*this);
+    // Name index invalidation (see FindByName). A Name written IN PLACE through a
+    // reference does not fire on_update, so the editor's rename path calls
+    // registry.patch<Name> / replace<Name>; anything that assigns the field
+    // directly must invalidate too, which is why the index is rebuilt from
+    // scratch rather than incrementally patched.
+    registry_.on_construct<Name>().connect<&Scene::OnNameChanged>(*this);
+    registry_.on_destroy<Name>().connect<&Scene::OnNameChanged>(*this);
+    registry_.on_update<Name>().connect<&Scene::OnNameChanged>(*this);
+}
+
+entt::entity Scene::FindByName(const std::string& name) const {
+    if (name.empty()) return entt::null;
+    // At most two passes: the second only happens if the first hit a stale handle
+    // (an entity destroyed without its Name signal firing, e.g. a bulk registry
+    // clear). A rebuild only inserts entities the view yields, so they are all
+    // valid afterwards and the loop cannot spin.
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (nameIndexDirty_) {
+            nameIndex_.clear();
+            // First writer wins, matching the old linear scan's "first match".
+            for (const entt::entity e : registry_.view<const Name>())
+                nameIndex_.emplace(registry_.get<const Name>(e).value, e);
+            nameIndexDirty_ = false;
+        }
+        const auto it = nameIndex_.find(name);
+        if (it == nameIndex_.end()) return entt::null;
+        if (registry_.valid(it->second)) return it->second;
+        nameIndexDirty_ = true; // stale: rebuild and try once more
+    }
+    return entt::null;
 }
 
 entt::entity Scene::CreateEntity(const std::string& name) {
@@ -278,13 +308,36 @@ static void OverlayPostLook(rhi::PostSettings& d, const rhi::PostSettings& s) {
     d.ssgiIntensity = s.ssgiIntensity;
     d.ssgiRadius = s.ssgiRadius;
     d.ssgiSamples = s.ssgiSamples;
+    // Painterly is a LOOK field set, so a volume overrides ALL of it - every knob the
+    // inspector exposes (Editor::DrawPostLookControls) and the serializer round-trips.
+    // Keep this list in lockstep with the painterly block of rhi::PostSettings; a field
+    // missing here is silently un-overridable per volume (it edits and saves, but the
+    // scene default keeps winning at render time).
     d.painterlyEnabled = s.painterlyEnabled;
     d.painterlyRadius = s.painterlyRadius;
     d.painterlyWarmCool = s.painterlyWarmCool;
     d.painterlyStrokeFlow = s.painterlyStrokeFlow;
     d.painterlyStrength = s.painterlyStrength;
+    d.painterlyEdge = s.painterlyEdge;
+    d.painterlyLightTint = s.painterlyLightTint;
+    d.painterlyStrokeDetail = s.painterlyStrokeDetail;
+    d.painterlyCanvasScale = s.painterlyCanvasScale;
+    d.painterlyCanvasStrength = s.painterlyCanvasStrength;
+    d.painterlyPosterize = s.painterlyPosterize;
+    d.painterlyStrokes = s.painterlyStrokes;
+    d.painterlyStrokeLength = s.painterlyStrokeLength;
+    d.painterlyStrokeDensity = s.painterlyStrokeDensity;
+    d.painterlyStrokeSharp = s.painterlyStrokeSharp;
+    d.painterlyStrokeBoil = s.painterlyStrokeBoil;
+    d.painterlyStrokeMask = s.painterlyStrokeMask;
+    d.painterlyStrokeMaskMinX = s.painterlyStrokeMaskMinX;
+    d.painterlyStrokeMaskMinY = s.painterlyStrokeMaskMinY;
+    d.painterlyStrokeMaskMaxX = s.painterlyStrokeMaskMaxX;
+    d.painterlyStrokeMaskMaxY = s.painterlyStrokeMaskMaxY;
     // NOT copied (project-global quality): taaEnabled, fxaaEnabled, ssaoEnabled,
-    // ssaoRadius, ssaoIntensity.
+    // ssaoRadius, ssaoIntensity. Nor shadowCascades (a runtime perf preset, re-applied
+    // every frame by ApplyGraphicsPreset AFTER volumes) or painterly3D (removed feature,
+    // kept only so old scene files still load).
 }
 
 rhi::SceneView Scene::MakeView(const Camera& camera) const {
@@ -668,6 +721,51 @@ void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh) {
     }
     HBE_INFO("Scene: spawned {} stress meshes ({} verts, {} draws total).", spawned,
              totalVerts, scene.EntityCount());
+}
+
+void SpawnParticleStress(Scene& scene, u32 count) {
+    if (count == 0) return;
+
+    // Particle cost is OVERDRAW bound, not simulation bound, so this rig is tuned
+    // to produce fill: big additive sprites, clustered, all overlapping. A grid of
+    // tiny non-overlapping puffs would measure nothing interesting.
+    constexpr u32 kPerEmitter = 2048;
+    const u32 emitters = (count + kPerEmitter - 1u) / kPerEmitter;
+    const u32 side = static_cast<u32>(std::ceil(std::sqrt(static_cast<f64>(emitters))));
+
+    u32 spawned = 0, budget = count;
+    for (u32 y = 0; y < side && spawned < emitters; ++y) {
+        for (u32 x = 0; x < side && spawned < emitters; ++x, ++spawned) {
+            const u32 mine = std::min(budget, kPerEmitter);
+            budget -= mine;
+
+            const entt::entity e = scene.CreateEntity("ParticleStress");
+            Transform t;
+            t.position = {static_cast<f32>(x) * 2.5f - side * 1.25f, 0.5f,
+                          static_cast<f32>(y) * 2.5f - side * 1.25f};
+            scene.Registry().emplace<Transform>(e, t);
+
+            ParticleEmitter em;
+            em.maxParticles = mine;
+            em.lifetime = 4.0f;
+            // Steady state is rate*lifetime, so this fills to the cap and holds there
+            // rather than ramping for the whole benchmark window.
+            em.rate = static_cast<f32>(mine) / em.lifetime * 1.25f;
+            em.lifetimeVariance = 0.1f;
+            em.emitRadius = 1.5f;
+            em.spread = 1.0f;             // full sphere - keeps the cloud dense
+            em.startSpeed = 0.6f;
+            em.gravity = {0.0f, 0.05f, 0.0f};
+            em.startSize = 0.9f;          // deliberately large: this is a FILL test
+            em.endSize = 0.6f;
+            em.additive = true;           // additive never depth-rejects -> full overdraw
+            em.loop = true;
+            em.emitting = true;
+            scene.Registry().emplace<ParticleEmitter>(e, em);
+        }
+    }
+    HBE_INFO("Scene: spawned {} particle emitters targeting {} live particles.",
+             spawned, count);
 }
 
 bool LoadModel(Scene& scene, Renderer& renderer, const std::string& path) {

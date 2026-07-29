@@ -596,7 +596,7 @@ private:
                motionBlurPipe_ = VK_NULL_HANDLE, ssrPipe_ = VK_NULL_HANDLE,
                exposurePipe_ = VK_NULL_HANDLE, volPipe_ = VK_NULL_HANDLE,
                ssgiPipe_ = VK_NULL_HANDLE, painterlyPipe_ = VK_NULL_HANDLE,
-               brushStrokesPipe_ = VK_NULL_HANDLE, copyPipe_ = VK_NULL_HANDLE,
+               brushStrokesPipe_ = VK_NULL_HANDLE,
                compositePipe_ = VK_NULL_HANDLE, applyPipe_ = VK_NULL_HANDLE,
                volPartPipe_ = VK_NULL_HANDLE; // volumetric-particles raymarch
 
@@ -2786,8 +2786,11 @@ bool VulkanDevice::CreatePostPipelines() {
     // Brush-stroke splat: alpha-over, drawn into the painterly target with LOAD so
     // strokes accumulate over the Kuwahara base (same render pass bloom-up uses).
     brushStrokesReady_ = makePipe(L"BrushStrokes", postPass16Load_, 2, brushStrokesPipe_);
-    // Passthrough/bilinear upscale (half-res Kuwahara -> full-res painterly_).
-    ok = ok && makePipe(L"Copy", postPass16_, false, copyPipe_);
+    // NOTE: no "Copy" (passthrough upscale) pipeline. It existed for the half-res
+    // Kuwahara underpainting, which was abandoned - the painterly pass runs FULL res now
+    // (see the comment at the Kuwahara draw), so nothing ever bound it. It was still
+    // gating `ok`, which meant a missing Copy shader silently killed the ENTIRE post
+    // stack for a pass that never ran. D3D12 never had one; the backends now agree.
     // Reduced-res effect composite (SSGI GI / fog) upscaled back over the full-res HDR.
     ok = ok && makePipe(L"ApplyHalfRes", postPass16_, false, applyPipe_);
     // Dynamic-layer composite: lerp painterly vs crisp lit colour by the HDR-alpha mask.
@@ -3193,7 +3196,12 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
     // The bindless set stays bound from the scene pass; rebind defensively.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
                             &bindlessSet_, 0, nullptr);
-    GpuMark("scene"); // delta shadow->here = the HDR forward pass (geo+sky+transparent+particles)
+    // NOTE: GpuMark("particles") deliberately does NOT live here. It is emitted at the
+    // end of the particle block in DrawScene, matching D3D12 exactly. The end-of-pass
+    // work above (vkCmdEndRenderPass + the defensive rebind) therefore falls into the
+    // "ssr" bucket, which is the symmetric choice: D3D12's "ssr" bucket already carries
+    // the equivalent work (RunPostStack's four PIXEL_SHADER_RESOURCE barriers land
+    // before its own GpuMark("ssr")).
 
     // --- Screen-space reflections (HDR; composited before bloom/tonemap) ----
     u32 hdrInput = slotHdr_; // what bloom + tonemap read (SSR output when on)
@@ -3335,7 +3343,7 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         // perf from other passes instead. (cb.outTexel/inTexel stay full-res, set above.)
         DrawPostPass(painterlyPipe_, postPass16_, painterly_, cb);
         hdrInput = slotPainterly_;
-        GpuMark("kuwahara");
+        GpuMark("strokefilter");
 
         // Collect world-anchored censors once (shared by the stroke pass + the
         // composite below). The shader does a 3D sphere test, so no projection here.
@@ -3710,12 +3718,17 @@ void VulkanDevice::DrawShadowPass(const SceneView& view, const DrawItem* items, 
         vkCmdSetViewport(cmd, 0, 1, &vp);
         vkCmdSetScissor(cmd, 0, 1, &scissor);
 
+        const u8 cascadeBit = static_cast<u8>(1u << c);
         u32 lastMesh = 0; // consecutive same-mesh draws skip the IA rebinds
         for (u32 i = 0; i < drawCount; ++i) {
             const DrawItem& it = items[i];
             if (it.instanceRun == 0) continue; // drawn by its run head
             if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) continue;
             if (it.materialFlags & MaterialFlag_NoShadow) continue; // doesn't cast a shadow
+            // Per-cascade culling: this caster cannot affect this cascade's slice.
+            // The object UBO above is written once and shared by every cascade, so
+            // skipping here removes the draw without disturbing the index coupling.
+            if (!(it.cascadeMask & cascadeBit)) continue;
             const GpuMeshVk& gm = meshes_[it.mesh.id - 1];
             const u32 dynOffset = static_cast<u32>(i * objectStride_);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
@@ -4460,9 +4473,8 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         }
     }
 
-    // 3D painterly: splat the per-mesh brush strokes as instanced PBR-lit cards
-    // over the lit surfaces, depth-tested against the scene. Reuses each item's
-    // object UBO (already written above) for model + albedo/paint.
+    GpuMark("scene"); // delta shadow->here = the HDR forward pass (geo+sky+transparent)
+
     // Particle billboards: depth-tested into the HDR colour (no write), alpha then
     // additive. Set 0 (frame UBO, offset 0) + set 1 (bindless) like the sky pass.
     if (particlePipeline_ != VK_NULL_HANDLE &&
@@ -4489,6 +4501,14 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
             vkCmdDraw(cmd, addN, 1, aN, 0);
         }
     }
+
+    // GPU profiler: delta scene->here = the particle billboard draws ONLY (alpha +
+    // additive), the same window D3D12 measures. It is written INSIDE the still-open
+    // HDR render pass, which vkCmdWriteTimestamp permits (GpuMark("scene") above does
+    // the same), and it is UNCONDITIONAL - putting it behind `postReady_` would drop
+    // the label whenever the post targets are missing and silently fold particle cost
+    // into the "ui" bucket, which D3D12 never does.
+    GpuMark("particles");
 
     // HDR resolve: SSAO -> bloom -> tonemap -> FXAA into the final target.
     if (postReady_) {
@@ -5520,7 +5540,6 @@ VulkanDevice::~VulkanDevice() {
     if (ssgiPipe_) vkDestroyPipeline(device_, ssgiPipe_, nullptr);
     if (painterlyPipe_) vkDestroyPipeline(device_, painterlyPipe_, nullptr);
     if (brushStrokesPipe_) vkDestroyPipeline(device_, brushStrokesPipe_, nullptr);
-    if (copyPipe_) vkDestroyPipeline(device_, copyPipe_, nullptr);
     if (applyPipe_) vkDestroyPipeline(device_, applyPipe_, nullptr);
     if (compositePipe_) vkDestroyPipeline(device_, compositePipe_, nullptr);
     if (hdrRenderPass_) vkDestroyRenderPass(device_, hdrRenderPass_, nullptr);

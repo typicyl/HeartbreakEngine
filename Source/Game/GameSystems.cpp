@@ -4,6 +4,7 @@
 #include "Core/Log.h"
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
+#include "Scene/WorldState.h" // per-area revisit state rides the same save blob
 
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
@@ -32,6 +33,8 @@ std::string g_musicState;
 std::vector<std::pair<std::string, f32>> g_musicParams;
 std::vector<std::string> g_stingers;
 std::vector<std::string> g_voicelines; // one-shot voiceline clips (rel. Assets)
+std::vector<SubtitleReq> g_subtitles;  // audio-less subtitle lines (cutscene narration)
+f32 g_cameraShake = 0.0f;              // accumulated impulse trauma this frame
 std::string g_dialogue;                // latest requested `.hbdialogue` (rel. Assets)
 bool g_dialoguePending = false;
 std::string g_cutscene;                // latest requested `.hbcutscene` (rel. Assets)
@@ -76,6 +79,27 @@ bool ConsumeVoiceline(std::string& outAsset) {
     if (g_voicelines.empty()) return false;
     outAsset = g_voicelines.front();
     g_voicelines.erase(g_voicelines.begin());
+    return true;
+}
+void QueueSubtitle(const std::string& speaker, const std::string& text, f32 duration) {
+    if (text.empty()) return;
+    g_subtitles.push_back({speaker, text, duration});
+}
+bool ConsumeSubtitle(SubtitleReq& out) {
+    if (g_subtitles.empty()) return false;
+    out = std::move(g_subtitles.front());
+    g_subtitles.erase(g_subtitles.begin());
+    return true;
+}
+void QueueCameraShake(f32 trauma) {
+    // Accumulate within the frame; the rig clamps on apply. Several impacts in
+    // one frame should add up, not overwrite each other.
+    g_cameraShake += glm::max(trauma, 0.0f);
+}
+bool ConsumeCameraShake(f32& outTrauma) {
+    if (g_cameraShake <= 0.0f) return false;
+    outTrauma = g_cameraShake;
+    g_cameraShake = 0.0f;
     return true;
 }
 void PlayDialogue(const std::string& asset) {
@@ -144,6 +168,10 @@ void ClearTransientQueues() {
     g_deaths.clear();
     g_noises.clear();
     g_spotted.clear();
+    // A shake or narration line queued right before a level switch must not fire
+    // into the freshly loaded world.
+    g_subtitles.clear();
+    g_cameraShake = 0.0f;
 }
 
 void SetFlag(const std::string& name, f32 value) {
@@ -267,6 +295,9 @@ std::string SerializeState() {
     nlohmann::json& items = j["items"] = nlohmann::json::object();
     for (const auto& [id, n] : g_items) items[id] = n;
     j["equipped"] = g_equippedWeapon;
+    // Per-area world state (what the player changed in each area) rides the same
+    // save blob as the story flags, so a reload restores revisited areas exactly.
+    j["world"] = world::Get().Serialize();
     return j.dump();
 }
 
@@ -287,6 +318,7 @@ void DeserializeState(const std::string& json) {
             for (const auto& [id, value] : iit->items())
                 if (value.is_number_unsigned()) g_items[id] = value.get<u32>();
         g_equippedWeapon = j.value("equipped", std::string());
+        world::Get().Deserialize(j.value("world", std::string()));
     } catch (const std::exception& e) {
         HBE_WARN("game: failed to parse save state: {}", e.what());
     }
@@ -296,6 +328,7 @@ void Reset() {
     g_objectives.clear();
     g_reached.clear();
     g_flags.clear();
+    world::Get().Clear(); // new game: every area is unvisited again
     g_items.clear();
     g_equippedWeapon.clear();
     g_saveRequested = false;
@@ -307,6 +340,8 @@ void Reset() {
     // Newer deferred queues (parity with the music queues): clear so a request
     // queued right before a restart/level transition can't fire into the fresh run.
     g_voicelines.clear();
+    g_subtitles.clear();
+    g_cameraShake = 0.0f;
     g_dialogue.clear();
     g_dialoguePending = false;
     g_cutscene.clear();

@@ -16,7 +16,9 @@
 #include "Physics/PhysicsWorld.h"
 #include "Project/Project.h"
 #include "Renderer/Renderer.h"
+#include "Scene/ParticleSystem.h"
 #include "Scene/Scene.h"
+#include "Vfx/VfxStack.h"
 
 #include <algorithm>
 #include <cctype>
@@ -46,6 +48,23 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-seamweld") == 0) {
             const bool ok = hbe::weld::SelfTest();
             std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vfxstack: prove the VFX attribute model + module-stack core
+        // (64-byte record layout, dead-stream elimination, stage-order validation,
+        // determinism) headless, no GPU/window. Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-vfxstack") == 0) {
+            const bool ok = hbe::vfx::SelfTest();
+            std::printf("vfxstack %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vfxcompat: prove that moving ParticleEmitter onto the module stack
+        // changed nothing. Diffs the live path against a frozen copy of the pre-stack
+        // simulation loop, bit-for-bit, over every preset plus a parameter fuzz.
+        // Headless, no GPU/window. Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-vfxcompat") == 0) {
+            const bool ok = hbe::particle::CompatSelfTest();
+            std::printf("vfxcompat %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
     }

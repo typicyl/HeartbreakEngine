@@ -131,13 +131,10 @@ std::string RelFromMeshRef(const std::string& source) {
     return hash == std::string::npos ? rest : rest.substr(0, hash);
 }
 
+// Backed by Scene's hashed name index (was a per-call linear scan over every
+// named entity, run per animated entity per frame).
 entt::entity FindEntityByName(const Scene& scene, const std::string& name) {
-    if (name.empty()) return entt::null;
-    const auto& reg = scene.Registry();
-    for (const entt::entity e : reg.view<const Name>()) {
-        if (reg.get<const Name>(e).value == name) return e;
-    }
-    return entt::null;
+    return scene.FindByName(name);
 }
 
 // First joint in `skeleton` whose canonical name matches `name`; -1 if none.

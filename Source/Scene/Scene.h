@@ -86,6 +86,17 @@ public:
     // Creates an entity, optionally tagging it with a Name component.
     entt::entity CreateEntity(const std::string& name = {});
 
+    // O(1) lookup of an entity by its Name. Cutscenes, camera targets, animation
+    // tracks and dialogue actors all address entities by name, and they did it
+    // with a full linear scan + string compare EVERY FRAME - cam::Update alone
+    // ran several (follow target, zone track, zone camera, spline), so the cost
+    // scaled with total scene size on a path that has nothing to do with it.
+    // The index is rebuilt lazily only after a Name is added/changed/removed
+    // (EnTT signals mark it dirty), so a steady-state frame pays one hash lookup.
+    // Duplicate names resolve to one arbitrary match, exactly as the linear scan
+    // did; entt::null when there is no match.
+    entt::entity FindByName(const std::string& name) const;
+
     // World-space matrix of an entity: composes Transform up the Parent chain.
     glm::mat4 WorldMatrix(entt::entity e) const;
 
@@ -116,6 +127,9 @@ private:
     // EnTT signal target: any construct/destroy/update of a hierarchy-shaping
     // component bumps the UI structure version.
     void OnUIStructural(entt::registry&, entt::entity) { ++uiStructureVersion_; }
+    // EnTT signal target: a Name was added / changed / removed, so the name index
+    // is stale. Rebuilt lazily on the next FindByName.
+    void OnNameChanged(entt::registry&, entt::entity) { nameIndexDirty_ = true; }
 
     entt::registry   registry_;
     SceneEnvironment env_;
@@ -129,6 +143,11 @@ private:
     // they self-clean as entities disappear. mutable: CollectDrawItems is const.
     mutable std::unordered_map<entt::entity, glm::mat4> prevWorld_, curWorld_;
     mutable std::unordered_map<entt::entity, std::vector<glm::mat4>> prevPalette_, curPalette_;
+
+    // Name -> entity index behind FindByName. mutable: FindByName is const and
+    // rebuilds lazily. Starts dirty so the first lookup builds it.
+    mutable std::unordered_map<std::string, entt::entity> nameIndex_;
+    mutable bool nameIndexDirty_ = true;
 };
 
 namespace scene {
@@ -148,6 +167,14 @@ bool LoadModel(Scene& scene, Renderer& renderer, const std::string& path);
 // instances of ONE mesh (draw-sort/instancing measurement rig) instead of a
 // unique mesh per instance (vertex-bandwidth stress).
 void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh = false);
+
+// Spawns emitters totalling roughly `count` LIVE particles (particle stress rig).
+// Exists because neither the reference project nor MyProject authors a single
+// ParticleEmitter, so the GpuMark("particles") slot could only ever be observed
+// reading 0.00 - which proves the mark exists, not that it accumulates. Particle
+// cost is overdraw-bound, so the emitters are deliberately spawned near the origin
+// with large, overlapping, additive sprites.
+void SpawnParticleStress(Scene& scene, u32 count);
 
 } // namespace scene
 } // namespace hbe

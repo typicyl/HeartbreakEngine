@@ -78,7 +78,25 @@ json CameraToJson(const CameraComponent& c) {
                 {"lookPitchMax", c.lookPitchMax},
                 {"collide", c.collide},
                 {"collisionMinDistance", c.collisionMinDistance},
-                {"collisionPadding", c.collisionPadding}};
+                {"collisionPadding", c.collisionPadding},
+                {"collisionReturnSpeed", c.collisionReturnSpeed},
+                // Cinematic rig (nested so the camera block stays readable).
+                {"cinematic",
+                 {{"handheld", c.cinematic.handheld},
+                  {"handheldPosAmount", c.cinematic.handheldPosAmount},
+                  {"handheldRotAmount", c.cinematic.handheldRotAmount},
+                  {"handheldFrequency", c.cinematic.handheldFrequency},
+                  {"handheldRoll", c.cinematic.handheldRoll},
+                  {"handheldSharpness", c.cinematic.handheldSharpness},
+                  {"breathing", c.cinematic.breathing},
+                  {"breathAmount", c.cinematic.breathAmount},
+                  {"breathRate", c.cinematic.breathRate},
+                  {"framing", c.cinematic.framing},
+                  {"framingX", c.cinematic.framingX},
+                  {"framingY", c.cinematic.framingY},
+                  {"leadAmount", c.cinematic.leadAmount},
+                  {"leadSpeed", c.cinematic.leadSpeed},
+                  {"framingDamping", c.cinematic.framingDamping}}}};
 }
 
 void CameraFromJson(const json& j, CameraComponent& c) {
@@ -110,6 +128,25 @@ void CameraFromJson(const json& j, CameraComponent& c) {
     c.collide = j.value("collide", c.collide);
     c.collisionMinDistance = j.value("collisionMinDistance", c.collisionMinDistance);
     c.collisionPadding = j.value("collisionPadding", c.collisionPadding);
+    c.collisionReturnSpeed = j.value("collisionReturnSpeed", c.collisionReturnSpeed);
+    if (const auto cit = j.find("cinematic"); cit != j.end() && cit->is_object()) {
+        cam::CinematicSettings& cs = c.cinematic;
+        cs.handheld = cit->value("handheld", cs.handheld);
+        cs.handheldPosAmount = cit->value("handheldPosAmount", cs.handheldPosAmount);
+        cs.handheldRotAmount = cit->value("handheldRotAmount", cs.handheldRotAmount);
+        cs.handheldFrequency = cit->value("handheldFrequency", cs.handheldFrequency);
+        cs.handheldRoll = cit->value("handheldRoll", cs.handheldRoll);
+        cs.handheldSharpness = cit->value("handheldSharpness", cs.handheldSharpness);
+        cs.breathing = cit->value("breathing", cs.breathing);
+        cs.breathAmount = cit->value("breathAmount", cs.breathAmount);
+        cs.breathRate = cit->value("breathRate", cs.breathRate);
+        cs.framing = cit->value("framing", cs.framing);
+        cs.framingX = glm::clamp(cit->value("framingX", cs.framingX), -1.0f, 1.0f);
+        cs.framingY = glm::clamp(cit->value("framingY", cs.framingY), -1.0f, 1.0f);
+        cs.leadAmount = glm::max(cit->value("leadAmount", cs.leadAmount), 0.0f);
+        cs.leadSpeed = glm::max(cit->value("leadSpeed", cs.leadSpeed), 0.01f);
+        cs.framingDamping = glm::max(cit->value("framingDamping", cs.framingDamping), 0.0f);
+    }
     c.orbitAngle = c.yaw; // start orbit/spin at the authored yaw
 }
 
@@ -239,6 +276,10 @@ json BuildSceneJson(const Scene& scene,
         // Instantiate on load, so they are never serialized (else they'd double up
         // as static bind-pose meshes alongside the freshly-spawned ones).
         if (reg.all_of<SkinnedPartRef>(e)) return;
+        // Destruction debris is rebuilt from the owning Destructible's chunk state,
+        // so a save landing mid-collapse must not bake the loose pieces in as
+        // permanent authored props.
+        if (reg.all_of<DebrisChunk>(e)) return;
         if (include && !include(e)) return; // not part of the scene being saved
         const u32 key = static_cast<u32>(e);
         if (indexOf.find(key) == indexOf.end()) {
@@ -402,6 +443,24 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         }
         if (const SchematicComponent* sg = reg.try_get<SchematicComponent>(e)) {
             je["schematic"] = {{"asset", sg->asset}};
+        }
+        if (const Destructible* ds = reg.try_get<Destructible>(e)) {
+            je["destructible"] = {{"asset", ds->asset},
+                                  {"impulseThreshold", ds->impulseThreshold},
+                                  {"chunkHealth", ds->chunkHealth},
+                                  {"damageRadius", ds->damageRadius},
+                                  {"breakImpulseScale", ds->breakImpulseScale},
+                                  {"debrisLifetime", ds->debrisLifetime},
+                                  {"density", ds->density},
+                                  {"structural", ds->structural},
+                                  {"breakEvent", ds->breakEvent}};
+            // Runtime break progress rides the .hbsave only (runtimeTags), never the
+            // authored scene - saving it there would ship a pre-broken level.
+            if (runtimeTags && ds->activated) {
+                je["destructible"]["activated"] = true;
+                je["destructible"]["chunkState"] = ds->chunkState;
+                je["destructible"]["chunkHp"] = ds->chunkHp;
+            }
         }
         if (const Checkpoint* cp = reg.try_get<Checkpoint>(e)) {
             je["checkpoint"] = {{"id", cp->id},
@@ -793,7 +852,14 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                 {"volRadiusScale", pe->volRadiusScale}, {"volTemperature", pe->volTemperature},
                 {"volEmission", pe->volEmission}, {"volExtinction", pe->volExtinction},
                 {"volSteps", pe->volSteps}, {"volResolution", pe->volResolution},
-                {"volDetail", pe->volDetail}};
+                {"volDetail", pe->volDetail},
+                // Module-stack opt-ins. Every one is written, but every one also
+                // parses back to the pre-stack behaviour when ABSENT, which is what
+                // lets a scene saved before the module stack load unchanged.
+                {"useCurlNoise", pe->useCurlNoise}, {"curlStrength", pe->curlStrength},
+                {"curlFrequency", pe->curlFrequency}, {"expDrag", pe->expDrag},
+                {"simulateColor", pe->simulateColor}, {"colorVariance", pe->colorVariance},
+                {"simulateSize", pe->simulateSize}, {"sizeVariance", pe->sizeVariance}};
         }
         if (const AudioSource* src = reg.try_get<AudioSource>(e)) {
             je["audio"] = {{"asset", src->asset},
@@ -905,6 +971,7 @@ json BuildSubtreeJson(const Scene& scene, entt::entity root) {
         stack.pop_back();
         if (reg.try_get<TerrainChunk>(e)) continue; // runtime-generated chunks
         if (reg.try_get<UISurface>(e)) continue;    // runtime world-UI quads
+        if (reg.all_of<DebrisChunk>(e)) continue;   // runtime destruction debris
         const u32 key = static_cast<u32>(e);
         if (indexOf.count(key)) continue;
         indexOf[key] = static_cast<int>(order.size());
@@ -1020,6 +1087,26 @@ void ParseSceneJson(const json& root, SceneData& out) {
         if (auto it = je.find("schematic"); it != je.end()) {
             d.hasSchematic = true;
             d.schematicAsset = it->value("asset", "");
+        }
+        if (auto it = je.find("destructible"); it != je.end()) {
+            d.hasDestructible = true;
+            Destructible& ds = d.destructible;
+            ds.asset = it->value("asset", "");
+            ds.impulseThreshold = it->value("impulseThreshold", ds.impulseThreshold);
+            ds.chunkHealth = it->value("chunkHealth", ds.chunkHealth);
+            ds.damageRadius = it->value("damageRadius", ds.damageRadius);
+            ds.breakImpulseScale = it->value("breakImpulseScale", ds.breakImpulseScale);
+            ds.debrisLifetime = it->value("debrisLifetime", ds.debrisLifetime);
+            ds.density = it->value("density", ds.density);
+            ds.structural = it->value("structural", ds.structural);
+            ds.breakEvent = it->value("breakEvent", "");
+            // Break progress (.hbsave only). chunkEntity/supportScratch are NOT
+            // restored - they are live handles rebuilt when the object re-activates.
+            ds.activated = it->value("activated", false);
+            if (const auto cs = it->find("chunkState"); cs != it->end() && cs->is_array())
+                ds.chunkState = cs->get<std::vector<u8>>();
+            if (const auto hp = it->find("chunkHp"); hp != it->end() && hp->is_array())
+                ds.chunkHp = hp->get<std::vector<f32>>();
         }
         if (auto it = je.find("checkpoint"); it != je.end()) {
             d.hasCheckpoint = true;
@@ -1556,6 +1643,18 @@ void ParseSceneJson(const json& root, SceneData& out) {
             p.volSteps = glm::clamp(it->value("volSteps", p.volSteps), 4, 256);
             p.volResolution = glm::clamp(it->value("volResolution", p.volResolution), 32, 192);
             p.volDetail = glm::clamp(it->value("volDetail", p.volDetail), 0.0f, 1.0f);
+            // Module-stack opt-ins. The struct defaults are all "off", so a scene
+            // authored before the module stack omits every key here and compiles to
+            // the pure legacy stack - which is the compatibility guarantee, expressed
+            // in the one place it can actually be broken.
+            p.useCurlNoise = it->value("useCurlNoise", p.useCurlNoise);
+            p.curlStrength = it->value("curlStrength", p.curlStrength);
+            p.curlFrequency = it->value("curlFrequency", p.curlFrequency);
+            p.expDrag = it->value("expDrag", p.expDrag);
+            p.simulateColor = it->value("simulateColor", p.simulateColor);
+            p.colorVariance = glm::clamp(it->value("colorVariance", p.colorVariance), 0.0f, 1.0f);
+            p.simulateSize = it->value("simulateSize", p.simulateSize);
+            p.sizeVariance = glm::clamp(it->value("sizeVariance", p.sizeVariance), 0.0f, 1.0f);
         }
         if (auto it = je.find("navAgent"); it != je.end()) {
             d.hasNavAgent = true;
@@ -2111,6 +2210,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             sg.asset = d.schematicAsset;
             reg.emplace<SchematicComponent>(e, std::move(sg));
         }
+        if (d.hasDestructible) reg.emplace<Destructible>(e, d.destructible);
         if (d.hasCheckpoint) reg.emplace<Checkpoint>(e, d.checkpoint);
         if (d.hasHealth) reg.emplace<Health>(e, d.health);
         if (d.hasWeapon) reg.emplace<Weapon>(e, d.weapon);

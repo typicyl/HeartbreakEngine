@@ -41,13 +41,45 @@ using Microsoft::WRL::ComPtr;
 namespace hbe::rhi {
 namespace {
 
+// Human-readable name for the DXGI device-removal reasons. An 8-digit hex code
+// in a log tells you nothing; the name says whether you are chasing a shader
+// fault (HUNG), a driver crash (DRIVER_INTERNAL_ERROR) or a TDR (RESET).
+const char* DxgiReasonName(HRESULT hr) {
+    switch (static_cast<u32>(hr)) {
+        case 0x887A0005u: return "DXGI_ERROR_DEVICE_REMOVED";
+        case 0x887A0006u: return "DXGI_ERROR_DEVICE_HUNG (GPU fault/timeout - bad draw or shader)";
+        case 0x887A0007u: return "DXGI_ERROR_DEVICE_RESET (TDR: driver reset the GPU)";
+        case 0x887A0020u: return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+        case 0x887A0001u: return "DXGI_ERROR_INVALID_CALL";
+        case 0x887A000Cu: return "DXGI_ERROR_ACCESS_LOST";
+        case 0x8007000Eu: return "E_OUTOFMEMORY";
+        default: return "unknown";
+    }
+}
+
+// True when the HRESULT means the device is gone (any further GPU call is futile).
+bool IsDeviceLost(HRESULT hr) {
+    const u32 c = static_cast<u32>(hr);
+    return c == 0x887A0005u || c == 0x887A0006u || c == 0x887A0007u || c == 0x887A000Cu;
+}
+
 // Logs and returns false when an HRESULT indicates failure.
+//
+// Device loss gets special handling: once the device is gone EVERY subsequent
+// call fails the same way, and callers that retry per frame (the editor's
+// viewport resize did exactly this) turn one real error into an unbounded log
+// flood that buries the FIRST failure - the only one that identifies the cause.
+// So the loss is latched and reported once, with the decoded removal reason.
 #define HR_CHECK(expr, what)                                                    \
     do {                                                                        \
         const HRESULT _hr = (expr);                                            \
         if (FAILED(_hr)) {                                                      \
-            HBE_ERROR("[D3D12] {} failed (hr=0x{:08X})", what,                 \
-                      static_cast<u32>(_hr));                                   \
+            if (IsDeviceLost(_hr)) {                                            \
+                ReportDeviceLost(what, _hr);                                    \
+            } else {                                                            \
+                HBE_ERROR("[D3D12] {} failed (hr=0x{:08X} {})", what,          \
+                          static_cast<u32>(_hr), DxgiReasonName(_hr));          \
+            }                                                                   \
             return false;                                                       \
         }                                                                       \
     } while (0)
@@ -281,6 +313,14 @@ struct GpuMesh {
     ComPtr<ID3D12Resource> indexBuffer;
     D3D12_VERTEX_BUFFER_VIEW vbv{};
     D3D12_INDEX_BUFFER_VIEW  ibv{};
+    // ALLOCATED capacity, which is NOT the same as the view size. UpdateMesh
+    // rewrites vbv/ibv.SizeInBytes to the new (possibly smaller) contents, so
+    // using the view as the capacity check made a shrink permanent: a later
+    // update back to the original size was rejected even though the underlying
+    // resource was still large enough. Mirrors GpuMeshVk::vbSize/ibSize, which
+    // already got this right.
+    u64 vbCapacity = 0;
+    u64 ibCapacity = 0;
     u32 indexCount = 0;
     // 3D painterly: per-instance brush-stroke seeds scattered over this mesh's
     // surface (StrokeSurface.hlsl expands each into a lit world-space card).
@@ -350,6 +390,12 @@ public:
 private:
     bool CreateRenderTargetViews();
     void MoveToNextFrame();
+
+    // Latches device loss and reports it ONCE with the decoded removal reason
+    // from GetDeviceRemovedReason(). `what` is the call that first noticed.
+    void ReportDeviceLost(const char* what, HRESULT hr);
+    bool DeviceLost() const { return deviceLost_; }
+    bool deviceLost_ = false;
 
     // Scene-rendering setup.
     bool CreateDepthResources(u32 width, u32 height);
@@ -912,13 +958,43 @@ bool D3D12Device::CreateRenderTargetViews() {
     return true;
 }
 
+// NOTE: deliberately OUTSIDE any #if HBE_EDITOR block - HR_CHECK expands in
+// runtime-build code paths too, so the runtime link needs this definition.
+void D3D12Device::ReportDeviceLost(const char* what, HRESULT hr) {
+    if (deviceLost_) return; // already reported; stay silent (see HR_CHECK)
+    deviceLost_ = true;
+    // GetDeviceRemovedReason is the ONLY call that says why. The HRESULT the
+    // failing call returned is almost always the generic DEVICE_REMOVED.
+    const HRESULT reason = device_ ? device_->GetDeviceRemovedReason() : hr;
+    HBE_ERROR("[D3D12] DEVICE LOST during '{}' (hr=0x{:08X}).", what, static_cast<u32>(hr));
+    HBE_ERROR("[D3D12]   reason=0x{:08X} {}", static_cast<u32>(reason), DxgiReasonName(reason));
+    HBE_ERROR("[D3D12]   Rendering is dead from here; further GPU errors are suppressed.");
+    HBE_ERROR("[D3D12]   Diagnose with --validation (and set HBE_GBV=1 for GPU-based "
+              "validation, which catches shader out-of-bounds).");
+}
+
 void D3D12Device::BeginFrame() {
 #if HBE_EDITOR
     // Apply a pending viewport (offscreen target) resize.
+    //
+    // The result MUST be honoured. This used to discard it, which meant a failed
+    // re-create left viewportReady_ true with offscreenColor_ null - the frame
+    // then ran TransitionBarrier() on a null resource - AND left vpW_/vpH_ stale,
+    // so the mismatch that triggers the re-create never cleared and it retried
+    // every single frame, flooding the log with the same error forever.
     if (viewportReady_ && pendingVpW_ > 0 && pendingVpH_ > 0 &&
         (pendingVpW_ != vpW_ || pendingVpH_ != vpH_)) {
         WaitForGpuIdle();
-        CreateViewportTarget(pendingVpW_, pendingVpH_);
+        if (!CreateViewportTarget(pendingVpW_, pendingVpH_)) {
+            // Fall back to rendering straight to the swapchain rather than into a
+            // target that no longer exists, and stop retrying this size.
+            viewportReady_ = false;
+            vpW_ = pendingVpW_;
+            vpH_ = pendingVpH_;
+            HBE_WARN("[D3D12] Offscreen viewport target unavailable at {}x{}; "
+                     "rendering to the window instead.",
+                     pendingVpW_, pendingVpH_);
+        }
     }
 #endif
 
@@ -1088,15 +1164,9 @@ void D3D12Device::EndFrame() {
         // A device removal/hang (e.g. a TDR after a bad draw) otherwise looks
         // like a freeze while the CPU loop spins at thousands of "FPS": shout
         // about it once so the cause is visible in the log.
-        static bool reported = false;
-        if (!reported) {
-            reported = true;
-            const HRESULT reason = device_ ? device_->GetDeviceRemovedReason() : S_OK;
-            HBE_ERROR("[D3D12] Present failed (hr=0x{:08X}); device removed "
-                      "reason=0x{:08X}. The GPU likely hung or faulted - "
-                      "rendering is dead from here on.",
-                      static_cast<u32>(pr), static_cast<u32>(reason));
-        }
+        // Shares the one latch with HR_CHECK, so whichever call notices FIRST is
+        // the one that gets reported - and it is reported exactly once.
+        ReportDeviceLost("Present", pr);
     }
     MoveToNextFrame();
 }
@@ -2245,8 +2315,12 @@ bool D3D12Device::CreatePostPipelines() {
     painterlyReady_ = makePso(L"Painterly", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                               DXGI_FORMAT_UNKNOWN, painterlyPSO_); // repaints HDR
     // Dynamic-layer composite: lerp painterly vs crisp lit colour by the HDR-alpha mask.
-    makePso(L"PainterlyComposite", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
-            DXGI_FORMAT_UNKNOWN, compositePSO_);
+    // REQUIRED, not optional: the painterly chain binds compositePSO_ unconditionally
+    // (no ready flag), so dropping this result on the floor would bind a null PSO if the
+    // shader were ever missing. Gate `ok` like every other required pass - matching the
+    // Vulkan backend, which already does, so a broken shader disables post coherently.
+    ok = ok && makePso(L"PainterlyComposite", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+                       DXGI_FORMAT_UNKNOWN, compositePSO_);
     // Reduced-res effect composite (SSGI GI / fog) upscaled back over the full-res HDR.
     ok = ok && makePso(L"ApplyHalfRes", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                        DXGI_FORMAT_UNKNOWN, applyPSO_);
@@ -2715,7 +2789,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(painterlyPSO_.Get(), painterly_.Get(), rtvAt(15 + kBloomMaxMips), sceneW_,
                      sceneH_, cb);
         hdrInput = slotPainterly_;
-        GpuMark("kuwahara");
+        GpuMark("strokefilter");
 
         // Collect world-anchored censors once (shared by the stroke pass + the
         // composite below). The shader does a 3D sphere test, so no projection here.
@@ -3107,10 +3181,15 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
             cmdList_->SetGraphicsRootConstantBufferView(0, frameAddr);
         }
 
+        const u8 cascadeBit = static_cast<u8>(1u << c);
         u32 lastMesh = 0; // consecutive same-mesh draws skip the IA rebinds
         for (u32 i = 0; i < count; ++i) {
             const DrawItem& it = items[i];
             if (!shadowObjAddrs_[i]) continue; // no CB = NoShadow or run-consumed
+            // Per-cascade culling: this caster cannot affect this cascade's slice.
+            // The object CB above is still uploaded once and shared, so skipping
+            // here costs nothing and removes the draw entirely.
+            if (!(it.cascadeMask & cascadeBit)) continue;
             const GpuMesh& gm = meshes_[it.mesh.id - 1];
             cmdList_->SetGraphicsRootConstantBufferView(1, shadowObjAddrs_[i]);
             if (it.mesh.id != lastMesh) {
@@ -3212,6 +3291,10 @@ MeshHandle D3D12Device::CreateMesh(const hbe::MeshData& mesh) {
     gm.ibv.BufferLocation = gm.indexBuffer->GetGPUVirtualAddress();
     gm.ibv.SizeInBytes = static_cast<UINT>(ibSize);
     gm.ibv.Format = DXGI_FORMAT_R32_UINT;
+    // Record the true allocation size once, at creation. UpdateMesh checks
+    // against THIS, never the view size (which tracks the live contents).
+    gm.vbCapacity = vbSize;
+    gm.ibCapacity = ibSize;
     gm.indexCount = mesh.IndexCount();
     meshes_.push_back(std::move(gm));
     return MeshHandle{static_cast<u32>(meshes_.size())}; // 1-based id
@@ -3222,10 +3305,9 @@ void D3D12Device::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
     GpuMesh& gm = meshes_[handle.id - 1];
     const u64 vbSize = static_cast<u64>(mesh.vertices.size()) * sizeof(hbe::Vertex);
     const u64 ibSize = static_cast<u64>(mesh.indices.size()) * sizeof(u32);
-    // In-place path needs the new data to fit the existing allocation. Terrain
-    // sculpting keeps the topology fixed so this always holds; bail otherwise
-    // (callers that change topology recreate the mesh instead).
-    if (vbSize > gm.vbv.SizeInBytes || ibSize > gm.ibv.SizeInBytes) return;
+    // In-place path needs the new data to fit the ALLOCATION - not the current
+    // view size, which shrinks with the contents (see GpuMesh::vbCapacity).
+    if (vbSize > gm.vbCapacity || ibSize > gm.ibCapacity) return;
 
     ComPtr<ID3D12Resource> vStage = CreateUploadBuffer(device_.Get(), vbSize);
     ComPtr<ID3D12Resource> iStage = CreateUploadBuffer(device_.Get(), ibSize);
@@ -3651,6 +3733,8 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         }
     }
 
+    GpuMark("scene"); // GPU profiler: delta shadow->here = the HDR forward pass (geo+sky+transparent)
+
     // Particle billboards: depth-tested against the scene (no write), into the HDR
     // colour, alpha first then additive. Root sig / frame CBV / bindless from above
     // stay bound; only the PSO + VB change.
@@ -3679,7 +3763,11 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         }
     }
 
-    GpuMark("scene"); // GPU profiler: delta shadow->here = the HDR forward pass (geo+sky+particles)
+    // GPU profiler: delta scene->here = the particle billboard draws ONLY (alpha + additive).
+    // Split out of "scene" so VFX cost is measurable and regression-testable on its own.
+    // Vulkan emits the same label at the same point in its own DrawScene, so the two
+    // backends' "particles" buckets measure the same work and are comparable.
+    GpuMark("particles");
     // HDR resolve: SSAO -> bloom -> tonemap -> FXAA into the final target.
     // (Per-pass GpuMarks inside break the post cost down: ssr/ssgi/fog/kuwahara/...)
     if (postReady_) {
@@ -4032,6 +4120,7 @@ void D3D12Device::ShutdownUI() {
 
 bool D3D12Device::CreateViewportTarget(u32 w, u32 h) {
     if (w == 0 || h == 0 || !imguiSrvHeap_) return false;
+    if (deviceLost_) return false; // nothing can succeed; don't re-log every frame
     const D3D12_HEAP_PROPERTIES def = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
 
     // Color target (render target + shader resource).

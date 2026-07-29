@@ -8,6 +8,35 @@
 #include <algorithm>
 #include <fstream>
 
+namespace hbe {
+
+// Declared in `hbe` (next to CutsceneEase itself), not in `hbe::assets` - the
+// enum belongs to the asset's data model, which lives in the outer namespace.
+const char* EaseName(CutsceneEase e) {
+    switch (e) {
+        case CutsceneEase::Linear:    return "Linear";
+        case CutsceneEase::EaseIn:    return "Ease In";
+        case CutsceneEase::EaseOut:   return "Ease Out";
+        case CutsceneEase::EaseInOut: return "Ease In-Out";
+        case CutsceneEase::Hold:      return "Hold";
+    }
+    return "Linear";
+}
+
+f32 ApplyEase(CutsceneEase e, f32 u) {
+    u = std::clamp(u, 0.0f, 1.0f);
+    switch (e) {
+        case CutsceneEase::Linear:    return u;
+        case CutsceneEase::EaseIn:    return u * u;
+        case CutsceneEase::EaseOut:   return 1.0f - (1.0f - u) * (1.0f - u);
+        case CutsceneEase::EaseInOut: return u * u * (3.0f - 2.0f * u); // smoothstep
+        case CutsceneEase::Hold:      return 0.0f;                      // never leaves `a`
+    }
+    return u;
+}
+
+} // namespace hbe
+
 namespace hbe::assets {
 
 using json = nlohmann::json;
@@ -29,7 +58,7 @@ glm::quat RdQ(const json& j, glm::quat def) {
 bool SaveCutscene(const std::filesystem::path& path, const CutsceneAsset& c) {
     json j;
     j["type"] = "cutscene";
-    j["version"] = 1;
+    j["version"] = 2; // v2: per-key ease/roll/focus/aimTarget + shake/subtitle tracks
     j["duration"] = c.duration;
 
     json cam = json::array();
@@ -38,9 +67,39 @@ bool SaveCutscene(const std::filesystem::path& path, const CutsceneAsset& c) {
                        {"position", V3(k.position)},
                        {"aim", V3(k.aim)},
                        {"fov", k.fov},
-                       {"cut", k.cut}});
+                       {"cut", k.cut},
+                       {"ease", static_cast<int>(k.ease)},
+                       {"roll", k.roll},
+                       {"focusDistance", k.focusDistance},
+                       {"focusRange", k.focusRange},
+                       {"aperture", k.aperture},
+                       {"aimTarget", k.aimTarget}});
     }
     j["camera"] = std::move(cam);
+
+    json shakes = json::array();
+    for (const CutsceneShakeMarker& m : c.shakes)
+        shakes.push_back({{"time", m.time}, {"trauma", m.trauma}});
+    j["shakes"] = std::move(shakes);
+
+    json subs = json::array();
+    for (const CutsceneSubtitleMarker& m : c.subtitles) {
+        subs.push_back({{"time", m.time},
+                        {"duration", m.duration},
+                        {"speaker", m.speaker},
+                        {"text", m.text}});
+    }
+    j["subtitles"] = std::move(subs);
+
+    j["cinematic"] = {{"handheld", c.cinematic.handheld},
+                      {"handheldPosAmount", c.cinematic.handheldPosAmount},
+                      {"handheldRotAmount", c.cinematic.handheldRotAmount},
+                      {"handheldFrequency", c.cinematic.handheldFrequency},
+                      {"handheldRoll", c.cinematic.handheldRoll},
+                      {"handheldSharpness", c.cinematic.handheldSharpness},
+                      {"breathing", c.cinematic.breathing},
+                      {"breathAmount", c.cinematic.breathAmount},
+                      {"breathRate", c.cinematic.breathRate}};
 
     json tracks = json::array();
     for (const CutsceneAnimTrack& t : c.animTracks) {
@@ -99,8 +158,45 @@ std::optional<CutsceneAsset> LoadCutscene(const std::filesystem::path& path) {
             k.aim = RdV3(jk.value("aim", json()), k.aim);
             k.fov = jk.value("fov", 60.0f);
             k.cut = jk.value("cut", false);
-            c.camera.push_back(k);
+            // v1 files have none of these; the defaults reproduce v1 playback
+            // EXCEPT ease, which defaults to EaseInOut on a fresh key. A v1 file
+            // was authored against linear interpolation, so honour that.
+            k.ease = static_cast<CutsceneEase>(glm::clamp(
+                jk.value("ease", static_cast<int>(CutsceneEase::Linear)), 0, 4));
+            k.roll = jk.value("roll", 0.0f);
+            k.focusDistance = jk.value("focusDistance", -1.0f);
+            k.focusRange = jk.value("focusRange", 3.0f);
+            k.aperture = jk.value("aperture", 0.0f);
+            k.aimTarget = jk.value("aimTarget", "");
+            c.camera.push_back(std::move(k));
         }
+    }
+    if (const auto it = j.find("shakes"); it != j.end() && it->is_array()) {
+        for (const json& jm : *it)
+            c.shakes.push_back({jm.value("time", 0.0f),
+                                glm::clamp(jm.value("trauma", 0.5f), 0.0f, 1.0f)});
+    }
+    if (const auto it = j.find("subtitles"); it != j.end() && it->is_array()) {
+        for (const json& jm : *it) {
+            CutsceneSubtitleMarker m;
+            m.time = jm.value("time", 0.0f);
+            m.duration = jm.value("duration", 0.0f);
+            m.speaker = jm.value("speaker", "");
+            m.text = jm.value("text", "");
+            c.subtitles.push_back(std::move(m));
+        }
+    }
+    if (const auto it = j.find("cinematic"); it != j.end() && it->is_object()) {
+        cam::CinematicSettings& cs = c.cinematic;
+        cs.handheld = it->value("handheld", cs.handheld);
+        cs.handheldPosAmount = it->value("handheldPosAmount", cs.handheldPosAmount);
+        cs.handheldRotAmount = it->value("handheldRotAmount", cs.handheldRotAmount);
+        cs.handheldFrequency = it->value("handheldFrequency", cs.handheldFrequency);
+        cs.handheldRoll = it->value("handheldRoll", cs.handheldRoll);
+        cs.handheldSharpness = it->value("handheldSharpness", cs.handheldSharpness);
+        cs.breathing = it->value("breathing", cs.breathing);
+        cs.breathAmount = it->value("breathAmount", cs.breathAmount);
+        cs.breathRate = it->value("breathRate", cs.breathRate);
     }
     if (const auto it = j.find("animTracks"); it != j.end() && it->is_array()) {
         for (const json& jt : *it) {
@@ -144,6 +240,8 @@ std::optional<CutsceneAsset> LoadCutscene(const std::filesystem::path& path) {
         std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
     }
     std::stable_sort(c.dialogue.begin(), c.dialogue.end(), byTime);
+    std::stable_sort(c.shakes.begin(), c.shakes.end(), byTime);
+    std::stable_sort(c.subtitles.begin(), c.subtitles.end(), byTime);
     return c;
 }
 

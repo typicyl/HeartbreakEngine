@@ -1,9 +1,24 @@
 // Scene/ParticleSystem.h - CPU-simulated, GPU-billboarded particles.
 //
-// Each ParticleEmitter pools its particles (no per-frame allocation). Update()
-// integrates + spawns; BuildVertices() emits camera-facing billboard quads into
-// two batched lists (alpha-blended + additive) drawn in one pass each by the
-// renderer's particle pass. Efficient by construction: pooled, one buffer.
+// Update() steps every ParticleEmitter through the VFX MODULE STACK (Source/Vfx):
+// the component's authored fields are compiled into an ordered list of small kernels
+// over a structure-of-arrays pool, once, and re-stamped in place every frame.
+// BuildVertices() then emits camera-facing billboard quads into two batched lists
+// (alpha-blended + additive), one draw each.
+//
+// BACKWARDS COMPATIBILITY IS THE POINT OF THE DEFAULT STACK. An emitter that nobody
+// has touched compiles to the four Legacy.* compatibility modules, which are verbatim
+// copies of the fixed loop this system used to run - same arithmetic, same order,
+// same RNG draws, same f32 spawn accumulator. So an already-authored scene simulates
+// bit-identically; only an artist ticking one of the new module flags changes
+// anything. CompatSelfTest() proves that against a frozen copy of the old loop.
+//
+// Allocation: the pool is a structure-of-arrays sized at stack-compile time and grown
+// geometrically at SPAWN time up to the authored maxParticles - never by per-particle
+// push_back the way the old pool was, and never inside an update kernel. Steady state
+// is zero allocations per frame, which is what the header used to claim and did not do.
+// The authored cap is a ceiling, not a commitment: an emitter authored at 200 000 max
+// that only ever holds 50 particles pays for 50.
 #pragma once
 
 #include "Core/Types.h"
@@ -53,6 +68,23 @@ void BuildVertices(Scene& scene, Renderer& renderer,
 // volumetric emitters are active and the caller should clear the volume.
 bool BuildVolumetricBlobs(Scene& scene, std::vector<rhi::VolumeBlob>& blobsOut,
                           rhi::VolumeParams& paramsOut);
+
+// Headless, GPU-free A/B proof that moving onto the module stack changed nothing.
+//
+// It runs a FROZEN copy of the pre-stack simulation loop (the oracle) and the live
+// module-stack path side by side over the same dt sequence, and compares position,
+// velocity, age, lifetime and rotation BIT-EXACTLY, particle for particle, for every
+// built-in template plus a parameter fuzz that exercises all six emit shapes, both
+// non-billboard render modes, bursts, non-looping windows, buoyancy/vortex roll and
+// emission on/off edges. Anything less than bit-exact is not a proof: a particle
+// system is chaotic, so a one-ulp difference in frame 1 is a visibly different effect
+// a second later.
+//
+// It also checks that the opt-in modules are genuinely opt-in (enabling none leaves
+// the hashes untouched) and that enabling one actually changes the result - a
+// compatibility test that passes because nothing is wired up would be worthless.
+// Returns true on pass; logs each sub-result. Wired to --test-vfxcompat.
+bool CompatSelfTest();
 
 } // namespace particle
 } // namespace hbe

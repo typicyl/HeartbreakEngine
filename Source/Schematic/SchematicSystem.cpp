@@ -9,6 +9,7 @@
 #include "Scene/Components.h"
 #include "Scene/FacialSystem.h"
 #include "Scene/Scene.h"
+#include "Scene/WorldState.h" // area visit counts + per-area vars (World nodes)
 #include "Schematic/Schematic.h"
 
 #include <glm/glm.hpp>
@@ -279,6 +280,17 @@ private:
                                                  static_cast<u32>(glm::max(0.0f, InF(n.id, 1, d)))));
             case NodeType::ItemCount:
                 return Value::Float(static_cast<f32>(game::ItemCount(EvalInput(n.id, 0, d).s)));
+            case NodeType::AreaVisitCount: {
+                const u32 visits =
+                    world::Get().VisitCount(world::ResolveArea(EvalInput(n.id, 0, d).s));
+                // Pin 1 "First Visit" is true DURING the first visit (visits == 1),
+                // which is what revisit scripting actually asks.
+                return outPin == 1 ? Value::Bool(visits <= 1)
+                                   : Value::Float(static_cast<f32>(visits));
+            }
+            case NodeType::GetAreaVar:
+                return Value::Float(world::Get().GetVar(world::ResolveArea(EvalInput(n.id, 0, d).s),
+                                                        EvalInput(n.id, 1, d).s));
             default: return {};
         }
     }
@@ -441,6 +453,11 @@ private:
                 Follow(n.id, 0, depth);
                 break;
             }
+            case NodeType::SetAreaVar:
+                world::Get().SetVar(world::ResolveArea(EvalInput(n.id, 1, 0).s),
+                                    EvalInput(n.id, 2, 0).s, InF(n.id, 3, 0));
+                Follow(n.id, 0, depth);
+                break;
             case NodeType::SetMusicState:
                 game::SetMusicState(EvalInput(n.id, 1, 0).s);
                 Follow(n.id, 0, depth);

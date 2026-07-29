@@ -19,12 +19,22 @@ class Camera;
 
 namespace cutscene {
 
+// Depth-of-field the camera track asks for at a given time. The player computes
+// it but does NOT apply it - the caller owns PostSettings and decides whether a
+// cutscene may drive focus (the editor preview does; a headless bake might not).
+struct FocusState {
+    bool valid = false;   // false = the cutscene has no camera track / no opinion
+    f32 distance = 0.0f;  // world units to the focus plane
+    f32 range = 3.0f;     // sharp band around it
+    f32 aperture = 0.0f;  // 0 = leave the scene's blur strength alone
+};
+
 // Apply the cutscene's POSE at absolute time t: the camera (only when
 // applyCamera and a camera track exists) and every animation track's transform
 // keyframes. Deterministic and idempotent - safe to drive from an editor
-// scrubber every frame.
+// scrubber every frame. `outFocus` (optional) receives the rack-focus state.
 void Evaluate(const CutsceneAsset& cs, f32 t, Scene& scene, Camera& camera,
-              bool applyCamera);
+              bool applyCamera, FocusState* outFocus = nullptr);
 
 // Fire the EVENTS whose time lies in the half-open interval [prev, t): skeletal
 // clip triggers (restart the target's Animator) and dialogue/voiceline markers

@@ -288,7 +288,104 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
             }
             i = runEnd;
         }
-        for (u32 i = visibleCount; i < itemCount; ++i) drawItems_[i].instanceRun = 1;
+        // The SHADOW-ONLY TAIL (culled from view, still casting) gets the same
+        // treatment. It used to stay unsorted singles, so a scene of repeated
+        // meshes - foliage, props, modular kit pieces, i.e. every real complex
+        // scene - submitted one shadow draw per instance per cascade. Sorting and
+        // run-building the tail is SAFE: the shadow<->scene index coupling only
+        // constrains indices < visibleCount, and DrawScene never reads the tail.
+        if (itemCount > visibleCount + 1) {
+            std::sort(drawItems_.begin() + visibleCount, drawItems_.begin() + itemCount,
+                      [](const rhi::DrawItem& a, const rhi::DrawItem& b) {
+                          return a.mesh.id < b.mesh.id;
+                      });
+        }
+        for (u32 i = visibleCount; i < itemCount;) {
+            drawItems_[i].instanceRun = 1;
+            if (!Instanceable(drawItems_[i])) {
+                ++i;
+                continue;
+            }
+            u32 runEnd = i + 1;
+            while (runEnd < itemCount && Instanceable(drawItems_[runEnd]) &&
+                   SameMaterial(drawItems_[i], drawItems_[runEnd]))
+                ++runEnd;
+            const u32 runLen = runEnd - i;
+            if (runLen > 1) {
+                drawItems_[i].instanceRun = runLen;
+                for (u32 j = i + 1; j < runEnd; ++j) drawItems_[j].instanceRun = 0;
+                ++stats_.instancedDraws;
+                stats_.totalInstances += runLen;
+            }
+            i = runEnd;
+        }
+
+        // --- Per-cascade shadow culling -------------------------------------
+        // The shadow pass gets the FULL list (off-screen casters still shadow),
+        // but it was re-rasterizing every caster into EVERY cascade: measured at
+        // 58% of total GPU time (5.6 of 9.7 ms at 2000 casters), and the cost
+        // barely moved with cascade count because the per-object constants are
+        // shared - so it is per-DRAW overhead, which is exactly what culling
+        // removes. A near cascade covers a tiny world volume; most casters cannot
+        // affect it.
+        //
+        // Correctness: each cascade's ortho near plane is already pulled back to
+        // the scene bounds in Scene::MakeView ("casters behind the slice still
+        // occlude"), so the frustum contains everything that could cast into the
+        // slice - a plain AABB test is conservative, not an approximation.
+        //
+        // Ordering: this runs AFTER the run-builder, because an instanced run head
+        // draws its whole run in one call and must therefore carry the UNION of
+        // its followers' masks.
+        stats_.shadowDraws = 0;
+        stats_.shadowCulled = 0;
+        if (view.shadowsEnabled && itemCount > 0) {
+            const u32 cascades = glm::min(view.cascadeCount, rhi::kMaxShadowCascades);
+            if (cascades == 0 || !cullingEnabled_) {
+                for (u32 i = 0; i < itemCount; ++i) drawItems_[i].cascadeMask = 0xFF;
+            } else {
+                std::vector<Frustum> cascadeFrusta;
+                cascadeFrusta.reserve(cascades);
+                for (u32 c = 0; c < cascades; ++c)
+                    cascadeFrusta.emplace_back(view.cascadeViewProj[c]);
+                const u8 allBits = static_cast<u8>((1u << cascades) - 1u);
+
+                for (u32 i = 0; i < itemCount; ++i) {
+                    rhi::DrawItem& it = drawItems_[i];
+                    if (it.instanceRun == 0) { it.cascadeMask = 0; continue; } // run follower
+                    if (it.materialFlags & rhi::MaterialFlag_NoShadow) {
+                        it.cascadeMask = 0;
+                        continue;
+                    }
+                    const auto bit = meshBounds_.find(it.mesh.id);
+                    // Skinned poses and unknown bounds are never culled: a bind-pose
+                    // AABB does not describe an animated mesh.
+                    if (it.boneCount > 0 || bit == meshBounds_.end()) {
+                        it.cascadeMask = allBits;
+                        stats_.shadowDraws += cascades;
+                        continue;
+                    }
+                    u8 mask = 0;
+                    const u32 runLen = glm::max(it.instanceRun, 1u);
+                    for (u32 k = 0; k < runLen; ++k) { // union over the instanced run
+                        glm::vec3 wc, we;
+                        WorldAabb(drawItems_[i + k].transform, bit->second.center,
+                                  bit->second.extent, wc, we);
+                        for (u32 c = 0; c < cascades; ++c) {
+                            const u8 b = static_cast<u8>(1u << c);
+                            if (mask & b) continue; // already needed
+                            if (cascadeFrusta[c].Intersects(wc, we)) mask |= b;
+                        }
+                        if (mask == allBits) break; // cannot narrow further
+                    }
+                    it.cascadeMask = mask;
+                    for (u32 c = 0; c < cascades; ++c) {
+                        if (mask & (1u << c)) ++stats_.shadowDraws;
+                        else ++stats_.shadowCulled;
+                    }
+                }
+            }
+        }
 
         // Particle billboards for this frame (drawn inside DrawScene's HDR pass).
         device_->SetParticles(particleAlpha_, particleAlphaCount_, particleAdd_,

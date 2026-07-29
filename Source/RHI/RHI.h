@@ -282,7 +282,12 @@ struct PostSettings {
     // sec) instead of recomputing every rendered frame - the hand-painted/stop-motion
     // look. Lower = slower/choppier; 0 = smooth/continuous (off). Drives a quantized
     // time step folded into the per-stroke seed (CPU-side).
-    f32 painterlyStrokeBoil = 8.0f;
+    // Default lowered 8 -> 3: at 8 the pattern re-rolled 8x a second, which reads as
+    // a fast shimmer rather than hand-painted stop-motion. Real stop-motion animation
+    // is shot on twos or threes (12 or 8 fps), and a PAINTED look wants slower still -
+    // each re-roll should register as a new brush pass, not a flicker. 2-4 is the
+    // usable range; 0 = smooth/continuous.
+    f32 painterlyStrokeBoil = 3.0f;
     // Optional area mask: confine the real brush strokes to a screen-space rect
     // (a "censor box"). Outside the rect only the Kuwahara base shows through.
     u32 painterlyStrokeMask = 0;       // 0 = strokes everywhere, 1 = only inside the rect
@@ -509,6 +514,20 @@ struct DrawItem {
     // scene passes must skip it). Same markers drive BOTH passes, so the
     // per-index shadow<->scene coupling becomes per-run and stays consistent.
     u32 instanceRun = 1;
+
+    // Per-cascade shadow visibility: bit c set = this item can affect cascade c.
+    // The shadow pass deliberately receives the FULL (unculled) item list, because
+    // an off-screen object still casts into the view - but that meant every caster
+    // was re-rasterized into EVERY cascade, which measured at 58% of all GPU time
+    // (5.6 ms of 9.7 ms at 2000 casters). A near cascade covers a tiny world
+    // volume, so most casters cannot possibly affect it.
+    // The Renderer fills this by testing each item's world AABB against each
+    // cascade's light frustum; that frustum's near plane is already pulled back to
+    // the scene bounds (Scene::MakeView), so the test is conservative - anything
+    // that could cast into the slice is inside it.
+    // 0xFF (all bits) = "affects every cascade", so an item the renderer never
+    // touches behaves exactly as before.
+    u8 cascadeMask = 0xFF;
 
     // Facial blendshapes: `morphTexture` is a bindless RGBA16F delta atlas
     // (width = vertex count, one ROW per morph target = xyz position delta). The VS

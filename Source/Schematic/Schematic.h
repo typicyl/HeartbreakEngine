@@ -110,6 +110,10 @@ enum class NodeType : u16 {
     // --- Facial / blendshapes (append-only) -----------------------------------
     SetMorphWeight,       // exec + Target(Entity) + Name(string) + Weight(float) -> exec
     PlayFacialExpression, // exec + Target(Entity) + Preset(string) + Weight(float) -> exec
+    // --- World state / revisits (append-only) ---------------------------------
+    AreaVisitCount,  // Area(string; ""=current) -> Count(float) + FirstVisit(bool) (pure)
+    GetAreaVar,      // Area(string) + Name(string) -> Value(float)  (pure)
+    SetAreaVar,      // exec + Area(string) + Name(string) + Value(float) -> exec
     Count
 };
 

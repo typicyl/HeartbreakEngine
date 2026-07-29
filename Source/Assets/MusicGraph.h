@@ -32,11 +32,31 @@ struct MusicLayer {
     f32 paramHi = 1.0f;         // fully in here
 };
 
+// When a queued state change is allowed to actually happen. Switching the instant
+// gameplay asks lands mid-phrase and sounds like a mistake; waiting for the next
+// musical boundary is what makes an adaptive score feel composed rather than
+// switched. Serialized - append only.
+enum class MusicSync : u8 {
+    Immediate = 0, // switch on the spot (stingers, hard cuts, deaths)
+    Beat,          // wait for the next beat
+    Bar,           // wait for the next bar (the usual choice)
+    TwoBars,
+    FourBars,      // phrase-level; the most musical, the least responsive
+};
+
+const char* SyncName(MusicSync s);
+// The sync interval in seconds for a state's tempo. Immediate returns 0.
+f32 SyncInterval(MusicSync s, f32 bpm, int beatsPerBar);
+
 // A music section: layers that loop together; entering the state crossfades them in.
 struct MusicState {
     std::string name = "State";
-    f32 bpm = 120.0f;           // metadata (future beat-quantized transitions)
+    f32 bpm = 120.0f;           // drives beat/bar-quantized transitions
     int beatsPerBar = 4;
+    // When LEAVING this state, wait for this musical boundary before the switch.
+    // The outgoing state owns the rule because the boundary being waited for is
+    // the one currently playing.
+    MusicSync sync = MusicSync::Immediate;
     std::vector<MusicLayer> layers;
 };
 
@@ -51,6 +71,12 @@ struct MusicParameter {
 struct MusicGraph {
     f32 defaultFade = 2.0f;            // crossfade seconds between states
     std::string initialState;         // state played when the game starts
+    // Dialogue ducking: while a voice line plays, the music bus drops by this many
+    // dB so speech stays intelligible without the player reaching for the mixer.
+    // 0 = off. Standard practice in any game with spoken dialogue.
+    f32 duckDecibels = 0.0f;
+    f32 duckAttack = 0.15f;   // seconds to duck down (fast: speech starts abruptly)
+    f32 duckRelease = 0.60f;  // seconds to come back up (slow: avoids pumping)
     std::vector<MusicParameter> parameters;
     std::vector<MusicState> states;
 

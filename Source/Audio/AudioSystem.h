@@ -12,6 +12,7 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "UI/Subtitles.h" // structured caption lines (speaker / text / kind)
 
 #include <glm/glm.hpp>
 
@@ -51,11 +52,15 @@ public:
     void SetBusMuted(const std::string& bus, bool muted);
     bool BusMuted(const std::string& bus) const;
 
-    // Closed captions: when enabled, starting playback of an audio asset that carries
-    // a caption enqueues its text; the engine drains it (PopCaption) to an on-screen
-    // caption element. No-op / nothing enqueued when disabled.
+    // Subtitles / closed captions: starting playback of an audio asset that carries
+    // a caption enqueues a STRUCTURED subtitle::Line (speaker + text + kind mapped
+    // from uaf::AudioKind), which the engine drains into the one subtitle stack.
+    // Keeping the parts separate here is what lets the engine gate speech and
+    // non-speech independently and format each correctly - the queue used to hold
+    // pre-joined "Speaker: text" strings, which threw that information away.
+    // Nothing is enqueued while captions are globally disabled.
     void SetCaptionsEnabled(bool on);
-    bool PopCaption(std::string& out); // FIFO; returns false when the queue is empty
+    bool PopCaption(subtitle::Line& out); // FIFO; false when the queue is empty
 
     // Active playback device description for boot/diagnostics UI (device name +
     // sample rate, e.g. "Speakers (Realtek) - 48000 Hz"). "No audio device" when
@@ -127,6 +132,17 @@ public:
     std::string CurrentMusicState() const; // "" when stopped
     std::vector<std::string> MusicStateNames() const; // states in the installed graph
     bool HasMusicGraph() const;
+    // Dialogue ducking: while true, the music layers are pulled down by the
+    // graph's duckDecibels (attack/release smoothed) so speech stays intelligible.
+    // The engine sets this from "is a conversation or voiceline playing"; the
+    // duck multiplies each layer's own gain, so it composes with parameter fades.
+    // No-op when the graph's duckDecibels is 0.
+    void SetMusicDucking(bool active);
+
+    // A state change waiting on a musical boundary (beat/bar quantized). Returns
+    // false when nothing is queued. Editor/diagnostics use it to show the wait.
+    bool MusicTransitionPending(std::string& outState, f32& outSeconds) const;
+
     // One-shot musical accent over the current music (fire-and-forget on `bus`).
     void PostStinger(const std::filesystem::path& uafPath, const std::string& bus = "Music",
                      f32 volume = 1.0f);

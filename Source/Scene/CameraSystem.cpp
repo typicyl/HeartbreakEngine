@@ -17,13 +17,12 @@ namespace {
 constexpr f32 kDeg2Rad = 0.01745329252f;
 constexpr f32 kRad2Deg = 57.2957795131f;
 
+// Scene keeps a hashed name index; this used to be a full linear scan with a
+// string compare per entity, run several times PER FRAME from Update (follow
+// target, zone track, zone camera, spline), so camera cost scaled with total
+// scene size for no reason.
 entt::entity FindByName(const Scene& scene, const std::string& name) {
-    if (name.empty()) return entt::null;
-    const auto& reg = scene.Registry();
-    for (const entt::entity e : reg.view<const Name>()) {
-        if (reg.get<const Name>(e).value == name) return e;
-    }
-    return entt::null;
+    return scene.FindByName(name);
 }
 
 // View direction from a yaw (around +Y, 0 = -Z) and a downward pitch in degrees
@@ -165,13 +164,19 @@ void OverlayAuthored(CameraComponent& dst, const CameraComponent& src) {
     dst.collide = src.collide;
     dst.collisionMinDistance = src.collisionMinDistance;
     dst.collisionPadding = src.collisionPadding;
+    dst.collisionReturnSpeed = src.collisionReturnSpeed;
+    // The cinematic rig is authored data like everything else here, so a zone can
+    // hand a region its own handheld/framing look.
+    dst.cinematic = src.cinematic;
     // NOT copied: primary, lookYaw/lookPitch/lookInit, orbitAngle, splineT.
 }
 
 } // namespace
 
+void AddShake(CameraState& state, f32 trauma) { cam::AddShake(state.cinematic, trauma); }
+
 bool Update(Scene& scene, Camera& camera, CameraState& state, f32 dt, const Input& input,
-            const RaycastFn& raycast) {
+            const RaycastFn& raycast, f32 aspect) {
     auto& reg = scene.Registry();
 
     // Find the primary (or any) camera entity.
@@ -311,9 +316,27 @@ bool Update(Scene& scene, Camera& camera, CameraState& state, f32 dt, const Inpu
             const glm::vec3 dir = boom / dist;
             const f32 pad = glm::max(cam.collisionPadding, 0.0f);
             const f32 hit = raycast(pivot, dir, dist + pad);
-            const f32 d = glm::clamp(hit - pad, cam.collisionMinDistance, dist);
-            pos = pivot + dir * d;
+            const f32 wanted = glm::clamp(hit - pad, cam.collisionMinDistance, dist);
+            // ASYMMETRIC easing: pull IN immediately (any delay puts the camera
+            // inside the wall for those frames), but ease back OUT at a bounded
+            // speed so clearing a corner doesn't snap the shot to full boom in one
+            // frame. This is the difference between "functional" and "shot".
+            f32 applied = wanted;
+            if (state.valid && state.collisionBoom >= 0.0f) {
+                if (wanted > state.collisionBoom) {
+                    const f32 rate = glm::max(cam.collisionReturnSpeed, 0.0f);
+                    applied = rate <= 0.0f
+                                  ? wanted // 0 = legacy instant return
+                                  : glm::min(wanted, state.collisionBoom + rate * dt);
+                }
+            }
+            state.collisionBoom = applied;
+            pos = pivot + dir * applied;
+        } else {
+            state.collisionBoom = -1.0f;
         }
+    } else {
+        state.collisionBoom = -1.0f; // no constraint active; re-arm on next collide
     }
 
     // --- Rotation mode overrides the aim -------------------------------------
@@ -364,9 +387,21 @@ bool Update(Scene& scene, Camera& camera, CameraState& state, f32 dt, const Inpu
     state.up = worldUp;
     state.valid = true;
 
+    // --- Cinematic rig -------------------------------------------------------
+    // Applied AFTER damping, on the settled pose: handheld wander, breathing,
+    // impulse shake and compositional framing. Damping the rig's own noise would
+    // just low-pass it back out, which is why this is the last step and does not
+    // write back into `state.position/forward` (the smoother must keep tracking
+    // the clean pose, or the noise would integrate and drift).
+    CinematicPose pose;
+    pose.position = state.position;
+    pose.forward = state.forward;
+    pose.up = state.up;
+    Apply(pose, state.cinematic, cam.cinematic, dt, pivot, hasTarget, state.fovY, aspect);
+
     camera.SetFovY(state.fovY);
     camera.SetClipPlanes(glm::max(cam.nearZ, 0.001f), glm::max(cam.farZ, cam.nearZ + 0.01f));
-    camera.LookAt(state.position, state.position + state.forward, state.up);
+    camera.LookAt(pose.position, pose.position + pose.forward, pose.up);
 
     // Persist this frame's runtime state back to the base camera (eff is a copy),
     // so look/orbit/spline progress survive across zone overrides.

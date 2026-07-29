@@ -1,6 +1,7 @@
 // Editor/Importer.cpp
 #include "Editor/Importer.h"
 
+#include "Assets/AssetFormats.h" // the single source of truth for source formats
 #include "Assets/MaterialAsset.h"
 #include "Assets/ModelLoader.h"
 #include "Assets/UAF.h"
@@ -32,21 +33,15 @@ u64 GenGuid() {
     return rng();
 }
 
-std::string LowerExt(const fs::path& p) {
-    std::string e = p.extension().string();
-    std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return std::tolower(c); });
-    return e;
-}
+// All four category tests defer to the registry (Assets/AssetFormats.cpp), which
+// is also what the editor's Import dialog builds its filter from - so the dialog
+// can no longer offer a different set of formats than the importer accepts.
+std::string LowerExt(const fs::path& p) { return assets::NormalizeExtension(p); }
 
-bool IsImage(const std::string& e) {
-    return e == ".png" || e == ".jpg" || e == ".jpeg" || e == ".tga" || e == ".bmp" ||
-           e == ".psd" || e == ".gif" || e == ".hdr";
-}
-bool IsModel(const std::string& e) {
-    return e == ".gltf" || e == ".glb" || e == ".obj" || e == ".fbx" || e == ".dae" || e == ".ply";
-}
-bool IsAudio(const std::string& e) { return e == ".wav" || e == ".mp3" || e == ".flac"; }
-bool IsFont(const std::string& e) { return e == ".ttf" || e == ".otf"; }
+bool IsImage(const std::string& e) { return assets::IsSourceKind(e, assets::SourceKind::Image); }
+bool IsModel(const std::string& e) { return assets::IsSourceKind(e, assets::SourceKind::Model); }
+bool IsAudio(const std::string& e) { return assets::IsSourceKind(e, assets::SourceKind::Audio); }
+bool IsFont(const std::string& e)  { return assets::IsSourceKind(e, assets::SourceKind::Font); }
 
 // Fonts are stored verbatim (the engine bakes atlases at load time).
 bool ImportFont(const fs::path& src, const fs::path& out) {

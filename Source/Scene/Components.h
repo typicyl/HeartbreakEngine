@@ -3,8 +3,11 @@
 
 #include "Core/Types.h"
 #include "RHI/RHI.h"
+#include "Scene/CameraRig.h"   // cam::CinematicSettings (CameraComponent cinematic rig)
 #include "Scene/PaintSystem.h" // paint::Stroke (PaintComponent stroke database)
 #include "Schematic/Schematic.h" // schematic::Value (SchematicComponent blackboard)
+#include "Vfx/VfxLegacy.h"       // vfx::LegacyParams (ParticleEmitter compat block)
+#include "Vfx/VfxStack.h"        // vfx::CompiledStack / ParticleSoA (ParticleEmitter pool)
 
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
@@ -42,10 +45,17 @@ struct Parent {
 // hidden setup survives reloads; the runtime ignores it (see Scene::SetEditorView).
 struct EditorHidden {};
 
-// CPU-simulated, GPU-billboarded particle emitter. Particles are pooled (no
-// per-frame allocation) and drawn as camera-facing quads in one batched pass per
-// blend mode (see Scene/ParticleSystem + the renderer's particle pass). Authored
-// params are serialized; the live pool is runtime-only.
+// CPU-simulated, GPU-billboarded particle emitter, simulated by the VFX module stack
+// (Source/Vfx). Drawn as camera-facing quads in one batched pass per blend mode (see
+// Scene/ParticleSystem + the renderer's particle pass). Authored params are
+// serialized; the pool, the compiled stack and the emitter clocks are runtime-only.
+//
+// The fields below are the AUTHORED surface, unchanged from before the module stack.
+// They are not simulation state any more - Scene/ParticleSystem.cpp compiles them
+// into a module stack whose default shape is the four Legacy.* compatibility modules,
+// which reproduce the old fixed loop bit-exactly. The `use*` / `simulate*` flags at
+// the bottom are the opt-ins that swap a legacy module for a real one; every one of
+// them defaults to the value that keeps an already-authored emitter identical.
 struct ParticleEmitter {
     // Emission
     f32 rate = 24.0f;          // particles/second (continuous)
@@ -118,24 +128,44 @@ struct ParticleEmitter {
     i32 volResolution = 96;      // volume voxel dim (quality knob; 64 = low-end)
     f32 volDetail = 0.6f;        // procedural noise detail: 0 = raw blobs, 1 = heavy wisps
 
+    // --- Module-stack opt-ins (serialized; defaults == the pre-stack simulation) ---
+    // Each flag swaps one compatibility module for a real one. They are OFF by
+    // default and every absent key in an old scene therefore parses to the legacy
+    // behaviour - which is the whole reason they are flags and not replacements.
+
+    // Update.CurlNoiseForce: the curl of a sinusoidal potential, so it is EXACTLY
+    // divergence-free and particles swirl instead of piling into sinks. The legacy
+    // `turbulence` field is a raw sin/cos triple with non-zero divergence, which is
+    // why it visibly clumps. Both can run at once (curl is applied after the legacy
+    // forces and before drag).
+    bool useCurlNoise = false;
+    f32 curlStrength = 1.0f;
+    f32 curlFrequency = 0.9f;
+    // Update.Drag: exp(-drag*dt), the exact solution of dv/dt = -drag*v, replacing the
+    // legacy max(0, 1 - drag*dt). Identical at 30/60/144 Hz, where the legacy form is
+    // framerate-dependent and saturates to a dead stop once drag*dt >= 1 (reachable on
+    // a hitch at high drag). Reuses the same `drag` value.
+    bool expDrag = false;
+    // Update.ColorOverLife / SizeOverLife: promote colour and size from render-time
+    // curve evaluation to real per-particle ATTRIBUTES. With variance 0 the result is
+    // identical to the renderer-side ramp; above 0 each particle gets its own stable
+    // scale, which the render-time curve could not express at all.
+    bool simulateColor = false;
+    f32 colorVariance = 0.0f; // 0..1 per-particle brightness spread
+    bool simulateSize = false;
+    f32 sizeVariance = 0.0f;  // 0..1 per-particle size spread
+
     // --- runtime (NOT serialized) ---
-    struct Particle {
-        glm::vec3 pos{0.0f};
-        glm::vec3 vel{0.0f};
-        f32 age = 0.0f;
-        f32 life = 1.0f;
-        f32 rot = 0.0f;
-        f32 seed = 0.0f;
-    };
-    std::vector<Particle> pool;     // live particles
-    f32 spawnAccum = 0.0f;          // fractional spawn carry
-    u32 rngState = 0x1234567u;      // per-emitter PRNG
-    u32 textureCache = 0;           // resolved bindless index
+    // Structure-of-arrays pool, sized when the stack is compiled and grown
+    // geometrically at spawn time up to `maxParticles` - the old pool was a per-emitter
+    // std::vector<Particle> grown by bare push_back on every single spawn.
+    vfx::ParticleSoA pool;
+    vfx::CompiledStack stack;   // recompiled only when the module SET or cap changes
+    vfx::EmitterState state;    // clocks, spawn carry, emitter RNG, burst/emit edges
+    vfx::LegacyParams legacy;   // rebuilt each frame; reaches kernels via ParticleView::user
+    u64 stackSignature = 0;     // structural hash; 0 == never compiled
+    u32 textureCache = 0;       // resolved bindless index
     bool textureResolved = false;
-    f32 simTime = 0.0f;             // ever-accumulating time (turbulence phase)
-    f32 activeAge = 0.0f;           // time since emission (re)started (duration gate)
-    bool bursted = false;           // one-shot burst already fired this activation
-    bool wasEmitting = false;       // edge-detect emission restart
 };
 
 // Renders a GPU mesh with a metallic-roughness material.
@@ -499,6 +529,16 @@ struct CameraComponent {
     bool collide = true;
     f32  collisionMinDistance = 0.6f;    // never pull closer than this
     f32  collisionPadding = 0.25f;       // keep the camera this far off the hit
+    // How fast the boom RETURNS after a collision clears. Pulling in must be
+    // instant (or the camera punches through the wall for a few frames), but
+    // easing back out is what stops the shot snapping when the player rounds a
+    // corner. 0 = the old instant behaviour.
+    f32  collisionReturnSpeed = 6.0f;    // metres/second the boom extends back out
+
+    // Cinematic rig (handheld / breathing / framing). Authored per camera and
+    // overridable by a camera zone, like every other value here. All-zero
+    // amplitudes make it an exact no-op. See Scene/CameraRig.h.
+    cam::CinematicSettings cinematic;
 
     // Runtime state (advanced by cam::Update while the camera is live; not
     // meaningfully serialized beyond their authored start values).
@@ -1455,6 +1495,53 @@ struct FacialAnimator {
     u32 rng = 0;             // per-entity PRNG (seeded from entity id)
     bool seeded = false;
     std::vector<std::string> driven; // channels written last frame (cleared when idle)
+};
+
+// A pre-fractured breakable object (a `.hbfrac`, see Assets/Fracture.h).
+//
+// COST MODEL - the reason this is worth having at all: while INTACT the object is
+// exactly one draw and one static body, identical to any other prop. The chunks are
+// DATA (indices into the fracture asset), not entities. Only when something actually
+// breaks it do chunk entities get created, and only for the chunks that come loose.
+// A level can therefore be full of breakables at no cost until the player touches
+// them.
+struct Destructible {
+    std::string asset;               // `.hbfrac` path relative to Assets/
+    f32 impulseThreshold = 12.0f;    // contact impulse (kg*m/s) that starts a break
+    f32 chunkHealth = 12.0f;         // hp per chunk before it comes loose
+    f32 damageRadius = 0.6f;         // world radius one damage hit spreads over
+    f32 breakImpulseScale = 1.0f;    // multiplier on the impulse handed to freed chunks
+    f32 debrisLifetime = 12.0f;      // seconds a freed chunk lives (0 = forever)
+    f32 density = 1000.0f;           // kg/m^3; chunk mass = volume * density
+    bool structural = true;          // re-run the support flood fill after each break
+    std::string breakEvent;          // audio/particle tag fired per break ("" = none)
+
+    // --- runtime -------------------------------------------------------------
+    // Loose = still in place but no longer welded; Detached = a live physics body.
+    enum class ChunkState : u8 { Intact = 0, Loose = 1, Detached = 2 };
+    bool activated = false;          // chunk entities exist; the root mesh is hidden
+    bool structureDirty = false;     // a break happened; the support pass is owed
+    std::vector<u8> chunkState;      // ChunkState per chunk
+    std::vector<f32> chunkHp;
+    std::vector<entt::entity> chunkEntity; // entt::null until that chunk detaches
+    std::vector<u8> supportScratch;  // flood-fill visited buffer, reused (no per-break alloc)
+};
+
+// One live chunk. Runtime-generated, never authored and never serialized - the
+// serializer skips these the way it already skips TerrainChunk / SkinnedPartRef,
+// because they are rebuilt from the Destructible's state.
+struct DebrisChunk {
+    entt::entity owner = entt::null;
+    u32 index = 0;
+    f32 age = 0.0f;
+    // Impulse owed to this chunk. PhysicsWorld creates bodies LAZILY during its own
+    // Update, so at the moment a chunk detaches it has no body yet and an impulse
+    // applied then is silently dropped - the chunk would just sag instead of being
+    // thrown. The push is parked here and applied on a later tick, once the body
+    // exists. hasImpulse guards against re-applying it every frame.
+    glm::vec3 pendingImpulse{0.0f};
+    glm::vec3 pendingPoint{0.0f};
+    bool hasImpulse = false;
 };
 
 } // namespace hbe

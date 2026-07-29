@@ -164,6 +164,18 @@ std::array<NodeDesc, static_cast<usize>(NodeType::Count)> BuildCatalog() {
                                          {EXEC, {"Target", P::Entity}, {"Preset", P::String},
                                           {"Weight", P::Float}},
                                          {EXEC}});
+    // World state: "has the player been here before" and per-area variables. An
+    // empty Area string means the area currently loaded.
+    set(NodeType::AreaVisitCount, {"Area Visit Count", "World",
+                                   {{"Area", P::String}},
+                                   {{"Count", P::Float}, {"First Visit", P::Bool}}});
+    set(NodeType::GetAreaVar, {"Get Area Var", "World",
+                               {{"Area", P::String}, {"Name", P::String}},
+                               {{"Value", P::Float}}});
+    set(NodeType::SetAreaVar, {"Set Area Var", "World",
+                               {EXEC, {"Area", P::String}, {"Name", P::String},
+                                {"Value", P::Float}},
+                               {EXEC}});
     return c;
 }
 } // namespace

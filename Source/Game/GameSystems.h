@@ -88,6 +88,25 @@ bool ConsumeStinger(std::string& outAsset);
 void PlayVoiceline(const std::string& asset);
 bool ConsumeVoiceline(std::string& outAsset);
 
+// --- Standalone subtitles (deferred) ----------------------------------------
+// A line with no audio behind it (cutscene narration, a translated sign). Goes
+// through the engine's ONE subtitle stack, so it is formatted and gated exactly
+// like a spoken dialogue line.
+struct SubtitleReq {
+    std::string speaker;
+    std::string text;
+    f32 duration = 0.0f; // 0 = auto from length
+};
+void QueueSubtitle(const std::string& speaker, const std::string& text, f32 duration = 0.0f);
+bool ConsumeSubtitle(SubtitleReq& out); // FIFO
+
+// --- Camera shake (deferred) -------------------------------------------------
+// Impulse trauma (0..1) for the live camera rig: explosions, impacts, a cutscene
+// shake marker. Accumulates within a frame; the engine drains it into the camera
+// state, so gameplay and cutscene shakes go through one path.
+void QueueCameraShake(f32 trauma);
+bool ConsumeCameraShake(f32& outTrauma); // true once per frame when non-zero
+
 // --- Dialogue (deferred; a `.hbdialogue` sequence) --------------------------
 // A schematic starts a conversation; the engine loads it and runs the lines
 // over time (each shows its caption + plays its clip). Latest request wins.

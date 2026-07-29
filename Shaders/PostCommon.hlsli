@@ -35,9 +35,28 @@ cbuffer PostConstants : register(b1)
 // D3D12: static sampler s1. Vulkan: immutable sampler at set 0 binding 2.
 [[vk::binding(2, 0)]] SamplerState gClampSampler : register(s1, space0);
 
+// Bindless sample for POST passes.
+//
+// Deliberately WITHOUT NonUniformResourceIndex: every index a post pass uses
+// (gInput0..gInput3) comes from the PostConstants cbuffer, so it is identical
+// for every lane in the wave - uniform by construction, not by luck. The
+// qualifier is therefore semantically unnecessary here, and on Vulkan it lowers
+// to nonuniformEXT which can make a driver emit a per-wave waterfall loop.
+//
+// HONEST MEASUREMENT NOTE: removing it was NOT the fix for the Vulkan painterly
+// gap, despite being a plausible suspect. Measured on the real game scene over
+// 3 runs, the anisotropic-Kuwahara pass is ~0.95 ms on D3D12 and ~2.1-2.9 ms on
+// Vulkan BOTH BEFORE AND AFTER this change. The remaining cause is SPIR-V
+// codegen for that shader specifically (prime suspect: register pressure from
+// its four 8-element sector accumulators hurting occupancy), which needs a
+// shader profiler (Nsight) to confirm. This change is kept because it is
+// correct and free, not because it bought a measurable win.
+//
+// If a post pass ever needs a per-pixel VARYING bindless index, it must use its
+// own explicitly non-uniform sampler - do not add the qualifier back here.
 float4 SamplePost(uint index, float2 uv)
 {
-    return gTextures[NonUniformResourceIndex(index)].SampleLevel(gClampSampler, uv, 0.0f);
+    return gTextures[index].SampleLevel(gClampSampler, uv, 0.0f);
 }
 
 struct FSOutput

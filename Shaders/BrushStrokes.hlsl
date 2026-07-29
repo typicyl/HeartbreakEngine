@@ -79,6 +79,13 @@ float3 WorldFromDepth(float2 uv, float depth) {
     return w.xyz / w.w;
 }
 
+// A/B switch for the vertex-side coverage cull + conditional flow Sobel. 1 = the
+// optimised path (default). Set to 0 to measure the pre-optimisation cost with an
+// otherwise identical build - the only honest way to attribute a saving.
+#ifndef HBE_STROKE_CULL
+#define HBE_STROKE_CULL 1
+#endif
+
 struct VSOut {
     float4 pos : SV_Position;
     float2 luv : TEXCOORD0; // local quad uv 0..1 (x along stroke, y across)
@@ -165,6 +172,36 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     }
     const float2 uv = centerPx * gOutTexel;
 
+    // --- EARLY COVERAGE CULL -------------------------------------------------
+    // Everything below this point costs ~16 texture fetches per vertex (a 5-tap
+    // colour average, a 9-tap Sobel, and two silhouette depth taps), and the VS
+    // runs SIX TIMES per stroke - once per quad vertex - even though all of that
+    // work depends only on SV_InstanceID.
+    //
+    // The coverage test used to live only in the pixel shader, so a stroke outside
+    // the paint area paid the whole VS cost six times and was then discarded. With
+    // "real brush strokes" OFF the coverage box is EMPTY, which meant every stroke
+    // on screen did that: the pass was near its full cost while drawing nothing.
+    //
+    // Testing coverage HERE, off the one depth sample already taken, collapses a
+    // culled stroke to a degenerate triangle before any of that work happens.
+    // The PS test stays (it is per-pixel and does the soft edges); this is a
+    // conservative early-out, so the visual result is unchanged.
+    {
+        const bool inBox = uv.x >= gPostParams3.x && uv.x <= gPostParams3.z &&
+                           uv.y >= gPostParams3.y && uv.y <= gPostParams3.w;
+        // A censored stroke is always kept: censors paint even when the global box
+        // is empty (that is the censor-only mode).
+        if (HBE_STROKE_CULL && !inBox && !inCensor) {
+            VSOut culled;
+            culled.pos = float4(0.0f, 0.0f, 0.0f, 0.0f); // w=0 -> degenerate, clipped
+            culled.luv = float2(0.0f, 0.0f);
+            culled.col = float3(0.0f, 0.0f, 0.0f);
+            culled.rnd = float2(0.0f, 0.0f);
+            return culled;
+        }
+    }
+
     // Average the stroke colour over a small area at the stroke scale (a 5-tap cross)
     // rather than a single point. A fixed-position stroke that point-samples the scene
     // flickers frame-to-frame because the scene under it changes fast - specular
@@ -179,21 +216,31 @@ VSOut VSMain(uint vid : SV_VertexID, uint iid : SV_InstanceID) {
     c *= 0.2f;
 
     // --- flow orientation: Sobel on luma at stroke scale -> structure tensor --
-    const float es = max(lenPx * 0.18f, 1.5f);
-    float l[9];
-    int k = 0;
-    [unroll] for (int sy = -1; sy <= 1; ++sy)
-        [unroll] for (int sx = -1; sx <= 1; ++sx)
-            l[k++] = Luma(FetchHDR(gInput0, uv + float2(sx, sy) * es * d));
-    const float gx = (l[2] + 2.0f * l[5] + l[8]) - (l[0] + 2.0f * l[3] + l[6]);
-    const float gy = (l[6] + 2.0f * l[7] + l[8]) - (l[0] + 2.0f * l[1] + l[2]);
-    const float gmag = sqrt(gx * gx + gy * gy);
-    const float phi = 0.5f * atan2(2.0f * gx * gy, gx * gx - gy * gy); // gradient dir
-    // Strokes run ALONG the edge (perp to gradient). In flat regions the gradient
-    // is meaningless, so blend toward a random angle (scatter) by flow strength.
-    const float edgeAng = phi + 1.5707963f;
+    // Nine texture fetches, and BOTH of the cases below discard the result:
+    //   * a censored stroke uses randAng outright (see `ang` assignment), and
+    //   * flowStr == 0 makes `oriented` zero, so the lerp returns randAng anyway.
+    // Computing it regardless was ~9 wasted fetches per vertex (54 per stroke) in
+    // exactly the censor-only configuration this feature ships in.
     const float randAng = (Hash21(hk + 3.7f) * 2.0f - 1.0f) * kPI;
-    const float oriented = saturate(gmag * flowStr * 6.0f);
+    const bool needFlow = (!HBE_STROKE_CULL) || (!inCensor && flowStr > 0.0f);
+    float edgeAng = randAng;
+    float oriented = 0.0f;
+    if (needFlow) {
+        const float es = max(lenPx * 0.18f, 1.5f);
+        float l[9];
+        int k = 0;
+        [unroll] for (int sy = -1; sy <= 1; ++sy)
+            [unroll] for (int sx = -1; sx <= 1; ++sx)
+                l[k++] = Luma(FetchHDR(gInput0, uv + float2(sx, sy) * es * d));
+        const float gx = (l[2] + 2.0f * l[5] + l[8]) - (l[0] + 2.0f * l[3] + l[6]);
+        const float gy = (l[6] + 2.0f * l[7] + l[8]) - (l[0] + 2.0f * l[1] + l[2]);
+        const float gmag = sqrt(gx * gx + gy * gy);
+        const float phi = 0.5f * atan2(2.0f * gx * gy, gx * gx - gy * gy); // gradient dir
+        // Strokes run ALONG the edge (perp to gradient). In flat regions the
+        // gradient is meaningless, so blend toward a random angle by flow strength.
+        edgeAng = phi + 1.5707963f;
+        oriented = saturate(gmag * flowStr * 6.0f);
+    }
     // Censored strokes use a BOIL-STABLE orientation (random per object-cell, keyed off
     // the time-quantized seed) instead of the live image-gradient angle. The live angle
     // is recomputed every frame, so it re-orients continuously as the camera orbits =

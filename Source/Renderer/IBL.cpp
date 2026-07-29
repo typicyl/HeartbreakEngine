@@ -14,6 +14,7 @@
 #include "Assets/Mesh.h"
 #include "Assets/MeshGenerator.h"
 #include "Assets/UAF.h"
+#include "Assets/VFS.h"
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
 #include "Scene/Components.h"
@@ -25,7 +26,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -1001,25 +1004,34 @@ GiVolume BakeGIVolume(Renderer& renderer, const Scene& scene,
 GiVolume LoadGIVolume(Renderer& renderer, const std::filesystem::path& path) {
     GiVolume vol;
     if (!renderer.SupportsScene()) return vol;
-    std::ifstream f{path, std::ios::binary};
-    if (!f) return vol;
+    // Pack-aware: a shipped build serves .hbgi from the mounted packs, not disk.
+    // This was a raw ifstream, so baked GI silently vanished in shipped builds
+    // (the scene fell back to sky-only ambient with no warning).
+    const std::optional<std::vector<u8>> bytes = vfs::ReadFile(path);
+    if (!bytes) return vol;
+    usize cursor = 0;
+    bool truncated = false;
     const auto rd = [&](void* p, usize n) {
-        f.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(n));
+        if (cursor + n > bytes->size()) { truncated = true; return; }
+        std::memcpy(p, bytes->data() + cursor, n);
+        cursor += n;
     };
     u32 magic = 0, ver = 0;
     rd(&magic, 4); rd(&ver, 4);
-    if (magic != 0x56494748u) return vol;
+    if (truncated || magic != 0x56494748u) return vol;
     glm::ivec3 dims(0);
     glm::vec3 origin(0.0f);
     f32 spacing = 1.0f;
     rd(&dims.x, 4); rd(&dims.y, 4); rd(&dims.z, 4);
     rd(&origin.x, 12); rd(&spacing, 4);
+    if (truncated) return vol;
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) return vol;
     const usize cells = static_cast<usize>(dims.x) * dims.y * dims.z;
     if (cells == 0 || cells > 1'000'000) return vol; // sanity
     std::vector<glm::vec4> atlas(4 * cells), depthAtlas(64 * cells);
     rd(atlas.data(), atlas.size() * sizeof(glm::vec4));
     rd(depthAtlas.data(), depthAtlas.size() * sizeof(glm::vec4));
-    if (!f) return vol;
+    if (truncated) return vol;
     {
         rhi::TextureDesc d;
         d.width = 4; d.height = static_cast<u32>(cells);

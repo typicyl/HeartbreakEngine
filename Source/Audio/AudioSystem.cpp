@@ -227,9 +227,57 @@ struct AudioSystem::Impl {
     f32 musicFade = 2.0f;       // active crossfade seconds
     bool musicHasGraph = false;
 
-    // Closed captions: pending texts enqueued when a captioned sound starts.
+    // --- Musical clock + deferred (quantized) transitions --------------------
+    // A state switch requested mid-phrase sounds like a mistake. The clock runs
+    // from the moment the current state started, and a request whose outgoing
+    // state has a sync rule waits here until the next beat/bar boundary.
+    f32 musicClock = 0.0f;          // seconds since the current state started
+    bool musicPendingValid = false;
+    std::string musicPendingState;  // "" with musicPendingValid = a deferred Stop
+    f32 musicPendingFade = -1.0f;
+    f32 musicPendingAt = 0.0f;      // musicClock value to switch at
+    // Set while UpdateMusic fires a due transition, so the PlayMusicState /
+    // StopMusic call it makes performs the switch instead of re-deferring it
+    // against the very boundary that just elapsed (which would never resolve).
+    bool musicForceImmediate = false;
+
+    // --- Dialogue ducking ----------------------------------------------------
+    // While speech plays, the music layers drop by duckDecibels so the line stays
+    // intelligible. `duckTarget` is set from outside each frame; `duckGain` is the
+    // smoothed multiplier actually applied on top of every layer's own gain.
+    bool duckActive = false;
+    f32 duckGain = 1.0f;
+
+    // Linear gain for the graph's duck depth (0 dB = 1.0, no change).
+    f32 DuckFloor() const {
+        if (musicGraph.duckDecibels <= 0.0f) return 1.0f;
+        return std::pow(10.0f, -musicGraph.duckDecibels / 20.0f);
+    }
+
+    // Subtitles / closed captions: structured lines enqueued when a captioned
+    // sound starts. The engine drains these into its subtitle::Stack, which does
+    // the per-kind gating and formatting.
     bool captionsEnabled = false;
-    std::deque<std::string> captions;
+    std::deque<subtitle::Line> captions;
+
+    // Builds the subtitle line for a .uaf that carries a caption, mapping the
+    // asset's AudioKind onto the subtitle kind so speech and non-speech stay
+    // distinguishable all the way to the screen. Returns false when the asset has
+    // no caption (the common case for UI/SFX clips).
+    bool MakeCaption(const uaf::Audio& a, subtitle::Line& out) const {
+        if (!captionsEnabled || a.caption.empty()) return false;
+        out.speaker = a.speaker;
+        out.text = a.caption;
+        switch (a.kind) {
+            case uaf::AudioKind::Voiceline: out.kind = subtitle::Kind::Voiceline; break;
+            case uaf::AudioKind::Ambience:  out.kind = subtitle::Kind::Ambient;   break;
+            case uaf::AudioKind::Music:     out.kind = subtitle::Kind::Ambient;   break;
+            case uaf::AudioKind::Sfx:       out.kind = subtitle::Kind::Sound;     break;
+        }
+        // Speech outranks ambience so a noisy scene can't evict a spoken line.
+        out.priority = subtitle::IsSpeech(out.kind) ? 10 : 0;
+        return true;
+    }
 
     // Decoded-PCM cache for PlayUAF one-shots (path -> Audio). Cleared when an
     // asset is re-imported / edited so stale PCM or captions aren't served.
@@ -469,7 +517,7 @@ void AudioSystem::SetCaptionsEnabled(bool on) {
     if (impl_) impl_->captionsEnabled = on;
 }
 
-bool AudioSystem::PopCaption(std::string& out) {
+bool AudioSystem::PopCaption(subtitle::Line& out) {
     if (!impl_ || impl_->captions.empty()) return false;
     out = std::move(impl_->captions.front());
     impl_->captions.pop_front();
@@ -582,12 +630,11 @@ bool AudioSystem::PlayUAF(const std::filesystem::path& uafPath, const std::strin
         it = impl_->uafCache.emplace(key, std::move(*audio)).first;
     }
     const uaf::Audio& a = it->second;
-    // Surface a baked caption ("Speaker: text") so a voiceline played this way
-    // (e.g. a schematic PlayVoiceline) captions just like a scene AudioSource.
-    // UI/SFX clips have empty captions, so this is a no-op for them.
-    if (caption && impl_ && impl_->captionsEnabled && !a.caption.empty())
-        impl_->captions.push_back(a.speaker.empty() ? a.caption
-                                                    : a.speaker + ": " + a.caption);
+    // Surface a baked caption so a voiceline played this way (e.g. a schematic
+    // PlayVoiceline) subtitles just like a scene AudioSource. UI/SFX clips have
+    // empty captions, so this is a no-op for them.
+    if (subtitle::Line cap; caption && impl_->MakeCaption(a, cap))
+        impl_->captions.push_back(std::move(cap));
     return PlayPCM(a.pcm.data(), a.pcm.size(), a.channels, a.sampleRate,
                    a.bitsPerSample, bus);
 }
@@ -606,8 +653,8 @@ bool AudioSystem::PlayUAFAt(const std::filesystem::path& uafPath, const glm::vec
         it = impl_->uafCache.emplace(key, std::move(*audio)).first;
     }
     const uaf::Audio& a = it->second;
-    if (caption && impl_->captionsEnabled && !a.caption.empty())
-        impl_->captions.push_back(a.speaker.empty() ? a.caption : a.speaker + ": " + a.caption);
+    if (subtitle::Line cap; caption && impl_->MakeCaption(a, cap))
+        impl_->captions.push_back(std::move(cap));
     return impl_->StartVoice(a.pcm.data(), a.pcm.size(), a.channels, a.sampleRate, a.bitsPerSample,
                              bus, 1.0f, 1.0f, false, &position, minDist, maxDist) != nullptr;
 }
@@ -641,6 +688,26 @@ void AudioSystem::PlayMusicState(const std::string& state, f32 fadeSeconds) {
         HBE_WARN("Music: no state '{}'.", state);
         return;
     }
+    // Quantized transition: the state currently PLAYING owns the boundary we wait
+    // for (it is its bar line we are mid-way through). Defer until then; a later
+    // request before the boundary simply replaces the pending one, so rapid
+    // gameplay changes collapse to the last intent instead of queueing a burst.
+    if (!impl_->musicForceImmediate) {
+        if (const MusicState* cur = impl_->musicGraph.FindState(impl_->musicState)) {
+            const f32 interval = SyncInterval(cur->sync, cur->bpm, cur->beatsPerBar);
+            if (interval > 0.0f) {
+                const f32 next = std::ceil((impl_->musicClock + 1e-4f) / interval) * interval;
+                impl_->musicPendingValid = true;
+                impl_->musicPendingState = state;
+                impl_->musicPendingFade = fadeSeconds;
+                impl_->musicPendingAt = next;
+                HBE_INFO("Music: '{}' -> '{}' queued for {} ({:.2f}s away).", impl_->musicState,
+                         state, SyncName(cur->sync), next - impl_->musicClock);
+                return;
+            }
+        }
+    }
+    impl_->musicPendingValid = false;
     impl_->musicFade =
         glm::max(fadeSeconds < 0.0f ? impl_->musicGraph.defaultFade : fadeSeconds, 0.01f);
     // The outgoing state's layers fade to silence and get reaped.
@@ -664,14 +731,40 @@ void AudioSystem::PlayMusicState(const std::string& state, f32 fadeSeconds) {
         impl_->musicLayers.push_back(std::move(mv));
     }
     impl_->musicState = state;
+    impl_->musicClock = 0.0f; // the new state's bar grid starts now
     HBE_INFO("Music: -> '{}' ({} layers, {:.1f}s fade).", state, st->layers.size(),
              impl_->musicFade);
+}
+
+void AudioSystem::SetMusicDucking(bool active) {
+    if (impl_) impl_->duckActive = active;
+}
+
+bool AudioSystem::MusicTransitionPending(std::string& outState, f32& outSeconds) const {
+    if (!impl_ || !impl_->musicPendingValid) return false;
+    outState = impl_->musicPendingState;
+    outSeconds = glm::max(impl_->musicPendingAt - impl_->musicClock, 0.0f);
+    return true;
 }
 
 void AudioSystem::StopMusic(f32 fadeSeconds) {
     if (!IsAvailable()) return;
     impl_->musicFade =
         glm::max(fadeSeconds < 0.0f ? impl_->musicGraph.defaultFade : fadeSeconds, 0.01f);
+    // A Stop respects the same musical boundary a state change would.
+    if (const MusicState* cur =
+            impl_->musicForceImmediate ? nullptr : impl_->musicGraph.FindState(impl_->musicState)) {
+        const f32 interval = SyncInterval(cur->sync, cur->bpm, cur->beatsPerBar);
+        if (interval > 0.0f) {
+            impl_->musicPendingValid = true;
+            impl_->musicPendingState.clear(); // empty pending state = deferred stop
+            impl_->musicPendingFade = fadeSeconds;
+            impl_->musicPendingAt =
+                std::ceil((impl_->musicClock + 1e-4f) / interval) * interval;
+            return;
+        }
+    }
+    impl_->musicPendingValid = false;
     for (Impl::MusicLayerVoice& m : impl_->musicLayers) m.fadingOut = true;
     impl_->musicState.clear();
 }
@@ -718,12 +811,42 @@ void AudioSystem::PostStinger(const std::filesystem::path& uafPath, const std::s
 
 void AudioSystem::UpdateMusic(f32 dt) {
     if (!IsAvailable()) return;
+
+    // Musical clock + any deferred (quantized) transition that is now due.
+    impl_->musicClock += dt;
+    if (impl_->musicPendingValid && impl_->musicClock >= impl_->musicPendingAt) {
+        const std::string next = impl_->musicPendingState;
+        const f32 fade = impl_->musicPendingFade;
+        impl_->musicPendingValid = false; // clear FIRST: the calls below re-enter
+        impl_->musicForceImmediate = true; // ...and must not re-defer themselves
+        if (next.empty()) StopMusic(fade);
+        else PlayMusicState(next, fade);
+        impl_->musicForceImmediate = false;
+    }
+
+    // Dialogue ducking: attack fast (speech starts abruptly), release slow (a
+    // quick release pumps audibly between lines).
+    {
+        const f32 floor = impl_->DuckFloor();
+        const f32 target = impl_->duckActive ? floor : 1.0f;
+        const f32 tau = impl_->duckActive ? impl_->musicGraph.duckAttack
+                                          : impl_->musicGraph.duckRelease;
+        if (tau <= 0.0f) {
+            impl_->duckGain = target;
+        } else {
+            const f32 a = 1.0f - std::exp(-dt / tau);
+            impl_->duckGain += (target - impl_->duckGain) * glm::clamp(a, 0.0f, 1.0f);
+        }
+    }
+
     const f32 step = dt / glm::max(impl_->musicFade, 0.01f); // gain change this frame
     for (auto it = impl_->musicLayers.begin(); it != impl_->musicLayers.end();) {
         Impl::MusicLayerVoice& m = *it;
         const f32 target = m.fadingOut ? 0.0f : impl_->LayerGain(m);
         m.current += glm::clamp(target - m.current, -step, step);
-        ma_sound_set_volume(&m.voice.sound, m.current);
+        // Ducking multiplies the layer's own gain, so a parameter-driven fade and
+        // a duck compose instead of fighting.
+        ma_sound_set_volume(&m.voice.sound, m.current * impl_->duckGain);
         if (m.fadingOut && m.current <= 0.001f) {
             ma_sound_uninit(&m.voice.sound);
             ma_audio_buffer_uninit(&m.voice.buffer);
@@ -792,12 +915,9 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
             const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / src.asset);
             if (!audio) continue;
 
-            // Closed caption: surface the asset's caption when this voice starts,
-            // prefixed with the speaker name when set ("Speaker: caption").
-            if (impl_->captionsEnabled && !audio->caption.empty())
-                impl_->captions.push_back(audio->speaker.empty()
-                                              ? audio->caption
-                                              : audio->speaker + ": " + audio->caption);
+            // Closed caption: surface the asset's caption when this voice starts.
+            if (subtitle::Line cap; impl_->MakeCaption(*audio, cap))
+                impl_->captions.push_back(std::move(cap));
 
             ma_format format;
             switch (audio->bitsPerSample) {
