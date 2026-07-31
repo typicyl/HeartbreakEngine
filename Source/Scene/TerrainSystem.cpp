@@ -48,8 +48,10 @@ f32 ProceduralHeight(const TerrainComponent& t, f32 x, f32 z) {
 }
 
 // Local-XZ extent helpers (the terrain is centered on the entity origin).
-f32 Step(const TerrainComponent& t) { return t.chunkSize / static_cast<f32>(t.resolution); }
-f32 Total(const TerrainComponent& t) { return static_cast<f32>(t.chunks) * t.chunkSize; }
+// Thin aliases for the public SampleStep/ExtentXZ so this file and the physics
+// collider cannot drift apart.
+f32 Step(const TerrainComponent& t) { return SampleStep(t); }
+f32 Total(const TerrainComponent& t) { return ExtentXZ(t); }
 
 void ClampParams(TerrainComponent& t) {
     t.chunks = glm::clamp(t.chunks, 1u, 32u);
@@ -66,7 +68,6 @@ f32 HeightAt(const TerrainComponent& t, i32 gx, i32 gz) {
 
 MeshData BuildChunk(const TerrainComponent& t, u32 cx, u32 cz) {
     const u32 res = t.resolution;
-    const i32 gridN = static_cast<i32>(t.GridN());
     const f32 step = Step(t);
     const f32 total = Total(t);
     const u32 gx0 = cx * res, gz0 = cz * res;
@@ -97,13 +98,64 @@ MeshData BuildChunk(const TerrainComponent& t, u32 cx, u32 cz) {
     for (u32 j = 0; j < res; ++j) {
         for (u32 i = 0; i < res; ++i) {
             const u32 i0 = j * stride + i, i1 = i0 + 1, i2 = i0 + stride, i3 = i2 + 1;
-            m.indices.insert(m.indices.end(), {i0, i2, i1, i1, i2, i3});
+            // MAIN-diagonal split (i0-i3), matching Jolt's HeightFieldShape exactly -
+            // see the triangulation note in TerrainSystem.h. Both triangles keep +Y
+            // winding: cross(i2-i0, i3-i0) = cross(i3-i0, i1-i0) = (0, step^2, 0).
+            // The old ANTI-diagonal split ({i0,i2,i1, i1,i2,i3}) drew a different
+            // surface than the collider in every quad with a twist, so the player
+            // walked up invisible bumps and fell into invisible dips.
+            m.indices.insert(m.indices.end(), {i0, i2, i3, i0, i3, i1});
         }
     }
     return m;
 }
 
 } // namespace
+
+f32 SampleStep(const TerrainComponent& t) {
+    // `resolution` is clamped to >= 2 by every mutation path, but a freshly
+    // deserialized component can still arrive with 0 - never divide by it.
+    return t.chunkSize / static_cast<f32>(glm::max(t.resolution, 1u));
+}
+
+f32 ExtentXZ(const TerrainComponent& t) {
+    return static_cast<f32>(t.chunks) * t.chunkSize;
+}
+
+bool HoleMaskUsable(const TerrainComponent& t) {
+    const usize need = static_cast<usize>(t.GridN()) * t.GridN();
+    return !t.holeMask.empty() && t.holeMask.size() == need;
+}
+
+bool IsHole(const TerrainComponent& t, i32 gx, i32 gz) {
+    if (!HoleMaskUsable(t)) return false;
+    const i32 g = static_cast<i32>(t.GridN());
+    gx = glm::clamp(gx, 0, g - 1);
+    gz = glm::clamp(gz, 0, g - 1);
+    // 255 = hole, 0 = solid; the brush hard-stamps the endpoints, so any midpoint
+    // is a resampling artefact - treat >= 128 as hole.
+    return t.holeMask[static_cast<usize>(gz) * g + gx] >= 128;
+}
+
+void MarkColliderDirty(TerrainComponent& t, i32 x0, i32 z0, i32 x1, i32 z1) {
+    const i32 g = static_cast<i32>(t.GridN());
+    x0 = glm::clamp(x0, 0, g - 1);
+    z0 = glm::clamp(z0, 0, g - 1);
+    x1 = glm::clamp(x1, 0, g - 1);
+    z1 = glm::clamp(z1, 0, g - 1);
+    if (x1 < x0 || z1 < z0) return;
+    if (t.colliderDirtyMaxX < t.colliderDirtyMinX || t.colliderDirtyMaxZ < t.colliderDirtyMinZ) {
+        t.colliderDirtyMinX = x0;
+        t.colliderDirtyMinZ = z0;
+        t.colliderDirtyMaxX = x1;
+        t.colliderDirtyMaxZ = z1;
+        return;
+    }
+    t.colliderDirtyMinX = glm::min(t.colliderDirtyMinX, x0);
+    t.colliderDirtyMinZ = glm::min(t.colliderDirtyMinZ, z0);
+    t.colliderDirtyMaxX = glm::max(t.colliderDirtyMaxX, x1);
+    t.colliderDirtyMaxZ = glm::max(t.colliderDirtyMaxZ, z1);
+}
 
 void EnsureHeights(TerrainComponent& t) {
     ClampParams(t);
@@ -122,18 +174,87 @@ void EnsureHeights(TerrainComponent& t) {
     }
 }
 
-f32 SampleHeight(const TerrainComponent& t, f32 x, f32 z) {
-    if (t.heights.size() != static_cast<usize>(t.GridN()) * t.GridN()) {
-        return ProceduralHeight(t, x, z);
-    }
+namespace {
+
+// The shared surface evaluator: resolves terrain-local XZ to the containing quad,
+// picks the MAIN-diagonal triangle the renderer draws and Jolt collides, and returns
+// that triangle's plane (height + per-sample-step gradients) plus its hole state.
+// `outInside` reports whether (x,z) is within the footprint. See TerrainSystem.h.
+struct SurfaceSample {
+    f32 h = 0.0f;
+    f32 dhdu = 0.0f; // rise per SAMPLE STEP in x
+    f32 dhdv = 0.0f; // rise per SAMPLE STEP in z
+    bool hole = false;
+    bool inside = false;
+};
+
+SurfaceSample EvalSurface(const TerrainComponent& t, f32 x, f32 z) {
+    SurfaceSample s;
+    const i32 g = static_cast<i32>(t.GridN());
+    if (g < 2 || t.heights.size() != static_cast<usize>(g) * g) return s;
+
     const f32 step = Step(t), total = Total(t);
+    if (step <= 0.0f) return s;
     const f32 fx = (x + total * 0.5f) / step;
     const f32 fz = (z + total * 0.5f) / step;
-    const i32 x0 = static_cast<i32>(std::floor(fx)), z0 = static_cast<i32>(std::floor(fz));
-    const f32 tx = fx - x0, tz = fz - z0;
+    // Footprint test in SAMPLE space: valid quads are [0, g-1] x [0, g-1]. This is
+    // REPORTED, not enforced - the clamping below then evaluates the edge-clamped
+    // surface, which is what SampleHeight's caller (the brush raycast, which marches
+    // up to a metre outside the border) has always relied on. SampleSurface is the
+    // one that turns `inside` into a hard reject.
+    constexpr f32 kEps = 1e-4f;
+    s.inside = fx >= -kEps && fz >= -kEps && fx <= static_cast<f32>(g - 1) + kEps &&
+               fz <= static_cast<f32>(g - 1) + kEps;
+
+    // Clamp to the last real quad so a sample exactly on the far edge (or outside)
+    // still lands on a triangle rather than one past the end.
+    const i32 x0 = glm::clamp(static_cast<i32>(std::floor(fx)), 0, g - 2);
+    const i32 z0 = glm::clamp(static_cast<i32>(std::floor(fz)), 0, g - 2);
+    const f32 tx = glm::clamp(fx - static_cast<f32>(x0), 0.0f, 1.0f);
+    const f32 tz = glm::clamp(fz - static_cast<f32>(z0), 0.0f, 1.0f);
+
     const f32 h00 = HeightAt(t, x0, z0), h10 = HeightAt(t, x0 + 1, z0);
     const f32 h01 = HeightAt(t, x0, z0 + 1), h11 = HeightAt(t, x0 + 1, z0 + 1);
-    return glm::mix(glm::mix(h00, h10, tx), glm::mix(h01, h11, tx), tz);
+
+    // Which half of the main diagonal? tz >= tx is tri0 = (0,0),(0,1),(1,1);
+    // otherwise tri1 = (0,0),(1,1),(1,0). Both planes pass through h00 and h11, so
+    // the two agree on the diagonal itself (the surface is continuous).
+    if (tz >= tx) {
+        s.dhdu = h11 - h01;
+        s.dhdv = h01 - h00;
+        s.hole = IsHole(t, x0, z0) || IsHole(t, x0, z0 + 1) || IsHole(t, x0 + 1, z0 + 1);
+    } else {
+        s.dhdu = h10 - h00;
+        s.dhdv = h11 - h10;
+        s.hole = IsHole(t, x0, z0) || IsHole(t, x0 + 1, z0 + 1) || IsHole(t, x0 + 1, z0);
+    }
+    s.h = h00 + s.dhdu * tx + s.dhdv * tz;
+    return s;
+}
+
+} // namespace
+
+f32 SampleHeight(const TerrainComponent& t, f32 x, f32 z) {
+    // No heightmap yet: fall back to the procedural function, which is what the
+    // pre-heightmap editor raycast has always done.
+    if (t.heights.size() != static_cast<usize>(t.GridN()) * t.GridN())
+        return ProceduralHeight(t, x, z);
+    return EvalSurface(t, x, z).h; // edge-clamped outside the footprint
+}
+
+bool SampleSurface(const TerrainComponent& t, f32 localX, f32 localZ, f32& outH, f32& outDhDx,
+                   f32& outDhDz, bool& outHole) {
+    const SurfaceSample s = EvalSurface(t, localX, localZ);
+    if (!s.inside) return false;
+    const f32 step = Step(t);
+    const f32 inv = step > 0.0f ? 1.0f / step : 0.0f;
+    outH = s.h;
+    // Per-sample-step rise -> per-LOCAL-UNIT rise. Getting this wrong makes every
+    // terrain read as flat (or as a wall) to the slope test.
+    outDhDx = s.dhdu * inv;
+    outDhDz = s.dhdv * inv;
+    outHole = s.hole;
+    return true;
 }
 
 void Update(Scene& scene, Renderer& renderer) {
@@ -145,11 +266,21 @@ void Update(Scene& scene, Renderer& renderer) {
     // .r and clips where it's set; chunks reference this via the parent terrain.
     for (const entt::entity e : reg.view<TerrainComponent>()) {
         TerrainComponent& t = reg.get<TerrainComponent>(e);
-        if (!t.holeDirty || t.holeMask.empty()) continue;
+        if (!t.holeDirty) continue;
+        // A wrong-sized mask is STALE and must be ignored WHOLESALE - the same rule
+        // terrain::IsHole (and therefore the collider) already follows. The old code
+        // partial-filled it (min(mask.size(), n*n)), which laid a 385-stride source
+        // into a 641-stride texture: the shipped reference project ships exactly that
+        // mismatch, so every load sheared holes diagonally across the north third of
+        // the terrain while the collider left all of it solid. Three consumers of one
+        // array must not disagree about what "usable" means.
+        if (!HoleMaskUsable(t)) {
+            t.holeDirty = false;
+            continue;
+        }
         const u32 n = t.GridN();
         std::vector<u8> rgba(static_cast<usize>(n) * n * 4, 0);
-        const usize count = std::min<usize>(t.holeMask.size(), static_cast<usize>(n) * n);
-        for (usize i = 0; i < count; ++i) {
+        for (usize i = 0; i < static_cast<usize>(n) * n; ++i) {
             const u8 m = t.holeMask[i];
             rgba[i * 4 + 0] = m; rgba[i * 4 + 1] = m; rgba[i * 4 + 2] = m; rgba[i * 4 + 3] = m;
         }
@@ -219,29 +350,23 @@ void Update(Scene& scene, Renderer& renderer) {
                 reg.emplace<Parent>(ce, Parent{e});
                 reg.emplace<TerrainChunk>(ce, TerrainChunk{cx, cz});
 
-                // Static triangle-mesh collider so characters/physics walk on the
-                // terrain. Geometry is the chunk mesh (local space, identity chunk
-                // transform -> the parent terrain's world places it); rebuilt with the
-                // chunk each time the heightmap is sculpted, so collision tracks shape.
-                RigidBody rb;
-                rb.shape = RigidBody::Shape::Mesh;
-                rb.motion = RigidBody::Motion::Static;
-                rb.collisionVertices.reserve(md.vertices.size());
-                for (const Vertex& v : md.vertices) rb.collisionVertices.push_back(v.position);
-                rb.collisionIndices = md.indices;
-                reg.emplace<RigidBody>(ce, rb);
+                // NO per-chunk collider. Collision is one static Jolt
+                // HeightFieldShape on the PARENT terrain entity (PhysicsWorld
+                // builds it from `heights`), which is both far cheaper - 256 static
+                // mesh bodies and ~819k collision triangles for this terrain became
+                // one body - and the only version that tracks sculpting, since the
+                // per-chunk MeshShape was built once here and never rebuilt.
             }
         }
         reg.get<TerrainComponent>(e).dirty = false;
+        // The grid was (re)generated, so the whole heightfield is new to physics.
+        MarkColliderDirty(reg.get<TerrainComponent>(e), 0, 0,
+                          static_cast<i32>(t.GridN()) - 1, static_cast<i32>(t.GridN()) - 1);
     }
 }
 
-void Sculpt(Scene& scene, Renderer& renderer, entt::entity terrain, f32 localX,
-            f32 localZ, f32 radius, f32 amount, Brush brush, f32 flattenTarget) {
-    auto& reg = scene.Registry();
-    TerrainComponent* tp = reg.try_get<TerrainComponent>(terrain);
-    if (!tp || tp->dirty) return; // wait until chunks exist
-    TerrainComponent& t = *tp;
+void SculptHeights(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, f32 amount,
+                   Brush brush, f32 flattenTarget) {
     EnsureHeights(t);
 
     const i32 gridN = static_cast<i32>(t.GridN());
@@ -282,6 +407,21 @@ void Sculpt(Scene& scene, Renderer& renderer, entt::entity terrain, f32 localX,
         }
     }
 
+    // Physics: the collider is a live Jolt heightfield, so only the sample rect the
+    // brush covered has to be pushed - no chunk collider rebuild, no world rebake.
+    MarkColliderDirty(t, i0, j0, i1, j1);
+}
+
+void Sculpt(Scene& scene, Renderer& renderer, entt::entity terrain, f32 localX,
+            f32 localZ, f32 radius, f32 amount, Brush brush, f32 flattenTarget) {
+    auto& reg = scene.Registry();
+    TerrainComponent* tp = reg.try_get<TerrainComponent>(terrain);
+    if (!tp || tp->dirty) return; // wait until chunks exist
+    TerrainComponent& t = *tp;
+    SculptHeights(t, localX, localZ, radius, amount, brush, flattenTarget);
+
+    const f32 step = Step(t), total = Total(t);
+
     // Update the chunk meshes overlapping the brush (in place, no realloc).
     const f32 bxMin = localX - radius, bxMax = localX + radius;
     const f32 bzMin = localZ - radius, bzMax = localZ + radius;
@@ -306,7 +446,17 @@ void PaintHole(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, bool era
     EnsureHeights(t);
     const i32 gridN = static_cast<i32>(t.GridN());
     const usize need = static_cast<usize>(gridN) * gridN;
-    if (t.holeMask.size() != need) t.holeMask.assign(need, 0); // 0 = solid
+    if (t.holeMask.size() != need) {
+        // A wrong-sized mask is STALE (nothing resizes it on a resolution change), so
+        // it is reset rather than reinterpreted. Resetting drops every hole it
+        // described, so the COLLIDER has to be fully re-pushed - but only when there
+        // WAS a mask. Allocating the first all-solid mask changes nothing, and marking
+        // the whole grid for that would make the first hole stroke on every terrain
+        // pay a full shape rebuild.
+        const bool wasDescribingHoles = !t.holeMask.empty();
+        t.holeMask.assign(need, 0); // 0 = solid
+        if (wasDescribingHoles) MarkColliderDirty(t, 0, 0, gridN - 1, gridN - 1);
+    }
 
     const f32 step = Step(t), total = Total(t);
     const f32 inv = step > 0.0f ? 1.0f / step : 0.0f;
@@ -330,6 +480,9 @@ void PaintHole(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, bool era
         }
     }
     t.holeDirty = true;
+    // A hole is a hole in the COLLIDER too (Jolt's no-collision sample value), so
+    // the same rect goes to physics.
+    MarkColliderDirty(t, i0, j0, i1, j1);
 }
 
 void PaintSplat(TerrainComponent& t, f32 localX, f32 localZ, f32 radius, i32 layer) {

@@ -8,6 +8,7 @@
 #include "Core/BinaryStream.h"
 #include "Renderer/Renderer.h"
 #include "Scene/Components.h"
+#include "Scene/TerrainSystem.h" // heightfield raycast + layout for RaycastTerrain
 
 #include <algorithm>
 #include <cmath>
@@ -260,6 +261,35 @@ bool RaycastMesh(const MeshData& mesh, const glm::vec3& ro, const glm::vec3& rd,
         out.uvPerWorld = (worldArea > 1e-9f) ? std::sqrt(uvArea / worldArea) : 1.0f;
     }
     return hit;
+}
+
+bool RaycastTerrain(const TerrainComponent& t, const glm::vec3& localOrigin,
+                    const glm::vec3& localDir, PaintHit& out) {
+    const f32 dirLen = glm::length(localDir);
+    const f32 total = terrain::ExtentXZ(t);
+    if (dirLen < 1e-9f || total <= 0.0f) return false;
+
+    glm::vec3 localHit;
+    if (!terrain::RaycastLocal(t, localOrigin, localDir, localHit)) return false;
+
+    const f32 step = terrain::SampleStep(t);
+    out.localPos = localHit;
+    // The same normal TerrainSystem::BuildChunk bakes into its vertices (central
+    // differences over one sample spacing), so the brush's relief lift and the
+    // stroke's orientation agree with how the ground is actually shaded.
+    const f32 hl = terrain::SampleHeight(t, localHit.x - step, localHit.z);
+    const f32 hr = terrain::SampleHeight(t, localHit.x + step, localHit.z);
+    const f32 hd = terrain::SampleHeight(t, localHit.x, localHit.z - step);
+    const f32 hu = terrain::SampleHeight(t, localHit.x, localHit.z + step);
+    out.localNormal = glm::normalize(glm::vec3(hl - hr, 2.0f * step, hd - hu));
+    // Terrain-wide canvas UV: the whole terrain maps to [0,1]^2, so the UV density
+    // is a constant rather than something to derive per triangle.
+    out.uv = glm::vec2((localHit.x + total * 0.5f) / total,
+                       (localHit.z + total * 0.5f) / total);
+    out.uvPerWorld = 1.0f / total;
+    // `t` such that localOrigin + localDir * t == localHit (localDir is not unit).
+    out.t = glm::length(localHit - localOrigin) / dirLen;
+    return true;
 }
 
 MeshData BuildRibbon(const std::vector<glm::vec3>& pts,

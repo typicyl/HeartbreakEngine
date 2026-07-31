@@ -80,13 +80,44 @@ std::vector<ProbePlacement> AutoPlaceProbes(const Scene& scene,
 // count; row index = x + y*dimX + z*dimX*dimY). Sampled trilinearly and evaluated
 // by the surface normal for smooth, directional diffuse GI - the upgrade over the
 // box-probe grid (no seams, leak-weighted).
+// WHAT HAPPENED to a scene's `giSource`. This exists because the failure was
+// SILENT: LoadGIVolume had five bare `return vol;` paths with no logging, and its
+// caller tested `if (vol.valid)` with no `else` - so a missing or corrupt `.hbgi`
+// left the PREVIOUS scene's volume bound (or none at all) while `giSource` was
+// still assigned, and the next save re-wrote a path to a file that never loaded.
+// A sealed interior then falls through to MeshPBR.hlsl's sky-irradiance branch,
+// which lights it as though the roof were not there - "unbaked" and "broken" look
+// identical on screen. One field, so the log, the editor banner and the parity
+// test all read the same answer.
+//
+// `Loaded` means the FILE parsed. On a device-less (headless) renderer the atlases
+// are not uploaded, so the handles stay invalid while the status is still Loaded -
+// that is deliberate: it is the only way a headless self-test can tell a good
+// `.hbgi` from a missing one.
+enum class GiStatus : u32 {
+    None = 0,  // giSource is empty - no baked volume was ever asked for
+    Loaded,    // the .hbgi parsed (handles valid iff the renderer has a device)
+    Missing,   // giSource names a file the VFS could not read
+    Corrupt,   // read, but bad magic / truncated / nonsense dimensions
+    // Parsed fine, but the GPU refused the atlas (descriptor heap exhausted, a
+    // device-lost recovery). Distinct from Corrupt because the FILE is good and
+    // re-baking would not help. It exists because `status` used to be set to Loaded
+    // BEFORE the uploads and never downgraded, so a failed upload rendered exactly
+    // like an unbaked level - the sealed room leaks sky light - while the status,
+    // the banner and the log all said "loaded".
+    UploadFailed,
+};
+
+const char* ToString(GiStatus s);
+
 struct GiVolume {
     glm::vec3  origin{0.0f};   // world centre of cell (0,0,0)
     glm::vec3  spacing{1.0f};  // cell size (world units)
     glm::ivec3 dims{0};        // grid resolution
     rhi::TextureHandle sh;     // bindless SH atlas (4 coeffs x cells)
     rhi::TextureHandle depth;  // bindless octahedral depth atlas (DDGI visibility)
-    bool valid = false;
+    bool valid = false;        // uploaded and bindable (implies status == Loaded)
+    GiStatus status = GiStatus::None; // why `valid` is what it is (see above)
 };
 
 // Bakes the level GI volume: grids the scene AABB, ray-casts a low-res environment

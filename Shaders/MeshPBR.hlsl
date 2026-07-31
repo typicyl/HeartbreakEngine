@@ -224,9 +224,31 @@ PSOutput PSMain(VSOutput input)
     // Terrain hole mask: clip painted-transparent terrain pixels so cliff/cave models
     // show through. The mask rides in the (terrain-unused) thickness-texture slot; we
     // discard early, before any shading. Mesh UV == terrain-wide UV for terrain chunks.
-    if ((gMaterialFlags & HBE_MAT_TERRAIN_HOLE) != 0u && gThicknessIndex != 0u &&
-        SampleBindless(gThicknessIndex, input.uv).r > 0.5f)
-        clip(-1.0f);
+    //
+    // THIS MUST AGREE WITH THE COLLIDER, PIXEL FOR TRIANGLE. Jolt's heightfield drops a
+    // triangle when ANY of its three corner samples is no-collision, so a hole is one
+    // whole triangle wide in physics. Filter-sampling the mask at `input.uv` (what this
+    // used to do) was wrong twice over: it clipped roughly the painted region, leaving a
+    // band up to a full sample wide that was DRAWN as ground with no collision behind it
+    // (the player fell through early, always on the dangerous side); and because the mask
+    // is n x n while uv runs 0..1 over n-1 quads, it was stretched by half a texel at the
+    // terrain edges, misregistering the visible hole against the grid it was painted on.
+    if ((gMaterialFlags & HBE_MAT_TERRAIN_HOLE) != 0u && gThicknessIndex != 0u)
+    {
+        // uv * (n-1) IS the heightfield sample coordinate, so the containing quad is
+        // floor() of it and the corners are exact texels.
+        int n = int(BindlessSize(gThicknessIndex).x);
+        float2 q = input.uv * float(max(n - 1, 1));
+        int2 q0 = clamp(int2(floor(q)), int2(0, 0), int2(max(n - 2, 0), max(n - 2, 0)));
+        float2 tq = saturate(q - float2(q0));
+        // Same MAIN-diagonal split as BuildChunk and Jolt (tz >= tx picks the
+        // (0,0),(0,1),(1,1) half); the third corner is what distinguishes them.
+        int2 cC = (tq.y >= tq.x) ? q0 + int2(0, 1) : q0 + int2(1, 0);
+        float hole = max(max(LoadBindless(gThicknessIndex, q0).r,
+                             LoadBindless(gThicknessIndex, q0 + int2(1, 1)).r),
+                         LoadBindless(gThicknessIndex, cC).r);
+        if (hole > 0.5f) clip(-1.0f);
+    }
 
     float3 V = normalize(gCameraPosWS - input.positionWS);
 

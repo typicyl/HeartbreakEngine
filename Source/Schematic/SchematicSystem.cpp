@@ -156,10 +156,18 @@ private:
     u32 evtSpotter_ = 0xFFFFFFFFu;
     u32 evtSpotTarget_ = 0xFFFFFFFFu;
 
+    // An UNSET Entity input operates on this entity; a SET one that names a dead
+    // entity resolves to entt::null, never to self_ (see BakedEnt in the header - a
+    // Kill aimed at a despawned target must not turn into a Kill aimed at the
+    // caller). Every component read below goes through Get<T>, which tolerates null.
     entt::entity Resolve(const Value& v) const {
-        if (v.type == PinType::Entity && v.entity != 0xFFFFFFFFu)
-            return static_cast<entt::entity>(v.entity);
-        return self_; // unconnected/invalid Entity inputs operate on this entity
+        return schematic::BakedEnt(scene_.Registry(), v, self_);
+    }
+    // Component lookup that tolerates a null/dead handle (shared with the transpiled
+    // C++ so the two paths cannot disagree).
+    template <typename T>
+    T* Get(entt::entity e) const {
+        return schematic::BakedGet<T>(scene_.Registry(), e);
     }
 
     // The value feeding an input pin: the wired output, else the literal default.
@@ -221,7 +229,7 @@ private:
             }
             case NodeType::GetPosition: {
                 entt::entity e = Resolve(EvalInput(n.id, 0, d));
-                const Transform* t = scene_.Registry().try_get<Transform>(e);
+                const Transform* t = Get<Transform>(e);
                 return Value::Vec3(t ? t->position : glm::vec3(0.0f));
             }
             case NodeType::EventUIClicked: // Action data output (valid while firing)
@@ -248,19 +256,19 @@ private:
             case NodeType::IsAlive:
                 return Value::Bool(combat::IsAlive(scene_, Resolve(EvalInput(n.id, 0, d))));
             case NodeType::GetHealth: {
-                const Health* h = scene_.Registry().try_get<Health>(Resolve(EvalInput(n.id, 0, d)));
+                const Health* h = Get<Health>(Resolve(EvalInput(n.id, 0, d)));
                 return Value::Float(h ? (outPin == 1 ? h->max : h->current) : 0.0f);
             }
             case NodeType::OnDeath: // Tag(pin1) + Instigator(pin2) payload (while firing)
                 return outPin == 2 ? Value::Ent(evtInstigator_) : Value::Str(evtDeathTag_);
             case NodeType::IsPlayerVisible: {
                 const AIPerception* p =
-                    scene_.Registry().try_get<AIPerception>(Resolve(EvalInput(n.id, 0, d)));
+                    Get<AIPerception>(Resolve(EvalInput(n.id, 0, d)));
                 return Value::Bool(p && p->canSeeTarget);
             }
             case NodeType::GetAwareness: {
                 const AIPerception* p =
-                    scene_.Registry().try_get<AIPerception>(Resolve(EvalInput(n.id, 0, d)));
+                    Get<AIPerception>(Resolve(EvalInput(n.id, 0, d)));
                 return Value::Float(p ? p->awareness : 0.0f);
             }
             case NodeType::OnSpotPlayer: // Spotter(pin1) + Target(pin2) payload
@@ -327,14 +335,14 @@ private:
                 break;
             case NodeType::SetPosition: {
                 entt::entity e = Resolve(EvalInput(n.id, 1, 0));
-                if (Transform* t = scene_.Registry().try_get<Transform>(e))
+                if (Transform* t = Get<Transform>(e))
                     t->position = EvalInput(n.id, 2, 0).v3;
                 Follow(n.id, 0, depth);
                 break;
             }
             case NodeType::Translate: {
                 entt::entity e = Resolve(EvalInput(n.id, 1, 0));
-                if (Transform* t = scene_.Registry().try_get<Transform>(e))
+                if (Transform* t = Get<Transform>(e))
                     t->position += EvalInput(n.id, 2, 0).v3;
                 Follow(n.id, 0, depth);
                 break;
@@ -378,7 +386,7 @@ private:
                 Follow(n.id, 0, depth);
                 break;
             case NodeType::SetHealth: {
-                if (Health* h = scene_.Registry().try_get<Health>(Resolve(EvalInput(n.id, 1, 0)))) {
+                if (Health* h = Get<Health>(Resolve(EvalInput(n.id, 1, 0)))) {
                     h->current = glm::clamp(InF(n.id, 2, 0), 0.0f, h->max);
                     if (h->current <= 0.0f) h->alive = false;
                     else if (!h->alive) { h->alive = true; h->deathDispatched = false; } // revive
@@ -387,20 +395,20 @@ private:
                 break;
             }
             case NodeType::SetInvulnerable: {
-                if (Health* h = scene_.Registry().try_get<Health>(Resolve(EvalInput(n.id, 1, 0))))
+                if (Health* h = Get<Health>(Resolve(EvalInput(n.id, 1, 0))))
                     h->invincible = InB(n.id, 2, 0);
                 Follow(n.id, 0, depth);
                 break;
             }
             case NodeType::SetAIState: {
-                if (AIBehavior* b = scene_.Registry().try_get<AIBehavior>(Resolve(EvalInput(n.id, 1, 0))))
+                if (AIBehavior* b = Get<AIBehavior>(Resolve(EvalInput(n.id, 1, 0))))
                     b->state = AIStateFromName(EvalInput(n.id, 2, 0).s);
                 Follow(n.id, 0, depth);
                 break;
             }
             case NodeType::SetAlert: {
                 if (AIPerception* p =
-                        scene_.Registry().try_get<AIPerception>(Resolve(EvalInput(n.id, 1, 0))))
+                        Get<AIPerception>(Resolve(EvalInput(n.id, 1, 0))))
                     p->awareness = glm::clamp(InF(n.id, 2, 0), 0.0f, 1.0f);
                 Follow(n.id, 0, depth);
                 break;
@@ -446,7 +454,7 @@ private:
             }
             case NodeType::PlayFacialExpression: {
                 if (FacialAnimator* fa =
-                        scene_.Registry().try_get<FacialAnimator>(Resolve(EvalInput(n.id, 1, 0)))) {
+                        Get<FacialAnimator>(Resolve(EvalInput(n.id, 1, 0)))) {
                     fa->expression = EvalInput(n.id, 2, 0).s;
                     fa->expressionWeight = glm::clamp(InF(n.id, 3, 0), 0.0f, 1.0f);
                 }

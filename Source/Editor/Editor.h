@@ -1,6 +1,7 @@
 // Editor/Editor.h - Dear ImGui editor: hierarchy, inspector, gizmo, stats.
 #pragma once
 
+#include "Assets/AssetRefs.h" // pack dependency closure (BuildSettings::onlyReferenced)
 #include "Assets/AudioEvent.h"
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
@@ -10,6 +11,7 @@
 #include "Assets/SeamWeld.h"
 #include "Assets/UAF.h"
 #include "Editor/MovieRender.h"
+#include "Editor/SaveDispatch.h" // Ctrl+S: which focused surface owns the chord
 #include "Core/Types.h"
 #include "Navigation/GridNav.h"
 #include "Renderer/CameraController.h"
@@ -18,6 +20,9 @@
 #include "Scene/Components.h"
 #include "Scene/PaintSystem.h"
 #include "Scene/SceneStreamer.h"
+#include "Scene/StreamPolicy.h" // stream::Evaluate (the editor's streaming SIMULATION)
+#include "Scene/TagShard.h" // save-time spatial shard bake (BakeReport / TagStat)
+#include "UI/UIDocument.h" // `.hbui` documents: the UI Document panel authors these
 
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
@@ -71,13 +76,134 @@ public:
     // (newest config found) + shaders + .hbproj + packs (+ loose Assets only
     // when packAssets is off).
     static bool BuildShipping(std::string& outMessage);
-    // Assets-relative paths referenced by the project's scenes: the scenes
-    // themselves, meshes + their textures, materials + their textures, audio.
-    static std::set<std::string> CollectReferencedAssets();
+    // The TRANSITIVE closure of every asset reachable from the active project's
+    // roots (its scenes / UI documents / prefabs, plus the non-scene roots in
+    // ProjectSettings: startupScene, bootDocument, every uiDocuments[] entry,
+    // musicGraph and the input-icon glyphs). `included` is the pack filter used
+    // when BuildSettings::onlyReferenced is on; the result also carries the
+    // exclusion list and every unresolvable reference, so a cook can prove what
+    // it left out instead of assuming. See Assets/AssetRefs.h.
+    static assets::ClosureResult CollectReferencedAssets();
+
+    // Gives a NEWLY CREATED asset its permanent pack slot and writes it into the
+    // file (Assets/SlotIds.h). Call it right after any editor path that produces
+    // a new asset - the number is a property of the asset from birth, and the
+    // cooker reads it back rather than inventing one. Idempotent and cheap to get
+    // wrong in the safe direction: an asset that already carries an id is left
+    // exactly as it is. No project open, or not a packable file, does nothing.
+    static void StampNewAsset(const std::filesystem::path& file);
+
+    // Re-stamps every packable asset under Assets/ written at or after `mark` that
+    // has NO embedded id. Call after any SAVE, not just after a creation.
+    //
+    // Necessary because the JSON savers build their document from scratch
+    // (`json j;` ... `dump(2)`) and therefore DROP the top-level "packSlot" the
+    // stamper wrote - so an asset that has been saved once is back on tier 2 until
+    // something restores it. Restoring it is free and exact: StampNewAssets prefers
+    // the id the manifest remembers for that same key, which IS the id the file had.
+    // Doing it per-operation rather than per-file also covers a save's by-products
+    // (the `.hbpaint` canvases a scene save writes, every additively streamed scene).
+    static void StampSavedAssets(std::filesystem::file_time_type mark);
+
+    // Carries slot memory across a rename or a move that has already happened on
+    // disk (Assets/SlotIds.h). Handles files and whole folders.
+    static void RekeyMovedAsset(const std::filesystem::path& from,
+                                const std::filesystem::path& to);
+
+    // --test-uiseparation: proves the SEPARATION GUARANTEE's save-time half.
+    //
+    // Creation-time gating (the UI create menu / Add-Component entries disabled
+    // unless a document is the edit target) is the primary enforcement, but it is
+    // ImGui state and cannot be asserted headlessly. The half that CAN be proven
+    // is the backstop: SaveSceneToDisk must REFUSE, with a message, and write
+    // NOTHING, when a non-document entity carries one of the six document
+    // components - never silently drop it, which is what the cancelled U5 would
+    // have done and which quietly deletes an author's UI on Ctrl+S.
+    //
+    // Also pins the deliberate exemptions: document content, generated world-UI
+    // page quads, transient runtime UI, and WorldText (level signage - policing
+    // it would make a level with a 3D sign unsaveable).
+    //
+    // Headless, no GPU/window, no project. Same contract as --test-seamweld.
+    static bool SeparationSelfTest();
+
+    // --test-uieditor: the AUTHORING contract of the dedicated `.hbui` editor's
+    // palette, hierarchy and tools (phase I3). Everything here is what a mouse
+    // gesture in that panel ends up calling, minus the mouse:
+    //   1. THE PALETTE IS THE CREATE MENU. Every catalog recipe, created through
+    //      Editor::CreateUIElementInDocument, joins the document via
+    //      DocumentSet::Track - so it carries UIDocMember{doc} AND appears in the
+    //      instance's order list (the list CaptureDocument writes the file in).
+    //      An entity with the tag but not the list lands wherever entt's free list
+    //      put its handle instead of at the end of the document.
+    //   2. NO DOCUMENT, NO CREATION. With activeDoc_ == 0 the call creates nothing
+    //      and returns null - the creation-time half of the separation guarantee,
+    //      which the palette must not be a second hole in.
+    //   3. NOTHING THE PALETTE MAKES IS WORLD CONTENT: every recipe passes
+    //      AuditDocumentForWorldContent, and a save of the scene alongside it
+    //      writes none of it.
+    //   4. Z-ORDER SURVIVES A SAVE. Raise/lower swaps two siblings in the entt
+    //      pool AND in the document order list; capture -> save -> reload must
+    //      reproduce the SAME draw order. This is the gate on "what you see is
+    //      what ships": draw order comes from pool iteration order, which no file
+    //      records directly, so only a round-trip can prove it.
+    //   5. REPARENT RULES: inside one document it nests; UNPARENT is allowed and
+    //      keeps membership; ACROSS documents (and across the document/scene
+    //      boundary) it is REFUSED, not "fixed".
+    //   6. CUT IS NOT DESTRUCTIVE. A subtree copy rooted inside a document is a
+    //      real fragment with the elements in it (the B11 bug produced a non-empty
+    //      STRING holding zero entities, so every frag.empty() guard passed and
+    //      Cut deleted content it had not copied).
+    //
+    // Headless, no GPU/window, no project - documents open with preload=false and
+    // a null Renderer. Same contract as --test-uiseparation.
+    static bool UIEditorSelfTest();
+
+    // --test-pasteparent: THE PASTE-PARENTING CONTRACT (see AttachPastedRoot).
+    //
+    //   1. A copied CHILD pastes as a SIBLING of the source, under the same
+    //      parent, LAST in that sibling group. This is the reported bug: the
+    //      fragment cannot carry the root's parent (it is outside the subtree),
+    //      so it has to be captured at COPY time.
+    //   2. A copied ROOT still pastes as a root.
+    //   3. Ctrl+D captures the SELECTION's parent, not the clipboard's.
+    //   4. A `.hbprefab` drop is a ROOT - it has no source parent, and placeAt
+    //      already positions it.
+    //   5. Prefab REVERT restores the INSTANCE's own parent (plus its guid and
+    //      its sibling order - a revert visibly changes nothing).
+    //   6. Every way the captured parent can go bad is handled and never
+    //      emplaced: destroyed since the copy, replaced world (undo/redo
+    //      recycles handles), aliasing an entity the paste itself just created,
+    //      or living in a different `.hbui` document.
+    //   7. Clones still mint FRESH guids - parenting does not touch identity.
+    //
+    // Headless, no GPU/window/project. Same contract as --test-pasteorder.
+    static bool PasteParentSelfTest();
+
+    // --test-scenesave <scene.hbscene> [--project <proj>]: THE SCENE-SAVE
+    // COMPLETENESS CONTRACT - "a .hbscene contains every entity of the active world,
+    // or the save does not happen".
+    //
+    // Works on a COPY of `sceneFile` in the temp directory and re-checks the
+    // original's bytes and mtime at the end; it never writes to the file it is
+    // pointed at. An empty path FAILS rather than falling through.
+    //
+    // Proves, in order: no entity and no component key present in the file on disk
+    // is missing from the file a load+save produces (compared against the FILE, so a
+    // bug that drops the same thing twice cannot pass); the bytes are identical after
+    // 0 and after 600 edit-mode ticks (a save is a function of the scene, not of how
+    // long the editor had it open - the UIAnimator-bake class); save -> load -> save
+    // is a fixed point; the subtree writer excludes what the file writer excludes;
+    // and that a save is REFUSED, with the target file untouched, when shards are
+    // despawned, when the world was replaced behind the editor's back, when the world
+    // is empty over a populated file, and while playing.
+    //
+    // Headless: no GPU, no window, no ImGui context.
+    static bool SceneSaveSelfTest(const std::filesystem::path& sceneFile);
 
 private:
     void DrawViewport(Engine& engine);
-    void DrawHierarchy(Scene& scene, Renderer& renderer);
+    void DrawHierarchy(Engine& engine);
     // One tree row (recurses into children). Uses childrenByParent_.
     void DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e);
     // Makes `child` a child of `newParent` (entt::null = scene root), keeping
@@ -164,6 +290,7 @@ private:
         bool isMusic = false;      // .hbmusic adaptive-music graph
         bool isCharacter = false;  // .hbchar modular-character rig
         bool isUIAnim = false;     // .hbuianim UI animation clip
+        bool isUIDoc = false;      // .hbui UI document (screen/world UI tree)
         u64  thumbId = 0;       // ImGui texture id (textures only; 0 = icon)
         bool thumbTried = false;
     };
@@ -246,6 +373,42 @@ private:
     bool vpVisible_ = false; // the Viewport image was actually drawn this frame
     bool layoutBuilt_ = false;
 
+    // -- Editor snapshot (undo/redo AND play-mode revert) -----------------------
+    // A snapshot is the scene string PLUS every open `.hbui` document. Document
+    // entities are deliberately excluded from BuildSceneJson (they are asset
+    // content with their own file), so a scene-only snapshot captures nothing of
+    // a UI edit and restores nothing of it. Putting documents back into
+    // BuildSceneJson is NOT the fix: that reintroduces the duplication the skip
+    // exists to prevent.
+    // NOTE: no handle. A restore CLOSES every open document and OPENS the
+    // captured ones fresh, so the restored handles are new. Nothing outside the
+    // editor holds a handle across a restore (the runtime never restores), and
+    // `active` is what has to survive, not the number.
+    struct DocSnapshot {
+        std::filesystem::path path;
+        bool screenOwned = true;
+        bool active = false; // was this the edit target?
+        // Carried because OpenFromData always produces a CLEAN instance: without
+        // this, one Ctrl+Z over three unsaved edits cleared the tab's `*` while the
+        // document still differed from disk by two of them. Save is not gated on
+        // the flag, so this is the unsaved INDICATOR, not the save itself.
+        bool dirty = false;
+        std::string json;    // ui::SaveDocumentToString
+    };
+    struct Snapshot {
+        std::string scene;
+        std::vector<DocSnapshot> docs;
+    };
+    Snapshot CaptureSnapshot(Engine& engine) const;
+    // The capture CaptureSnapshot performs for ONE open document. Factored out and
+    // engine-free so --test-uieditor drives the REAL call rather than a lookalike:
+    // this site once omitted CaptureDocument's `order` argument while the Save site
+    // passed it, and the difference silently reverted every z-order edit on the next
+    // undo (a pool permutation does not move entity indices, so the index fallback
+    // cannot stand in for the order list).
+    static std::string CaptureDocumentSnapshotJson(Scene& scene,
+                                                   const ui::DocumentInstance& inst);
+
     // -- Game view / play mode -------------------------------------------------
     // Unity-style Game tab: Play snapshots the scene and starts the simulation
     // (physics + scripts); Stop restores the snapshot; Pause freezes both.
@@ -254,10 +417,18 @@ private:
     void StopPlayMode(Engine& engine);
     bool playMode_ = false;
     bool playPaused_ = false;
-    std::string playSnapshot_;      // scene state at Play, restored on Stop
+    Snapshot playSnapshot_;         // scene + open documents at Play, restored on Stop
+    bool playSnapshotValid_ = false;
     std::string gameStateSnapshot_; // game:: story state (flags/objectives) at Play, restored on Stop
     bool focusGameView_ = false; // focus the Game tab next frame
     bool focusViewport_ = false; // focus the Viewport tab next frame
+    // True when DrawGameView fed a LIVE in-game UI pointer this frame (the cursor
+    // is over the game image). Reset at the top of BuildUI. The dedicated UI editor
+    // reads it: that panel otherwise pins the pointer OFF so its own mouse cannot
+    // live-activate the document it is showing (Engine falls back to raw editor-
+    // window coords when nobody feeds one), and it must not do that while the Game
+    // view is legitimately driving the UI. BuildUI draws the Game view first.
+    bool gameViewPointerFed_ = false;
 
     // -- UI editing (Scene viewport, while not playing) ----------------------------
     // Click-select, drag to move, corner handles to resize, with grid +
@@ -439,7 +610,325 @@ private:
     void DrawSceneManager(Engine& engine);
     void RefreshScenes();
     std::vector<std::filesystem::path> sceneList_; // all .hbscene under Assets/
+    std::vector<std::filesystem::path> uiDocList_; // all .hbui under Assets/
     bool scenesScanned_ = false;
+
+    // -- UI documents (.hbui) ---------------------------------------------------
+    // A `.hbui` is an ASSET, not scene content: its entities carry UIDocMember and
+    // are excluded from every .hbscene / .hbprefab / .hbsave write, and both
+    // Replace sweeps spare them. The editor opens them into the LIVE scene (so the
+    // viewport lays them out and the gizmo/inspector work unchanged) through the
+    // Engine's DocumentSet.
+    //
+    // activeDoc_ is the EDIT TARGET, and it is the whole separation guarantee:
+    // the UI create menu and the UI Add-Component entries are disabled unless it
+    // is set, so a UI component cannot be authored onto a world entity in the
+    // first place. SaveSceneToDisk refuses (never silently drops) if one exists
+    // anyway - a hand-edited file, or a scene authored before this landed.
+    void DrawUIDocumentPanel(Engine& engine);
+    ui::DocHandle activeDoc_ = 0;
+
+    // -- Dedicated `.hbui` UI editor (Source/Editor/UIEditor.cpp) ----------------
+    // A DEDICATED 2D authoring surface, not gizmos in the 3D viewport: the active
+    // document is rendered by the REAL UI pass into its own render target and shown
+    // as an ImGui image, so what the author sees cannot drift from what ships (see
+    // ui::BuildDocumentVertices). Its own translation unit so Editor.cpp does not
+    // grow further (it already needs /bigobj), following DialogueEditor.cpp.
+    //
+    // I1 = the canvas (zoom, pan, aspect preview, screen picker).
+    // I2 = direct manipulation: select, move, 8-handle resize, the anchor widget,
+    //      parent/sibling snapping - see uiEdDragMode_.
+    // I3 = a real editor rather than a viewer: the element PALETTE (drag out or
+    //      click, dropped where the cursor is), the DOCUMENT TREE with reparent by
+    //      drag, TABS over every open document, clipboard + delete + z-order, and
+    //      an INTERACT preview that runs the document through the real
+    //      ui::UpdateInteraction without entering Play.
+    void DrawUIEditorPanel(Engine& engine);
+    // The right-hand strip: the numeric rect, the anchor preset grid, the pivot,
+    // and the layout-group explanation. Same translation unit.
+    void DrawUIEditorInspector(Engine& engine, f32 width);
+    // The left strip: the element palette (a drag source per recipe) above the
+    // open document's tree (select / reparent by drag / per-row tools).
+    void DrawUIEditorPalette(Engine& engine, f32 width);
+    void DrawUIEditorTree(Engine& engine);
+    // The shared clipboard / delete / duplicate / z-order row, drawn in both the
+    // left strip and the canvas's right-click menu so the two cannot diverge.
+    void DrawUIEditorTools(Engine& engine, bool compact);
+    // Abandons any in-flight gesture and drops the cached layout. Called on a
+    // change of edit target and from RestoreSnapshot - after an undo every
+    // DocHandle and every entt::entity is invalid (see the Snapshot comment
+    // above), so cached per-element state must be dropped, never revalidated.
+    void UIEditorInvalidate();
+    f32  uiEdZoom_ = 0.0f;             // px per canvas unit; <= 0 = fit on next draw
+    glm::vec2 uiEdPan_{0.0f};          // canvas image offset inside the view, px
+    bool uiEdFitPending_ = true;       // refit at the next draw (open / doc change / F)
+    int  uiEdAspect_ = 0;              // index into the aspect-preview presets (0 = document)
+    ui::DocHandle uiEdLastDoc_ = 0;    // to detect an edit-target change and refit
+    // Set by RestoreSnapshot: the documents were reopened, so every handle is new
+    // even though the FILES are the same. The panel still compares handles (its tab
+    // bar re-selects from that), but consumes this to keep the zoom and pan instead
+    // of refitting - an undo must not throw away where the author was looking.
+    bool uiEdPreserveView_ = false;
+    // The authoring canvas's vertex buffer + layout for THIS frame. Members, not
+    // locals: Renderer::SetEditorUICanvas borrows the vertex pointer until
+    // RenderScene consumes it later in the same frame.
+    std::vector<rhi::UIVertex> uiEdVerts_;
+    std::vector<ui::LayoutItem> uiEdLayout_;
+    std::string uiEdNote_; // budget / backend message shown in the panel
+    // The canvas size uiEdLayout_ was built at. Input is hit-tested against the
+    // PREVIOUS frame's layout (which is what the author was looking at when they
+    // pressed, and lets this frame's rebuild show the drag with zero lag), so a
+    // canvas that changed under it - a new aspect preview, a new document header -
+    // must invalidate the mapping for one frame rather than mis-register a click.
+    glm::vec2 uiEdLayoutCanvas_{0.0f};
+
+    // -- Direct manipulation on the authoring canvas (phase I2) -------------------
+    // Click to select; drag the body to move; drag one of eight handles to resize;
+    // drag an anchor diamond to re-anchor. Every gesture edits a RECT in the item's
+    // OWN canvas units and back-solves it into the RectTransform through
+    // ui::SolveElementFromRect, so what the runtime computes is what the author
+    // dragged - no screen-space fudge - and anchors + pivot survive a drag (a
+    // stretched element stays stretched).
+    //
+    // Deliberately SEPARATE state from the viewport overlay's uiDrag*_: the two
+    // surfaces can both be visible, they map the mouse through different
+    // transforms, and one shared drag-in-progress would let a click in one finish a
+    // gesture started in the other. `selected_` IS shared, on purpose - the
+    // Hierarchy and the Inspector are how you edit everything a rect cannot express.
+    //
+    // GESTURE LIFECYCLE, and why it is armed rather than immediate: a press
+    // SELECTS and classifies a candidate gesture but writes nothing. The first
+    // mouse movement past ImGui's drag threshold promotes it - and THAT is where
+    // the single PushUndo fires. So a plain click costs no undo slot (there are
+    // only kMaxUndoSteps of them), a click-drag both selects and moves in one
+    // motion, and a completed drag is exactly one undo entry.
+    int  uiEdDragMode_ = 0;    // 0 none; see kUIEd* in UIEditor.cpp
+    bool uiEdDragLive_ = false; // classified AND past the threshold: now writing
+    bool uiEdPanning_ = false;  // this left-drag began on empty canvas, so it pans
+    entt::entity uiEdDragEntity_ = entt::null; // who the gesture started on
+    glm::vec2 uiEdPressScreen_{0.0f};          // screen px at press (threshold test)
+    glm::vec2 uiEdDragStartMouse_{0.0f};       // canvas units at press
+    glm::vec2 uiEdDragStartCenter_{0.0f};
+    glm::vec2 uiEdDragStartSize_{0.0f};
+    glm::vec4 uiEdDragParentRect_{0.0f}; // x0,y0,x1,y1 - what the item laid out in
+    glm::vec2 uiEdDragCanvasSize_{1.0f}; // the dragged item's own canvas size
+    // Anchors as they were at press. An anchor drag re-derives from these every
+    // frame instead of accumulating, so it is idempotent and cannot creep.
+    glm::vec2 uiEdDragStartAMin_{0.0f};
+    glm::vec2 uiEdDragStartAMax_{0.0f};
+    // Snap lines the last applied drag frame actually locked onto, in the dragged
+    // item's canvas units. Drawn so the author can see WHY an edge stopped there.
+    std::vector<f32> uiEdGuideX_, uiEdGuideY_;
+    bool uiEdShowAnchors_ = true; // draw + allow dragging the anchor widget
+
+    // -- Palette / tree / tools (phase I3) ---------------------------------------
+public:
+    // ONE authorable thing the palette can make. Deliberately a RECIPE, not a
+    // component name: "Vertical Layout Group" is a Panel element plus a
+    // UILayoutGroup plus the defaults that make it visible, and an author thinks
+    // in those terms. Enumerated from the ACTUAL document component set
+    // (UIElement's ten types + UICanvas / UIPanel / UILayoutGroup /
+    // UICanvasGroup); WorldText is deliberately absent - it is not a `.hbui` key
+    // at all (UIDocument.h decision 4), it is level signage placed by a Transform.
+    // UIAnimator is absent too: it is a clip binding with no rect, so it belongs
+    // to the Inspector's Add Component, not to a 2D layout palette.
+    enum class UICreate : u8 {
+        Panel = 0,
+        Label,
+        Button,
+        Image,
+        ProgressBar,
+        ProgressWheel,
+        Slider,
+        Toggle,
+        Selector,
+        ScrollView,
+        TextInput,
+        Screen,          // + UIPanel: a NAMED SCREEN the UIManager can push/pop
+        VerticalGroup,   // + UILayoutGroup{Vertical}
+        HorizontalGroup, // + UILayoutGroup{Horizontal}
+        GridGroup,       // + UILayoutGroup{Grid}
+        FadeGroup,       // + UICanvasGroup: inherited opacity / interactivity
+        Canvas,          // a UICanvas root (its own scale mode; world-space pages)
+        Count
+    };
+    struct UICreateDesc {
+        UICreate what;
+        const char* label;    // palette button + menu item
+        const char* entName;  // the Name component the new entity gets
+        const char* tip;      // why an author would reach for it
+        bool container;       // drawn in the palette's "containers" group
+    };
+    // The single source of truth for both the palette and the Hierarchy's
+    // Create > UI menu, so the two cannot offer different sets or different
+    // defaults. Defined in UIEditor.cpp next to the creation function.
+    static const UICreateDesc* UICreateCatalog(int& count);
+
+    // THE ONE CREATION PATH for `.hbui` content. Both the palette and the
+    // Hierarchy menu call this; nothing else may create UI. Returns entt::null
+    // (creating nothing, pushing no undo) when there is no active document - the
+    // creation-time half of the separation guarantee. Pushes exactly one undo
+    // entry, joins the document through DocumentSet::Track (tag AND order list),
+    // selects the result and marks the document dirty.
+    //
+    // `parentHint` is where the author put it: the element under a palette drop,
+    // or a tree row. See UIParentForNew for the fallback chain.
+    entt::entity CreateUIElementInDocument(Engine& engine, UICreate what,
+                                          entt::entity parentHint = entt::null);
+    // The RECIPE half, with no Editor and no Engine in it: `parent` is already
+    // resolved and the undo / selection / dirty bookkeeping is the caller's. Split
+    // out so --test-uieditor can exercise every recipe for real - a test that
+    // re-implemented the defaults would only prove it agrees with itself.
+    static entt::entity UIBuildRecipe(Scene& scene, ui::DocumentSet& docs,
+                                      ui::DocHandle doc, UICreate what,
+                                      entt::entity parent);
+
+private:
+    // Resolves the parent a newly created element should get, in order: the hint's
+    // nearest UI ancestor in this document, the selection's, the screen the canvas
+    // is currently showing, the document's first UICanvas, else entt::null = a
+    // DOCUMENT ROOT.
+    //
+    // That last step is a deliberate change from the old create menu, which minted
+    // a "Canvas" entity when the document had none. The reference project's menu
+    // has ZERO UICanvas entities - its screens are canvas-less roots laying out
+    // against the document header - so auto-creating one injected a stray root
+    // into exactly the documents that are built the other way, moving entities from
+    // the canvas-less walk to the canvas walk (and thus changing draw order and
+    // world-space routing). A root is what those documents are made of.
+    // Not static: it consults `selected_` (the editor-wide selection) as one of
+    // its fallbacks.
+    entt::entity UIParentForNew(Scene& scene, ui::DocHandle doc,
+                                entt::entity hint) const;
+
+    // Z-ORDER. Draw order is the order the layout walk visits siblings, which is
+    // entt POOL order (canvas-less roots come from view<UIElement>, children from
+    // view<Parent>), and no file records it directly - a document's ENTITY ORDER
+    // reproduces it because InstantiateDocument creates in that order. So a
+    // reorder has to move the entity in BOTH: swap_elements in the governing pool
+    // (immediately visible) and the same swap in DocumentInstance::entities (what
+    // CaptureDocument writes). Doing both keeps the two in step, which is the only
+    // reason the result survives a save; --test-uieditor round-trips it.
+    //
+    // `dir` > 0 = toward the FRONT (later in the layout), < 0 = toward the back.
+    // `run` = go as far as it can (Bring to Front / Send to Back).
+    // The neighbour is taken from uiEdLayout_, i.e. from what is actually drawn,
+    // so this does not depend on which direction entt happens to iterate a pool.
+    void UIReorder(Engine& engine, entt::entity e, int dir, bool run);
+    // Swaps `a` and `b` in every pool that governs their order plus the document
+    // order list. Both must be members of the same document and the same kind of
+    // sibling (both roots, or both children of one parent); when NO pool governs
+    // both it does nothing at all rather than desynchronise the saved order from
+    // the live one. Engine-free so the self-test drives the real thing.
+    static void UISwapOrder(Scene& scene, ui::DocumentSet& docs, entt::entity a,
+                            entt::entity b);
+
+    // INTERACT PREVIEW: run the document through the REAL ui::UpdateInteraction
+    // (hover, click, toggle, slider drag, selector cells, scroll wheel) against
+    // the authoring canvas, without entering Play. Its own UIContext, never the
+    // Engine's: this is an extra pass inside a frame whose runtime pass already
+    // ran, and sharing the context would corrupt the runtime's touched-flag list
+    // and its stats.
+    bool uiEdInteract_ = false;
+    ui::UIContext uiEdInteractCtx_;
+    // Interaction WRITES authored fields in place - value / toggled / selected /
+    // scrollPos are the widget's serialized initial state, and the runtime
+    // overwrites them. Testing states must not silently re-author the document, so
+    // the four are snapshotted when Interact goes on and restored when it goes
+    // off (or the document changes, or the panel closes, or an undo lands).
+    struct UIPreviewState {
+        entt::entity e = entt::null;
+        f32 value = 0.0f;
+        bool toggled = false;
+        int selected = 0;
+        glm::vec2 scrollPos{0.0f};
+    };
+    std::vector<UIPreviewState> uiEdPreview_;
+    // A tab X was clicked on a document with unsaved work: the close waits for the
+    // Save / Discard / Cancel modal. DocumentSet::Close destroys every member entity
+    // and pushes no undo entry, so this is the only thing standing between the X and
+    // a lost layout. 0 = nothing pending.
+    ui::DocHandle uiEdCloseConfirm_ = 0;
+    void UIEditorBeginInteract(Engine& engine);
+    void UIEditorEndInteract(Engine& engine);
+
+    bool uiEdShowPalette_ = true; // left strip (palette + document tree)
+    // The screen being authored, by UIPanel NAME rather than by entity. EditorUIShow
+    // is a session-only tag on a live entity, so every undo, every document reopen
+    // and every play-snapshot restore destroys it and the canvas went blank until
+    // the author re-picked from the combo. The NAME is the document's own stable id
+    // (it is what the UIManager pushes), so re-applying from it survives all three.
+    // Cleared when the author explicitly picks "(as the game left it)".
+    //
+    // PER DOCUMENT, keyed on DocumentInstance::rel. It was ONE name for the whole
+    // editor, which worked while there was one open document holding N panels.
+    // After the screen split there are N open documents holding ONE panel each, so
+    // a single name can match in at most one of them: after any undo (RestoreSnapshot
+    // closes and REOPENS every document) three of the four tabs came back with a
+    // blank canvas. `rel` is the right key because DocHandle is NOT stable across
+    // that reopen - OpenFromData mints a new one.
+    std::unordered_map<std::string, std::string> uiEdShownScreen_;
+    // Key for the map above: the active document's `rel`, falling back to its
+    // handle for a never-saved "New" (which no reopen can outlive anyway).
+    std::string UIEdDocKey(const ui::DocumentSet& docs) const;
+    // Deferred structural edits: applied after the tree/canvas walks, because the
+    // rows and the layout list are snapshots and destroying mid-walk would leave
+    // stale entities behind them.
+    entt::entity uiEdPendingDelete_ = entt::null;
+    entt::entity uiEdPendingReparentChild_ = entt::null;
+    entt::entity uiEdPendingReparentTo_ = entt::null;
+    bool uiEdPendingUnparent_ = false; // distinguishes "to entt::null" from "none"
+    int uiEdPendingCreate_ = -1;       // UICreate index queued by a palette drop
+    entt::entity uiEdPendingCreateParent_ = entt::null;
+    glm::vec2 uiEdPendingCreateAt_{0.0f}; // canvas units of the drop point
+    bool uiEdPendingCreatePlace_ = false; // place it at uiEdPendingCreateAt_
+
+    // -- Streaming tags -------------------------------------------------------
+    // The project's tag list (ProjectSettings::tags) is the streaming CONFIG;
+    // the Inspector's Tag combo is the per-object assignment. Editing the list
+    // re-seeds the process-wide table (tags::SeedFromProject) because a TagId is
+    // an index into it, and deleting a row goes through tags::RemoveTag so live
+    // entities are remapped rather than silently repointed at the next tag.
+    void DrawTagsPanel(Engine& engine);
+    char tagNewName_[64] = {};   // "New Tag..." / Add-tag name buffer
+    bool tagNewPopupOpen_ = false; // request to open the Inspector's naming modal
+    // Creates `name` in the project's tag list (no-op when it already exists),
+    // re-seeds the table and SAVES the `.hbproj` - the tag list is project data,
+    // so an unsaved new tag would be lost on the next open. Returns its id.
+    TagId CreateProjectTag(const std::string& name);
+    // Deferred "Save As" / "New" naming, applied outside the ImGui draw.
+    char uiDocNameBuf_[128] = {};
+    ui::DocHandle uiDocSaveAs_ = 0;
+    bool wantUIDocNew_ = false;
+    std::string uiDocError_; // shown in the panel + the save-refusal modal
+    // True when `e` is inside an open document (i.e. it is UI ASSET content).
+    static bool IsDocumentEntity(const Scene& scene, entt::entity e);
+    // "New scene" teardown: destroys the world but leaves every open document's
+    // entities alive. Replaces the bare `Registry().clear()` the two New handlers
+    // used to call, which orphaned open documents into 0-entity saves.
+    static void ClearWorldSparingDocuments(Scene& scene);
+    // Refuses with a message when a non-document entity carries one of the six
+    // document components. This is the SaveScene half of the guarantee.
+    static bool AuditSceneForLooseUI(const Scene& scene, std::string& why);
+    // The MIRROR of that audit, on the document side: refuses when a document
+    // member carries a component CaptureDocument cannot write (a MeshInstance, a
+    // collider, a 3D sign, a Health...). Without it those components exist in no
+    // file at all - BuildSceneJson skips the entity and the capture whitelist
+    // drops the component - so they vanish on the next save+reopen, which is
+    // exactly the silent-drop behaviour the cancelled U5 was rejected for.
+    static bool AuditDocumentForWorldContent(const Scene& scene, ui::DocHandle doc,
+                                             std::string& why);
+    // Saves an open document back to its file (Save As when `as` is non-empty).
+    // Flags the document that OWNS `e` (via UIDocMember) as edited, so the UI
+    // Document panel shows its `*`. A no-op for a world entity or an untracked one.
+    //
+    // Both drag surfaces mutate UIElement components in place, which no save path
+    // can observe, so the `*` used to never appear for a layout edit. SaveAll no
+    // longer trusts this flag (it saves every open document regardless) - this is
+    // the author-facing signal, not a correctness gate.
+    void MarkDocumentDirty(Engine& engine, entt::entity e);
+    bool SaveUIDocument(Engine& engine, ui::DocHandle doc,
+                        const std::filesystem::path& as = {});
     std::filesystem::path renameScene_;  // pending rename target
     char renameBuf_[128] = {};
 
@@ -448,7 +937,9 @@ private:
     void DrawSchematicEditor(Engine& engine);
     void DrawSchematicCanvas();        // the node canvas (links/nodes/interaction)
     void OpenSchematic(const std::filesystem::path& path);
-    void SaveSchematic();
+    // Returns whether a file was WRITTEN. A failed write must not be reported as a
+    // save (same reason SaveCurrent returns bool).
+    bool SaveSchematic();
     // Creates <dir>/<name>.hbschem (a fresh graph seeded with On Update). `dir`
     // empty = Assets/Schematics/.
     std::filesystem::path CreateSchematicAsset(const std::filesystem::path& dir = {},
@@ -471,7 +962,7 @@ private:
     void DrawDialogueEditor(Engine& engine); // toolbar + canvas + node inspector
     void DrawDialogueCanvas(float width);    // node canvas (links/nodes/interaction)
     void OpenDialogue(const std::filesystem::path& path);
-    void SaveDialogue();                     // writes dlgGraph_ back to editedDialoguePath_
+    bool SaveDialogue();                     // writes dlgGraph_ back to editedDialoguePath_
     std::filesystem::path editedDialoguePath_; // open .hbdialogue graph (empty = none)
     dlg::Graph dlgGraph_;                      // working copy
     bool dlgDirty_ = false;
@@ -490,8 +981,99 @@ private:
     void DrawProjectSettings(Engine& engine);
 
     // Saves the whole project: the active scene (Save As if never saved) plus the
-    // project settings (.hbproj: environment, build, audio, startup scene).
+    // project settings (.hbproj: environment, build, audio, startup scene), every
+    // open `.hbui` document, and every file-backed asset editor that has something
+    // open. Ctrl+Shift+S. Focus is irrelevant to "save everything", so it is the one
+    // chord no panel may claim.
     void SaveAll(Engine& engine);
+
+    // -- Ctrl+S DISPATCH -------------------------------------------------------
+    // Ctrl+S saves the surface that owns the FOCUSED window, and exactly that.
+    //
+    // MECHANISM, and why it is imgui INPUT ROUTING and not IsWindowFocused(). The
+    // global keyboard block in BuildUI runs before the dockspace and before every
+    // Draw*Panel, where the "current window" is imgui's implicit fallback window -
+    // ImGui::IsWindowFocused() is meaningless there, so a central dispatcher could
+    // only ever read LAST frame's focus. Worse, a hand-rolled focus gate cannot
+    // ARBITRATE: ImGui::IsKeyPressed() is frame state and is not consumed by
+    // reading it, so the two panel-local Ctrl+S handlers that used to exist fired
+    // IN ADDITION to the global one (schematic/dialogue: graph AND scene on one
+    // keypress; a fresh project even popped Save-Scene-As over the graph editor).
+    //
+    // ImGui::Shortcut() grants a chord to exactly ONE owner per frame, and
+    // RouteFocused outscores RouteGlobal, so:
+    //   * every panel that owns a savable surface calls ClaimSave() right after its
+    //     Begin(), UNCONDITIONALLY (even with nothing open - see below);
+    //   * the global Ctrl+S route is the scene fallback and only fires when no panel
+    //     claimed;
+    //   * Ctrl+Shift+S registers ONE global route and is unclaimable. Shortcut()
+    //     matches modifiers exactly, so a Ctrl+S route never fires on Ctrl+Shift+S -
+    //     which is the other half of the old double-fire, for free.
+    // Forgetting to claim in a new panel degrades to today's behaviour (the scene
+    // saves): a missing feature, never a wrong write.
+    //
+    // The claim is unconditional so that a focused-but-empty surface reports
+    // "nothing open to save" instead of silently writing the LEVEL - the author
+    // believing they saved a graph is the exact bug class this replaces.
+    //
+    // KNOWN, ACCEPTED: imgui settles route arbitration with a one-frame delay (a
+    // route registered this frame is scored against last frame's table). Focus is
+    // gained by a click, which is itself a prior frame, so a human cannot reach it.
+    bool ClaimSave(editor::SaveSurface surface);
+    // Ctrl+S fallback + Ctrl+Shift+S. Called from the global keyboard block.
+    void RegisterSaveShortcuts(Engine& engine);
+    // End of frame, after every panel has had its chance to claim: turn the claim
+    // into a SaveContext, ask editor::DecideSave, execute the one action it returns.
+    void ProcessSaveRequest(Engine& engine);
+    // Which of the Asset Viewer's three sub-editors is live right now.
+    editor::SaveSurface AssetViewerSurface() const;
+    // Does `s` actually have something open. Resolved at EXECUTION time, not at
+    // claim time, so a panel only ever has to answer "I am focused".
+    bool SurfaceHasContent(Engine& engine, editor::SaveSurface s) const;
+    // The one author-facing save message. Errors/refusals are red and do not fade.
+    void SetSaveStatus(std::string msg, bool error);
+    void DrawSaveToast();
+    // SaveCurrent + the status line, in one place. Every scene-save button and the
+    // Ctrl+S dispatcher go through it, so a REFUSAL can no longer be discarded at
+    // three of the five call sites (Scene menu / Scenes panel / Art Editor) the way
+    // it silently was. Returns whether a file was written.
+    bool SaveSceneWithStatus(Scene& scene);
+
+    editor::SaveSurface saveClaim_ = editor::SaveSurface::None; // who won the chord
+    bool saveRequested_ = false;                                // ...this frame
+    editor::SaveSurface pendingSaveSurface_ = editor::SaveSurface::None;
+    bool pendingSave_ = false; // deferred across a text field's commit frame
+    // Deliberately NOT buildResult_: a save must not clobber build output, and the
+    // build result renders only in Stats / Build Settings, which an author editing
+    // UI is not looking at.
+    std::string saveStatus_;
+    f64 saveStatusTime_ = -1.0; // ImGui::GetTime() when it was set (<0 = never)
+    bool saveStatusError_ = false;
+    // Bumped by every SetSaveStatus. A WRAPPER'S GENERIC MESSAGE MUST NOT OVERWRITE
+    // A SPECIFIC ONE: SaveSceneToDisk refuses for five different reasons and four of
+    // them set a precise, actionable line (which shards are missing, that a preview
+    // is posing the scene, that the world is empty), while only one - loose UI in a
+    // non-document entity - deliberately sets none. SaveSceneWithStatus and SaveAll
+    // used to react to `false` by stamping "See the UI Document panel" over all of
+    // them, so the author read the wrong cause on the only surface they were looking
+    // at. Snapshot this before the call, compare after, and only fill in the generic
+    // line when nothing else spoke.
+    u32 saveStatusSeq_ = 0;
+    // The viewport the toast should appear on: with multi-viewport enabled a panel
+    // dragged onto a second monitor is its own OS window, and a confirmation pinned
+    // to the main viewport lands where the author is not looking - which defeats the
+    // entire point of a save toast in the one setup that needs it most.
+    u32 saveStatusViewport_ = 0; // ImGuiViewport::ID, 0 = the main viewport
+
+    // The extracted per-surface savers. Each one is the SAME code its panel button
+    // runs (the button now calls these), so the chord and the button can never
+    // drift, and SaveAll can cover them without duplicating a sort or a cache clear.
+    bool SaveCutsceneAsset();          // sorts every track by time, then writes
+    bool SaveMusicAsset();             // + the .hbproj keys the music graph owns
+    bool SaveCharacterAsset();         // + character::ClearCache (re-weld)
+    bool SaveViewedMaterial(Engine& engine); // + re-applies it to every wearer
+    bool SaveViewedAudioEvent();
+    bool SaveViewedMesh();             // material slots back into the .uaf
 
     // -- Terrain editor (sculpt brushes) ------------------------------------------
     // When the sculpt tool is active and a Terrain entity is selected, dragging
@@ -523,6 +1105,21 @@ private:
     // brush raycast.
     const MeshData* GetCpuMesh(Scene& scene, entt::entity e);
     std::unordered_map<std::string, MeshData> cpuMeshCache_;
+    // TERRAIN is the one paintable surface GetCpuMesh can never answer for: chunk
+    // meshes are generated procedurally into a GPU buffer and the CPU copy is
+    // dropped, so a chunk has no MeshRef and no cacheable source. That is why
+    // painting on terrain used to do nothing at all - the brush bailed out one line
+    // before the code that knew about terrain.
+    //
+    // Resolves `e` (a chunk OR the terrain entity) to the terrain entity that owns
+    // the heightfield and the paint canvas; entt::null when `e` is not terrain.
+    entt::entity TerrainPaintOwner(Scene& scene, entt::entity e);
+    // World-space wrapper over paint::RaycastTerrain (which is where the geometry
+    // lives, and is covered by --test-terraincollide). `terrainEntity` must come from
+    // TerrainPaintOwner; the hit comes back in TERRAIN-local space.
+    bool RaycastTerrainSurface(Scene& scene, entt::entity terrainEntity,
+                               const glm::vec3& worldOrigin, const glm::vec3& worldDir,
+                               paint::PaintHit& out);
 
     bool paintActive_ = false;        // paint tool engaged
     bool paintErase_ = false;         // erase paint instead of adding
@@ -591,7 +1188,28 @@ private:
     bool strokeDrawing_ = false;          // a spline stroke is being drawn
     glm::vec3 strokePlaneP_{0.0f};        // draw-plane point (first-hit depth)
     glm::vec3 strokePlaneN_{0,0,1};       // draw-plane normal (camera forward at start)
+    // The SURFACE the stroke was started on - the same first hit that set the draw
+    // plane above, which used to be computed and thrown away. It is the stroke's
+    // ZONE: strokezone::ZoneOfSurface walks up its parents for a streaming Tag, and
+    // the stroke is grouped and tagged accordingly (Scene/StrokeZone.h). Stroke
+    // START, not release: one ribbon is one mesh is one entity is one tag, and it
+    // already lies on the plane of the surface it started on.
+    entt::entity strokeHitEntity_ = entt::null;
     int strokeMeshCounter_ = 0;           // unique ribbon .uaf names
+    // Both counters are seeded from what is ALREADY in Assets/Strokes/ at project
+    // open. Plain `= 0` members meant every session restarted naming at
+    // `ribbon_0.uaf`, so loading a saved scene and painting one stroke silently
+    // overwrote an existing stroke's mesh under the entity still referencing it -
+    // and `strokeMeshCounter_` also seeds the per-stroke noise, so the "random"
+    // jitter repeated across sessions. Harmless only while no scene referenced a
+    // stroke; zoning makes strokes content worth keeping.
+    bool strokeCountersSeeded_ = false;
+    void SeedStrokeCounters();
+    // Parents a freshly created stroke into the group node for the zone of
+    // `strokeHitEntity_`, tagging both. The ONE grouping site: the tap path and the
+    // ribbon path must not disagree, and before this they did - SpawnStroke never
+    // parented at all, so tap strokes were loose untagged roots.
+    void AttachStrokeToZone(Engine& engine, entt::entity stroke);
     glm::vec2 paintLastUV_{0.0f};     // previous stamp UV (continuous strokes)
     bool paintHasLast_ = false;       // paintLastUV_ is valid this stroke
     int  paintSyncTick_ = 0;          // throttles GPU re-upload during a stroke
@@ -621,14 +1239,68 @@ private:
     // writing its paint canvases first, then writes each streamed-in scene's
     // entities back to its own file. Streamed entities are never merged into the
     // active scene.
+    //
+    // REFUSES, before writing anything at all, when the world it is looking at
+    // cannot produce a complete file: loose (pre-.hbui) UI, Play mode, a world that
+    // was replaced behind the editor's back, a streamed world with despawned shards,
+    // or an empty world over a non-empty file. Never writes a partial scene.
     bool SaveSceneToDisk(Scene& scene, const std::filesystem::path& path);
+    // "The registry currently in `scene` IS the world at currentScenePath_."
+    //
+    // Called from every place the EDITOR deliberately replaces the world with the
+    // same level - a scene load, an undo/redo or Play->Stop restore, New Scene, and
+    // a successful save. Anything else that Replaces (a checkpoint load, a level
+    // bind) leaves the token behind and the next save refuses instead of writing one
+    // world over another's file. See Scene::WorldToken.
+    void AdoptWorld(const Scene& scene);
     // Saves whatever is open: the level (both layer files) when a level is open,
     // else the active scene in place, else opens "Save Scene As" (never saved yet).
     // The single save entry point for all the Save buttons / Ctrl+S.
-    void SaveCurrent(Scene& scene);
+    // Returns true only when a file was actually written - SaveSceneToDisk REFUSES
+    // when a non-document entity carries a UI component, and callers must not
+    // report success on a refusal.
+    bool SaveCurrent(Scene& scene);
     // Writes every distinct streamed-in scene (SceneSource-tagged) back to its
     // own .hbscene with just that scene's entities. Returns false on any failure.
     bool SaveStreamedScenes(Scene& scene);
+    // Logs the save-time shard bake's findings and keeps them for the Tags panel.
+    // NON-BLOCKING by design - see tagshard::Severity.
+    void ReportShardBake(const tagshard::BakeReport& rep, const std::filesystem::path& path);
+    // Last shard bake's author-facing lines + per-tag numbers (the scattered-tag
+    // failure mode is invisible without them). Shown in the Tags panel.
+    std::vector<std::string> shardDiagnostics_;
+    std::vector<tagshard::TagStat> shardStats_;
+    // The last bake's SHARD BOXES, which is what makes streaming visible at all: the
+    // author sets tags, the sharder decides the geometry, and without seeing the boxes
+    // and the radii they are authoring blind. Refreshed on every save (and by the Tags
+    // panel's "Re-bake now"), so it always describes the file on disk.
+    std::vector<scene::ShardDesc> shardDescs_;
+
+    // -- Streaming SIMULATION (editor-only) ---------------------------------------
+    // The editor runs the REAL stream::Evaluate against the real baked shard boxes with
+    // a movable focus, and colours the overlay by the result. It deliberately does NOT
+    // spawn or despawn anything: a streamer in the editor would have to BindWorld, which
+    // destroys the scene the author is editing. So this answers "which shards would be
+    // resident here, and why", and --tagstreamtest / the runtime answer "does spawning
+    // and despawning work". The panel says so, in those words.
+    bool streamSimEnabled_ = false;
+    // One-shot: the Tags panel seeds the shard preview the first time it is drawn with
+    // nothing baked, so the author sees their shards without having to press a button.
+    bool shardPreviewSeeded_ = false;
+    bool streamSimDrawBoxes_ = true;
+    bool streamSimDrawRadii_ = true;
+    glm::vec3 streamSimFocus_{0.0f};
+    std::vector<stream::PolicyShard> streamSimShards_; // rebuilt each evaluation
+    stream::PolicyOut streamSimOut_;
+    std::vector<u8> streamSimResident_; // parallel to shardDescs_: the simulated residency
+    std::vector<f32> streamSimDist_;    // parallel to shardDescs_: distance to the focus
+    // Re-runs the policy against shardDescs_ + the project's tag list.
+    void UpdateStreamSim();
+    // Draws the baked shard boxes and their load/unload radii in the viewport.
+    void DrawShardOverlay(Scene& scene, Renderer& renderer);
+    // Rebuilds shardDescs_/shardStats_ from the live scene WITHOUT saving, so the
+    // overlay is available before the first Ctrl+S of a session.
+    void RebakeShardPreview(Scene& scene);
 
     // -- Window menu / panel visibility ------------------------------------------
     // Every dockable panel can be shown/hidden from the Window menu (and via its
@@ -637,15 +1309,25 @@ private:
     enum Panel {
         Panel_Viewport, Panel_Game, Panel_Hierarchy, Panel_Inspector,
         Panel_AssetViewer, Panel_ProjectSettings, Panel_PostProcess,
-        Panel_Navigation, Panel_Streaming, Panel_Stats, Panel_Timeline,
+        Panel_Navigation, Panel_Stats, Panel_Timeline,
         Panel_Scenes, Panel_AudioMixer, Panel_Assets,
         Panel_ArtEditor, Panel_SchematicEditor, Panel_Music,
         Panel_CutsceneTimeline, Panel_DialogueEditor, Panel_InputIcons,
         Panel_Objectives, Panel_CharacterEditor, Panel_MovieRender,
+        Panel_UIDocument,
+        // APPEND ONLY. kNames[] is indexed BY this enum and kArtPanels[] holds its
+        // VALUES, so inserting a value mid-list silently swaps two panels'
+        // identities in both (stage 1 documented that hazard).
+        Panel_Tags,
+        Panel_UIEditor,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
     bool panelsInit_ = false;     // panelOpen_ defaulted on first BuildUI
+    // One-shot: on the first BuildUI frame, take the project's startupScene (which
+    // the Engine already loaded into the world at boot) as currentScenePath_, so
+    // Ctrl+S saves the level the author is looking at instead of opening Save As.
+    bool bootSceneAdopted_ = false;
     void DrawWindowMenu();
 
     // -- Undo / redo ----------------------------------------------------------------
@@ -653,31 +1335,105 @@ private:
     // BEFORE each mutation (gizmo drags, inspector edits, create/delete/spawn,
     // reparent, component add/remove, material apply); restoring re-instantiates
     // it. The serializer's persistent GPU caches make restores upload nothing.
+    //
+    // B12: a snapshot is the scene string PLUS every open `.hbui` document.
+    // Document entities are deliberately excluded from BuildSceneJson (they are
+    // asset content), so a scene-only snapshot captures nothing of a UI edit and
+    // restores nothing of it - Ctrl+Z over a UI drag would silently do the wrong
+    // thing, and RestoreSnapshot's Replace would leave the documents live and
+    // unchanged. Putting documents back into BuildSceneJson is NOT the fix: that
+    // reintroduces the duplication the skip exists to prevent.
+    // PushUndo takes a Scene for its ~60 existing call sites; the document half
+    // needs an Engine, so the Engine-taking overload is the real one and the
+    // Scene overload forwards through `engine_` (parked by BuildUI). The
+    // scene-only fallback can only be reached outside a frame, where no
+    // document can be open either.
     void PushUndo(Scene& scene);
+    void PushUndo(Engine& engine);
     void Undo(Engine& engine);
     void Redo(Engine& engine);
-    void RestoreSnapshot(Engine& engine, const std::string& snapshot);
-    std::vector<std::string> undoStack_;
-    std::vector<std::string> redoStack_;
+    void RestoreSnapshot(Engine& engine, const Snapshot& snapshot);
+    // Scene-only overload: restores the world and LEAVES open documents alone
+    // (the Replace sweep spares them). Used by the cutscene-preview revert and
+    // the movie-render job, neither of which can edit a document.
+    void RestoreSnapshot(Engine& engine, const std::string& sceneJson);
+    std::vector<Snapshot> undoStack_;
+    std::vector<Snapshot> redoStack_;
     bool gizmoEditing_ = false; // this gizmo drag already captured a snapshot
     static constexpr usize kMaxUndoSteps = 64;
 
     // -- Copy / paste / duplicate ---------------------------------------------------
     // The selected entity (and its descendants) serialize to an in-memory
-    // .hbscene fragment; pasting re-instantiates it additively, nudged off the
-    // original and freshly selected. Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+D + Edit menu.
+    // .hbscene fragment; pasting re-instantiates it additively, in place, as a
+    // SIBLING of the source (Unity's rule - see AttachPastedRoot), and selects it.
+    // Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+D + Edit menu.
     void CopySelection(Scene& scene);
     void PasteClipboard(Engine& engine);
     void DuplicateSelection(Engine& engine);
-    // Instantiates a serialized subtree additively, offsets + selects its root,
-    // and pushes one undo step. Shared by paste and duplicate.
-    // Instantiates a subtree JSON fragment additively. `placeAt` (when given)
-    // positions the new root there; otherwise the root is nudged off the original.
+    // Instantiates a subtree JSON fragment additively, parents + selects its root,
+    // and pushes one undo step. Shared by paste, duplicate, prefab drop and revert.
+    // `placeAt` (when given) positions the new root there; otherwise the clone
+    // keeps the source's exact local transform and lands on top of it.
     // pushUndo=false lets a caller that already snapshotted (e.g. prefab Revert)
     // record the whole operation as a single undo step.
-    void PasteSubtree(Engine& engine, const std::string& fragment,
-                      const glm::vec3* placeAt = nullptr, bool pushUndo = true);
+    // `intoDocument` forces the pasted subtree to join the ACTIVE document even
+    // when it carries no UI component of its own (a bare grouping node copied from
+    // inside a `.hbui`); UI-carrying fragments join it either way.
+    // `parentTo` is the entity the pasted ROOT becomes a child of, or entt::null
+    // for a scene/document root. It cannot come from the fragment - see
+    // AttachPastedRoot - so each caller supplies its own answer:
+    //   Ctrl+V           -> clipboardParent_ (the source's parent at COPY time)
+    //   Ctrl+D           -> the SELECTION's parent, read at duplicate time
+    //   .hbprefab drop   -> entt::null (a placed prefab is a root)
+    //   prefab Revert    -> the INSTANCE's own parent, captured before the destroy
+    // `worldFallback` (optional) is the SOURCE root's world matrix at copy time. It
+    // is used only when a requested `parentTo` is REJECTED: the clone's stored TRS is
+    // local to that parent, so dropping the parent silently reinterprets it as world
+    // and teleports the clone by the parent's transform (a child of a rig at x=100
+    // appears at the origin, off-screen, as the new selection). With it, a dropped
+    // parent keeps the clone where the author last saw it.
+    //
+    // RETURNS the new root, or entt::null if nothing was pasted - the four refusals
+    // (empty fragment, UI-into-no-document, unparseable, instantiated nothing) leave
+    // `selected_` untouched, so a caller that stamps a component "onto the paste"
+    // must be told there wasn't one.
+    entt::entity PasteSubtree(Engine& engine, const std::string& fragment,
+                              const glm::vec3* placeAt = nullptr, bool pushUndo = true,
+                              bool intoDocument = false, entt::entity parentTo = entt::null,
+                              const glm::mat4* worldFallback = nullptr);
+    // Parents a freshly instantiated paste ROOT and gives it a sibling index.
+    // Reparent()'s rules minus the two halves a paste must not have (its PushUndo,
+    // which would make one paste cost two Ctrl+Z, and its world-transform rebase,
+    // which would teleport a clone whose stored TRS is ALREADY in the destination
+    // parent's space). Returns the parent actually applied - entt::null when the
+    // requested one was rejected, so the paste still lands, as a root.
+    entt::entity AttachPastedRoot(Scene& scene, entt::entity root, entt::entity parentTo,
+                                  const std::vector<entt::entity>& created,
+                                  const glm::mat4* worldFallback = nullptr);
     std::string clipboard_; // last copied subtree (.hbscene JSON fragment)
+    bool clipboardFromDoc_ = false; // that fragment was copied out of a .hbui
+    // The parent the copied subtree's ROOT had, so a paste lands as its SIBLING
+    // rather than at the scene root. Handles are only meaningful inside ONE world,
+    // so the token that world had at copy time is stored with it: an undo/redo or a
+    // scene load Replaces the registry and recycles handles, and a stale index+
+    // version pair can silently alias a DIFFERENT entity afterwards.
+    entt::entity clipboardParent_ = entt::null;
+    u64 clipboardWorld_ = 0; // Scene::WorldToken() at copy time (0 = never copied)
+    // THE SAME PARENT AS A STABLE IDENTITY (Scene/EntityGuid.h). The handle above is
+    // unusable after a Replace, and undo/redo and Play->Stop are Replaces - so
+    // "copy, press Play, press Stop, paste" dropped the parent and the reported bug
+    // came back. Undo snapshots and play snapshots both go through BuildSceneJson,
+    // which WRITES guids, so the same parent survives a Replace as the same Guid with
+    // a fresh handle. 0 = the source root had no parent (or none was recorded).
+    u64 clipboardParentGuid_ = 0;
+    // The source root's WORLD matrix at copy time, for the teleport guard described
+    // on PasteSubtree. Identity + `false` = nothing recorded.
+    glm::mat4 clipboardWorldMatrix_{1.0f};
+    bool clipboardHasWorldMatrix_ = false;
+    // clipboardParent_ if `scene` is still the world it was captured in; otherwise
+    // the entity carrying clipboardParentGuid_ in the CURRENT world, if it is still
+    // there. What Ctrl+V passes as `parentTo`.
+    entt::entity ClipboardParentFor(const Scene& scene) const;
 
     // -- Prefabs (.hbprefab = a saved entity subtree, reusable across scenes) ------
     // Writes the selected entity + descendants to <dir>/<name>.hbprefab.
@@ -703,44 +1459,13 @@ private:
 
     // -- Scenes ------------------------------------------------------------------
     std::filesystem::path currentScenePath_; // last saved/loaded .hbscene
+    // Scene::WorldToken as of the last load/restore/save. 0 = nothing adopted yet
+    // (a fresh editor that has neither loaded nor saved), which skips the check -
+    // there is no file for the world to disagree with. See AdoptWorld.
+    u64 sceneWorldToken_ = 0;
     SceneStreamer streamer_;                 // additive async scene loads
     bool wantSaveSceneAs_ = false;
     char sceneSaveName_[128] = "MainScene";
-
-    // -- Levels (static + dynamic split, automatic) -----------------------------
-    // A level is ONE world in the editor; SceneLayer (per entity) decides static
-    // vs dynamic and Save partitions the whole scene into the two .hbscene files.
-    // Loads a level into the world. `additive` stacks it onto the current world
-    // (compose several levels); otherwise it replaces. Becomes the active level.
-    void OpenLevel(Engine& engine, const scene::LevelPaths& level, bool additive = false);
-    // Creates the empty static + dynamic layer files for `base`, then opens it.
-    void CreateLevel(Engine& engine, const std::filesystem::path& base);
-    // Tags `e`'s WHOLE hierarchy into the given level's `kind` layer file
-    // (SceneSource = <base>.<kind>.hbscene) + SceneLayer{kind}, so it saves to the
-    // right file and the navmesh reads the layer. The hierarchy moves as a unit.
-    void AssignToLevel(Scene& scene, entt::entity e, const std::filesystem::path& base,
-                       SceneKind kind);
-    // Convenience: change `e`'s layer within ITS current level (combo / drag).
-    void AssignToLayer(Scene& scene, entt::entity e, SceneKind kind);
-    // Auto-classifies a hierarchy from its components (Animator/CharacterController
-    // /dynamic body/script/nav agent/UI -> Dynamic; otherwise Static).
-    SceneKind ClassifyLayer(Scene& scene, entt::entity root) const;
-    // The root of `e`'s hierarchy (walks up Parent links).
-    entt::entity RootOf(Scene& scene, entt::entity e) const;
-    // The layer `e` belongs to: its ROOT's SceneLayer if set, else classified.
-    SceneKind EffectiveLayer(Scene& scene, entt::entity e) const;
-    // The level base `e` belongs to: from its root's SceneSource if it is a level
-    // layer file, else the active level (currentLevel_).
-    std::filesystem::path LevelBaseOf(Scene& scene, entt::entity e) const;
-    // Gives every level entity a definite SceneSource (its level layer FILE) +
-    // SceneLayer, filling only the untagged ones - so nothing is ever lost on save
-    // and the hierarchy/navmesh agree. No-op outside a level / during play.
-    void EnsureLevelMembership(Scene& scene);
-    scene::LevelPaths currentLevel_; // active level (base path); empty = none
-    bool levelOpen_ = false;
-    bool wantNewLevel_ = false;
-    bool startupSynced_ = false; // adopted the project's startup scene/level once
-    char levelNameBuf_[128] = "Level1";
 
     // -- Shipping ----------------------------------------------------------------
     // Build configurator window (game name, platform/backend, resolution,
@@ -768,10 +1493,6 @@ private:
     std::string navStatus_;
     nav::GridNavParams gridParams_;  // real-time A* pathfinder params (the live system)
     std::vector<glm::vec3> navCells_; // walkable grid cell centers (debug overlay)
-
-    // -- Streaming world (load + inspect cells; engine streams around camera) ------
-    void DrawStreaming(Engine& engine);
-    std::string streamStatus_;
 
     // -- Objectives browser (searchable index of task goals in the loaded scene) ---
     // Objectives ("task goals") are runtime strings (id + HUD text) that emerge from

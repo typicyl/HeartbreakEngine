@@ -8,7 +8,9 @@
 #include "Project/Project.h"
 #include "Renderer/IBL.h"
 #include "Renderer/Renderer.h"
+#include "Scene/EntityGuid.h"
 #include "Scene/PaintSystem.h"
+#include "Scene/TerrainSystem.h" // hole-mask usability (one rule for every consumer)
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
@@ -16,8 +18,74 @@
 #include <cmath>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 
 namespace hbe {
+
+EnvironmentStamp StampOf(const SceneEnvironment& env) {
+    EnvironmentStamp s;
+    s.ambientIntensity = env.ambientIntensity;
+    s.exposure = env.exposure;
+    s.shadowDistance = env.shadowDistance;
+    s.post = env.post;
+    s.giSource = env.giSource;
+    s.giStatus = env.giStatus;
+    s.giOrigin = env.giOrigin;
+    s.giSpacing = env.giSpacing;
+    s.giDims = env.giDims;
+    s.giShValid = env.giSh.IsValid();
+    s.giDepthValid = env.giDepth.IsValid();
+    s.timeOfDay = env.timeOfDay;
+    s.dayLengthSeconds = env.dayLengthSeconds;
+    s.dynamicSky = env.dynamicSky;
+    s.dayNightAuthored = env.dayNightAuthored;
+    return s;
+}
+
+std::string DescribeStampDiff(const EnvironmentStamp& a, const EnvironmentStamp& b) {
+    std::ostringstream o;
+    const auto cmp = [&o](const char* name, auto x, auto y) {
+        if (!(x == y)) o << " " << name << "(" << x << " vs " << y << ")";
+    };
+    cmp("ambientIntensity", a.ambientIntensity, b.ambientIntensity);
+    cmp("exposure", a.exposure, b.exposure);
+    cmp("shadowDistance", a.shadowDistance, b.shadowDistance);
+    if (!(a.post == b.post)) o << " post(differs)";
+    cmp("giSource", a.giSource, b.giSource);
+    if (a.giStatus != b.giStatus)
+        o << " giStatus(" << ToString(a.giStatus) << " vs " << ToString(b.giStatus) << ")";
+    if (a.giOrigin != b.giOrigin) o << " giOrigin(differs)";
+    if (a.giSpacing != b.giSpacing) o << " giSpacing(differs)";
+    if (a.giDims != b.giDims) o << " giDims(differs)";
+    cmp("giShValid", a.giShValid, b.giShValid);
+    cmp("giDepthValid", a.giDepthValid, b.giDepthValid);
+    cmp("timeOfDay", a.timeOfDay, b.timeOfDay);
+    cmp("dayLengthSeconds", a.dayLengthSeconds, b.dayLengthSeconds);
+    cmp("dynamicSky", a.dynamicSky, b.dynamicSky);
+    cmp("dayNightAuthored", a.dayNightAuthored, b.dayNightAuthored);
+    return o.str();
+}
+
+// The day/night curve, evaluated ONCE per definition (see Scene.h `struct DayNight`).
+// The sun arc is overhead at noon and underfoot at midnight, rising near 6am and
+// setting near 6pm, tilted by `lat` so it crosses toward the south rather than
+// dead overhead.
+DayNight EvalDayNight(f32 hours) {
+    DayNight d;
+    const f32 ang = (hours - 12.0f) / 12.0f * 3.14159265f; // 0 at noon, +/-PI midnight
+    const f32 ax = std::sin(ang);   // -1 at 6am, +1 at 6pm (rises -X, sets +X)
+    const f32 ay = std::cos(ang);   // +1 noon (up), -1 midnight (down)
+    const f32 lat = 0.55f;          // ~31 degrees of southward tilt
+    d.toSun = glm::normalize(glm::vec3(ax, ay * std::cos(lat), -ay * std::sin(lat)));
+    const f32 elev = d.toSun.y;     // sun height, -1..1
+    d.day = glm::clamp(elev * 6.0f + 0.15f, 0.0f, 1.0f);
+    const f32 warm = glm::clamp(1.0f - glm::max(elev, 0.0f) * 3.0f, 0.0f, 1.0f);
+    // A MULTIPLIER on the authored sun colour, not a replacement for it: white at
+    // midday, sunset-orange at the horizon. Normalized so midday leaves the
+    // authored colour untouched.
+    d.tint = glm::mix(glm::vec3(1.0f), glm::vec3(1.0f, 0.51f, 0.23f), warm);
+    return d;
+}
 
 Scene::Scene() {
     // UI structure signals: constructing/destroying/replacing a hierarchy-shaping
@@ -69,6 +137,18 @@ entt::entity Scene::FindByName(const std::string& name) const {
 
 entt::entity Scene::CreateEntity(const std::string& name) {
     const entt::entity e = registry_.create();
+    // THE mint site. This is the only wrapper around registry_.create() in the
+    // tree, so stamping identity here covers every authored, loaded and spawned
+    // entity. A load overwrites this with the guid from the file
+    // (scene::Instantiate -> guid::Apply); everything else keeps the fresh one,
+    // which is exactly what makes a duplicate a new object. See Scene/EntityGuid.h.
+    registry_.emplace<Guid>(e, Guid{guid::Mint()});
+    // THE SIBLING-ORDER MINT, for the same reason and at the same place. Entity
+    // handles are recycled, so they are not a creation sequence; this counter is.
+    // A load overwrites it with the file's "order" (scene::Instantiate), exactly
+    // like the guid above; everything else keeps the fresh value, which puts a
+    // newly created entity LAST among its siblings. See Scene/Hierarchy.h.
+    registry_.emplace<HierarchyOrder>(e, HierarchyOrder{NextHierarchyOrder()});
     if (!name.empty()) {
         registry_.emplace<Name>(e, name);
     }
@@ -97,6 +177,13 @@ bool Scene::IsEditorHidden(entt::entity e) const {
         cur = (p && registry_.valid(p->entity)) ? p->entity : entt::null;
     }
     return false;
+}
+
+void Scene::ForgetMotionHistory(entt::entity e) {
+    prevWorld_.erase(e);
+    curWorld_.erase(e);
+    prevPalette_.erase(e);
+    curPalette_.erase(e);
 }
 
 void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
@@ -215,7 +302,11 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
                     // Live terrain roughness (the inspector slider takes effect without a
                     // chunk rebuild; also the splat roughness floor reads this).
                     item.roughness = tc->roughness;
-                    if (tc->holeMaskTex.IsValid() && !tc->holeMask.empty()) {
+                    // HoleMaskUsable, not !empty(): a stale (wrong-sized) mask is
+                    // ignored by terrain::IsHole and therefore by the collider, so
+                    // flagging the shader to clip against a stale texture would show
+                    // holes where physics has solid ground. One rule, three consumers.
+                    if (tc->holeMaskTex.IsValid() && terrain::HoleMaskUsable(*tc)) {
                         item.thicknessTexture = tc->holeMaskTex;
                         item.materialFlags |= rhi::MaterialFlag_TerrainHole;
                     }
@@ -348,6 +439,16 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
     v.exposure = env_.exposure;
     v.ambientIntensity = env_.ambientIntensity;
     v.post = env_.post;
+    // THE PLAYER'S QUALITY PRESET, applied to the COPY (see SceneEnvironment::
+    // postQualityPreset). Position is exact, not approximate: the engine loop used to
+    // stamp this onto env_.post BEFORE calling RenderScene, so the degrade landed
+    // before the volume overlay below and a Post Volume could re-enable a pass the
+    // preset dropped. Applying it here reproduces that ordering byte for byte while
+    // leaving the authored `post` untouched. `postQualityPreset` is 0 unless the
+    // runtime (or the editor's shipped-look preview) declares otherwise, so this is a
+    // no-op everywhere else.
+    scene::ApplyGraphicsPreset(v.post, env_.postQualityPreset);
+    if (env_.forceShadowCascades > 0) v.post.shadowCascades = env_.forceShadowCascades;
     // Post Volumes: the highest-priority enabled volume that contains the camera
     // overrides the look fields; outside all of them the scene default applies.
     {
@@ -379,20 +480,42 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         v.light.color = sun.color;
         v.light.intensity = sun.intensity;
     }
-    // Day/night owns the exposure: auto-exposure (even from a Post Volume above)
-    // would adapt a dark starry night back into looking like daylight, so force a
-    // deterministic exposure from the sun height whenever the dynamic sky is on.
+    // DAY/NIGHT MODULATES THE AUTHORED LOOK - IT DOES NOT REPLACE IT.
+    //
+    // This used to be a REPLACEMENT, split across two files: Engine::UpdateDayNight
+    // overwrote env.ambientIntensity and every sun's colour/intensity with absolute
+    // constants every frame, and this block overwrote the authored exposure. The
+    // consequence was that with `dynamicSky` on, a scene's authored ambientIntensity,
+    // exposure and sun were DEAD DATA - a sealed interior authored at ambient 0.63
+    // rendered at 1.0 and swept 0.12 -> 1.0 once per day cycle, so the same room was
+    // a different brightness depending on when you looked at it. That is precisely
+    // "I cannot light this scene".
+    //
+    // Now the curve is a MULTIPLIER applied at READ time, here, on the values the
+    // scene file authored. Nothing writes back, so the inspector keeps showing (and
+    // editing) the authored numbers, and the GI bake sees what the author sees. The
+    // sun DIRECTION is still owned by the cycle (Engine::UpdateDayNight) - a sun that
+    // does not move is not a day/night cycle - which is why direction is absent here.
     if (env_.dynamicSky != 0) {
-        const f32 sunY = -v.light.direction.y; // to-sun = -(from-light direction)
-        const f32 day = glm::clamp(sunY * 6.0f + 0.15f, 0.0f, 1.0f);
+        // From the HOUR, not from the resulting light direction: the direction is
+        // whatever the last UpdateDayNight left (and on the first frame after a load,
+        // whatever the file authored), so deriving `day` from it made the curve
+        // depend on evaluation order.
+        const DayNight dn = EvalDayNight(env_.timeOfDay);
+        v.light.color *= dn.tint;
+        v.light.intensity *= dn.day;                 // dims to ~0 at night
+        v.ambientIntensity *= glm::mix(0.12f, 1.0f, dn.day); // dim moonlit floor at night
+        // Auto-exposure (even from a Post Volume above) would adapt a dark starry
+        // night back into looking like daylight, so force a deterministic exposure.
         v.post.autoExposureEnabled = 0;
-        // Night keeps a deep-blue glow (not crushed to black); day is full exposure.
-        v.exposure = glm::mix(0.6f, 1.0f, day);
+        // Night keeps a deep-blue glow (not crushed to black); day is the authored
+        // exposure, exactly.
+        v.exposure *= glm::mix(0.6f, 1.0f, dn.day);
         // Volumetric fog scatters a sun/sky haze that washes the night horizon, so
         // fade the fog with daylight (and kill the sun-shaft term when the sun is
         // down) - keeps a dark night dark.
-        v.post.fogDensity *= glm::mix(0.10f, 1.0f, day);
-        v.post.fogSunIntensity *= day;
+        v.post.fogDensity *= glm::mix(0.10f, 1.0f, dn.day);
+        v.post.fogSunIntensity *= dn.day;
     }
     v.irradianceIndex = env_.irradiance.index;
     v.prefilteredIndex = env_.prefiltered.index;
@@ -618,11 +741,40 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
 
 namespace scene {
 
-void SetupEnvironment(Scene& scene, Renderer& renderer) {
-    if (!renderer.SupportsScene()) return;
+// See the header. Moved here VERBATIM from Engine.cpp's anonymous namespace so the
+// one table has one home and both the runtime and the editor's preview read it.
+void ApplyGraphicsPreset(rhi::PostSettings& p, int preset) {
+    if (preset <= 0) return; // High: the authored look, exactly
+    // Medium (default in shipped builds): drop the heaviest SCREEN-SPACE passes -
+    // they cost the most at native fullscreen resolution and are the least missed.
+    p.ssgiEnabled = 0;
+    p.motionBlurEnabled = 0;
+    p.ssrEnabled = 0;   // screen-space reflections
+    p.fogEnabled = 0;   // volumetric fog raymarch
+    // DoF + SSAO are the remaining COVERAGE-SCALED costs (they ramp with lit-geometry
+    // screen fill = the daytime dip). Dropping them frees the ~2ms to hold 120 with the
+    // full-res painterly intact. Painterly is untouched (it's the art style).
+    p.dofEnabled = 0;
+    p.ssaoEnabled = 0;
+    // Shadows are "the dominant DAYTIME GPU cost" (see Common.hlsli ShadowFactor): each
+    // cascade re-rasterizes every caster (cost = cascades x casters, a per-draw descriptor
+    // bind on Vulkan). Drop the 4th (farthest, coarsest) cascade at Medium - the split
+    // scheme redistributes over 3 slices in Scene::MakeView so the full shadow DISTANCE is
+    // kept, only distant shadows get slightly coarser. ~25% off the whole shadow pass.
+    p.shadowCascades = 3;
+    if (preset >= 2) { // Low: minimal post; TAA falls back to cheap FXAA
+        p.ssrEnabled = 0;
+        p.dofEnabled = 0;
+        p.ssaoEnabled = 0;
+        p.shadowCascades = 2; // half the shadow-render cost; distant shadows softer
+        if (p.taaEnabled) {
+            p.taaEnabled = 0;
+            p.fxaaEnabled = 1;
+        }
+    }
+}
 
-    // Derive the procedural sky from the project's environment settings (custom
-    // skybox), defaulting to the built-in gradient when no project is active.
+ProceduralSkyParams ProjectSkyParams() {
     ProceduralSkyParams sky;
     EnvironmentSettings env;
     if (Project::HasActive()) env = Project::Active().Settings().environment;
@@ -633,9 +785,17 @@ void SetupEnvironment(Scene& scene, Renderer& renderer) {
     sky.sunTint = env.sky.sunTint;
     sky.sunIntensity = env.sky.sunIntensity;
     sky.skyIntensity = env.sky.skyIntensity;
+    return sky;
+}
 
-    const IBLMaps ibl = GenerateProceduralIBL(renderer, sky);
+void SetupSky(Scene& scene, Renderer& renderer) {
+    if (!renderer.SupportsScene()) return;
+    // Derive the procedural sky from the project's environment settings (custom
+    // skybox), defaulting to the built-in gradient when no project is active.
+    const IBLMaps ibl = GenerateProceduralIBL(renderer, ProjectSkyParams());
     if (!ibl.valid) return;
+    EnvironmentSettings env;
+    if (Project::HasActive()) env = Project::Active().Settings().environment;
     SceneEnvironment& se = scene.Environment();
     se.irradiance = ibl.irradiance;
     se.prefiltered = ibl.prefiltered;
@@ -643,23 +803,47 @@ void SetupEnvironment(Scene& scene, Renderer& renderer) {
     se.skinLUT = ibl.skinLUT;
     se.sky = ibl.sky;
     se.prefilteredMaxLod = ibl.prefilteredMaxLod;
-    se.ambientIntensity = env.ambientIntensity;
-    se.exposure = env.exposure;
-    se.post = env.post; // project-wide post stack is the scene default
     // Fallback sun (a scene's DirectionalLightComponent entity still wins in
     // MakeView). The light points from the sun toward the scene.
     se.sun.direction = glm::normalize(-env.sky.sunDirection);
     se.sun.color = env.sunColor;
     se.sun.intensity = env.sunLightIntensity;
-    // Day/night cycle settings (the engine loop advances + drives the sun when on).
-    se.timeOfDay = env.timeOfDay;
-    se.dayLengthSeconds = env.dayLengthSeconds;
-    se.dynamicSky = env.dynamicSky;
+    // Day/night cycle settings (the engine loop advances the clock when on) - the
+    // project's, and only while the LOADED SCENE has not claimed the clock for
+    // itself. A per-scene override (SceneEnvironment::dayNightAuthored, applied by
+    // scene::ApplyEnvironment) is authored data in the `.hbscene`; letting "Rebuild
+    // Sky + Lighting" quietly replace it with the project's values would both change
+    // the level's lighting and - because the override round-trips - write the
+    // project's hour into the level file on the next save.
+    if (se.dayNightAuthored == 0) {
+        se.timeOfDay = env.timeOfDay;
+        se.dayLengthSeconds = env.dayLengthSeconds;
+        se.dynamicSky = env.dynamicSky;
+    }
     se.cloudCoverage = env.cloudCoverage;
     se.cloudDensity = env.cloudDensity;
     se.overcast = env.overcast;
     se.windAngle = env.windAngle;
     se.windSpeed = env.windSpeed;
+}
+
+void ApplyProjectLookDefaults(Scene& scene) {
+    EnvironmentSettings env;
+    if (Project::HasActive()) env = Project::Active().Settings().environment;
+    SceneEnvironment& se = scene.Environment();
+    se.ambientIntensity = env.ambientIntensity;
+    se.exposure = env.exposure;
+    se.post = env.post; // project-wide post stack is the scene default
+}
+
+void SetupEnvironment(Scene& scene, Renderer& renderer) {
+    // Boot order, and the only place the two halves belong together: project
+    // defaults FIRST, then the startup scene's header overrides them.
+    // The device guard is kept where it always was, so a headless/device-less
+    // boot leaves the environment exactly as untouched as it used to.
+    if (!renderer.SupportsScene()) return;
+    SetupSky(scene, renderer);
+    ApplyProjectLookDefaults(scene);
 }
 
 // Minimal default world when no project/startup scene/model is given: an
@@ -723,7 +907,7 @@ void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh) {
              totalVerts, scene.EntityCount());
 }
 
-void SpawnParticleStress(Scene& scene, u32 count) {
+void SpawnParticleStress(Scene& scene, u32 count, bool gpuExpand, bool gpuSim) {
     if (count == 0) return;
 
     // Particle cost is OVERDRAW bound, not simulation bound, so this rig is tuned
@@ -761,11 +945,20 @@ void SpawnParticleStress(Scene& scene, u32 count) {
             em.additive = true;           // additive never depth-rejects -> full overdraw
             em.loop = true;
             em.emitting = true;
+            em.gpuExpand = gpuExpand;
+            // gpuSim owns the whole path (sim + expansion), so it does not also need
+            // the CPU-upload expansion flag - the two are mutually exclusive here so
+            // the three benchmark arms stay clean A/B/C rather than overlapping.
+            em.gpuSim = gpuSim;
+            if (gpuSim) em.gpuExpand = false;
             scene.Registry().emplace<ParticleEmitter>(e, em);
         }
     }
-    HBE_INFO("Scene: spawned {} particle emitters targeting {} live particles.",
-             spawned, count);
+    HBE_INFO("Scene: spawned {} particle emitters targeting {} live particles ({}).", spawned,
+             count,
+             gpuSim ? "GPU simulation + GPU expansion"
+                    : (gpuExpand ? "CPU simulation + GPU expansion"
+                                 : "CPU simulation + CPU expansion"));
 }
 
 bool LoadModel(Scene& scene, Renderer& renderer, const std::string& path) {

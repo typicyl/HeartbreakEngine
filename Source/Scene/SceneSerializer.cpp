@@ -10,16 +10,25 @@
 #include "Project/Project.h"
 #include "Scene/AnimationSystem.h"
 #include "Scene/CharacterSystem.h"
+#include "Scene/EntityGuid.h"
+#include "Scene/Hierarchy.h" // BuildChildrenMap (the one parent->children walk)
 #include "Scene/PaintSystem.h"
 #include "Scene/PostSettingsSerialization.h"
 #include "Scene/Scene.h"
+#include "Scene/TagTable.h" // tags::Name / Intern / Assign (streaming groups)
+#include "UI/UIDocumentJson.h" // the shared per-component UI JSON blocks (.hbscene + .hbui)
 #include "UI/UISystem.h" // PreloadUIAssets (eager UI font/texture load)
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -193,29 +202,47 @@ void FillColliderGeometry(RigidBody& rb, const std::string& meshSource, StagedAs
     rb.collisionIndices = md->indices;
 }
 
-// Builds + uploads a blendshape delta atlas for an entity's mesh, if that mesh has
-// morph targets available in `staged`. Layout: RGBA32F, width = vertex count, one
-// ROW per target (xyz = position delta). Fills `outNames` (atlas row order) and
-// `outVertexCount`; returns an invalid handle when there are no morphs. Only the
-// fresh-staged path resolves (a cached GPU mesh has no CPU MeshData here) - the
-// common single-instance/hero case; multi-instance/cached is a mesh-cache TODO.
-rhi::TextureHandle BuildMorphAtlas(Renderer& renderer, StagedAssets& staged,
-                                   const std::string& meshSource,
-                                   std::vector<std::string>& outNames, u32& outVertexCount) {
-    std::string rel;
-    u32 submesh = 0;
-    if (!SplitUafSource(meshSource, rel, submesh)) return {}; // prim:/non-uaf = no morphs
-    auto it = staged.models.find(rel);
-    if (it == staged.models.end() || submesh >= it->second.size()) return {};
-    const MeshData& md = it->second[submesh];
-    if (md.morphTargets.empty()) return {};
+// A RESOLVED blendshape atlas for one mesh source ("uaf:<rel>#<n>"). This is a
+// cache VALUE, and `hasMorphs == false` is a real answer ("that mesh has no
+// blendshapes"), not a failure - which is what lets a negative be cached and stop
+// the lookup from being retried for every instance of every prop.
+//
+// It exists as a cache entry because deriving it per spawn is plan blocker B3, and
+// both halves of B3 come from that: StageAssets skips loading the CPU model when
+// the GPU mesh is already cache-resident, so the SECOND spawn of a mesh had no
+// MeshData to read morphs out of and silently lost facial animation for the rest
+// of the session; and on the one path that does keep staging (a Mesh/ConvexHull
+// collider needs CPU geometry) the atlas was re-uploaded on every respawn with no
+// release, leaking one atlas per cycle - there is no texture destroy in the RHI.
+struct MorphAtlas {
+    rhi::TextureHandle texture; // bindless delta atlas (invalid if hasMorphs == false)
+    u32 vertexCount = 0;
+    std::vector<std::string> names; // atlas row order
+    bool hasMorphs = false;
+};
+
+// How many atlases have actually been BUILT+uploaded since process start (reset by
+// ClearInstantiateCaches). A respawn must not increment it - see MorphAtlasBuildCount.
+std::atomic<u32>& MorphBuilds() {
+    static std::atomic<u32> n{0};
+    return n;
+}
+
+// Builds + uploads a blendshape delta atlas from CPU mesh data. Layout: RGBA32F,
+// width = vertex count, one ROW per target (xyz = position delta). Returns an
+// entry with hasMorphs == false when the mesh carries no blendshapes.
+//
+// Callers go through ResolveMorphAtlas, never here: this function is the cache
+// MISS path and knows nothing about caching or about which mesh it was handed.
+MorphAtlas BuildMorphAtlasFromMesh(Renderer& renderer, const MeshData& md) {
+    MorphAtlas out;
     const u32 w = md.VertexCount();
     const u32 h = static_cast<u32>(md.morphTargets.size());
-    if (w == 0) return {};
+    if (w == 0 || h == 0) return out; // no blendshapes: a definitive answer
     std::vector<glm::vec4> pix(static_cast<usize>(w) * h, glm::vec4(0.0f));
     for (u32 t = 0; t < h; ++t) {
         const MorphTarget& mt = md.morphTargets[t];
-        outNames.push_back(mt.name);
+        out.names.push_back(mt.name);
         const usize n = std::min<usize>(mt.posDelta.size(), w);
         for (usize v = 0; v < n; ++v)
             pix[static_cast<usize>(t) * w + v] = glm::vec4(mt.posDelta[v], 0.0f);
@@ -225,8 +252,12 @@ rhi::TextureHandle BuildMorphAtlas(Renderer& renderer, StagedAssets& staged,
     desc.height = h;
     desc.format = rhi::Format::R32G32B32A32_FLOAT;
     desc.pixels = pix.data();
-    outVertexCount = w;
-    return renderer.UploadTexture(desc);
+    desc.debugName = "morph_atlas";
+    out.vertexCount = w;
+    out.hasMorphs = true;
+    out.texture = renderer.UploadTexture(desc); // invalid without a device (headless)
+    MorphBuilds().fetch_add(1, std::memory_order_relaxed);
+    return out;
 }
 
 rhi::TextureHandle UploadStagedTexture(Renderer& renderer, uaf::Texture& tex,
@@ -244,48 +275,157 @@ rhi::TextureHandle UploadStagedTexture(Renderer& renderer, uaf::Texture& tex,
 
 } // namespace
 
+// The scene writer's SKIP LIST, lifted out of BuildSceneJson so that anything which
+// has to agree with "what actually lands in the file" reads the same predicate
+// instead of copying the list. The shard bake is the first such caller: its
+// per-shard member `count` is cross-checked at load against the entities the FILE
+// contains, so a bake that counted an entity the writer drops would report every
+// shard as corrupt.
+// THE EXCLUSION LIST. One table, one reason per row, and the reason is the
+// REGENERATOR: an entity may be left out of the file if and only if something
+// puts it back. Nothing else may be omitted, ever - a `.hbscene` is the only
+// complete copy of an authored level.
+//
+// Kept as data rather than a chain of `if`s so that the writer, the shard bake,
+// BuildSubtreeJson and --test-scenesave all read the SAME rows, and so that the
+// reason travels with the rule instead of living in a comment somewhere upstream.
+// Adding a row here is a claim that must be true; --test-scenesave checks the
+// claim for every excluded entity it can reach.
+namespace {
+struct Exclusion {
+    // Does `e` match this row?
+    bool (*match)(const entt::registry&, entt::entity);
+    const char* component;
+    const char* regenerator;
+};
+
+constexpr Exclusion kExclusions[] = {
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<TerrainChunk>(e); },
+     "TerrainChunk",
+     "terrain::Update destroys and rebuilds every chunk from TerrainComponent::heights, "
+     "which IS serialized (with holeMask + splat); parse sets the dirty flag"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<UISurface>(e); },
+     "UISurface",
+     "ui::UpdateWorldSurfaces re-creates the page quad + render target from its "
+     "UICanvas every frame"},
+    // Transient UI the conversation player spawns; a checkpoint landing mid-Choice
+    // must NOT bake them into the .hbsave (they would reload as permanent, tag-less,
+    // un-clearable UI).
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<DialogueChoiceButton>(e); },
+     "DialogueChoiceButton",
+     "Engine::ClearDialogueChoices creates and destroys these per conversation"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<InteractPromptTag>(e); },
+     "InteractPromptTag",
+     "Engine::UpdateInteractions stamps the prompt/icon fresh each frame"},
+    // Modular-character parts: serializing them would double them up as static
+    // bind-pose meshes alongside the freshly-spawned ones.
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<SkinnedPartRef>(e); },
+     "SkinnedPartRef",
+     "character::Instantiate respawns every slot from the .hbchar on load; the root's "
+     "Character{asset,loadout,activeVariant} is serialized and is what it respawns from"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<DebrisChunk>(e); },
+     "DebrisChunk",
+     "rebuilt from the owning Destructible::chunkState on reactivate, so a save landing "
+     "mid-collapse does not bake the loose pieces in as authored props"},
+    // See EntityGuid.h rule 4: writing it means a restore re-creates all of it
+    // alongside the copies the Replace sweep spared - duplicate UI, with freshly
+    // minted per-launch identities on the duplicates.
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<Persistent>(e); },
+     "Persistent",
+     "the resident UI layer is loaded ONCE from the project's uiScene at boot and is "
+     "the exact set LoadMode::Replace refuses to destroy"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<UIDocMember>(e); },
+     "UIDocMember",
+     "a .hbui DOCUMENT's entities are ASSET content with their own file; the editor "
+     "writes them through SaveUIDocument and rebuilds them from it on the next open"},
+};
+} // namespace
+
+const char* SceneWriteExclusion(const entt::registry& reg, entt::entity e,
+                                const char** regeneratorOut) {
+    for (const Exclusion& x : kExclusions) {
+        if (!x.match(reg, e)) continue;
+        if (regeneratorOut) *regeneratorOut = x.regenerator;
+        return x.component;
+    }
+    if (regeneratorOut) *regeneratorOut = nullptr;
+    return nullptr;
+}
+
+usize SceneWriteExclusionCount() { return std::size(kExclusions); }
+
+const char* SceneWriteExclusionRow(usize i, const char** regeneratorOut) {
+    if (i >= std::size(kExclusions)) return nullptr;
+    if (regeneratorOut) *regeneratorOut = kExclusions[i].regenerator;
+    return kExclusions[i].component;
+}
+
+bool IsSerializedEntity(const entt::registry& reg, entt::entity e) {
+    return SceneWriteExclusion(reg, e, nullptr) == nullptr;
+}
+
+std::string SaveRefusal(const Scene& scene, u64 expectedWorldToken) {
+    // 1) IDENTITY. The registry is no longer the world the caller loaded, so the path
+    //    it is holding names a different level. Refusing is the whole point: the
+    //    alternative is writing world B over level A's file, which is unrecoverable.
+    if (expectedWorldToken != 0 && scene.WorldToken() != expectedWorldToken) {
+        return "this world was REPLACED since it was loaded (a checkpoint load, a "
+               "scene load, or a level bind), so it is not the level this file "
+               "describes. Reload the level, or use Save As.";
+    }
+    // 2) COMPLETENESS. A streamed world only contains what is spawned right now.
+    const StreamingResidency& s = scene.Streaming();
+    if (!s.bound) return {};
+    if (s.nonResident > 0) {
+        return std::to_string(s.nonResident) + " of " + std::to_string(s.shardCount) +
+               " streaming shard(s) are NOT loaded (" + s.missing +
+               "), so this world is missing objects that are in the file.";
+    }
+    // Every shard happens to be resident - but a world owned by the streamer is a
+    // world whose contents change with the camera, and a save is not atomic with
+    // respect to that. Authoring belongs to the editor's own load path.
+    return "this world is owned by the tag STREAMER (a bound level), whose contents "
+           "change with the camera. Load the level in the editor to author it.";
+}
+
 namespace {
 json EntityToJson(const entt::registry& reg, entt::entity e,
                   const std::unordered_map<u32, int>& indexOf, bool runtimeTags = false);
+
+SceneData HeaderOf(const SceneEnvironment& env) {
+    SceneData h;
+    h.ambientIntensity = env.ambientIntensity;
+    h.exposure = env.exposure;
+    h.shadowDistance = env.shadowDistance;
+    h.giSource = env.giSource;
+    h.post = env.post;
+    h.hasDayNight = env.dayNightAuthored != 0;
+    h.timeOfDay = env.timeOfDay;
+    h.dayLengthSeconds = env.dayLengthSeconds;
+    h.dynamicSky = env.dynamicSky;
+    return h;
+}
 
 // Builds the .hbscene JSON document (shared by file saves and snapshots). When
 // `include` is set, only entities it accepts are written (used to save each
 // loaded scene back to its own file - the active scene vs. streamed-in ones).
 json BuildSceneJson(const Scene& scene,
                     const std::function<bool(entt::entity)>& include = {},
-                    SceneKind kind = SceneKind::Full, bool runtimeTags = false) {
+                    SceneKind kind = SceneKind::Full, bool runtimeTags = false,
+                    const std::vector<ShardDesc>* shards = nullptr,
+                    const SceneData* headerFrom = nullptr) {
     const auto& reg = scene.Registry();
 
-    // Stable entity -> index mapping for parent links. Entities are gathered
-    // from every component type the serializer writes (anything with none of
-    // them would round-trip to nothing anyway).
+    // WHICH entities are written. Gathered from every component type the serializer
+    // writes (anything with none of them would round-trip to nothing anyway). This
+    // decides membership only - the ORDER is settled separately, below.
     std::vector<entt::entity> order;
     std::unordered_map<u32, int> indexOf;
+    std::unordered_set<u32> member;
     const auto add = [&](entt::entity e) {
-        // Terrain chunks are runtime-generated from a TerrainComponent; never
-        // serialize them (they're rebuilt on load). Same for world-UI surface
-        // quads (rebuilt from their UICanvas by ui::UpdateWorldSurfaces).
-        if (reg.try_get<TerrainChunk>(e)) return;
-        if (reg.try_get<UISurface>(e)) return;
-        // Dialogue Choice buttons are transient UI the conversation player spawns
-        // at runtime; a checkpoint/quicksave landing mid-Choice must NOT bake them
-        // into the .hbsave (they'd reload as permanent, tag-less, un-clearable UI).
-        if (reg.try_get<DialogueChoiceButton>(e)) return;
-        if (reg.all_of<InteractPromptTag>(e)) return; // transient interaction prompt UI (empty tag)
-        // Modular-character parts are respawned from the .hbchar by character::
-        // Instantiate on load, so they are never serialized (else they'd double up
-        // as static bind-pose meshes alongside the freshly-spawned ones).
-        if (reg.all_of<SkinnedPartRef>(e)) return;
-        // Destruction debris is rebuilt from the owning Destructible's chunk state,
-        // so a save landing mid-collapse must not bake the loose pieces in as
-        // permanent authored props.
-        if (reg.all_of<DebrisChunk>(e)) return;
+        if (!IsSerializedEntity(reg, e)) return;
         if (include && !include(e)) return; // not part of the scene being saved
-        const u32 key = static_cast<u32>(e);
-        if (indexOf.find(key) == indexOf.end()) {
-            indexOf[key] = static_cast<int>(order.size());
-            order.push_back(e);
-        }
+        member.insert(static_cast<u32>(e));
     };
     for (const entt::entity e : reg.view<const Transform>()) add(e);
     for (const entt::entity e : reg.view<const Name>()) add(e);
@@ -328,16 +468,86 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const FacialAnimator>()) add(e);
     for (const entt::entity e : reg.view<const Interactable>()) add(e);
     for (const entt::entity e : reg.view<const TriggerVolume>()) add(e);
+    // Streaming tag. Every tagged entity is gathered by one of the sweeps above in
+    // practice (they all carry Name/Transform), but an entity whose ONLY component
+    // were a Tag would otherwise be dropped silently - and dropping a member of a
+    // streaming group is exactly the failure that is impossible to notice.
+    for (const entt::entity e : reg.view<const Tag>()) add(e);
+
+    // THE WRITE ORDER, and why it is not just "whatever the gather produced".
+    //
+    // The gather above is a sequence of sweeps over DIFFERENT component pools, and an
+    // entt view walks its pool in REVERSE insertion order - so the file's entity array
+    // came out reversed relative to the world, and reversed AGAIN on the next save.
+    // Every save of a level therefore rewrote the entire file with its array flipped
+    // (37 MB of churn on the reference level, and a diff that says everything changed),
+    // and save -> load -> save was not a fixed point: it took TWO round trips to come
+    // back to the same bytes. That is a save whose output depends on how many times it
+    // has been saved, which is not a property a save may have.
+    //
+    // So the order comes from ONE pool - the entity storage - walked once, reversed
+    // into creation order. Instantiate creates entities in file order, so file order
+    // becomes creation order becomes file order: a fixed point after ONE round trip,
+    // for every scene, regardless of which components each entity happens to hold.
+    // (Membership is still the multi-sweep set above; this only sequences it.)
+    if (const auto* es = reg.storage<entt::entity>()) {
+        order.reserve(member.size());
+        for (const entt::entity e : *es)
+            if (reg.valid(e) && member.count(static_cast<u32>(e))) order.push_back(e);
+        std::reverse(order.begin(), order.end());
+    }
+    // Parent links are indices into the array we are about to write, so this map is
+    // built from the FINAL order - never from the gather.
+    for (usize i = 0; i < order.size(); ++i)
+        indexOf[static_cast<u32>(order[i])] = static_cast<int>(i);
 
     json root;
     root["version"] = 1;
     if (kind != SceneKind::Full) root["kind"] = ToString(kind);
-    root["ambientIntensity"] = scene.Environment().ambientIntensity;
-    root["exposure"] = scene.Environment().exposure;
-    root["shadowDistance"] = scene.Environment().shadowDistance;
-    root["post"] = PostToJson(scene.Environment().post);
-    if (!scene.Environment().giSource.empty())
-        root["giSource"] = scene.Environment().giSource;
+    // THE HEADER'S SOURCE, and why it is a parameter.
+    //
+    // A scene file's header describes THAT FILE's look. The live environment
+    // describes the look of whatever was loaded with LoadMode::Replace - which for
+    // a STREAMED-IN scene is a different file entirely (scene::ApplyEnvironment
+    // deliberately applies nothing on an additive load). Writing the live
+    // environment into every file the editor happens to have open therefore
+    // overwrote each streamed file's ambient/exposure/shadowDistance/post AND its
+    // giSource with the active document's, on a plain Ctrl+S - so a streamed level
+    // silently adopted another level's baked `.hbgi`, which resolves, loads, and
+    // lights the room with an irradiance grid baked for different geometry. That is
+    // worse than no GI and completely silent.
+    //
+    // So the caller may hand in the header to emit (Editor::SaveStreamedScenes
+    // re-parses the DESTINATION file and passes its own header straight back).
+    // nullptr = "this scene IS the live environment", which is every other caller.
+    const SceneData live = HeaderOf(scene.Environment());
+    const SceneData& hdr = headerFrom ? *headerFrom : live;
+    root["ambientIntensity"] = hdr.ambientIntensity;
+    root["exposure"] = hdr.exposure;
+    root["shadowDistance"] = hdr.shadowDistance;
+    root["post"] = PostToJson(hdr.post);
+    if (!hdr.giSource.empty()) root["giSource"] = hdr.giSource;
+    // Written only when the scene AUTHORED an override, so a level that inherits the
+    // project's cycle stays byte-for-byte what it was before the keys existed.
+    if (hdr.hasDayNight) {
+        root["timeOfDay"] = hdr.timeOfDay;
+        root["dayLengthSeconds"] = hdr.dayLengthSeconds;
+        root["dynamicSky"] = hdr.dynamicSky;
+    }
+    // Baked streaming shards (see ShardDesc). Written only when there are any, so a
+    // scene with no tags is byte-for-byte what it was before sharding existed -
+    // which is also what keeps the two-round-trip byte-identity assertions in
+    // LevelTypesSelfTest / tags::SelfTest honest.
+    if (shards && !shards->empty()) {
+        json& sa = root["tagShards"] = json::array();
+        for (const ShardDesc& s : *shards) {
+            sa.push_back(json{{"tag", s.tag},
+                              {"index", s.index},
+                              {"min", ToJson(s.min)},
+                              {"max", ToJson(s.max)},
+                              {"count", s.count}});
+        }
+    }
 
     json& arr = root["entities"] = json::array();
     for (const entt::entity e : order)
@@ -351,6 +561,14 @@ json BuildSceneJson(const Scene& scene,
 json EntityToJson(const entt::registry& reg, entt::entity e,
                   const std::unordered_map<u32, int>& indexOf, bool runtimeTags) {
         json je;
+        // Stable per-entity identity, written as a 16-char hex STRING (a 64-bit
+        // JSON number is the one thing tooling reliably mangles). Always written,
+        // exactly like "sceneLayer" below - saved state keys on this, so an entity
+        // that round-trips without one rebinds to a different object on the next
+        // load. BuildSubtreeJson deliberately REMOVES it again: a copy/paste,
+        // duplicate or prefab instance is a NEW object and must mint a fresh guid.
+        if (const Guid* g = reg.try_get<Guid>(e); g && g->value != 0)
+            je["guid"] = guid::ToHex(g->value);
         if (const Name* n = reg.try_get<Name>(e)) je["name"] = n->value;
         // Prefab-instance link (root entity of a placed .hbprefab).
         if (const PrefabInstance* pi = reg.try_get<PrefabInstance>(e); pi && !pi->source.empty())
@@ -358,15 +576,42 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         // Editor-only visibility (hidden but loaded). Runtime ignores it.
         if (reg.all_of<EditorHidden>(e)) je["editorHidden"] = true;
         if (const Transform* t = reg.try_get<Transform>(e)) {
-            je["transform"] = {{"p", ToJson(t->position)},
-                               {"r", ToJson(t->rotation)},
-                               {"s", ToJson(t->scale)}};
+            Transform xf = *t;
+            // AN AUTO-PLAYING KEYFRAME TRACK OWNS THIS TRANSFORM, so the live value is
+            // a PLAYHEAD POSITION, not authored data - anim::Update samples into it
+            // every frame, in the editor as well as in Play. Writing it made a save
+            // depend on how long the scene had been open (open the level, walk away,
+            // Ctrl+S, and every animated prop is frozen wherever its clip happened to
+            // be), which is both authored-value loss and a save that is not a function
+            // of the scene.
+            //
+            // t = 0 is not an arbitrary choice: `time` is deliberately not serialized,
+            // so t = 0 is exactly where the entity WILL be on the frame after this file
+            // is loaded. Writing it makes the file agree with the world it produces,
+            // and makes save -> load -> save a fixed point (--test-scenesave step 4).
+            // A paused/stopped track (playing == false) is never sampled on load, so
+            // its live transform IS the authored one and is written unchanged.
+            if (const AnimationTrack* at = reg.try_get<AnimationTrack>(e);
+                at && at->playing && at->duration > 0.0f && !at->keys.empty()) {
+                anim::SampleAt(*at, 0.0f, xf);
+            }
+            je["transform"] = {{"p", ToJson(xf.position)},
+                               {"r", ToJson(xf.rotation)},
+                               {"s", ToJson(xf.scale)}};
         }
         if (const Parent* p = reg.try_get<Parent>(e)) {
             if (auto it = indexOf.find(static_cast<u32>(p->entity)); it != indexOf.end()) {
                 je["parent"] = it->second;
             }
         }
+        // SIBLING ORDER. Authored data, written unconditionally like "guid" and
+        // "sceneLayer" - the whole point of the field is that hierarchy order stops
+        // depending on entt pool order, which a single unrelated delete permutes
+        // (swap_and_pop / swap_only) and which this file's ROW order still derives
+        // from. See Scene/Hierarchy.h. Absent on read = the file's row index, so
+        // older scenes are unaffected.
+        if (const HierarchyOrder* ho = reg.try_get<HierarchyOrder>(e))
+            je["order"] = ho->index;
         if (const MeshInstance* mi = reg.try_get<MeshInstance>(e)) {
             const MeshRef* ref = reg.try_get<MeshRef>(e);
             je["mesh"] = {{"source", ref ? ref->source : std::string()},
@@ -723,109 +968,43 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         if (const IKConstraint* ik = reg.try_get<IKConstraint>(e)) {
             json chains = json::array();
             for (const IKChain& ch : ik->chains) {
-                chains.push_back({{"endJoint", ch.endJoint},
-                                  {"target", ToJson(ch.target)},
-                                  {"pole", ToJson(ch.pole)},
-                                  {"hasPole", ch.hasPole},
-                                  {"weight", ch.weight},
-                                  {"enabled", ch.enabled},
-                                  {"targetEntity", ch.targetEntity}});
+                json jc = {{"endJoint", ch.endJoint},
+                           {"pole", ToJson(ch.pole)},
+                           {"hasPole", ch.hasPole},
+                           {"weight", ch.weight},
+                           {"enabled", ch.enabled},
+                           {"targetEntity", ch.targetEntity}};
+                // `target` is AUTHORED only while the chain has no targetEntity. With
+                // one set, anim::UpdateSkeletal OVERWRITES target from that entity's
+                // world position every frame - editor included - so writing it stored
+                // a derived value and destroyed whatever vec3 the author had typed
+                // before they bound the entity. Omitting it also makes the file a
+                // function of the scene rather than of how long it had been open:
+                // the parser leaves the default and the first UpdateSkeletal
+                // recomputes it, which is what would have happened anyway.
+                if (ch.targetEntity.empty()) jc["target"] = ToJson(ch.target);
+                chains.push_back(std::move(jc));
             }
             je["ik"] = {{"chains", std::move(chains)}};
         }
-        if (const UIElement* el = reg.try_get<UIElement>(e)) {
-            je["ui"] = {{"type", static_cast<int>(el->type)},
-                        {"text", el->text},
-                        {"anchorMin", json::array({el->anchorMin.x, el->anchorMin.y})},
-                        {"anchorMax", json::array({el->anchorMax.x, el->anchorMax.y})},
-                        {"pivot", json::array({el->pivot.x, el->pivot.y})},
-                        {"offset", json::array({el->offset.x, el->offset.y})},
-                        {"size", json::array({el->size.x, el->size.y})},
-                        {"color", ToJson(el->color)},
-                        {"textSize", el->textSize},
-                        {"hAlign", static_cast<int>(el->hAlign)},
-                        {"vAlign", static_cast<int>(el->vAlign)},
-                        {"visible", el->visible},
-                        {"texture", el->texture},
-                        {"fill", el->fill},
-                        {"fillColor", ToJson(el->fillColor)},
-                        {"radial", el->radial},
-                        {"fullscreen", el->fullscreen},
-                        {"action", el->action},
-                        {"font", el->font},
-                        {"rotation", el->rotation},
-                        {"scale", json::array({el->scale.x, el->scale.y})},
-                        {"value", el->value},
-                        {"toggled", el->toggled},
-                        {"selected", el->selected},
-                        {"options", el->options},
-                        {"frames", el->frames},
-                        {"contentSize", json::array({el->contentSize.x, el->contentSize.y})},
-                        {"scrollPos", json::array({el->scrollPos.x, el->scrollPos.y})},
-                        {"scrollSpeed", el->scrollSpeed},
-                        {"scrollVertical", el->scrollVertical},
-                        {"scrollHorizontal", el->scrollHorizontal},
-                        {"autoScroll", el->autoScroll},
-                        {"autoScrollLoop", el->autoScrollLoop},
-                        {"placeholder", el->placeholder},
-                        {"maxLength", el->maxLength},
-                        {"hoverColor", ToJson(el->hoverColor)},
-                        {"pressedColor", ToJson(el->pressedColor)},
-                        {"disabledColor", ToJson(el->disabledColor)},
-                        {"enabled", el->enabled},
-                        {"hoverSound", el->hoverSound},
-                        {"clickSound", el->clickSound},
-                        {"trackTexture", el->trackTexture},
-                        {"fillTexture", el->fillTexture},
-                        {"handleTexture", el->handleTexture},
-                        {"handleSize", el->handleSize},
-                        {"onTexture", el->onTexture},
-                        {"offTexture", el->offTexture},
-                        {"hoverTexture", el->hoverTexture},
-                        {"pressedTexture", el->pressedTexture},
-                        {"disabledTexture", el->disabledTexture},
-                        {"cellTexture", el->cellTexture},
-                        {"slice", ToJson(el->slice)},
-                        {"wrap", el->wrap}};
-        }
-        if (const UICanvas* canvas = reg.try_get<UICanvas>(e)) {
-            je["uiCanvas"] = {{"scaleMode", canvas->scaleMode},
-                              {"refWidth", canvas->refWidth},
-                              {"refHeight", canvas->refHeight},
-                              {"sortOrder", canvas->sortOrder},
-                              {"visible", canvas->visible},
-                              {"worldSpace", canvas->worldSpace},
-                              {"worldWidth", canvas->worldWidth},
-                              {"emissive", canvas->emissive},
-                              {"rtWidth", canvas->rtWidth},
-                              {"rtHeight", canvas->rtHeight}};
-        }
-        if (const UIAnimator* an = reg.try_get<UIAnimator>(e)) {
-            je["uiAnimator"] = {{"clip", an->clip}, {"trigger", static_cast<int>(an->trigger)}};
-        }
-        if (const UIPanel* p = reg.try_get<UIPanel>(e)) {
-            je["uiPanel"] = {{"name", p->name}, {"startVisible", p->startVisible}};
-        }
-        if (const UILayoutGroup* lg = reg.try_get<UILayoutGroup>(e)) {
-            je["uiLayoutGroup"] = {{"kind", static_cast<int>(lg->kind)},
-                                   {"spacing", lg->spacing},
-                                   {"cellSize", json::array({lg->cellSize.x, lg->cellSize.y})},
-                                   {"padding", ToJson(lg->padding)},
-                                   {"columns", lg->columns},
-                                   {"fitContent", lg->fitContent}};
-        }
-        if (const UICanvasGroup* cg = reg.try_get<UICanvasGroup>(e)) {
-            je["uiCanvasGroup"] = {{"opacity", cg->opacity},
-                                   {"interactable", cg->interactable}};
-        }
-        if (const WorldText* wt = reg.try_get<WorldText>(e)) {
-            je["worldText"] = {{"text", wt->text},
-                               {"size", wt->size},
-                               {"color", json::array({wt->color.r, wt->color.g,
-                                                      wt->color.b, wt->color.a})},
-                               {"font", wt->font},
-                               {"billboard", wt->billboard}};
-        }
+        // The seven UI-adjacent component blocks live in UI/UIDocumentJson.h so
+        // that `.hbscene` and `.hbui` cannot drift: ONE writer, two callers. The
+        // bodies moved verbatim (--test-uidoc diffs them against a frozen copy of
+        // what used to be inlined right here, byte for byte). `worldText` is in
+        // that set by adjacency only - it is world-space 3D text, NOT screen UI,
+        // and is deliberately not a `.hbui` key.
+        if (const UIElement* el = reg.try_get<UIElement>(e)) je["ui"] = ui::WriteElement(*el);
+        if (const UICanvas* canvas = reg.try_get<UICanvas>(e))
+            je["uiCanvas"] = ui::WriteCanvas(*canvas);
+        if (const UIAnimator* an = reg.try_get<UIAnimator>(e))
+            je["uiAnimator"] = ui::WriteAnimator(*an);
+        if (const UIPanel* p = reg.try_get<UIPanel>(e)) je["uiPanel"] = ui::WritePanel(*p);
+        if (const UILayoutGroup* lg = reg.try_get<UILayoutGroup>(e))
+            je["uiLayoutGroup"] = ui::WriteLayout(*lg);
+        if (const UICanvasGroup* cg = reg.try_get<UICanvasGroup>(e))
+            je["uiCanvasGroup"] = ui::WriteGroup(*cg);
+        if (const WorldText* wt = reg.try_get<WorldText>(e))
+            je["worldText"] = ui::WriteWorldText(*wt);
         if (const ParticleEmitter* pe = reg.try_get<ParticleEmitter>(e)) {
             je["particles"] = {
                 {"rate", pe->rate}, {"maxParticles", pe->maxParticles},
@@ -859,7 +1038,8 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                 {"useCurlNoise", pe->useCurlNoise}, {"curlStrength", pe->curlStrength},
                 {"curlFrequency", pe->curlFrequency}, {"expDrag", pe->expDrag},
                 {"simulateColor", pe->simulateColor}, {"colorVariance", pe->colorVariance},
-                {"simulateSize", pe->simulateSize}, {"sizeVariance", pe->sizeVariance}};
+                {"simulateSize", pe->simulateSize}, {"sizeVariance", pe->sizeVariance},
+                {"gpuExpand", pe->gpuExpand}, {"gpuSim", pe->gpuSim}};
         }
         if (const AudioSource* src = reg.try_get<AudioSource>(e)) {
             je["audio"] = {{"asset", src->asset},
@@ -921,7 +1101,13 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         // CharacterController's "character" key.
         if (const Character* ch = reg.try_get<Character>(e)) {
             json av = json::object();
-            for (const auto& [slot, variant] : ch->activeVariant) av[slot] = variant;
+            // ONLY when the map is authored (an equip, or overrides the file already
+            // carried). A map that character::Instantiate merely resolved from the
+            // .hbchar's defaults is derived state; writing it froze a custom loadout
+            // the author never chose and permanently cut the entity off from later
+            // changes to the asset's defaults. See Character::variantAuthored.
+            if (ch->variantAuthored)
+                for (const auto& [slot, variant] : ch->activeVariant) av[slot] = variant;
             je["characterRig"] = {{"asset", ch->asset}, {"loadout", ch->loadout},
                                   {"activeVariant", std::move(av)}};
         }
@@ -939,11 +1125,55 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                {"playing", a->playing},
                                {"keys", std::move(keys)}};
         }
-        // Per-object Static/Dynamic layer is authored INTO the one scene file (the
-        // editor works in a single scene; the build splits .static/.dynamic from
-        // these tags). Always written on disk now, not just snapshots.
+        // Per-object Static/Dynamic layer, authored INTO the one scene file. A
+        // level is ONE .hbscene, so this tag is the ONLY carrier of the layer -
+        // the navmesh filter (GridNav) and MaterialFlag_PainterlyExempt read it.
+        // Always written on disk, not just in snapshots.
         if (const SceneLayer* sl = reg.try_get<SceneLayer>(e))
             je["sceneLayer"] = ToString(sl->kind);
+        // Streaming group + baked shard. Authored, so on disk - but written
+        // CONDITIONALLY, unlike "sceneLayer" above. LevelTypesSelfTest asserts two
+        // save/parse/save round trips are BYTE-IDENTICAL and its `rebuild` lambda
+        // reconstructs only Guid/Transform/SceneLayer/Parent; an always-present
+        // key (even an empty one) would survive the first save and vanish from the
+        // second. Absence already means Untagged, so there is nothing to write.
+        if (const Tag* tg = reg.try_get<Tag>(e); tg && tg->id != kTagUntagged) {
+            const std::string& tn = tags::Name(tg->id);
+            // BOTH KEYS OR NEITHER. "shard" without "tag" is a row the loader drops
+            // from its streaming group (parse leaves hasTag false, Instantiate gives
+            // it no Tag, tagshard::FromParsed skips it) while the header still counts
+            // it - so the whole shard table reads as stale and the level stops
+            // streaming. A live Tag holding an id with no table entry is what
+            // tags::ReconcileWithTable exists to prevent, but the writer must not
+            // depend on that having run.
+            if (tn.empty()) {
+                HBE_WARN("Scene: entity holds tag id {} which the live tag table does not "
+                         "name; its streaming group is not written.",
+                         tg->id);
+            } else {
+                je["tag"] = tn; // the NAME serializes, never the id
+                // Only when actually baked: "shard": -1 on every entity would double
+                // the churn in a diff and mean nothing.
+                if (tg->shard >= 0) je["shard"] = tg->shard;
+            }
+        }
+        // PAINT-STROKE ZONE GROUP (Scene/StrokeZone.h). The NAME serializes, exactly
+        // like "tag" above and for the same reason - a `.hbscene` stays portable
+        // between projects, where a raw interned id would not. Written whenever the
+        // component is present, INCLUDING the untagged group ("Untagged"): the
+        // component is the group's identity, and the untagged group is precisely the
+        // one that has no Tag to infer it from.
+        //
+        // The zone is read from the node's OWN Tag (strokezone::GroupZone), not from a
+        // second copy inside the component: the marker carries no id any more, because
+        // nothing kept a copy in sync with tags::RemoveTag / tags::AssignSubtree. The
+        // written value is therefore always the same string "tag" carries above (or
+        // "Untagged" when the node has no Tag, which is the untagged group).
+        if (reg.all_of<StrokeGroup>(e)) {
+            const Tag* gt = reg.try_get<Tag>(e);
+            const std::string gn = gt ? tags::Name(gt->id) : std::string();
+            je["strokeGroup"] = gn.empty() ? std::string(tags::kUntaggedName) : gn;
+        }
         // SceneSource (which FILE an entity belongs to) stays snapshot-only: it's a
         // load-time partition tag, meaningless inside a single authored scene.
         if (runtimeTags) {
@@ -966,30 +1196,95 @@ json BuildSubtreeJson(const Scene& scene, entt::entity root) {
     std::vector<entt::entity> order;
     std::unordered_map<u32, int> indexOf;
     std::vector<entt::entity> stack{root};
+    // B11 is a CROSS-BOUNDARY rule, not a "documents are uncopyable" rule. The
+    // reference frame is the ROOT's document: 0 for a world root, `doc` for a
+    // subtree rooted inside an open `.hbui`. Skipping the root itself (which is
+    // what testing `all_of<UIDocMember>` unconditionally did) made
+    // BuildSubtreeJson return `{"version":1,"entities":[]}` for every document
+    // entity - non-empty as a STRING, so every caller's `frag.empty()` guard
+    // sailed past it: Ctrl+C / Ctrl+D on a menu button became a silent no-op,
+    // Ctrl+X deleted the widget and copied nothing, and "Save as Prefab" wrote a
+    // zero-entity `.hbprefab`. Intra-document copy is legitimate and is how a
+    // widget gets duplicated; PasteSubtree re-stamps UIDocMember on the clone and
+    // refuses the fragment outright when no document is the edit target, and
+    // Editor::CreatePrefabFromSelection refuses a UI-carrying fragment, so the
+    // "document content must never reach a .hbscene / .hbprefab" half still holds.
+    const UIDocMember* rootDoc = reg.try_get<UIDocMember>(root);
+    const u32 rootDocId = rootDoc ? rootDoc->doc : 0u;
+    // ONE pass over the Parent pool, bucketed and SORTED BY SIBLING ORDER, instead
+    // of a full `view<Parent>` scan per visited node. Two separate fixes in one:
+    //
+    //   ORDER. The old inner scan queued children in Parent-POOL order, which is
+    //   authored order only until the pool is perturbed - and `swap_and_pop` (one
+    //   component erase, one unparent) plus `swap_only` (one destroy) both permute
+    //   it. A copy taken after any delete therefore emitted a different child order
+    //   from the one the author sees, and the paste reproduced the wrong one. The
+    //   map sorts by HierarchyOrder, which is authored data (Scene/Hierarchy.h).
+    //
+    //   COST. The scan made this O(N x P) against the WORLD-WIDE Parent pool, not
+    //   the subtree: measured 5 ms at 1000 nodes, 79 ms at 4000, 1.26 s at 16000 -
+    //   a hard stall on Ctrl+C. This is linear.
+    const ChildrenMap kids = BuildChildrenMap(reg);
     while (!stack.empty()) {
         const entt::entity e = stack.back();
         stack.pop_back();
-        if (reg.try_get<TerrainChunk>(e)) continue; // runtime-generated chunks
-        if (reg.try_get<UISurface>(e)) continue;    // runtime world-UI quads
-        if (reg.all_of<DebrisChunk>(e)) continue;   // runtime destruction debris
+        // THE SAME EXCLUSION TABLE the file writer uses, minus its UIDocMember row -
+        // which is replaced, not dropped, by the cross-boundary rule just below (a
+        // subtree rooted INSIDE a document legitimately copies its own members).
+        //
+        // It used to be a hand-written subset: TerrainChunk, UISurface, DebrisChunk
+        // and nothing else. SkinnedPartRef was the expensive omission - Ctrl+D or
+        // "Save as Prefab" on a modular character walked its spawned parts, which
+        // carry no MeshRef, so they serialized with an empty mesh source and pasted
+        // back as junk entities that the next Ctrl+S then wrote into the .hbscene as
+        // real authored content, six more per duplicate. Persistent,
+        // DialogueChoiceButton and InteractPromptTag were the same shape.
+        if (const char* excluded = SceneWriteExclusion(reg, e, nullptr);
+            excluded && std::strcmp(excluded, "UIDocMember") != 0)
+            continue;
+        // The cross-boundary skip: a world child parented under a document
+        // element (or vice versa) is NOT carried along.
+        {
+            const UIDocMember* m = reg.try_get<UIDocMember>(e);
+            if ((m ? m->doc : 0u) != rootDocId) continue;
+        }
         const u32 key = static_cast<u32>(e);
         if (indexOf.count(key)) continue;
         indexOf[key] = static_cast<int>(order.size());
         order.push_back(e);
-        // Queue children (any entity parented to this one).
-        for (const entt::entity c : reg.view<const Parent>()) {
-            const Parent* pp = reg.try_get<Parent>(c);
-            if (pp && static_cast<u32>(pp->entity) == key) stack.push_back(c);
+        // Queue children, pushed in REVERSE so the LIFO pops them in sibling order.
+        if (const auto it = kids.find(key); it != kids.end()) {
+            for (auto r = it->second.rbegin(); r != it->second.rend(); ++r)
+                stack.push_back(*r);
         }
     }
     for (const entt::entity e : order) {
         json je = EntityToJson(reg, e, indexOf);
+        // IDENTITY IS NOT COPIED. Every duplication path in the editor funnels
+        // through here - CopySelection/PasteSubtree, DuplicateSelection,
+        // CreatePrefabFromSelection (so a .hbprefab on disk is guid-free too),
+        // InstantiatePrefab and RevertPrefabInstance - and a duplicate is a NEW
+        // object, not the same one restored. Dropping the key here means the
+        // paste has nothing to adopt, so Scene::CreateEntity's fresh mint stands.
+        // Carrying it forward instead would alias two entities' persisted state,
+        // which is the one failure this whole mechanism exists to prevent.
+        // (Undo/redo and .hbsave restores go through BuildSceneJson, NOT here,
+        // and do keep their guids - those are the same objects coming back.)
+        je.erase("guid");
         // Preserve each entity's level layer (Static/Dynamic) so copy/paste, duplicate
         // and prefab instancing keep the same layer instead of being re-auto-classified
         // on paste. (sceneSrc is deliberately NOT copied - a clone belongs to whatever
         // scene it is pasted into, but it should stay on the layer it was authored on.)
         if (const SceneLayer* sl = reg.try_get<SceneLayer>(e))
             je["sceneLayer"] = ToString(sl->kind);
+        // THE STREAMING TAG IS COPIED, THE BAKED SHARD IS NOT. A clone belongs to
+        // the same streaming GROUP as its source (that is what the author asked
+        // for, and it is how a `.hbprefab` of a camp tent stays part of "Camp"),
+        // but the shard index is a spatial fact about a position the clone does
+        // not have yet - it is re-derived by the sharder on the next save. Keeping
+        // it would file the clone under whatever shard the original sat in.
+        // (EntityToJson already wrote "tag"; only "shard" needs removing.)
+        je.erase("shard");
         arr.push_back(std::move(je));
     }
     return doc;
@@ -997,6 +1292,13 @@ json BuildSubtreeJson(const Scene& scene, entt::entity root) {
 
 // Fills SceneData from a parsed .hbscene JSON document.
 void ParseSceneJson(const json& root, SceneData& out) {
+    // FILLS `out` - it does not append to it. Every caller assumes that, and the
+    // guid migration in ParseSceneFile depends on it hard: it derives each
+    // pre-guid entity's identity from its INDEX in `out.entities`, which is only
+    // the index in the FILE when the vector starts empty. Re-parsing into a
+    // reused SceneData without this would both double the entities and shift
+    // every derived guid.
+    out.entities.clear();
     out.kind = SceneKindFromString(root.value("kind", std::string("full")));
     out.ambientIntensity = root.value("ambientIntensity", 1.0f);
     out.giSource = root.value("giSource", std::string());
@@ -1005,9 +1307,41 @@ void ParseSceneJson(const json& root, SceneData& out) {
     if (const auto it = root.find("post"); it != root.end() && it->is_object()) {
         PostFromJson(*it, out.post); // out.post starts at defaults (effects on)
     }
+    // The optional per-scene day/night override. ANY of the three keys claims the
+    // clock for this level; the other two then fall back to the STRUCT's defaults
+    // (`out.<field>`, never a literal - the "a default lives in two places" rule).
+    // Absent entirely = inherit the project, exactly as before this key existed.
+    out.hasDayNight = root.contains("timeOfDay") || root.contains("dayLengthSeconds") ||
+                      root.contains("dynamicSky");
+    if (out.hasDayNight) {
+        out.timeOfDay = root.value("timeOfDay", out.timeOfDay);
+        out.dayLengthSeconds = root.value("dayLengthSeconds", out.dayLengthSeconds);
+        out.dynamicSky = root.value("dynamicSky", out.dynamicSky);
+    }
+    // Baked streaming shards (see ShardDesc). Rows missing a tag name are dropped:
+    // a shard nothing can be matched to is worse than no shard at all, because the
+    // count cross-check would then fail for a reason no author could act on.
+    out.tagShards.clear();
+    if (const auto it = root.find("tagShards"); it != root.end() && it->is_array()) {
+        for (const json& js : *it) {
+            if (!js.is_object()) continue;
+            ShardDesc s;
+            s.tag = js.value("tag", std::string());
+            if (s.tag.empty()) continue;
+            s.index = js.value("index", 0u);
+            s.min = Vec3(js.value("min", json()));
+            s.max = Vec3(js.value("max", json()));
+            s.count = js.value("count", 0u);
+            out.tagShards.push_back(std::move(s));
+        }
+    }
 
     for (const json& je : root.value("entities", json::array())) {
         EntityData d;
+        // Stable identity. Absent (pre-guid file, or a clipboard/prefab fragment
+        // that had it stripped) leaves 0, which Instantiate reads as "mint one".
+        if (auto it = je.find("guid"); it != je.end() && it->is_string())
+            d.guid = guid::FromHex(it->get<std::string>());
         d.name = je.value("name", "");
         d.prefabSource = je.value("prefab", "");
         d.editorHidden = je.value("editorHidden", false);
@@ -1018,6 +1352,9 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.transform.scale = Vec3(it->value("s", json()), glm::vec3(1.0f));
         }
         d.parent = je.value("parent", -1);
+        // -1 = the file predates the field; Instantiate substitutes the row index.
+        // The same default is spelled out on EntityData::order - change both.
+        d.order = je.value("order", -1);
         if (auto it = je.find("mesh"); it != je.end()) {
             d.hasMesh = true;
             d.meshSource = it->value("source", "");
@@ -1404,6 +1741,9 @@ void ParseSceneJson(const json& root, SceneData& out) {
             if (const auto av = it->find("activeVariant"); av != it->end() && av->is_object())
                 for (const auto& [slot, variant] : av->items())
                     d.characterRig.activeVariant[slot] = variant.get<std::string>();
+            // "The file carried overrides" IS what makes the map authored - the flag
+            // itself is never written (see Character::variantAuthored).
+            d.characterRig.variantAuthored = !d.characterRig.activeVariant.empty();
         }
         if (auto it = je.find("character"); it != je.end()) {
             d.hasCharacter = true;
@@ -1437,142 +1777,39 @@ void ParseSceneJson(const json& root, SceneData& out) {
                 }
             }
         }
+        // Readers for the same seven blocks, from UI/UIDocumentJson.h. They carry
+        // the back-compat rules (the v2 collapsed "anchor", the v1 "textScale" x
+        // 28) and every clamp - which is exactly the part a hand-written .hbui
+        // reader would have silently lost. These stay HERE PERMANENTLY: an
+        // unmigrated .hbscene with UI in it must keep parsing forever, and the
+        // migrator reads through this very path.
         if (auto it = je.find("ui"); it != je.end()) {
             d.hasUI = true;
-            const int type = it->value("type", 1);
-            d.uiElement.type = static_cast<UIElement::Type>(glm::clamp(type, 0, 9));
-            d.uiElement.text = it->value("text", "");
-            const auto vec2Of = [&](const char* key, glm::vec2 def) {
-                const json arr = it->value(key, json::array());
-                if (arr.is_array() && arr.size() >= 2) {
-                    return glm::vec2{arr[0].get<f32>(), arr[1].get<f32>()};
-                }
-                return def;
-            };
-            // v2 scenes stored one "anchor" point: both anchors collapse to it.
-            const glm::vec2 legacyAnchor = vec2Of("anchor", {0.5f, 0.5f});
-            d.uiElement.anchorMin = vec2Of("anchorMin", legacyAnchor);
-            d.uiElement.anchorMax = vec2Of("anchorMax", legacyAnchor);
-            d.uiElement.pivot = vec2Of("pivot", {0.5f, 0.5f});
-            const json offset = it->value("offset", json::array());
-            if (offset.is_array() && offset.size() >= 2) {
-                d.uiElement.offset = {offset[0].get<f32>(), offset[1].get<f32>()};
-            }
-            const json size = it->value("size", json::array());
-            if (size.is_array() && size.size() >= 2) {
-                d.uiElement.size = {size[0].get<f32>(), size[1].get<f32>()};
-            }
-            d.uiElement.color = Vec4(it->value("color", json()), glm::vec4(1.0f));
-            // v1 scenes stored a multiplier ("textScale"); v2 stores canvas px.
-            d.uiElement.textSize = it->contains("textSize")
-                                       ? it->value("textSize", 28.0f)
-                                       : it->value("textScale", 1.0f) * 28.0f;
-            d.uiElement.hAlign = static_cast<UIElement::HAlign>(
-                glm::clamp(it->value("hAlign", 1), 0, 2));
-            d.uiElement.vAlign = static_cast<UIElement::VAlign>(
-                glm::clamp(it->value("vAlign", 1), 0, 2));
-            d.uiElement.visible = it->value("visible", true);
-            d.uiElement.texture = it->value("texture", "");
-            d.uiElement.fill = it->value("fill", 0.65f);
-            d.uiElement.fillColor = Vec4(it->value("fillColor", json()),
-                                         {0.86f, 0.27f, 0.33f, 1.0f});
-            d.uiElement.radial = it->value("radial", false);
-            d.uiElement.fullscreen = it->value("fullscreen", false);
-            d.uiElement.action = it->value("action", "");
-            d.uiElement.font = it->value("font", "");
-            d.uiElement.rotation = it->value("rotation", 0.0f);
-            d.uiElement.scale = vec2Of("scale", {1.0f, 1.0f});
-            d.uiElement.value = it->value("value", 0.5f);
-            d.uiElement.toggled = it->value("toggled", false);
-            d.uiElement.selected = it->value("selected", 0);
-            d.uiElement.options = it->value("options", std::vector<std::string>{});
-            d.uiElement.frames = it->value("frames", std::vector<std::string>{});
-            d.uiElement.contentSize = glm::max(vec2Of("contentSize", {0.0f, 0.0f}),
-                                               glm::vec2(0.0f));
-            d.uiElement.scrollPos = vec2Of("scrollPos", {0.0f, 0.0f});
-            d.uiElement.scrollSpeed =
-                glm::clamp(it->value("scrollSpeed", 40.0f), 1.0f, 4000.0f);
-            d.uiElement.scrollVertical = it->value("scrollVertical", true);
-            d.uiElement.scrollHorizontal = it->value("scrollHorizontal", false);
-            d.uiElement.autoScroll =
-                glm::clamp(it->value("autoScroll", 0.0f), -4000.0f, 4000.0f);
-            d.uiElement.autoScrollLoop = it->value("autoScrollLoop", false);
-            d.uiElement.placeholder = it->value("placeholder", "");
-            d.uiElement.maxLength = glm::clamp(it->value("maxLength", 64), 1, 4096);
-            d.uiElement.hoverColor = Vec4(it->value("hoverColor", json()), glm::vec4(0.0f));
-            d.uiElement.pressedColor =
-                Vec4(it->value("pressedColor", json()), glm::vec4(0.0f));
-            d.uiElement.disabledColor =
-                Vec4(it->value("disabledColor", json()), glm::vec4(0.0f));
-            d.uiElement.enabled = it->value("enabled", true);
-            d.uiElement.hoverSound = it->value("hoverSound", "");
-            d.uiElement.clickSound = it->value("clickSound", "");
-            d.uiElement.trackTexture = it->value("trackTexture", "");
-            d.uiElement.fillTexture = it->value("fillTexture", "");
-            d.uiElement.handleTexture = it->value("handleTexture", "");
-            d.uiElement.handleSize = glm::max(it->value("handleSize", 0.0f), 0.0f);
-            d.uiElement.onTexture = it->value("onTexture", "");
-            d.uiElement.offTexture = it->value("offTexture", "");
-            d.uiElement.hoverTexture = it->value("hoverTexture", "");
-            d.uiElement.pressedTexture = it->value("pressedTexture", "");
-            d.uiElement.disabledTexture = it->value("disabledTexture", "");
-            d.uiElement.cellTexture = it->value("cellTexture", "");
-            d.uiElement.slice = glm::max(Vec4(it->value("slice", json()), glm::vec4(0.0f)),
-                                         glm::vec4(0.0f));
-            d.uiElement.wrap = it->value("wrap", false);
+            ui::ReadElement(*it, d.uiElement);
         }
         if (auto it = je.find("uiAnimator"); it != je.end()) {
             d.hasUIAnimator = true;
-            d.uiAnimator.clip = it->value("clip", "");
-            d.uiAnimator.trigger = static_cast<UIAnimator::Trigger>(
-                glm::clamp(it->value("trigger", 1), 0, 5));
+            ui::ReadAnimator(*it, d.uiAnimator);
         }
         if (auto it = je.find("uiPanel"); it != je.end()) {
             d.hasUIPanel = true;
-            d.uiPanel.name = it->value("name", "");
-            d.uiPanel.startVisible = it->value("startVisible", false);
+            ui::ReadPanel(*it, d.uiPanel);
         }
         if (auto it = je.find("uiLayoutGroup"); it != je.end()) {
             d.hasUILayoutGroup = true;
-            UILayoutGroup& lg = d.uiLayoutGroup;
-            lg.kind = static_cast<UILayoutGroup::Kind>(
-                glm::clamp(it->value("kind", 0), 0, 2));
-            lg.spacing = it->value("spacing", 8.0f);
-            if (const json cs = it->value("cellSize", json());
-                cs.is_array() && cs.size() >= 2) {
-                lg.cellSize = {cs[0].get<f32>(), cs[1].get<f32>()};
-            }
-            lg.padding = Vec4(it->value("padding", json()), glm::vec4(0.0f));
-            lg.columns = glm::max(it->value("columns", 1), 1);
-            lg.fitContent = it->value("fitContent", false);
+            ui::ReadLayout(*it, d.uiLayoutGroup);
         }
         if (auto it = je.find("uiCanvasGroup"); it != je.end()) {
             d.hasUICanvasGroup = true;
-            d.uiCanvasGroup.opacity = glm::clamp(it->value("opacity", 1.0f), 0.0f, 1.0f);
-            d.uiCanvasGroup.interactable = it->value("interactable", true);
+            ui::ReadGroup(*it, d.uiCanvasGroup);
         }
         if (auto it = je.find("worldText"); it != je.end()) {
             d.hasWorldText = true;
-            d.worldText.text = it->value("text", "Text");
-            d.worldText.size = glm::clamp(it->value("size", 0.25f), 0.001f, 100.0f);
-            d.worldText.color = Vec4(it->value("color", json()), glm::vec4(1.0f));
-            d.worldText.font = it->value("font", "");
-            d.worldText.billboard = it->value("billboard", false);
+            ui::ReadWorldText(*it, d.worldText);
         }
         if (auto it = je.find("uiCanvas"); it != je.end()) {
             d.hasUICanvas = true;
-            d.uiCanvas.scaleMode = it->value("scaleMode", 1u);
-            d.uiCanvas.refWidth = it->value("refWidth", 1920.0f);
-            d.uiCanvas.refHeight = it->value("refHeight", 1080.0f);
-            d.uiCanvas.sortOrder = it->value("sortOrder", 0);
-            d.uiCanvas.visible = it->value("visible", true);
-            d.uiCanvas.worldSpace = it->value("worldSpace", false);
-            d.uiCanvas.worldWidth = glm::clamp(it->value("worldWidth", 1.0f), 0.01f, 1000.0f);
-            d.uiCanvas.emissive = glm::clamp(it->value("emissive", 0.0f), 0.0f, 10.0f);
-            const u32 rw = it->value("rtWidth", 0u);
-            const u32 rh = it->value("rtHeight", 0u);
-            d.uiCanvas.rtWidth = rw ? glm::clamp(rw, 64u, 4096u) : 0u;  // 0 = ref size
-            d.uiCanvas.rtHeight = rh ? glm::clamp(rh, 64u, 4096u) : 0u;
+            ui::ReadCanvas(*it, d.uiCanvas);
         }
         if (auto it = je.find("audio"); it != je.end()) {
             d.hasAudio = true;
@@ -1655,6 +1892,18 @@ void ParseSceneJson(const json& root, SceneData& out) {
             p.colorVariance = glm::clamp(it->value("colorVariance", p.colorVariance), 0.0f, 1.0f);
             p.simulateSize = it->value("simulateSize", p.simulateSize);
             p.sizeVariance = glm::clamp(it->value("sizeVariance", p.sizeVariance), 0.0f, 1.0f);
+            p.gpuExpand = it->value("gpuExpand", p.gpuExpand);
+            // Absent in every scene saved before GPU simulation existed -> false ->
+            // the legacy CPU stack, unchanged. Same contract as every flag above it.
+            p.gpuSim = it->value("gpuSim", p.gpuSim);
+            // A GPU-simulated emitter holds no CPU pool, and the raymarched volume is
+            // built from that pool - so the combination renders no plume at all. The
+            // inspector now refuses it; this catches a scene authored before it did.
+            if (p.gpuSim && p.volumetric) {
+                HBE_WARN("[scene] Particle emitter has both Volumetric and GPU simulation; "
+                         "GPU simulation disabled (it would silently remove the volume).");
+                p.gpuSim = false;
+            }
         }
         if (auto it = je.find("navAgent"); it != je.end()) {
             d.hasNavAgent = true;
@@ -1705,6 +1954,27 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.hasSceneLayerTag = true;
             d.sceneLayerKind = SceneKindFromString(it->get<std::string>());
         }
+        // Streaming group + baked shard (authored, on disk - see EntityData::tag).
+        // The NAME is kept as a string here: interning is a main-thread-only table
+        // mutation and this parse runs on job workers.
+        if (auto it = je.find("tag"); it != je.end() && it->is_string()) {
+            std::string tn = it->get<std::string>();
+            if (!tn.empty()) { // "" is Untagged, not a tag called ""
+                d.hasTag = true;
+                d.tag = std::move(tn);
+            }
+        }
+        if (auto it = je.find("shard"); it != je.end() && it->is_number_integer())
+            d.shard = it->get<int>();
+        // Paint-stroke zone group (Scene/StrokeZone.h). Same NAME-as-string handling
+        // as "tag": interning is a main-thread-only table mutation and this parse
+        // runs on job workers, so the name is carried through to Instantiate. Unlike
+        // "tag", an EMPTY/"Untagged" value is meaningful here - it is the untagged
+        // group, not the absence of a group.
+        if (auto it = je.find("strokeGroup"); it != je.end() && it->is_string()) {
+            d.hasStrokeGroup = true;
+            d.strokeGroupTag = it->get<std::string>();
+        }
         if (auto it = je.find("animator"); it != je.end()) {
             d.hasAnimator = true;
             d.animator.sourceAsset = it->value("source", "");
@@ -1735,118 +2005,141 @@ void ParseSceneJson(const json& root, SceneData& out) {
 } // namespace
 
 bool SaveScene(const Scene& scene, const fs::path& path,
-               const std::function<bool(entt::entity)>& include, SceneKind kind) {
-    const json root = BuildSceneJson(scene, include, kind);
+               const std::function<bool(entt::entity)>& include, SceneKind kind,
+               const std::vector<ShardDesc>* shards, const SceneData* headerFrom) {
+    const json root =
+        BuildSceneJson(scene, include, kind, /*runtimeTags*/ false, shards, headerFrom);
 
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
-    std::ofstream out(path);
-    if (!out) {
-        HBE_ERROR("Scene: cannot write '{}'.", path.string());
+
+    // WRITE ASIDE, THEN RENAME. `std::ofstream out(path)` TRUNCATES the target the
+    // instant it is constructed, and nothing after that used to be checked - no
+    // flush, no good(), no close() test - so a disk-full, a quota, a stalled network
+    // share or a scanner grabbing the file mid-write left a TRUNCATED `.hbscene`
+    // while this function returned true, SaveSceneToDisk adopted the world and the
+    // status line read "Saved scene 'X' (18 objects)". A destroyed level reported as
+    // a success is the worst outcome in this file, and it was one `if` away.
+    //
+    // The serialised text is also built BEFORE the target is touched: `root.dump(2)`
+    // on a 37 MB level is one large allocation, and a bad_alloc there used to unwind
+    // through a call chain with no handler, leaving the file already truncated.
+    std::string text;
+    try {
+        text = root.dump(2);
+    } catch (const std::exception& e) {
+        HBE_ERROR("Scene: failed to serialise '{}': {}. Nothing was written.",
+                  path.string(), e.what());
         return false;
     }
-    out << root.dump(2);
+
+    fs::path tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            HBE_ERROR("Scene: cannot write '{}' (temp file '{}'). '{}' is untouched.",
+                      path.string(), tmp.string(), path.filename().string());
+            return false;
+        }
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        out.flush();
+        const bool streamOk = out.good();
+        out.close();
+        if (!streamOk || out.fail()) {
+            HBE_ERROR("Scene: FAILED to write '{}' ({} bytes) - the target '{}' is "
+                      "untouched. Free space or permissions?",
+                      tmp.string(), text.size(), path.string());
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    // The temp file is complete on disk; swapping it in is the only step that can
+    // change the target, and it is atomic as far as any reader is concerned.
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        HBE_ERROR("Scene: cannot replace '{}' with the completed temp file '{}': {}. "
+                  "The previous file is intact; the new one is at the temp path.",
+                  path.string(), tmp.string(), ec.message());
+        return false;
+    }
     HBE_INFO("Scene: saved {} entities to '{}'.", root["entities"].size(), path.string());
     return true;
 }
 
-bool SplitSceneFile(const fs::path& src, const fs::path& staticOut, const fs::path& dynamicOut) {
-    // The editor authors ONE merged scene; the build splits it into the two layer
-    // files the runtime's level loader expects. Done at the JSON level (no GPU /
-    // instantiate): partition entities by their "sceneLayer" tag (default static) and
-    // REMAP parent indices per partition. A tagged subtree shares one layer (the
-    // Inspector toggle tags whole subtrees), so a parent is always in the same file;
-    // any cross-layer parent gracefully becomes a root. Returns true only when the
-    // source actually had BOTH layers (otherwise it's a plain scene, no split needed).
-    std::ifstream in(src, std::ios::binary);
-    if (!in) return false;
-    json doc;
-    try {
-        in >> doc;
-    } catch (...) {
-        return false;
-    }
-    if (!doc.contains("entities") || !doc["entities"].is_array()) return false;
-    const json& ents = doc["entities"];
-    const auto isDynamic = [](const json& e) {
-        return e.value("sceneLayer", std::string("static")) == "dynamic";
-    };
-    int nStatic = 0, nDynamic = 0;
-    for (const json& e : ents) (isDynamic(e) ? nDynamic : nStatic)++;
-    if (nStatic == 0 || nDynamic == 0) return false; // single-layer -> not a level
-
-    const auto buildLayer = [&](bool wantDynamic) -> json {
-        json out = doc;
-        out["kind"] = wantDynamic ? "dynamic" : "static";
-        std::unordered_map<int, int> remap; // old index -> new index in this partition
-        std::vector<int> keep;
-        for (int i = 0; i < static_cast<int>(ents.size()); ++i)
-            if (isDynamic(ents[static_cast<usize>(i)]) == wantDynamic) {
-                remap[i] = static_cast<int>(keep.size());
-                keep.push_back(i);
-            }
-        json arr = json::array();
-        for (int oldIdx : keep) {
-            json e = ents[static_cast<usize>(oldIdx)];
-            if (auto it = e.find("parent"); it != e.end() && it->is_number_integer()) {
-                const int p = it->get<int>();
-                const auto rit = remap.find(p);
-                *it = (rit != remap.end()) ? rit->second : -1; // cross-layer parent -> root
-            }
-            arr.push_back(std::move(e));
-        }
-        out["entities"] = std::move(arr);
-        return out;
-    };
-
-    std::error_code ec;
-    fs::create_directories(staticOut.parent_path(), ec);
-    const auto writeJson = [](const fs::path& p, const json& d) {
-        std::ofstream o(p, std::ios::binary | std::ios::trunc);
-        if (!o) return false;
-        o << d.dump(2);
-        return static_cast<bool>(o);
-    };
-    bool ok = writeJson(staticOut, buildLayer(false));
-    ok = writeJson(dynamicOut, buildLayer(true)) && ok;
-    return ok;
-}
-
-void SavePaintCanvases(Scene& scene, const fs::path& assetsDir,
-                       const std::string& sceneStem) {
+// Shared by SavePaintCanvases (writes every canvas) and EnsurePaintSources (writes
+// only the ones that had no file yet). `onlyNew` is the difference between them.
+static void WritePaintCanvases(Scene& scene, const fs::path& assetsDir,
+                               const std::string& sceneStem, bool onlyNew) {
     auto& reg = scene.Registry();
-    std::unordered_set<std::string> used;
-    int counter = 0;
-    const auto sanitize = [](std::string s) {
-        for (char& c : s)
-            if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
-        return s.empty() ? std::string("paint") : s;
-    };
+    std::unordered_set<std::string> used; // sources claimed in THIS pass
     for (const entt::entity e : reg.view<PaintComponent>()) {
         PaintComponent& pc = reg.get<PaintComponent>(e);
-        if (pc.layers.empty()) continue;
-        if (pc.source.empty()) {
-            const std::string stem = sceneStem.empty() ? "scene" : sceneStem;
+        const bool isNew = pc.source.empty();
+        if (isNew) {
+            // Derived from the scene stem + the entity name, then deduplicated:
+            // entity names are not unique (imported meshes share them by
+            // construction, and a duplicated object clears its inherited source),
+            // and two canvases sharing one file would overwrite each other.
             const Name* nm = reg.try_get<Name>(e);
             const std::string base =
-                stem + "_" +
-                sanitize(nm && !nm->value.empty() ? nm->value
-                                                  : ("paint" + std::to_string(counter++)));
+                sceneStem + "_" +
+                ((nm && !nm->value.empty()) ? nm->value : std::string("Object"));
             std::string candidate = "Paint/" + base + ".hbpaint";
             for (int n = 1; used.contains(candidate); ++n)
                 candidate = "Paint/" + base + "_" + std::to_string(n) + ".hbpaint";
             pc.source = candidate;
         }
+        // Claimed BEFORE the skip below, so a brand-new canvas can never be handed
+        // the path of one that merely failed to load.
         used.insert(pc.source);
+        // NEVER WRITE BACK A CANVAS WE COULD NOT READ. Instantiate keeps the
+        // PaintComponent when its `.hbpaint` fails to load, so the scene does not
+        // lose the reference or any of its authored settings - but the `layers` are
+        // UNKNOWN, not empty, and writing them would replace a real canvas with a
+        // blank one. That would turn a temporarily unreadable file (renamed, on a
+        // stalled share, held by a scanner) into permanent destruction.
+        if (pc.canvasMissing) {
+            HBE_WARN("Scene: paint canvas '{}' never loaded - the reference is kept, "
+                     "the file is NOT rewritten.",
+                     pc.source);
+            continue;
+        }
+        if (onlyNew && !isNew) continue;
         if (!paint::Save(assetsDir / pc.source, pc))
             HBE_WARN("Scene: failed to write paint canvas '{}'.", pc.source);
     }
 }
 
-std::string SaveSceneToString(const Scene& scene) {
-    // Snapshots (play mode, undo/redo) keep the per-entity SceneSource/SceneLayer
-    // tags so a Replace restore preserves level grouping instead of dropping it.
-    return BuildSceneJson(scene, {}, SceneKind::Full, /*runtimeTags*/ true).dump();
+void SavePaintCanvases(Scene& scene, const fs::path& assetsDir, const std::string& sceneStem) {
+    // Pixels never live in the .hbscene: each PaintComponent writes its own
+    // .hbpaint and the scene stores only the reference + metadata. Run this
+    // BEFORE SaveScene, because it is what fills in a canvas's `source` - the
+    // scene writer skips any PaintComponent whose source is still empty.
+    WritePaintCanvases(scene, assetsDir, sceneStem, /*onlyNew*/ false);
+}
+
+void EnsurePaintSources(Scene& scene, const fs::path& assetsDir, const std::string& sceneStem) {
+    // The SNAPSHOT half of the same problem. BuildSceneJson skips a PaintComponent
+    // whose `source` is still empty, and SavePaintCanvases - the only thing that
+    // assigns one - runs exclusively on the file-save path. So a canvas painted in a
+    // session that had not yet saved the scene was absent from the play/undo snapshot
+    // and was DESTROYED by the Replace that Stop-Play and Undo perform: the painting
+    // simply ceased to exist, with no message.
+    //
+    // Only the canvases that had no file are written (the pixels of one that already
+    // has a `.hbpaint` are the stroke history's business, not the scene undo's), so
+    // this costs one write the first time a canvas appears and nothing after that -
+    // which is what makes it affordable on a path that runs ~60 times a session.
+    WritePaintCanvases(scene, assetsDir, sceneStem, /*onlyNew*/ true);
+}
+
+std::string SaveSceneToString(const Scene& scene,
+                              const std::function<bool(entt::entity)>& include) {
+    // Snapshots (play mode, undo/redo) keep the per-entity SceneSource tag too, so
+    // a Replace restore puts each entity back in the scene file it came from
+    // instead of collapsing everything into the active scene.
+    return BuildSceneJson(scene, include, SceneKind::Full, /*runtimeTags*/ true).dump();
 }
 
 std::string SaveSubtreeToString(const Scene& scene, entt::entity root) {
@@ -1860,26 +2153,54 @@ bool ParseSceneFile(const fs::path& path, SceneData& out) {
         HBE_ERROR("Scene: cannot open '{}'.", path.string());
         return false;
     }
+    // ParseSceneJson IS INSIDE THE TRY. Every field read goes through
+    // `it->value(key, default)`, which throws json::type_error when the stored value
+    // has the wrong type (a `paint.layer` written as a number, a hand-edited file, a
+    // half-migrated one). Outside the try that propagated out of a `noexcept`-ish
+    // call chain with no handler anywhere and TERMINATED THE PROCESS with no message
+    // at all - a hard crash of an unsaved editor session, and a crash on boot in the
+    // shipped runtime. Refusing the file loudly is the whole contract here.
     json root;
     try {
         root = json::parse(bytes->begin(), bytes->end());
+        ParseSceneJson(root, out);
     } catch (const std::exception& e) {
         HBE_ERROR("Scene: failed to parse '{}': {}", path.string(), e.what());
+        out.entities.clear(); // a half-parsed world must not look like a real one
         return false;
     }
-    ParseSceneJson(root, out);
+
+    // MIGRATION: every `.hbscene` authored before entity guids existed has none.
+    // Minting randomly on load would rebind every row of saved state to a
+    // different object on the next launch, so the fill has to be DETERMINISTIC:
+    // derive from (file identity, index in the file's entity array). Same file,
+    // same bytes, same order -> same guids, every load, on every machine. The
+    // first editor save writes them out as real guids and this never runs on that
+    // file again. Caveat, and it is inherent: inserting or reordering entities in
+    // a file that has never been saved by a guid-aware editor shifts the indices
+    // after the insertion point, and their derived guids with them.
+    //
+    // `.hbscene` ONLY. A `.hbprefab` is a TEMPLATE that gets instantiated over
+    // and over (Editor::InstantiatePrefab, spawn::DoBurst); its entities must
+    // mint fresh every time, so it is left guid-less on purpose. See EntityGuid.h.
+    if (path.extension() == ".hbscene") {
+        const u64 seed = guid::SeedFromPath(path);
+        for (u32 i = 0; i < static_cast<u32>(out.entities.size()); ++i)
+            if (out.entities[i].guid == 0) out.entities[i].guid = guid::Derive(seed, i);
+    }
     return true;
 }
 
 bool ParseSceneString(const std::string& text, SceneData& out) {
     json root;
-    try {
+    try { // ParseSceneJson inside the try - see ParseSceneFile for why
         root = json::parse(text);
+        ParseSceneJson(root, out);
     } catch (const std::exception& e) {
         HBE_ERROR("Scene: failed to parse snapshot: {}", e.what());
+        out.entities.clear();
         return false;
     }
-    ParseSceneJson(root, out);
     return true;
 }
 
@@ -1890,14 +2211,32 @@ struct InstantiateCaches {
     std::unordered_map<std::string, rhi::TextureHandle> textures; // Assets-rel name
     std::unordered_map<std::string, AABB> bounds;
     std::unordered_map<std::string, std::string> submeshMat;
+    // Resolved blendshape atlas per mesh source, cached BESIDE the GPU mesh - see
+    // MorphAtlas. Keyed on exactly the same string as `mesh`, so a mesh that is
+    // GPU-resident has its atlas resident too and the second spawn of a shard
+    // resolves without a CPU model (plan blocker B3).
+    std::unordered_map<std::string, MorphAtlas> morph;
+    // Surface-paint canvas textures (colour + material), keyed on
+    // "<paintSource>#<guid>". Same reason as `morph`: without it, EVERY respawn of a
+    // painted mesh calls paint::Sync on a PaintComponent with invalid handles, which
+    // takes UploadTexture's branch and mints two new mip'd RGBA textures - ~21 MB each
+    // at 2048 - that nothing ever frees (there is no texture destroy in the RHI). Twenty
+    // crossings of one shard boundary is ~1.7 GB. On a hit the handles are re-adopted
+    // and Sync takes its UpdateTexture branch instead, so a respawn costs zero VRAM.
+    //
+    // Keyed on the ENTITY's stable guid as well as the source, deliberately: two
+    // different entities sharing one `.hbpaint` keep their own canvases (they can be
+    // painted independently in the Art Editor), while the SAME entity respawning
+    // re-adopts its own. A guid of 0 (no stable identity) simply does not cache.
+    std::unordered_map<std::string, std::pair<rhi::TextureHandle, rhi::TextureHandle>> paint;
 };
 InstantiateCaches& Caches() {
     static InstantiateCaches c;
     return c;
 }
 
-// The caches are read by StageAssets (which runs on worker threads, e.g.
-// SceneStreamer and StreamingWorld) and written by Instantiate (main thread),
+// The caches are read by StageAssets (which runs on worker threads, e.g. the
+// editor's SceneStreamer) and written by Instantiate (main thread),
 // so every access goes through this lock. The heavy work - file IO in staging,
 // GPU upload in Instantiate - happens OUTSIDE these short critical sections.
 std::mutex& CachesMutex() {
@@ -1951,6 +2290,40 @@ void CachePutMesh(const std::string& key, rhi::MeshHandle mesh, const AABB& boun
     Caches().bounds[key] = bounds;
     Caches().submeshMat[key] = submeshMat;
 }
+
+// Read by StageAssets on WORKER threads (to decide whether the CPU model still has
+// to be loaded) and written by Instantiate on the main thread, exactly like the
+// mesh cache above - hence the same lock.
+bool CacheHasMorph(const std::string& key) {
+    std::lock_guard<std::mutex> lk(CachesMutex());
+    return Caches().morph.contains(key);
+}
+bool CacheGetMorph(const std::string& key, MorphAtlas& out) {
+    std::lock_guard<std::mutex> lk(CachesMutex());
+    const auto it = Caches().morph.find(key);
+    if (it == Caches().morph.end()) return false;
+    out = it->second; // copy: `names` is a handful of short strings
+    return true;
+}
+void CachePutMorph(const std::string& key, const MorphAtlas& atlas) {
+    std::lock_guard<std::mutex> lk(CachesMutex());
+    Caches().morph[key] = atlas;
+}
+
+// Paint canvases. Main thread only (Instantiate), but the same lock: one mutex for one
+// cache struct is simpler to keep correct than a second one that could be forgotten.
+bool CacheGetPaint(const std::string& key, rhi::TextureHandle& color, rhi::TextureHandle& mat) {
+    std::lock_guard<std::mutex> lk(CachesMutex());
+    const auto it = Caches().paint.find(key);
+    if (it == Caches().paint.end()) return false;
+    color = it->second.first;
+    mat = it->second.second;
+    return true;
+}
+void CachePutPaint(const std::string& key, rhi::TextureHandle color, rhi::TextureHandle mat) {
+    std::lock_guard<std::mutex> lk(CachesMutex());
+    Caches().paint[key] = {color, mat};
+}
 } // namespace
 
 void ClearInstantiateCaches() {
@@ -1958,10 +2331,74 @@ void ClearInstantiateCaches() {
         std::lock_guard<std::mutex> lk(CachesMutex());
         Caches() = InstantiateCaches{};
     }
+    MorphBuilds().store(0, std::memory_order_relaxed);
     anim::ClearRigCache(); // rigs are loaded from the same assets
 }
 
-void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets& out) {
+u32 MorphAtlasBuildCount() { return MorphBuilds().load(std::memory_order_relaxed); }
+
+void CacheUploadedMesh(const std::string& key, rhi::MeshHandle mesh, const AABB& bounds) {
+    if (key.empty() || !mesh.IsValid()) return;
+    // Empty submesh material: a generated mesh has no material of its own, which is
+    // exactly what the miss path would have recorded after loading it back.
+    CachePutMesh(key, mesh, bounds, std::string());
+}
+
+namespace {
+// The slice's row list. `indices == nullptr` = the whole file, which is the
+// shipping full-file path; a non-null pointer means a slice is active even at
+// count 0. Values are indices into SceneData::entities and are NOT renumbered -
+// see the "Slices" block in SceneSerializer.h.
+struct SliceView {
+    const u32* indices = nullptr;
+    u32 count = 0;
+    usize total = 0; // data.entities.size()
+
+    bool sliced() const { return indices != nullptr; }
+    usize visits() const { return sliced() ? static_cast<usize>(count) : total; }
+    // Row for visit `k`, or `total` (= out of range) for a bad index. One warning
+    // per bad row is the caller's job; this just refuses to index out of bounds.
+    usize row(usize k) const {
+        const usize i = sliced() ? static_cast<usize>(indices[k]) : k;
+        return i < total ? i : total;
+    }
+};
+
+// THE blendshape resolve. Answers "what is `meshSource`'s morph atlas?" from the
+// process-wide cache first and from `staged`'s CPU model only on a miss, so the
+// atlas outlives the StagedAssets it was born from - which is the whole of the
+// blocker-B3 fix (a respawned character resolves from the cache; nothing is
+// rebuilt, nothing is re-uploaded, nothing leaks).
+//
+// Returns FALSE only for "cannot tell yet": nothing cached AND the CPU model is
+// not staged. That case must NOT be cached - a negative recorded there would
+// permanently mark a real blendshape mesh as morph-less. StageAssets is what makes
+// it rare (it force-loads the model for a morph entity whose atlas is not cached);
+// the false return is the honest fallback for the rest.
+bool ResolveMorphAtlas(Renderer& renderer, StagedAssets& staged,
+                       const std::string& meshSource, MorphAtlas& out) {
+    if (meshSource.empty()) return false;
+    if (CacheGetMorph(meshSource, out)) return true; // includes cached negatives
+    std::string rel;
+    u32 submesh = 0;
+    if (!SplitUafSource(meshSource, rel, submesh)) {
+        // "prim:*" (and anything else that is not a mesh asset) can never carry
+        // blendshapes. That is a definitive negative, so cache it.
+        out = MorphAtlas{};
+        CachePutMorph(meshSource, out);
+        return true;
+    }
+    const auto it = staged.models.find(rel);
+    if (it == staged.models.end() || submesh >= it->second.size()) return false; // unknown
+    out = BuildMorphAtlasFromMesh(renderer, it->second[submesh]);
+    CachePutMorph(meshSource, out);
+    return true;
+}
+} // namespace
+
+void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets& out,
+                 const u32* indices, u32 count) {
+    const SliceView slice{indices, count, data.entities.size()};
     // Anything already resident in the persistent Instantiate caches skips its
     // disk IO entirely (snapshots restore instantly on undo/redo).
     const auto stageTexture = [&](const std::string& tex) {
@@ -1987,7 +2424,10 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         out.materials.emplace(matRef, std::move(*mat));
     };
 
-    for (const EntityData& d : data.entities) {
+    for (usize k = 0; k < slice.visits(); ++k) {
+        const usize i = slice.row(k);
+        if (i >= data.entities.size()) continue; // bad slice index (warned in Instantiate)
+        const EntityData& d = data.entities[i];
         stageMaterial(d.materialAsset);
         // Surface-paint canvases (CPU file IO only; uploaded in Instantiate).
         if (d.hasPaint && !d.paintSource.empty() && !out.paints.contains(d.paintSource)) {
@@ -1999,7 +2439,10 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         }
     }
 
-    for (const EntityData& d : data.entities) {
+    for (usize k = 0; k < slice.visits(); ++k) {
+        const usize i = slice.row(k);
+        if (i >= data.entities.size()) continue;
+        const EntityData& d = data.entities[i];
         if (!d.hasMesh) continue;
         std::string rel;
         u32 submesh = 0;
@@ -2010,7 +2453,16 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         const bool needsCollisionMesh =
             d.hasRigidBody && (d.rigidBody.shape == RigidBody::Shape::Mesh ||
                                d.rigidBody.shape == RigidBody::Shape::ConvexHull);
-        if (!needsCollisionMesh) {
+        // Same exemption for BLENDSHAPES, and for the same reason: the morph atlas
+        // is derived from the CPU model, so an entity that needs one must have the
+        // model staged at least ONCE even if the GPU mesh is already resident. The
+        // atlas is then cached beside the mesh, so this fires only until the first
+        // resolve - after that a respawn skips the load exactly as before (plan
+        // blocker B3). Without it the first spawn of a morph entity whose mesh was
+        // already cached by some OTHER, morph-less entity would silently have no
+        // face, which is the same failure one instance later.
+        const bool needsMorphMesh = d.hasMorphState && !CacheHasMorph(d.meshSource);
+        if (!needsCollisionMesh && !needsMorphMesh) {
             if (const MeshCacheHit hit = CacheGetMesh(d.meshSource); hit.found) {
                 // GPU-resident submesh: only its material asset is still needed.
                 if (!hit.submeshMat.empty()) stageMaterial(hit.submeshMat);
@@ -2038,46 +2490,141 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
 
     // Terrain splat layers are MATERIALS: stage each (loads it + its textures) so
     // Instantiate can resolve the layer's albedo on load.
-    for (const EntityData& d : data.entities) {
+    for (usize k = 0; k < slice.visits(); ++k) {
+        const usize i = slice.row(k);
+        if (i >= data.entities.size()) continue;
+        const EntityData& d = data.entities[i];
         if (!d.hasTerrain) continue;
         for (const std::string& mat : d.terrain.splatLayerSrc) stageMaterial(mat);
     }
 }
 
+namespace {
+// LoadMode::Replace's prologue has two halves, factored out so the SLICE path
+// (scene::BindWorld) runs the very same code instead of a second copy of it that
+// could drift - that is the whole point of the split. This half (world
+// destruction) is called only from Instantiate's Replace branch and from
+// BindWorld. The other half is scene::ApplyEnvironment, which is PUBLIC (see the
+// header) so --test-lightingparity can reach the environment apply without also
+// destroying a world.
+
+// Destroy everything EXCEPT the resident layers, so the UI survives gameplay
+// scene swaps. Two spares, and they mean different things:
+//   Persistent            - the runtime decoration (world-UI page quads, and
+//                           a legacy `.hbscene` UI layer).
+//   UIDocMember.screenOwned - an OPEN `.hbui` document. A document is an
+//                           asset with its own file; a scene load has no
+//                           business destroying it. The flag is duplicated
+//                           into the component precisely so this site and
+//                           Engine::FlowMainMenu evaluate it identically -
+//                           the serializer has no Engine and no DocumentSet.
+// With neither present this is equivalent to reg.clear() (the common case).
+// Collect first, then destroy - can't mutate the registry mid-iteration.
+//
+// Takes the SCENE, not the registry, so that bumping the world token cannot be
+// forgotten at a call site: this is the one and only place a world is wholesale
+// replaced, and Scene::WorldToken is what the editor's save path compares against
+// to notice that the registry it is about to write is no longer the level it loaded.
+void DestroyWorld(Scene& scene) {
+    entt::registry& reg = scene.Registry();
+    scene.BumpWorldToken();
+    std::vector<entt::entity> kill;
+    for (const entt::entity e : reg.storage<entt::entity>()) {
+        const UIDocMember* m = reg.try_get<UIDocMember>(e);
+        if (!reg.all_of<Persistent>(e) && !(m && m->screenOwned)) kill.push_back(e);
+    }
+    for (const entt::entity e : kill)
+        if (reg.valid(e)) reg.destroy(e);
+}
+
+} // namespace
+
+// See the header. THE ONE WRITER of the five header fields + the GI volume.
+void ApplyEnvironment(Scene& scene, Renderer& renderer, const SceneData& data) {
+    SceneEnvironment& env = scene.Environment();
+    env.ambientIntensity = data.ambientIntensity;
+    env.exposure = data.exposure;
+    env.shadowDistance = data.shadowDistance;
+    env.post = data.post;
+    // The optional per-scene day/night override. Applied here so it lands through
+    // the SAME one writer as the rest of the header - the clock is lighting, and a
+    // second stamping site is exactly what this function exists to prevent.
+    //
+    // A file that authored NO override is left alone rather than reset to a
+    // default: the project's cycle (scene::SetupSky) is then the answer, which is
+    // what every scene did before the keys existed. `dayNightAuthored` is cleared
+    // in that case so the scene does not start CLAIMING an override it never made -
+    // otherwise the first save would freeze whatever hour the process happened to
+    // be at into the file.
+    env.dayNightAuthored = data.hasDayNight ? 1u : 0u;
+    if (data.hasDayNight) {
+        env.timeOfDay = data.timeOfDay;
+        env.dayLengthSeconds = data.dayLengthSeconds;
+        env.dynamicSky = data.dynamicSky;
+    }
+    // Load the cached GI volume (.hbgi) so baked GI lights the scene without a
+    // re-bake.
+    //
+    // THE SAME VOLUME IS NOT RE-UPLOADED. Nothing in the RHI destroys a texture
+    // (there is DestroyGpuBuffer and no counterpart), so every re-bind of an
+    // identical volume leaked an SH + depth atlas pair. This path is not once per
+    // level: undo, redo and Stop-Play all restore through LoadMode::Replace, so a
+    // hundred Ctrl+Z on one level uploaded a hundred pairs and freed none. When the
+    // scene already has exactly this volume bound, keep it - byte-identical result,
+    // no allocation. (A re-BAKE writes the handles directly and is unaffected.)
+    if (!data.giSource.empty() && data.giSource == env.giSource &&
+        env.giStatus == GiStatus::Loaded && env.giSh.IsValid() && env.giDepth.IsValid()) {
+        return;
+    }
+    env.giSource = data.giSource;
+    // ALWAYS CLEAR FIRST. This used to be `if (vol.valid)` with no else, so a scene
+    // whose `.hbgi` was missing or corrupt kept the PREVIOUS scene's volume bound
+    // while advertising its own giSource - lighting inherited across a level load,
+    // silently, and dependent on which scene happened to be open before. Clearing
+    // makes a failed load a visible absence instead of someone else's GI.
+    env.giSh = {};
+    env.giDepth = {};
+    env.giOrigin = glm::vec3(0.0f);
+    env.giSpacing = glm::vec3(1.0f);
+    env.giDims = glm::ivec3(0);
+    env.giStatus = GiStatus::None;
+    if (data.giSource.empty()) return;
+    const GiVolume vol = LoadGIVolume(renderer, Project::Active().AssetsDir() / data.giSource);
+    env.giStatus = vol.status;
+    if (vol.status != GiStatus::Loaded) return; // LoadGIVolume already warned, loudly
+    env.giSh = vol.sh;
+    env.giDepth = vol.depth;
+    env.giOrigin = vol.origin;
+    env.giSpacing = vol.spacing;
+    env.giDims = vol.dims;
+}
+
+void BindWorld(Scene& scene, Renderer& renderer, const SceneData& data) {
+    DestroyWorld(scene);
+    ApplyEnvironment(scene, renderer, data);
+    HBE_INFO("Scene: world bound (environment applied, 0 entities created).");
+}
+
 void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                  StagedAssets& staged, LoadMode mode,
-                 std::vector<entt::entity>* createdOut, const std::string& sceneTag) {
+                 std::vector<entt::entity>* createdOut, const std::string& sceneTag,
+                 const u32* indices, u32 count) {
     auto& reg = scene.Registry();
+    const SliceView slice{indices, count, data.entities.size()};
+    // A slice owns neither the world nor its environment: Replace would destroy the
+    // sibling shards it is being loaded alongside, and it carries the header fields
+    // of a file it is only a fragment of. Refuse, change nothing, and name the
+    // replacement in the message.
+    if (slice.sliced() && mode == LoadMode::Replace) {
+        HBE_ERROR("Scene: LoadMode::Replace is illegal with a slice ({} row(s) ignored). "
+                  "Call scene::BindWorld once, then load each slice Additive.",
+                  count);
+        if (createdOut) createdOut->clear();
+        return;
+    }
     if (mode == LoadMode::Replace) {
-        // Destroy everything EXCEPT entities tagged Persistent (the resident UI layer),
-        // so a persistent UI scene survives gameplay scene swaps. With no Persistent
-        // entities present this is equivalent to reg.clear() (the common case). Collect
-        // first, then destroy - can't mutate the registry mid-iteration.
-        {
-            std::vector<entt::entity> kill;
-            for (const entt::entity e : reg.storage<entt::entity>())
-                if (!reg.all_of<Persistent>(e)) kill.push_back(e);
-            for (const entt::entity e : kill)
-                if (reg.valid(e)) reg.destroy(e);
-        }
-        scene.Environment().ambientIntensity = data.ambientIntensity;
-        scene.Environment().exposure = data.exposure;
-        scene.Environment().shadowDistance = data.shadowDistance;
-        scene.Environment().post = data.post;
-        // Load the cached GI volume (.hbgi) so baked GI lights the scene without a
-        // re-bake (falls back to no volume if the cache is missing).
-        scene.Environment().giSource = data.giSource;
-        if (!data.giSource.empty()) {
-            const GiVolume vol = LoadGIVolume(renderer, Project::Active().AssetsDir() / data.giSource);
-            if (vol.valid) {
-                SceneEnvironment& env = scene.Environment();
-                env.giSh = vol.sh;
-                env.giDepth = vol.depth;
-                env.giOrigin = vol.origin;
-                env.giSpacing = vol.spacing;
-                env.giDims = vol.dims;
-            }
-        }
+        DestroyWorld(scene);
+        ApplyEnvironment(scene, renderer, data);
     }
 
     // Process-wide caches (shared meshes/textures upload once EVER) are reached
@@ -2095,20 +2642,70 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         return h;
     };
 
+    // Identity claim. Seeded from the guids ALREADY live in the registry (after
+    // Replace's sweep above, so a Replace starts from an empty claim and adopts
+    // everything). A parsed guid that is already taken is not adopted - the
+    // entity keeps the fresh mint from CreateEntity instead. That is what makes
+    // the same fragment instantiated N times (a spawner burst, the same scene
+    // loaded additively twice) produce N distinct objects rather than N aliases.
+    //
+    // SLICES: this is per-CALL and seeded from what is LIVE, so slice 2 sees slice
+    // 1's already-adopted guids and cannot re-adopt one. Disjoint slices of one
+    // file therefore adopt exactly the file's guids, once each - and a slice
+    // loaded TWICE gets fresh mints for the second copy, same as any other
+    // repeated additive load.
+    guid::Claim guids(reg);
+
+    // `created` stays indexed by FILE ROW even under a slice (parent links are file
+    // indices), so a non-slice row simply stays entt::null.
     std::vector<entt::entity> created(data.entities.size(), entt::entity{entt::null});
-    for (usize i = 0; i < data.entities.size(); ++i) {
+    for (usize k = 0; k < slice.visits(); ++k) {
+        const usize i = slice.row(k);
+        if (i >= data.entities.size()) {
+            HBE_WARN("Scene: slice index {} is out of range ({} entities); skipped.",
+                     indices[k], data.entities.size());
+            continue;
+        }
+        if (created[i] != entt::null) {
+            HBE_WARN("Scene: slice index {} appears twice; the repeat is skipped.", i);
+            continue;
+        }
         const EntityData& d = data.entities[i];
         const entt::entity e = scene.CreateEntity(d.name);
+        guid::Apply(reg, e, d.guid, guids); // adopt the file's guid, or keep a fresh one
+        // SIBLING ORDER, overwriting CreateEntity's fresh mint exactly as the guid
+        // above does. `d.order < 0` = the file predates the field, so its implicit
+        // order - the ROW INDEX - is used, which reproduces the old behaviour
+        // byte-for-byte. The watermark is raised so the next CreateEntity cannot
+        // hand out a value this load already used. See Scene/Hierarchy.h.
+        {
+            const i32 ord = d.order >= 0 ? static_cast<i32>(d.order) : static_cast<i32>(i);
+            reg.emplace_or_replace<HierarchyOrder>(e, HierarchyOrder{ord});
+            scene.NoteHierarchyOrder(ord);
+        }
         created[i] = e;
         if (!sceneTag.empty()) reg.emplace<SceneSource>(e, SceneSource{sceneTag});
-        // Stamp the level layer from the file's kind (Full = standalone scene,
-        // left untagged so legacy/whole-scene behaviour is unchanged).
-        if (data.kind != SceneKind::Full) reg.emplace<SceneLayer>(e, SceneLayer{data.kind});
-        // Per-entity runtime tags from an in-memory snapshot win over the global
-        // ones, so a play/undo restore puts every entity back in its own scene +
-        // level layer instead of collapsing the grouping.
+        // NOTE: the file's header `kind` does NOT stamp a layer on its entities any
+        // more. A level is ONE scene file, so a file is not a layer of anything -
+        // the Static/Dynamic tag is per ENTITY (read below from `sceneLayerKind`).
+        // Consumers treat an untagged entity as Static (see GridNav::Rebuild).
+        // Per-entity runtime tags from an in-memory snapshot put every entity back
+        // in its own scene file instead of collapsing the grouping.
         if (d.hasSceneSourceTag) reg.emplace_or_replace<SceneSource>(e, SceneSource{d.sceneSourceTag});
         if (d.hasSceneLayerTag) reg.emplace_or_replace<SceneLayer>(e, SceneLayer{d.sceneLayerKind});
+        // Streaming group. tags::Intern registers a name the project does not list
+        // rather than folding it into Untagged (which would move content into the
+        // always-resident set without telling anyone), and tags::Assign refuses a
+        // `.hbui` document entity. This is main-thread code by Instantiate's own
+        // contract, which is what makes touching the tag table here legal.
+        if (d.hasTag) tags::Assign(reg, e, tags::Intern(d.tag), d.shard);
+        // Paint-stroke zone group. The component is a bare MARKER: the group's zone is
+        // the node's own Tag, emplaced by the line above. The file's "strokeGroup"
+        // string is therefore a HUMAN-READABLE ECHO of that tag rather than a second
+        // source of truth - it is still written (so a `.hbscene` diff says which zone a
+        // group collects) and still parsed, but nothing downstream can disagree with
+        // `tag` any more. Interning it here would resurrect exactly that possibility.
+        if (d.hasStrokeGroup) reg.emplace_or_replace<StrokeGroup>(e, StrokeGroup{});
         if (d.editorHidden) reg.emplace<EditorHidden>(e); // editor-only visibility
         if (!d.prefabSource.empty())
             reg.emplace<PrefabInstance>(e, PrefabInstance{d.prefabSource}); // linked prefab root
@@ -2117,7 +2714,17 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
 
         // A modular-character ROOT never draws (its MeshRef only provides the
         // skeleton for posing); character::Instantiate sets that up + spawns parts.
-        if (d.hasMesh && !d.meshSource.empty() && !d.hasCharacterRig) {
+        //
+        // Tested on the RIG ASSET, not on the presence of the component. An entity can
+        // carry an EMPTY Character (one Inspector "Add Component" away, and the
+        // reference level's Terrain already has one) - character::Instantiate
+        // early-returns on an empty asset, so nothing would ever spawn parts, but the
+        // old `!d.hasCharacterRig` test still suppressed the MeshInstance. The entity
+        // loaded invisible and the next save wrote no "mesh" key at all: the mesh
+        // reference and every inline material value, gone, permanently, from one
+        // component the author added by accident.
+        if (d.hasMesh && !d.meshSource.empty() &&
+            !(d.hasCharacterRig && !d.characterRig.asset.empty())) {
             MeshInstance mi;
             mi.baseColor = d.baseColor;
             mi.metallic = d.metallic;
@@ -2182,15 +2789,45 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                 }
             }
 
-            if (mi.mesh.IsValid()) {
+            // A MISSING ASSET MUST NOT DELETE THE REFERENCE TO IT. All four of these
+            // used to be gated on `mi.mesh.IsValid()`, i.e. on the GPU upload having
+            // succeeded - so an entity whose `.uaf` had been renamed, moved, or had
+            // failed to import loaded with NO MeshInstance, NO MeshRef, NO MaterialRef
+            // and NO AABB, and the next save therefore wrote no "mesh" key, no
+            // "aabb", and none of the inline material values. Fix the asset afterwards
+            // and there was nothing left pointing at it: the object was a bare named
+            // transform, permanently, and nothing had said a word.
+            //
+            // The handle is allowed to be invalid. Scene::CollectDrawItems skips an
+            // invalid mesh (Scene.cpp), so the object simply does not draw until the
+            // asset comes back - which is the correct failure for a broken reference,
+            // and is also what makes every serializer self-test able to run headless
+            // where UploadMesh returns nothing by design.
+            if (mi.mesh.IsValid())
                 CachePutMesh(d.meshSource, mi.mesh, bounds, submeshMaterial);
-                reg.emplace<MeshInstance>(e, mi);
-                reg.emplace<MeshRef>(e, MeshRef{d.meshSource});
-                if (!materialRef.empty() && staged.materials.contains(materialRef)) {
-                    reg.emplace<MaterialRef>(e, MaterialRef{materialRef});
-                }
-                reg.emplace<AABB>(e, d.hasAABB ? d.aabb : bounds);
-            }
+            reg.emplace<MeshInstance>(e, mi);
+            reg.emplace<MeshRef>(e, MeshRef{d.meshSource});
+            // ...and the SAME RULE for the material link, which the fix above
+            // missed by one screen. `stageMaterial` warns and returns on a missing
+            // or unparseable `.hbmat`, so gating the emplace on `staged.materials`
+            // meant: rename Materials/Rust.hbmat -> open the level -> Ctrl+S, and
+            // `mesh.material` is gone from the file. Restoring the asset afterwards
+            // leaves nothing pointing at it, and the entity is permanently
+            // downgraded to whatever inline colours it happened to carry (the
+            // comment at the top of this block calls the link the source of truth
+            // that OVERRIDES those, so this is a real demotion, not a wash).
+            //
+            // The AUTHORED link (`d.materialAsset`, the entity's own "material"
+            // key) is never gated: it is what the file said, and the file is the
+            // thing being preserved. The DERIVED one (the `.hbmat` the mesh was
+            // imported with) stays gated exactly as before - it is not in the file,
+            // so emplacing it unconditionally would start WRITING a "material" key
+            // to entities that never had one.
+            if (!d.materialAsset.empty())
+                reg.emplace<MaterialRef>(e, MaterialRef{d.materialAsset});
+            else if (!submeshMaterial.empty() && staged.materials.contains(submeshMaterial))
+                reg.emplace<MaterialRef>(e, MaterialRef{submeshMaterial});
+            reg.emplace<AABB>(e, d.hasAABB ? d.aabb : bounds);
         } else if (d.hasAABB) {
             reg.emplace<AABB>(e, d.aabb);
         }
@@ -2210,7 +2847,18 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             sg.asset = d.schematicAsset;
             reg.emplace<SchematicComponent>(e, std::move(sg));
         }
-        if (d.hasDestructible) reg.emplace<Destructible>(e, d.destructible);
+        if (d.hasDestructible) {
+            Destructible& ds = reg.emplace<Destructible>(e, d.destructible);
+            // A `.hbsave` snapshot carries break progress but never the chunk ENTITIES
+            // (entt handles do not survive), so a restored break arrives in the
+            // "activated but empty" state. destruction::Update rebuilds it; without the
+            // flag the object comes back rendering and colliding as PRISTINE while
+            // being internally fully broken and permanently unbreakable. Same reason
+            // world::ApplyEntityState sets it - see Destructible::reactivate.
+            ds.reactivate = ds.activated;
+            ds.structureDirty = false;
+            ds.chunkEntity.assign(ds.chunkState.size(), entt::entity{entt::null});
+        }
         if (d.hasCheckpoint) reg.emplace<Checkpoint>(e, d.checkpoint);
         if (d.hasHealth) reg.emplace<Health>(e, d.health);
         if (d.hasWeapon) reg.emplace<Weapon>(e, d.weapon);
@@ -2221,16 +2869,23 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasSpawned) reg.emplace<Spawned>(e, d.spawned);
         if (d.hasMorphState) {
             MorphState ms = d.morphState;
-            if (d.hasMesh) { // resolve the blendshape delta atlas from the mesh (fresh-staged)
-                std::vector<std::string> names;
-                u32 vtx = 0;
-                const rhi::TextureHandle atlas =
-                    BuildMorphAtlas(renderer, staged, d.meshSource, names, vtx);
-                if (atlas.IsValid()) {
-                    ms.morphTexture = atlas;
-                    ms.vertexCount = vtx;
-                    ms.targetNames = std::move(names);
-                    ms.resolved = true;
+            // Resolve the blendshape delta atlas for this mesh. Cache-first, so the
+            // SECOND and every later spawn of the same mesh resolves without a CPU
+            // model and without a second upload (plan blocker B3, both halves).
+            if (d.hasMesh) {
+                MorphAtlas atlas;
+                if (ResolveMorphAtlas(renderer, staged, d.meshSource, atlas) && atlas.hasMorphs) {
+                    // The channel LIST comes over whenever the mesh has blendshapes -
+                    // it is what the Inspector shows and what CollectDrawItems maps
+                    // names to atlas rows with. `resolved` still means "there is a
+                    // real atlas to sample", so it waits for a valid handle (there is
+                    // none without a device).
+                    ms.vertexCount = atlas.vertexCount;
+                    ms.targetNames = atlas.names;
+                    if (atlas.texture.IsValid()) {
+                        ms.morphTexture = atlas.texture;
+                        ms.resolved = true;
+                    }
                 }
             }
             reg.emplace<MorphState>(e, std::move(ms));
@@ -2244,24 +2899,53 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasMusicZone) reg.emplace<MusicZone>(e, d.musicZone);
         if (d.hasCameraSpline) reg.emplace<CameraSpline>(e, d.cameraSpline);
         if (d.hasPaint && !d.paintSource.empty()) {
-            if (const auto pit = staged.paints.find(d.paintSource); pit != staged.paints.end()) {
-                PaintComponent pc;          // file holds resolution + layer stack;
-                pc.resolution = pit->second.resolution; // metadata comes from the scene
+            // A MISSING CANVAS MUST NOT DELETE THE PAINT COMPONENT. Same rule, same
+            // reason as the mesh/material block above: `paint::Load` failing (the
+            // `.hbpaint` deleted, renamed, not yet copied to this machine, locked by
+            // a virus scanner) used to mean NO PaintComponent at all - and the
+            // writer emits "paint" only when the component exists, so the next
+            // Ctrl+S dropped the whole key: source, resolution, relief, opacity,
+            // heightScale, lodBias, layer and projection, permanently, off one
+            // warning line. Every one of those lives in the SCENE, not in the
+            // canvas, so all of it is recoverable from `d` alone.
+            const auto pit = staged.paints.find(d.paintSource);
+            const bool haveCanvas = pit != staged.paints.end();
+            PaintComponent pc;          // canvas holds the layer stack;
+            pc.resolution = haveCanvas ? pit->second.resolution : d.paintResolution;
+            if (haveCanvas) {           // metadata always comes from the scene
                 pc.layers = pit->second.layers;
                 pc.activeLayer = pit->second.activeLayer;
-                pc.source = d.paintSource;
-                pc.enabled = d.paintEnabled;
-                pc.locked = d.paintLocked;
-                pc.reliefEnabled = d.paintReliefEnabled;
-                pc.opacity = d.paintOpacity;
-                pc.heightScale = d.paintHeightScale;
-                pc.lodBias = d.paintLodBias;
-                pc.layer = d.paintLayer;
-                pc.projection = d.paintProjection;
-                pc.dirty = true;
-                pc.gpuReady = false;
-                PaintComponent& placed = reg.emplace<PaintComponent>(e, std::move(pc));
-                paint::Sync(renderer, placed); // upload canvas + mips
+            }
+            // The pixels are UNKNOWN, not empty. WritePaintCanvases skips a canvas
+            // carrying this flag, so a save cannot write an EMPTY `.hbpaint` over a
+            // file that was merely unreadable for a moment - which would turn a
+            // recoverable broken reference into real destruction.
+            pc.canvasMissing = !haveCanvas;
+            pc.source = d.paintSource;
+            pc.enabled = d.paintEnabled;
+            pc.locked = d.paintLocked;
+            pc.reliefEnabled = d.paintReliefEnabled;
+            pc.opacity = d.paintOpacity;
+            pc.heightScale = d.paintHeightScale;
+            pc.lodBias = d.paintLodBias;
+            pc.layer = d.paintLayer;
+            pc.projection = d.paintProjection;
+            pc.dirty = true;
+            pc.gpuReady = false;
+            // RE-ADOPT this entity's canvas textures if it has had them before (a
+            // shard respawn, an undo/redo). paint::Sync uploads on an invalid handle
+            // and UPDATES an existing one, and there is no texture destroy in the
+            // RHI - so without this every respawn of a painted mesh permanently
+            // adds two mip'd RGBA textures. See InstantiateCaches::paint.
+            const u64 pguid = reg.all_of<Guid>(e) ? reg.get<Guid>(e).value : 0ull;
+            const std::string pkey =
+                pguid != 0 ? d.paintSource + "#" + std::to_string(pguid) : std::string();
+            if (haveCanvas && !pkey.empty()) CacheGetPaint(pkey, pc.colorTex, pc.matTex);
+            PaintComponent& placed = reg.emplace<PaintComponent>(e, std::move(pc));
+            if (haveCanvas) {
+                paint::Sync(renderer, placed); // upload (first time) or update (respawn)
+                if (!pkey.empty() && placed.colorTex.IsValid() && placed.matTex.IsValid())
+                    CachePutPaint(pkey, placed.colorTex, placed.matTex);
             }
         }
         if (d.hasTerrain) {
@@ -2333,16 +3017,41 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
     }
 
     // Second pass: parent links (indices are within this file's entity list).
-    for (usize i = 0; i < data.entities.size(); ++i) {
+    //
+    // BLOCKER B1 - THE REGRESSION PIN. This loop used to iterate every row of the
+    // file and guard only the PARENT handle, so under any slice a child row outside
+    // the slice whose parent row was inside it called
+    // reg.emplace<Parent>(entt::null, ...) - an ENTT_ASSERT in Debug and
+    // out-of-bounds sparse-set writes in Release. It now iterates the SLICE and
+    // guards BOTH handles. On the full-file path this is behaviour-identical:
+    // every row has a handle, so neither new guard can fire.
+    for (usize k = 0; k < slice.visits(); ++k) {
+        const usize i = slice.row(k);
+        if (i >= data.entities.size()) continue;      // bad index, already warned
+        if (created[i] == entt::null) continue;       // the CHILD - a repeat index
         const int p = data.entities[i].parent;
-        if (p >= 0 && p < static_cast<int>(created.size()) && created[p] != entt::null) {
+        if (p < 0) continue;                          // authored root
+        if (p < static_cast<int>(created.size()) && created[p] != entt::null) {
             reg.emplace<Parent>(created[i], Parent{created[p]});
+            continue;
         }
+        // The parent row exists in the file but not in this slice (or the index is
+        // out of range): the child becomes a ROOT. Deliberate, and the same
+        // fallback SplitSceneFile documented for a cross-layer parent
+        // (StreamingSalvage.h SALVAGE 1). It means the child now renders at its
+        // LOCAL transform in world space - a silent teleport - so it is never
+        // silent. tags::AssignSubtree exists to keep whole subtrees in one shard
+        // precisely so this cannot happen from ordinary authoring.
+        HBE_WARN("Scene: '{}' (row {}) has parent row {} outside this slice; "
+                 "loaded as a ROOT at its local transform.",
+                 data.entities[i].name, i, p);
     }
 
+    // Already slice-correct: `created` only holds handles for rows this call made,
+    // so a slice's createdOut is exactly that slice (in file-row order).
     if (createdOut) {
         createdOut->clear();
-        createdOut->reserve(created.size());
+        createdOut->reserve(slice.visits()); // the slice, not the whole file
         for (const entt::entity e : created)
             if (e != entt::null) createdOut->push_back(e);
     }
@@ -2350,12 +3059,14 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
     // Eager UI asset preload: bake fonts + load every UI texture NOW (scene
     // load) instead of lazily on first draw - kills the blank-text/white-quad
     // first frame and the disk-I/O hitch inside the frame loop.
+    // Scoped to the SLICE: a shard with no UI/WorldText in it must not re-run the
+    // whole level's preload every time it spawns.
     bool anyUI = false;
-    for (const EntityData& d : data.entities) {
-        if (d.hasUI || d.hasWorldText) {
-            anyUI = true;
-            break;
-        }
+    for (usize k = 0; k < slice.visits() && !anyUI; ++k) {
+        const usize i = slice.row(k);
+        if (i >= data.entities.size()) continue;
+        const EntityData& d = data.entities[i];
+        if (d.hasUI || d.hasWorldText) anyUI = true;
     }
     if (anyUI && Project::HasActive()) {
         ui::PreloadUIAssets(scene, renderer, Project::Active().AssetsDir());
@@ -2366,25 +3077,52 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
     // character::Instantiate creates child entities, which would invalidate a live
     // view. Only freshly-loaded roots (no live parts yet) are built, so an additive
     // load over an already-assembled character leaves it untouched.
+    //
+    // The candidate set is the whole registry on the full-file path (unchanged, so a
+    // root left unassembled by an earlier load still gets picked up) but only THIS
+    // SLICE's entities under a slice: at N shards streaming in and out, a
+    // per-registry scan per spawn is O(registry) work for a fixed answer.
+    const auto forEachUnassembledCharacter = [&](auto&& fn) {
+        if (slice.sliced()) {
+            for (const entt::entity e : created)
+                if (e != entt::null && reg.valid(e))
+                    if (const Character* c = reg.try_get<Character>(e); c && c->liveParts.empty())
+                        fn(e);
+            return;
+        }
+        for (const entt::entity e : reg.view<Character>())
+            if (reg.get<Character>(e).liveParts.empty()) fn(e);
+    };
     if (Project::HasActive()) {
         const fs::path assetsDir = Project::Active().AssetsDir();
         std::vector<entt::entity> charRoots;
-        for (const entt::entity e : reg.view<Character>())
-            if (reg.get<Character>(e).liveParts.empty()) charRoots.push_back(e);
+        forEachUnassembledCharacter([&](entt::entity e) { charRoots.push_back(e); });
         for (const entt::entity e : charRoots)
             character::Instantiate(scene, renderer, e, assetsDir);
     } else {
         // No active project -> assets can't resolve (same assumption as UI-preload /
         // probe-load above). Don't fail silently: a Character root would otherwise
         // load with no parts + no skeleton binding.
-        for (const entt::entity e : reg.view<Character>())
-            if (reg.get<Character>(e).liveParts.empty())
-                HBE_WARN("Character '{}' not assembled: no active project to resolve its assets.",
-                         reg.get<Character>(e).asset);
+        forEachUnassembledCharacter([&](entt::entity e) {
+            HBE_WARN("Character '{}' not assembled: no active project to resolve its assets.",
+                     reg.get<Character>(e).asset);
+        });
     }
 
-    HBE_INFO("Scene: instantiated {} entities ({}).", data.entities.size(),
-             mode == LoadMode::Replace ? "replace" : "additive");
+    // A slice lands potentially every few frames, and RecentLog backs the boot
+    // screen's {log} token - so the per-load line stays INFO for a whole-file load
+    // (one per scene switch, and load-bearing in bug reports) and drops to TRACE for
+    // a slice.
+    if (slice.sliced()) {
+        u32 made = 0;
+        for (const entt::entity e : created)
+            if (e != entt::null) ++made;
+        HBE_TRACE("Scene: instantiated {} entities (slice of {}).", made,
+                  data.entities.size());
+    } else {
+        HBE_INFO("Scene: instantiated {} entities ({}).", data.entities.size(),
+                 mode == LoadMode::Replace ? "replace" : "additive");
+    }
 }
 
 // Assets are referenced relative to the project's Assets dir; the scene file
@@ -2413,62 +3151,1425 @@ bool LoadScene(Scene& scene, Renderer& renderer, const fs::path& path, LoadMode 
     return true;
 }
 
-// --- Levels ------------------------------------------------------------------
 
-fs::path LevelPaths::Member(SceneKind kind) const {
-    if (kind == SceneKind::Full || base.empty()) return {};
-    fs::path p = base;
-    p += ".";
-    p += ToString(kind); // "static" / "dynamic" / "ui"
-    p += ".hbscene";
-    return p;
-}
+// --- --test-noleveltypes ------------------------------------------------------
 
-bool IsLevelMember(const fs::path& p) {
-    // Only static/dynamic are level layers; UI scenes (menu/HUD) are standalone.
-    if (p.extension() != ".hbscene") return false;
-    const std::string stem = p.stem().string(); // e.g. "Foo.static"
-    const auto dot = stem.find_last_of('.');
-    if (dot == std::string::npos) return false;
-    const std::string suf = stem.substr(dot + 1);
-    return suf == "static" || suf == "dynamic";
-}
+GuidMigrationStats MigrateSceneGuids(const std::filesystem::path& assetsDir, bool dryRun) {
+    namespace fs = std::filesystem;
+    GuidMigrationStats st;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(assetsDir, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (!it->is_regular_file(ec)) continue;
+        const fs::path p = it->path();
+        if (p.extension() != ".hbscene") continue; // NOT .hbprefab - see the header.
+        ++st.files;
 
-LevelPaths ResolveLevel(const fs::path& memberOrBase) {
-    LevelPaths lp;
-    fs::path p = memberOrBase;
-    if (IsLevelMember(p)) {
-        std::string stem = p.stem().string();        // "Foo.static"
-        stem = stem.substr(0, stem.find_last_of('.')); // -> "Foo"
-        lp.base = p.parent_path() / stem;
-    } else {
-        if (p.extension() == ".hbscene") p = p.parent_path() / p.stem();
-        lp.base = p;
+        json j;
+        {
+            std::ifstream in(p, std::ios::binary);
+            if (!in) { HBE_WARN("MigrateSceneGuids: cannot read '{}'.", p.string()); ++st.failed; continue; }
+            try { in >> j; }
+            catch (const std::exception& e) {
+                HBE_WARN("MigrateSceneGuids: '{}' is not valid JSON ({}).", p.string(), e.what());
+                ++st.failed; continue;
+            }
+        }
+        const auto ents = j.find("entities");
+        if (ents == j.end() || !ents->is_array()) continue;
+
+        const u64 seed = guid::SeedFromPath(p);
+        u32 addedHere = 0;
+        for (usize i = 0; i < ents->size(); ++i) {
+            json& je = (*ents)[i];
+            if (!je.is_object()) continue;
+            if (const auto g = je.find("guid");
+                g != je.end() && g->is_string() && guid::FromHex(g->get<std::string>()) != 0) {
+                ++st.already; continue;
+            }
+            // Index-keyed to match ParseSceneJson exactly: parse pushes entities in
+            // array order (out.entities.push_back is the single push site), and the
+            // derivation loop indexes that same vector.
+            je["guid"] = guid::ToHex(guid::Derive(seed, static_cast<u32>(i)));
+            ++addedHere;
+        }
+        st.stamped += addedHere;
+        if (addedHere > 0 && !dryRun) {
+            std::ofstream out(p, std::ios::binary | std::ios::trunc);
+            if (!out) { HBE_WARN("MigrateSceneGuids: cannot write '{}'.", p.string()); ++st.failed; continue; }
+            out << j.dump(2);
+        }
+        if (addedHere > 0)
+            HBE_INFO("MigrateSceneGuids: {} - {} stamped.", p.filename().string(), addedHere);
     }
-    return lp;
+    return st;
 }
 
-bool LoadLevel(Scene& scene, Renderer& renderer, const LevelPaths& level,
-               std::vector<entt::entity>* createdOut, bool additive) {
-    // A level is static + dynamic ONLY; UI (menus/HUD) are separate standalone
-    // scenes (see Scene/Level.h). When not additive the first layer replaces the
-    // world (+ owns the environment) and the rest stack on; additive stacks all.
-    const SceneKind order[] = {SceneKind::Static, SceneKind::Dynamic};
-    bool loadedAny = false;
-    for (const SceneKind k : order) {
-        const fs::path m = level.Member(k);
-        if (m.empty() || !vfs::Exists(m)) continue; // a layer may be absent (pack-aware)
-        SceneData data;
-        if (!ParseSceneFile(m, data)) continue;
-        data.kind = k; // the filename is the source of truth for the layer
+bool LevelTypesSelfTest() {
+    namespace fs = std::filesystem;
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("noleveltypes: FAILED - {}", what);
+        }
+    };
+
+    // 1) There is no UI scene kind. It existed only so a level could own a third
+    //    "<base>.ui.hbscene" layer; UI is now a standalone scene of its own.
+    expect(SceneKindFromString("ui") == SceneKind::Full,
+           "\"ui\" must no longer parse as a scene kind");
+    expect(std::string(ToString(SceneKind::Full)) == "full" &&
+               std::string(ToString(SceneKind::Static)) == "static" &&
+               std::string(ToString(SceneKind::Dynamic)) == "dynamic",
+           "the only scene kinds are full/static/dynamic");
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "hbe_noleveltypes";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+
+    // 2) A scene whose FILENAME looks like an old level layer is an ORDINARY
+    //    scene. The deleted loader would have seen "Zone.static.hbscene", resolved
+    //    the level "Zone", and composed "Zone.dynamic.hbscene" in alongside it.
+    //    Nothing may do that any more: the .dynamic file next to it is a separate,
+    //    unrelated scene.
+    const fs::path layerNamed = dir / "Zone.static.hbscene";
+    const fs::path sibling = dir / "Zone.dynamic.hbscene";
+    {
+        Scene a;
+        for (const char* n : {"Ground", "Wall"}) {
+            const entt::entity e = a.CreateEntity(n);
+            a.Registry().emplace<Transform>(e);
+            a.Registry().emplace<SceneLayer>(e, SceneLayer{SceneKind::Static});
+        }
+        expect(SaveScene(a, layerNamed), "save a scene named like a level layer");
+
+        Scene b;
+        const entt::entity e = b.CreateEntity("Actor");
+        b.Registry().emplace<Transform>(e);
+        b.Registry().emplace<SceneLayer>(e, SceneLayer{SceneKind::Dynamic});
+        expect(SaveScene(b, sibling), "save the sibling .dynamic scene");
+    }
+    SceneData layerData;
+    expect(ParseSceneFile(layerNamed, layerData), "a .static.hbscene-named file parses");
+    expect(layerData.entities.size() == 2,
+           "a .static.hbscene-named file yields ONLY its own entities "
+           "(no sibling .dynamic layer composed in)");
+    bool sawActor = false;
+    for (const EntityData& d : layerData.entities)
+        if (d.name == "Actor") sawActor = true;
+    expect(!sawActor, "the sibling .dynamic scene's entities must NOT appear");
+    expect(layerData.kind == SceneKind::Full,
+           "a saved scene's header kind is Full - a file is not a layer");
+
+    // 3) The per-object Static/Dynamic tag is the thing the navmesh filter and the
+    //    painterly exemption read. It is per ENTITY and must survive a round trip
+    //    now that it no longer rides on the file's header.
+    {
+        Scene m;
+        const entt::entity st = m.CreateEntity("Rock");
+        m.Registry().emplace<Transform>(st);
+        m.Registry().emplace<SceneLayer>(st, SceneLayer{SceneKind::Static});
+        const entt::entity dy = m.CreateEntity("Crate");
+        m.Registry().emplace<Transform>(dy);
+        m.Registry().emplace<SceneLayer>(dy, SceneLayer{SceneKind::Dynamic});
+        const entt::entity un = m.CreateEntity("Untagged");
+        m.Registry().emplace<Transform>(un);
+
+        const fs::path merged = dir / "Merged.hbscene";
+        expect(SaveScene(m, merged), "save a merged scene");
+        SceneData d;
+        expect(ParseSceneFile(merged, d), "the merged scene parses");
+        expect(d.entities.size() == 3, "the merged scene round-trips all 3 entities");
+        int nStatic = 0, nDynamic = 0, nNone = 0;
+        for (const EntityData& e : d.entities) {
+            if (!e.hasSceneLayerTag) ++nNone;
+            else if (e.sceneLayerKind == SceneKind::Static) ++nStatic;
+            else if (e.sceneLayerKind == SceneKind::Dynamic) ++nDynamic;
+        }
+        expect(nStatic == 1 && nDynamic == 1 && nNone == 1,
+               "per-entity Static/Dynamic/untagged survives the round trip");
+
+        // 4) A round trip preserves the scene's CONTENT exactly - every entity, by
+        //    guid, with its name, its Static/Dynamic layer and its parent. Rebuild
+        //    from the parsed data (the fields this test wrote; a full rebuild is
+        //    scene::Instantiate's job and needs a GPU) and re-save.
+        //
+        //    ONE round trip is now byte-identical. It used not to be: the gather
+        //    walked entt views, which iterate their pool in REVERSE insertion order,
+        //    so every save flipped the file's entity array and it took TWO round
+        //    trips to come back. BuildSceneJson now sequences the write from a
+        //    single pool in creation order (see the note there), so the transform is
+        //    the identity. Two round trips are still what is asserted - if one is
+        //    identity, two are too, and the two-trip form also catches a writer that
+        //    is merely an involution rather than stable.
+        const auto rebuild = [](const SceneData& src, Scene& dst) {
+            std::vector<entt::entity> made;
+            for (const EntityData& e : src.entities) {
+                const entt::entity ne = dst.CreateEntity(e.name);
+                if (e.guid != 0) dst.Registry().emplace_or_replace<Guid>(ne, Guid{e.guid});
+                if (e.hasTransform) dst.Registry().emplace<Transform>(ne, e.transform);
+                if (e.hasSceneLayerTag)
+                    dst.Registry().emplace<SceneLayer>(ne, SceneLayer{e.sceneLayerKind});
+                made.push_back(ne);
+            }
+            for (usize i = 0; i < src.entities.size(); ++i) {
+                const int p = src.entities[i].parent;
+                if (p >= 0 && p < static_cast<int>(made.size()))
+                    dst.Registry().emplace<Parent>(made[i],
+                                                   Parent{made[static_cast<usize>(p)]});
+            }
+        };
+        // Fingerprint: guid -> (name, layer, parent guid). Order-independent, which
+        // is the point.
+        const auto fingerprint = [](const SceneData& src) {
+            std::unordered_map<u64, std::string> fp;
+            for (const EntityData& e : src.entities) {
+                const int p = e.parent;
+                const u64 pg = (p >= 0 && p < static_cast<int>(src.entities.size()))
+                                   ? src.entities[static_cast<usize>(p)].guid
+                                   : 0;
+                fp[e.guid] = e.name + "|" +
+                             (e.hasSceneLayerTag ? ToString(e.sceneLayerKind) : "none") + "|" +
+                             std::to_string(pg);
+            }
+            return fp;
+        };
+
+        const fs::path r1 = dir / "Round1.hbscene";
+        const fs::path r2 = dir / "Round2.hbscene";
+        Scene s1;
+        rebuild(d, s1);
+        expect(SaveScene(s1, r1), "re-save the rebuilt scene");
+        SceneData d1;
+        expect(ParseSceneFile(r1, d1), "the re-saved scene parses");
+        expect(fingerprint(d) == fingerprint(d1) && fingerprint(d).size() == 3,
+               "a round trip preserves every entity by guid, with its name, layer "
+               "and parent");
+        Scene s2;
+        rebuild(d1, s2);
+        expect(SaveScene(s2, r2), "re-save after a second round trip");
+
+        const auto readAll = [](const fs::path& p2) {
+            std::ifstream in(p2, std::ios::binary);
+            return std::string((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+        };
+        const std::string t0 = readAll(merged), t2 = readAll(r2);
+        if (t0.empty() || t0 != t2) {
+            usize at = 0;
+            while (at < t0.size() && at < t2.size() && t0[at] == t2[at]) ++at;
+            HBE_ERROR("noleveltypes: two round trips differ at byte {} ({} vs {} bytes)",
+                      at, t0.size(), t2.size());
+        }
+        expect(!t0.empty() && t0 == t2,
+               "two round trips return byte-for-byte to the original save");
+    }
+
+    fs::remove_all(dir, ec);
+    return ok;
+}
+
+
+// --- --test-sceneslice --------------------------------------------------------
+
+namespace {
+
+// The world's CONTENT, keyed by stable guid, read back through the shipping
+// writers (SaveSceneToString -> EntityToJson, runtimeTags on) rather than a
+// hand-rolled component walk - so this compares all ~130 serialized fields and
+// cannot drift as components are added.
+//
+// "parent" is a per-file ARRAY INDEX, so it is meaningless across two differently
+// ordered worlds: it is lifted out of the blob and re-expressed as the PARENT'S
+// GUID (0 = root), which is comparable.
+struct WorldFingerprint {
+    std::map<u64, std::string> blob;   // guid -> entity JSON minus "parent"
+    std::map<u64, u64> parentOf;       // guid -> parent guid (0 = root)
+    usize entities = 0;
+    usize parentLinks = 0;
+};
+
+WorldFingerprint Fingerprint(const Scene& s) {
+    WorldFingerprint fp;
+    json root;
+    try {
+        root = json::parse(SaveSceneToString(s));
+    } catch (const std::exception&) {
+        return fp;
+    }
+    const json& ents = root.value("entities", json::array());
+    const auto guidAt = [&](usize i) -> u64 {
+        if (i >= ents.size() || !ents[i].is_object()) return 0;
+        const auto g = ents[i].find("guid");
+        return (g != ents[i].end() && g->is_string()) ? guid::FromHex(g->get<std::string>()) : 0;
+    };
+    for (usize i = 0; i < ents.size(); ++i) {
+        json je = ents[i];
+        const u64 g = guidAt(i);
+        u64 pg = 0;
+        if (const auto it = je.find("parent"); it != je.end() && it->is_number_integer()) {
+            const int p = it->get<int>();
+            if (p >= 0) {
+                pg = guidAt(static_cast<usize>(p));
+                ++fp.parentLinks;
+            }
+            je.erase("parent");
+        }
+        fp.blob[g] = je.dump();
+        fp.parentOf[g] = pg;
+        ++fp.entities;
+    }
+    return fp;
+}
+
+// LIVE entities. Not Scene::EntityCount(), which reports the entity storage's
+// size (released slots included) - after a destroy-and-reload that would count
+// recycled slots and hide exactly the leak this test is looking for.
+usize LiveCount(const Scene& s) {
+    const auto& reg = s.Registry();
+    // EnTT's CONST storage<T>() returns a pointer (null when absent), as Scene.h notes.
+    const auto* st = reg.storage<entt::entity>();
+    if (!st) return 0;
+    usize n = 0;
+    for (const entt::entity e : *st)
+        if (reg.valid(e)) ++n;
+    return n;
+}
+
+// Live entities carrying a Parent, and whether every one of those links is sane.
+// This is the direct B1 pin: the old parent pass emplaced Parent on entt::null,
+// which is an ENTT_ASSERT in Debug and a sparse-set write out of bounds in Release.
+struct ParentAudit {
+    usize links = 0;
+    bool allValid = true; // both the holder and the target are live entities
+};
+ParentAudit AuditParents(const Scene& s) {
+    ParentAudit a;
+    const auto& reg = s.Registry();
+    for (const entt::entity e : reg.view<const Parent>()) {
+        ++a.links;
+        if (!reg.valid(e)) { a.allValid = false; continue; }
+        if (!reg.valid(reg.get<const Parent>(e).entity)) a.allValid = false;
+    }
+    return a;
+}
+
+} // namespace
+
+bool SceneSliceSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("sceneslice: FAILED - {}", what);
+        }
+    };
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "hbe_sceneslice";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "Materials", ec);
+
+    // No GPU: a device-less Renderer's UploadMesh/UploadTexture return invalid
+    // handles instead of touching a device, which is exactly the headless contract
+    // the other serializer self-tests keep.
+    Renderer renderer;
+
+    {
+        MaterialAsset a;
+        a.name = "A";
+        a.roughness = 0.25f;
+        MaterialAsset b;
+        b.name = "B";
+        b.roughness = 0.75f;
+        expect(assets::SaveMaterial(dir / "Materials" / "A.hbmat", a) &&
+                   assets::SaveMaterial(dir / "Materials" / "B.hbmat", b),
+               "write two scratch .hbmat assets (one per slice)");
+    }
+
+    // --- 1. Author ONE scene file --------------------------------------------
+    // Deliberately contains everything that makes slicing hard: a 3-deep chain
+    // inside one slice, a CROSS-SLICE parent link, a parent stored AFTER its child
+    // in the file, two entities sharing a name (names are not identity), streaming
+    // Tags, and header environment values nothing defaults to.
+    const fs::path file = dir / "Slice.hbscene";
+    {
+        Scene s;
+        auto& reg = s.Registry();
+        SceneEnvironment& env = s.Environment();
+        env.ambientIntensity = 0.37f;
+        env.exposure = 2.5f;
+        env.shadowDistance = 777.0f;
+        env.post.vignette = 0.42f;
+        env.post.bloomEnabled = 0;
+        env.post.fogDensity = 0.05f;
+
+        const auto make = [&](const char* n, const glm::vec3& p) {
+            const entt::entity e = s.CreateEntity(n);
+            Transform t;
+            t.position = p;
+            reg.emplace<Transform>(e, t);
+            return e;
+        };
+
+        const entt::entity hub = make("Hub", {1.0f, 0.0f, 0.0f});
+        reg.emplace<PointLightComponent>(hub, PointLightComponent{{0.2f, 0.4f, 0.6f}, 3.0f, 12.0f});
+        const entt::entity mid = make("Mid", {2.0f, 0.0f, 0.0f});
+        reg.emplace<Parent>(mid, Parent{hub});
+        Health hp;
+        hp.max = 55.0f;
+        hp.current = 33.0f;
+        reg.emplace<Health>(mid, hp);
+        const entt::entity leaf = make("Leaf", {3.0f, 0.0f, 0.0f});
+        reg.emplace<Parent>(leaf, Parent{mid});
+        Interactable ia;
+        ia.prompt = "Pry open";
+        ia.range = 4.25f;
+        reg.emplace<Interactable>(leaf, ia);
+
+        const entt::entity camp = make("Camp", {40.0f, 0.0f, 0.0f});
+        Spawner sp;
+        sp.prefab = "Prefabs/Guard.hbprefab";
+        sp.count = 4;
+        reg.emplace<Spawner>(camp, sp);
+        tags::Assign(reg, camp, tags::Intern("Camp"), 2);
+        const entt::entity guard = make("Guard", {41.0f, 0.0f, 0.0f});
+        reg.emplace<Parent>(guard, Parent{camp});
+        reg.emplace<Health>(guard, Health{});
+        tags::Assign(reg, guard, tags::Intern("Camp"), 2);
+
+        // THE CROSS-SLICE CASE: authored as a child of Camp (slice B) but assigned
+        // to slice A. Nothing in the shipping authoring tools produces this
+        // (tags::AssignSubtree tags whole subtrees) - it is here precisely because
+        // the fallback has to be proven.
+        const entt::entity orphan = make("Orphan", {42.0f, 1.0f, 0.0f});
+        reg.emplace<Parent>(orphan, Parent{camp});
+
+        const entt::entity wire = make("Wire", {50.0f, 0.0f, 0.0f});
+        TriggerVolume tv;
+        tv.halfExtents = {9.0f, 3.0f, 9.0f};
+        tv.flag = "camp_entered";
+        reg.emplace<TriggerVolume>(wire, tv);
+
+        const entt::entity lonely = make("Lonely", {-10.0f, 0.0f, 0.0f});
+        AudioSource as;
+        as.asset = "Audio/Wind.uaf";
+        reg.emplace<AudioSource>(lonely, as);
+
+        // Material carriers: a prim mesh (no file IO in staging) plus a MaterialRef,
+        // which is what puts "mesh.material" in the file for StageAssets to find.
+        for (const auto& [n, mat] : std::initializer_list<std::pair<const char*, const char*>>{
+                 {"MatA", "Materials/A.hbmat"}, {"MatB", "Materials/B.hbmat"}}) {
+            const entt::entity e = make(n, {0.0f, 5.0f, 0.0f});
+            reg.emplace<MeshInstance>(e, MeshInstance{});
+            reg.emplace<MeshRef>(e, MeshRef{"prim:cube"});
+            reg.emplace<MaterialRef>(e, MaterialRef{mat});
+        }
+
+        // Two entities with the SAME name, one per slice.
+        make("Twin", {7.0f, 0.0f, 0.0f});
+        make("Twin", {8.0f, 0.0f, 0.0f});
+
+        expect(SaveScene(s, file), "save the authored slice-test scene");
+    }
+
+    SceneData data;
+    expect(ParseSceneFile(file, data), "the slice-test scene parses");
+    if (!ok) {
+        fs::remove_all(dir, ec);
+        return false;
+    }
+    expect(data.entities.size() == 12, "all 12 authored entities round-trip");
+    expect(data.ambientIntensity == 0.37f && data.exposure == 2.5f &&
+               data.shadowDistance == 777.0f && data.post.vignette == 0.42f &&
+               data.post.bloomEnabled == 0u,
+           "the file header carries the authored environment");
+
+    // Rows by name (save REVERSES the entity array, so nothing may assume order).
+    const auto rowOf = [&](const std::string& n) -> int {
+        for (usize i = 0; i < data.entities.size(); ++i)
+            if (data.entities[i].name == n) return static_cast<int>(i);
+        return -1;
+    };
+    const int rHub = rowOf("Hub"), rMid = rowOf("Mid"), rLeaf = rowOf("Leaf");
+    const int rCamp = rowOf("Camp"), rGuard = rowOf("Guard"), rOrphan = rowOf("Orphan");
+    const int rWire = rowOf("Wire"), rLonely = rowOf("Lonely");
+    const int rMatA = rowOf("MatA"), rMatB = rowOf("MatB");
+    expect(rHub >= 0 && rMid >= 0 && rLeaf >= 0 && rCamp >= 0 && rGuard >= 0 &&
+               rOrphan >= 0 && rWire >= 0 && rLonely >= 0 && rMatA >= 0 && rMatB >= 0,
+           "every authored entity is findable by name");
+    if (!ok) {
+        fs::remove_all(dir, ec);
+        return false;
+    }
+    const u64 gOrphan = data.entities[static_cast<usize>(rOrphan)].guid;
+    const u64 gCamp = data.entities[static_cast<usize>(rCamp)].guid;
+
+    // Slice A = Hub chain + Orphan + Lonely + MatA + one Twin.
+    // Slice B = Camp + Guard + Wire + MatB + the other Twin.
+    // Disjoint, and together exactly the file.
+    std::vector<u32> sliceA{static_cast<u32>(rHub), static_cast<u32>(rMid),
+                            static_cast<u32>(rLeaf), static_cast<u32>(rOrphan),
+                            static_cast<u32>(rLonely), static_cast<u32>(rMatA)};
+    std::vector<u32> sliceB{static_cast<u32>(rCamp), static_cast<u32>(rGuard),
+                            static_cast<u32>(rWire), static_cast<u32>(rMatB)};
+    {
+        std::unordered_set<u32> taken(sliceA.begin(), sliceA.end());
+        taken.insert(sliceB.begin(), sliceB.end());
+        for (u32 i = 0; i < static_cast<u32>(data.entities.size()); ++i)
+            if (!taken.contains(i)) (sliceA.size() <= sliceB.size() ? sliceA : sliceB).push_back(i);
+        expect(sliceA.size() + sliceB.size() == data.entities.size(),
+               "the two slices partition the file exactly");
+    }
+
+    // --- 2. StageAssets stages strictly the slice's assets --------------------
+    {
+        StagedAssets all, a, b;
+        StageAssets(data, dir, all);
+        StageAssets(data, dir, a, sliceA.data(), static_cast<u32>(sliceA.size()));
+        StageAssets(data, dir, b, sliceB.data(), static_cast<u32>(sliceB.size()));
+        expect(all.materials.size() == 2, "a full stage loads both materials");
+        expect(a.materials.contains("Materials/A.hbmat") &&
+                   !a.materials.contains("Materials/B.hbmat"),
+               "slice A stages its own material and NOT slice B's");
+        expect(b.materials.contains("Materials/B.hbmat") &&
+                   !b.materials.contains("Materials/A.hbmat"),
+               "slice B stages its own material and NOT slice A's");
+        StagedAssets empty;
+        const u32 none[1] = {0};
+        StageAssets(data, dir, empty, none, 0); // non-null, count 0 = a real empty slice
+        expect(empty.materials.empty(), "an empty slice stages nothing");
+    }
+
+    // --- 3. Full load = the reference world ----------------------------------
+    Scene full;
+    StagedAssets stagedFull;
+    StageAssets(data, dir, stagedFull);
+    Instantiate(full, renderer, data, stagedFull, LoadMode::Replace);
+    const WorldFingerprint fpFull = Fingerprint(full);
+    const ParentAudit paFull = AuditParents(full);
+    expect(fpFull.entities == data.entities.size(),
+           "the full load creates every entity in the file");
+    expect(paFull.links == 4 && paFull.allValid,
+           "the full load links all four authored parents, all handles live");
+
+    // --- 4. Two disjoint slices build the SAME world --------------------------
+    Scene sliced;
+    std::vector<entt::entity> createdA, createdB;
+    BindWorld(sliced, renderer, data); // B2: the explicit environment step
+    expect(sliced.Environment().ambientIntensity == 0.37f &&
+               sliced.Environment().exposure == 2.5f &&
+               sliced.Environment().shadowDistance == 777.0f &&
+               sliced.Environment().post.vignette == 0.42f &&
+               sliced.Environment().post.bloomEnabled == 0u &&
+               sliced.Environment().post.fogDensity == 0.05f,
+           "BindWorld applies the file's environment (B2: Replace is not available "
+           "to a slice)");
+    {
+        StagedAssets sa, sb;
+        StageAssets(data, dir, sa, sliceA.data(), static_cast<u32>(sliceA.size()));
+        StageAssets(data, dir, sb, sliceB.data(), static_cast<u32>(sliceB.size()));
+        // Poke the environment between the slices: a slice must never stamp it.
+        sliced.Environment().exposure = 9.0f;
+        Instantiate(sliced, renderer, data, sa, LoadMode::Additive, &createdA, {},
+                    sliceA.data(), static_cast<u32>(sliceA.size()));
+        Instantiate(sliced, renderer, data, sb, LoadMode::Additive, &createdB, {},
+                    sliceB.data(), static_cast<u32>(sliceB.size()));
+        expect(sliced.Environment().exposure == 9.0f,
+               "an Additive slice load does NOT re-apply the environment "
+               "(exactly once, by BindWorld)");
+        sliced.Environment().exposure = 2.5f; // restore for the fingerprint compare
+    }
+    expect(createdA.size() == sliceA.size() && createdB.size() == sliceB.size(),
+           "createdOut is exactly the slice, per slice");
+
+    const WorldFingerprint fpSliced = Fingerprint(sliced);
+    const ParentAudit paSliced = AuditParents(sliced);
+    expect(fpSliced.entities == fpFull.entities,
+           "two disjoint slices create exactly as many entities as one full load");
+    expect(fpSliced.blob == fpFull.blob,
+           "every entity, keyed by guid, has byte-identical component state under "
+           "slicing");
+
+    // The ONLY licensed difference: the cross-slice parent link becomes a root.
+    {
+        std::map<u64, u64> expected = fpFull.parentOf;
+        const auto it = expected.find(gOrphan);
+        expect(it != expected.end() && it->second == gCamp,
+               "the full load parents Orphan to Camp");
+        expected[gOrphan] = 0; // cross-slice -> ROOT, deliberately
+        expect(fpSliced.parentOf == expected,
+               "the hierarchy is identical EXCEPT that the cross-slice child is a root");
+        expect(fpSliced.parentOf.count(gOrphan) == 1 && fpSliced.parentOf.at(gOrphan) == 0,
+               "the cross-slice child survives as a ROOT (it is never dropped)");
+    }
+    expect(paSliced.links == paFull.links - 1,
+           "one parent link fewer: the cross-slice one");
+    // B1 REGRESSION PIN. Pre-fix, slice A's pass reached row `Guard`/`Camp` (outside
+    // the slice, so created[] is null there) and emplaced Parent on entt::null.
+    expect(paSliced.allValid,
+           "no Parent component exists on, or points at, a dead handle (B1)");
+    {
+        const auto& reg = sliced.Registry();
+        usize orphanRoots = 0;
+        for (const entt::entity e : reg.view<const Guid>())
+            if (reg.get<const Guid>(e).value == gOrphan && !reg.all_of<Parent>(e)) ++orphanRoots;
+        expect(orphanRoots == 1,
+               "the cross-slice child carries no Parent component at all");
+    }
+
+    // --- 5. Guids: adopted once, unique across slices ------------------------
+    {
+        const auto& reg = sliced.Registry();
+        std::unordered_set<u64> seen;
+        bool unique = true, nonZero = true;
+        for (const entt::entity e : reg.view<const Guid>()) {
+            const u64 g = reg.get<const Guid>(e).value;
+            if (g == 0) nonZero = false;
+            if (!seen.insert(g).second) unique = false;
+        }
+        expect(nonZero && unique, "guids are unique and non-zero across both slices");
+        expect(seen.size() == data.entities.size(),
+               "every file guid is adopted exactly once across the slices "
+               "(slice 2's Claim sees slice 1's)");
+        std::unordered_set<u64> fileGuids;
+        for (const EntityData& d : data.entities) fileGuids.insert(d.guid);
+        expect(seen == fileGuids,
+               "the sliced world's guids ARE the file's guids (nothing re-minted)");
+    }
+
+    // --- 6. A second bind re-binds, it does not stack a second world ---------
+    {
+        StagedAssets sa, sb;
+        StageAssets(data, dir, sa, sliceA.data(), static_cast<u32>(sliceA.size()));
+        StageAssets(data, dir, sb, sliceB.data(), static_cast<u32>(sliceB.size()));
+        BindWorld(sliced, renderer, data);
+        expect(LiveCount(sliced) == 0,
+               "BindWorld destroys the previous world");
+        Instantiate(sliced, renderer, data, sa, LoadMode::Additive, nullptr, {},
+                    sliceA.data(), static_cast<u32>(sliceA.size()));
+        Instantiate(sliced, renderer, data, sb, LoadMode::Additive, nullptr, {},
+                    sliceB.data(), static_cast<u32>(sliceB.size()));
+        const WorldFingerprint again = Fingerprint(sliced);
+        expect(again.entities == fpFull.entities,
+               "a SECOND bind + slices leaves one world, not two (B2)");
+        expect(again.blob == fpSliced.blob,
+               "the re-bound world is identical to the first bind's");
+        expect(sliced.Environment().ambientIntensity == 0.37f &&
+                   sliced.Environment().exposure == 2.5f,
+               "the second bind re-applies the environment");
+    }
+
+    // --- 7. Replace with a slice is refused, and changes nothing -------------
+    {
+        Scene guarded;
+        StagedAssets st;
+        StageAssets(data, dir, st, sliceA.data(), static_cast<u32>(sliceA.size()));
+        Instantiate(guarded, renderer, data, st, LoadMode::Replace, nullptr, {},
+                    sliceA.data(), static_cast<u32>(sliceA.size()));
+        expect(LiveCount(guarded) == 0,
+               "Replace + slice creates nothing");
+        expect(guarded.Environment().shadowDistance != 777.0f,
+               "Replace + slice does not apply the environment either - it is refused "
+               "outright, so a caller cannot half-load a world");
+    }
+
+    // --- 8. Degenerate slices ------------------------------------------------
+    {
+        Scene s;
+        StagedAssets st;
+        const u32 one[1] = {static_cast<u32>(rWire)};
+        BindWorld(s, renderer, data);
+        Instantiate(s, renderer, data, st, LoadMode::Additive, nullptr, {}, one, 0);
+        expect(LiveCount(s) == 0,
+               "an empty slice (non-null indices, count 0) creates nothing");
+
+        // Out-of-range and repeated indices are skipped, not fatal, and never
+        // create a second copy of a row.
+        const u32 bad[4] = {static_cast<u32>(rWire), static_cast<u32>(rWire), 9999u,
+                            static_cast<u32>(rLonely)};
+        std::vector<entt::entity> made;
+        Instantiate(s, renderer, data, st, LoadMode::Additive, &made, {}, bad, 4);
+        expect(made.size() == 2,
+               "a repeated index and an out-of-range index are both skipped");
+    }
+
+    fs::remove_all(dir, ec);
+    return ok;
+}
+
+
+// --- --test-lightingparity ----------------------------------------------------
+//
+// THE POINT OF THIS TEST, stated once: an interior surrounded by cubes rendered
+// correctly DARK in the shipped game and wrongly BRIGHT in the editor, which makes
+// lighting unauthorable. Nothing in the tree compared an editor-loaded environment
+// against a runtime-loaded one, so the two could drift apart with no signal. This
+// runs the SAME file through BOTH REAL PATHS and compares the whole environment
+// value.
+//
+// It must be impossible to pass while the paths disagree, and equally impossible
+// to pass trivially: every stamp is also checked against the AUTHORED numbers, so
+// "both paths are identically broken" fails too.
+namespace {
+
+// Writes a syntactically valid `.hbgi` (the format BakeGIVolume emits) with a
+// recognisable grid, so the test can assert the loaded volume IS this file.
+bool WriteScratchGi(const fs::path& path, const glm::ivec3& dims, const glm::vec3& origin,
+                    f32 spacing) {
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    std::ofstream f{path, std::ios::binary};
+    if (!f) return false;
+    const u32 magic = 0x56494748u, ver = 1; // 'HGIV'
+    const auto wr = [&](const void* p, usize n) {
+        f.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
+    };
+    wr(&magic, 4);
+    wr(&ver, 4);
+    wr(&dims.x, 4); wr(&dims.y, 4); wr(&dims.z, 4);
+    wr(&origin.x, 12);
+    wr(&spacing, 4);
+    const usize cells = static_cast<usize>(dims.x) * dims.y * dims.z;
+    const std::vector<glm::vec4> sh(4 * cells, glm::vec4(0.5f, 0.4f, 0.3f, 1.0f));
+    const std::vector<glm::vec4> depth(64 * cells, glm::vec4(3.0f, 9.0f, 0.0f, 0.0f));
+    wr(sh.data(), sh.size() * sizeof(glm::vec4));
+    wr(depth.data(), depth.size() * sizeof(glm::vec4));
+    return true;
+}
+
+// Authors a scratch level: header values nothing defaults to, plus enough entities
+// (and a cross-shard parent link) that the runtime path has real slices to load.
+void AuthorParityScene(const fs::path& file, const std::string& giSource) {
+    Scene s;
+    auto& reg = s.Registry();
+    SceneEnvironment& env = s.Environment();
+    env.ambientIntensity = 0.6337f;   // the sealed-interior value, deliberately not 1.0
+    env.exposure = 1.25f;
+    env.shadowDistance = 1200.0f;
+    env.post.vignette = 0.91f;
+    env.post.bloomEnabled = 0;
+    env.post.ssgiEnabled = 0;
+    env.post.fogDensity = 0.037f;
+    // NOT shadowCascades: it lives in PostSettings but is project-global quality,
+    // deliberately not serialized per scene (the engine stamps it every frame from
+    // the graphics preset). Setting it here would assert a round-trip the format
+    // does not promise.
+    env.giSource = giSource;
+
+    const auto make = [&](const char* n, const glm::vec3& p) {
+        const entt::entity e = s.CreateEntity(n);
+        Transform t;
+        t.position = p;
+        reg.emplace<Transform>(e, t);
+        return e;
+    };
+    const entt::entity room = make("Room", {0.0f, 0.0f, 0.0f});
+    const entt::entity lamp = make("Lamp", {0.0f, 2.0f, 0.0f});
+    reg.emplace<Parent>(lamp, Parent{room});
+    reg.emplace<PointLightComponent>(lamp, PointLightComponent{{1.0f, 0.9f, 0.7f}, 6.0f, 9.0f});
+    const entt::entity outside = make("Blocker", {30.0f, 0.0f, 0.0f});
+    reg.emplace<MeshInstance>(outside, MeshInstance{});
+    reg.emplace<MeshRef>(outside, MeshRef{"prim:cube"});
+    const entt::entity far1 = make("FarProp", {90.0f, 0.0f, 0.0f});
+    reg.emplace<Parent>(far1, Parent{outside}); // the cross-slice link
+    make("Marker", {-20.0f, 0.0f, 5.0f});
+    SaveScene(s, file);
+}
+
+} // namespace
+
+bool LightingParitySelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("lightingparity: FAILED - {}", what);
+        }
+    };
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "hbe_lightingparity";
+    fs::remove_all(dir, ec);
+    // A real scratch PROJECT, because ApplyEnvironment resolves giSource against
+    // Project::Active().AssetsDir() - without one the `.hbgi` cases are untestable.
+    if (!Project::Active().Create(dir, "LightingParity")) {
+        HBE_ERROR("lightingparity: FAILED - could not create the scratch project");
+        return false;
+    }
+    const fs::path assets = Project::Active().AssetsDir();
+
+    // No GPU: a device-less Renderer uploads nothing, which is the same headless
+    // contract the other serializer self-tests keep. LoadGIVolume still PARSES the
+    // file in that state (that is why it no longer early-outs on the device), so
+    // Loaded / Missing / Corrupt remain distinguishable here.
+    Renderer renderer;
+
+    const glm::ivec3 kGiDims{3, 4, 5};
+    const glm::vec3 kGiOrigin{-7.5f, -1.25f, 3.0f};
+    constexpr f32 kGiSpacing = 2.75f;
+    expect(WriteScratchGi(assets / "GI" / "lit.hbgi", kGiDims, kGiOrigin, kGiSpacing),
+           "write a scratch .hbgi");
+    {   // A file that is present but is not a GI volume.
+        fs::create_directories(assets / "GI", ec);
+        std::ofstream bad{assets / "GI" / "bad.hbgi", std::ios::binary};
+        bad << "this is not a baked irradiance volume";
+    }
+
+    const fs::path fLit = assets / "Scenes" / "Lit.hbscene";
+    const fs::path fNoGi = assets / "Scenes" / "NoGi.hbscene";
+    const fs::path fMissing = assets / "Scenes" / "MissingGi.hbscene";
+    const fs::path fCorrupt = assets / "Scenes" / "CorruptGi.hbscene";
+    fs::create_directories(assets / "Scenes", ec);
+    AuthorParityScene(fLit, "GI/lit.hbgi");
+    AuthorParityScene(fNoGi, "");
+    AuthorParityScene(fMissing, "GI/nope.hbgi");
+    AuthorParityScene(fCorrupt, "GI/bad.hbgi");
+
+    // THE EDITOR PATH. Editor::LoadSceneInEditor does exactly this - the same
+    // overload with the same DEFAULTED mode (which is LoadMode::Replace).
+    const auto loadAsEditor = [&](Scene& s, const fs::path& p) {
+        return LoadScene(s, renderer, p);
+    };
+
+    // THE RUNTIME PATH. stream::Streamer::BindLevel does exactly this: BindWorld
+    // once for the level, then every shard's rows Additive. `reverse` loads the
+    // slices back-to-front, which is legal (residency order is a function of where
+    // the player is standing) and must not change the environment.
+    const auto loadAsRuntime = [&](Scene& s, const fs::path& p, bool reverse) {
+        SceneData d;
+        if (!ParseSceneFile(p, d)) return false;
+        BindWorld(s, renderer, d);
+        std::vector<u32> a, b;
+        for (u32 i = 0; i < static_cast<u32>(d.entities.size()); ++i)
+            (i % 2 == 0 ? a : b).push_back(i);
+        std::vector<const std::vector<u32>*> order{&a, &b};
+        if (reverse) std::swap(order[0], order[1]);
+        for (const std::vector<u32>* rows : order) {
+            StagedAssets st;
+            StageAssets(d, assets, st, rows->data(), static_cast<u32>(rows->size()));
+            Instantiate(s, renderer, d, st, LoadMode::Additive, nullptr, {}, rows->data(),
+                        static_cast<u32>(rows->size()));
+        }
+        return true;
+    };
+
+    // --- 1. The scene WITH a baked .hbgi -------------------------------------
+    EnvironmentStamp litEditor, litRuntime;
+    {
+        Scene e, r;
+        expect(loadAsEditor(e, fLit), "the editor path loads Lit.hbscene");
+        expect(loadAsRuntime(r, fLit, false), "the runtime path loads Lit.hbscene");
+        litEditor = StampOf(e.Environment());
+        litRuntime = StampOf(r.Environment());
+        if (litEditor != litRuntime)
+            HBE_ERROR("lightingparity: stamps differ ->{}", DescribeStampDiff(litEditor, litRuntime));
+        expect(litEditor == litRuntime,
+               "WITH a baked GI volume, the editor path and the runtime path produce "
+               "an IDENTICAL environment");
+    }
+    // ... and it is the AUTHORED environment, not two identically-wrong ones.
+    expect(litEditor.ambientIntensity == 0.6337f && litEditor.exposure == 1.25f &&
+               litEditor.shadowDistance == 1200.0f && litEditor.post.vignette == 0.91f &&
+               litEditor.post.bloomEnabled == 0u && litEditor.post.ssgiEnabled == 0u &&
+               litEditor.post.fogDensity == 0.037f,
+           "both paths apply the FILE's authored header (not a default, and not the "
+           "project's look)");
+    expect(litEditor.giSource == "GI/lit.hbgi" && litEditor.giStatus == GiStatus::Loaded,
+           "the baked volume named by giSource actually loaded");
+    expect(litEditor.giDims == kGiDims && litEditor.giOrigin == kGiOrigin &&
+               litEditor.giSpacing == glm::vec3(kGiSpacing),
+           "the loaded volume IS the file that was written (grid round-trips)");
+
+    // --- 2. The scene WITHOUT a baked .hbgi ----------------------------------
+    {
+        Scene e, r;
+        expect(loadAsEditor(e, fNoGi), "the editor path loads NoGi.hbscene");
+        expect(loadAsRuntime(r, fNoGi, false), "the runtime path loads NoGi.hbscene");
+        const EnvironmentStamp se = StampOf(e.Environment()), sr = StampOf(r.Environment());
+        if (se != sr)
+            HBE_ERROR("lightingparity: stamps differ ->{}", DescribeStampDiff(se, sr));
+        expect(se == sr,
+               "WITHOUT a baked GI volume, the editor path and the runtime path produce "
+               "an IDENTICAL environment");
+        expect(se.giSource.empty() && se.giStatus == GiStatus::None && !se.giShValid &&
+                   se.giDims == glm::ivec3(0),
+               "no giSource = no volume, and the absence is REPORTED (None), not guessed");
+        expect(se.ambientIntensity == litEditor.ambientIntensity,
+               "the header is applied identically whether or not there is a GI volume");
+    }
+
+    // --- 3. Shard ORDER does not change the environment ----------------------
+    {
+        Scene fwd, rev;
+        expect(loadAsRuntime(fwd, fLit, false) && loadAsRuntime(rev, fLit, true),
+               "the runtime path loads the slices in both orders");
+        expect(StampOf(fwd.Environment()) == StampOf(rev.Environment()),
+               "loading the shards back-to-front leaves the same environment "
+               "(residency order is where the player stands, not a look setting)");
+    }
+
+    // --- 4. An Additive load contributes NO environment ----------------------
+    {
+        Scene s;
+        SceneData d;
+        expect(ParseSceneFile(fLit, d), "parse Lit.hbscene for the additive probe");
+        BindWorld(s, renderer, d);
+        // Poke every field the header owns, then stream a shard in on top.
+        SceneEnvironment& env = s.Environment();
+        env.ambientIntensity = 9.0f;
+        env.exposure = 9.0f;
+        env.shadowDistance = 9.0f;
+        env.post.vignette = 0.09f;
+        env.giSource = "poked";
+        env.giStatus = GiStatus::Corrupt;
+        const EnvironmentStamp poked = StampOf(env);
+        std::vector<u32> rows;
+        for (u32 i = 0; i < static_cast<u32>(d.entities.size()); ++i) rows.push_back(i);
+        StagedAssets st;
+        StageAssets(d, assets, st, rows.data(), static_cast<u32>(rows.size()));
+        Instantiate(s, renderer, d, st, LoadMode::Additive, nullptr, {}, rows.data(),
+                    static_cast<u32>(rows.size()));
+        expect(StampOf(s.Environment()) == poked,
+               "an Additive load applies NO part of the environment - the open document "
+               "owns the look, a streamed-in scene contributes entities only");
+    }
+
+    // --- 5. A GI failure is REPORTED and never INHERITED ----------------------
+    // The regression this pins: ApplyEnvironment used to test `if (vol.valid)` with
+    // no else, so scene B with a broken `.hbgi` kept scene A's volume bound while
+    // advertising its own giSource. Lighting silently depended on which level had
+    // been open before.
+    for (int path = 0; path < 2; ++path) {
+        const char* which = path == 0 ? "editor" : "runtime";
+        Scene s;
+        const auto load = [&](const fs::path& p) {
+            return path == 0 ? loadAsEditor(s, p) : loadAsRuntime(s, p, false);
+        };
+        expect(load(fLit), "load the GOOD volume first");
+        expect(s.Environment().giStatus == GiStatus::Loaded &&
+                   s.Environment().giDims == kGiDims,
+               "the good volume is bound before the failure case");
+        expect(load(fMissing), "load a scene whose .hbgi does not exist");
+        const EnvironmentStamp miss = StampOf(s.Environment());
+        expect(miss.giStatus == GiStatus::Missing, "a missing .hbgi is reported as Missing");
+        expect(!miss.giShValid && !miss.giDepthValid && miss.giDims == glm::ivec3(0),
+               "a missing .hbgi CLEARS the volume - it does not inherit the previously "
+               "loaded scene's GI");
+        expect(miss.giSource == "GI/nope.hbgi",
+               "giSource is still what the file said (the editor can show the broken path)");
+        expect(load(fLit) && load(fCorrupt), "load a scene whose .hbgi is not a GI volume");
+        const EnvironmentStamp bad = StampOf(s.Environment());
+        expect(bad.giStatus == GiStatus::Corrupt, "a corrupt .hbgi is reported as Corrupt");
+        expect(!bad.giShValid && bad.giDims == glm::ivec3(0),
+               "a corrupt .hbgi CLEARS the volume too");
+        expect(bad.ambientIntensity == 0.6337f && bad.exposure == 1.25f,
+               "a GI failure does not stop the other four header fields from applying");
+        if (!ok) HBE_ERROR("lightingparity: (the failures above are on the {} path)", which);
+    }
+
+    // --- 6. Both paths agree on the FAILURE cases too ------------------------
+    for (const fs::path& p : {fMissing, fCorrupt}) {
+        Scene e, r;
+        expect(loadAsEditor(e, p) && loadAsRuntime(r, p, false),
+               "both paths load the broken-GI scene");
+        const EnvironmentStamp se = StampOf(e.Environment()), sr = StampOf(r.Environment());
+        if (se != sr) HBE_ERROR("lightingparity: stamps differ ->{}", DescribeStampDiff(se, sr));
+        expect(se == sr,
+               "the editor and the runtime agree about a BROKEN GI volume, not just a "
+               "working one");
+    }
+
+    // --- 7. Re-binding is idempotent -----------------------------------------
+    {
+        Scene s;
+        expect(loadAsRuntime(s, fLit, false), "first bind");
+        const EnvironmentStamp first = StampOf(s.Environment());
+        expect(loadAsRuntime(s, fLit, false), "second bind");
+        expect(StampOf(s.Environment()) == first,
+               "a second bind re-applies the same environment (it does not accumulate)");
+        expect(loadAsEditor(s, fLit) && StampOf(s.Environment()) == first,
+               "and an editor load onto an already-bound world lands on the same value");
+    }
+
+    // --- 8. DAY/NIGHT MODULATES THE AUTHORED LOOK, IT DOES NOT REPLACE IT -----
+    // The second, separate authoring bug: with `dynamicSky` on, UpdateDayNight
+    // overwrote ambientIntensity (and MakeView overwrote exposure) with absolute
+    // constants, so the authored numbers were dead data and the same room was a
+    // different brightness depending on when you looked at it. The contract now is
+    // PROPORTIONALITY: double the authored ambient, double what is rendered, at any
+    // hour.
+    {
+        Scene s;
+        expect(loadAsEditor(s, fLit), "load for the day/night check");
+        Camera cam;
+        cam.SetPerspective(60.0f, 1.0f, 0.1f, 1000.0f);
+        cam.LookAt({0.0f, 2.0f, 10.0f}, {0.0f, 0.0f, 0.0f});
+        SceneEnvironment& env = s.Environment();
+
+        env.dynamicSky = 0;
+        const rhi::SceneView off = s.MakeView(cam);
+        expect(off.ambientIntensity == env.ambientIntensity && off.exposure == env.exposure,
+               "with the dynamic sky OFF the authored ambient/exposure reach the view "
+               "untouched");
+
+        env.dynamicSky = 1;
+        env.timeOfDay = 12.0f; // noon: the curve is 1.0, so authored passes through
+        const rhi::SceneView noon = s.MakeView(cam);
+        expect(std::abs(noon.ambientIntensity - env.ambientIntensity) < 1e-5f,
+               "at NOON the day/night curve leaves the authored ambient alone "
+               "(it used to force 1.0)");
+        expect(std::abs(noon.exposure - env.exposure) < 1e-5f,
+               "at NOON the day/night curve leaves the authored exposure alone");
+
+        env.timeOfDay = 0.0f; // midnight
+        const rhi::SceneView night = s.MakeView(cam);
+        expect(night.ambientIntensity < noon.ambientIntensity,
+               "midnight is darker than noon (the cycle still does something)");
+        const f32 authored = env.ambientIntensity;
+        const f32 nightAt1x = night.ambientIntensity;
+        env.ambientIntensity = authored * 2.0f;
+        const rhi::SceneView night2x = s.MakeView(cam);
+        env.ambientIntensity = authored;
+        expect(std::abs(night2x.ambientIntensity - nightAt1x * 2.0f) < 1e-4f,
+               "the night curve is a MULTIPLIER on the authored ambient: doubling the "
+               "authored value doubles the rendered one (it used to ignore it entirely)");
+        const DayNight dn = EvalDayNight(12.0f);
+        expect(dn.day > 0.99f && dn.tint == glm::vec3(1.0f),
+               "the shared curve is identity at midday, so 'modulate' cannot quietly "
+               "become 'replace'");
+    }
+
+    // --- 9. THE CLOCK IS PART OF THE HEADER (when the scene claims it) --------
+    // The divergence the five header fields could not fix. The day/night clock
+    // FREE-RUNS from process boot, so the editor and the shipped game are at
+    // different hours the moment they have been open for different lengths of time -
+    // at a 60-second day length, 30 seconds apart is 12 in-game hours apart, ~8x on
+    // ambient. A scene may now pin it, and both load paths must agree about that.
+    {
+        const fs::path fClock = assets / "Scenes" / "Clock.hbscene";
+        {   // Author an override: an INTERIOR that opts out of the cycle entirely.
+            Scene s;
+            SceneEnvironment& env = s.Environment();
+            env.ambientIntensity = 0.6337f;
+            env.exposure = 1.25f;
+            env.dayNightAuthored = 1;
+            env.dynamicSky = 0;
+            env.timeOfDay = 3.5f;
+            env.dayLengthSeconds = 900.0f;
+            const entt::entity e = s.CreateEntity("Room");
+            s.Registry().emplace<Transform>(e, Transform{});
+            expect(SaveScene(s, fClock), "save a scene that claims the clock");
+        }
+        SceneData parsed;
+        expect(ParseSceneFile(fClock, parsed) && parsed.hasDayNight &&
+                   parsed.timeOfDay == 3.5f && parsed.dayLengthSeconds == 900.0f &&
+                   parsed.dynamicSky == 0,
+               "an authored day/night override round-trips through the .hbscene header");
+
+        // Both paths, starting from a world whose clock says something ELSE - which is
+        // what a free-running editor session actually looks like.
+        Scene e, r;
+        for (Scene* s : {&e, &r}) {
+            SceneEnvironment& env = s->Environment();
+            env.timeOfDay = 17.1f;
+            env.dayLengthSeconds = 60.0f;
+            env.dynamicSky = 1;
+        }
+        expect(loadAsEditor(e, fClock) && loadAsRuntime(r, fClock, false),
+               "both paths load the clock-claiming scene");
+        const EnvironmentStamp se = StampOf(e.Environment()), sr = StampOf(r.Environment());
+        if (se != sr) HBE_ERROR("lightingparity: stamps differ ->{}", DescribeStampDiff(se, sr));
+        expect(se == sr, "the editor and the runtime agree about the CLOCK, not just the "
+                         "five look fields");
+        expect(se.dayNightAuthored == 1 && se.dynamicSky == 0 && se.timeOfDay == 3.5f &&
+                   se.dayLengthSeconds == 900.0f,
+               "the scene's own clock replaces whatever the session was running");
+        // And with the override on and the cycle off, the authored numbers are what
+        // renders - the interior-authoring case, end to end.
+        Camera cam;
+        cam.SetPerspective(60.0f, 1.0f, 0.1f, 1000.0f);
+        cam.LookAt({0.0f, 2.0f, 10.0f}, {0.0f, 0.0f, 0.0f});
+        const rhi::SceneView v = e.MakeView(cam);
+        expect(v.ambientIntensity == 0.6337f && v.exposure == 1.25f,
+               "an interior that opts out of the cycle renders the EXACT authored "
+               "ambient/exposure");
+
+        // A scene that never claimed the clock leaves the session's alone (that is
+        // what every pre-existing `.hbscene` does, and its file must not grow keys).
+        Scene inherit;
+        inherit.Environment().timeOfDay = 17.1f;
+        inherit.Environment().dynamicSky = 1;
+        expect(loadAsEditor(inherit, fLit), "load a scene with no clock override");
+        expect(inherit.Environment().dayNightAuthored == 0 &&
+                   inherit.Environment().timeOfDay == 17.1f &&
+                   inherit.Environment().dynamicSky == 1,
+               "a scene that authored no override inherits the project's clock, "
+               "untouched");
+        std::ifstream litText(fLit);
+        const std::string litBytes((std::istreambuf_iterator<char>(litText)),
+                                   std::istreambuf_iterator<char>());
+        expect(litBytes.find("timeOfDay") == std::string::npos &&
+                   litBytes.find("dynamicSky") == std::string::npos,
+               "and its FILE is byte-for-byte what it was before the keys existed");
+    }
+
+    // --- 10. A SAVE MAY NOT GIVE ONE SCENE'S LOOK TO ANOTHER SCENE'S FILE -----
+    // The streamed-scene save-back. An additive load applies no environment, so the
+    // live environment belongs to the file the editor OPENED; writing it into every
+    // file the editor has open handed each streamed level the active one's ambient,
+    // exposure, post and - silently and worst - its giSource, which resolves and
+    // lights the room with a volume baked for different geometry.
+    {
+        const fs::path fVictim = assets / "Scenes" / "Victim.hbscene";
+        AuthorParityScene(fVictim, "GI/lit.hbgi");
+        SceneData before;
+        expect(ParseSceneFile(fVictim, before), "parse the streamed file's own header");
+
+        // A live world whose environment says something completely different.
+        Scene live;
+        SceneEnvironment& lenv = live.Environment();
+        lenv.ambientIntensity = 9.0f;
+        lenv.exposure = 4.0f;
+        lenv.shadowDistance = 12.0f;
+        lenv.giSource = "GI/someone_elses.hbgi";
+        lenv.dayNightAuthored = 1;
+        lenv.timeOfDay = 23.0f;
+        const entt::entity e = live.CreateEntity("Streamed");
+        live.Registry().emplace<Transform>(e, Transform{});
+        expect(SaveScene(live, fVictim, {}, SceneKind::Full, nullptr, &before),
+               "save the streamed file back with ITS OWN header");
+
+        SceneData after;
+        expect(ParseSceneFile(fVictim, after), "re-parse the streamed file");
+        expect(after.giSource == before.giSource && after.ambientIntensity ==
+                                                        before.ambientIntensity &&
+                   after.exposure == before.exposure &&
+                   after.shadowDistance == before.shadowDistance &&
+                   after.hasDayNight == before.hasDayNight,
+               "the streamed file kept its OWN look - the active scene's did not "
+               "overwrite it (giSource above all)");
+        expect(after.entities.size() == 1,
+               "and the entities written are still the live world's");
+
+        // The default (no header handed in) is still the live environment - every
+        // other caller depends on that.
+        expect(SaveScene(live, fVictim), "save with no header override");
+        SceneData plain;
+        expect(ParseSceneFile(fVictim, plain) && plain.ambientIntensity == 9.0f &&
+                   plain.giSource == "GI/someone_elses.hbgi" && plain.hasDayNight &&
+                   plain.timeOfDay == 23.0f,
+               "a save with no header override still writes the live environment");
+    }
+
+    // --- 11. THE PLAYER'S QUALITY PRESET DEGRADES THE VIEW, NOT THE FILE ------
+    // The last editor-vs-ship lighting difference the stamp could not see. The
+    // runtime used to stamp the preset onto the live `post` - one of the five
+    // stamped fields - so the shipped game rendered a stack the editor could not
+    // show, the authored flags were destroyed in memory, and a `.hbsave` written at
+    // Medium recorded the degrade as authored data.
+    {
+        Scene s;
+        expect(loadAsEditor(s, fLit), "load for the quality-preset check");
+        SceneEnvironment& env = s.Environment();
+        env.post.fogEnabled = 1;
+        env.post.dofEnabled = 1;
+        env.post.shadowCascades = 4;
+        const EnvironmentStamp authored = StampOf(env);
+        Camera cam;
+        cam.SetPerspective(60.0f, 1.0f, 0.1f, 1000.0f);
+        cam.LookAt({0.0f, 2.0f, 10.0f}, {0.0f, 0.0f, 0.0f});
+
+        env.postQualityPreset = 0; // High = the authored look, exactly
+        const rhi::SceneView high = s.MakeView(cam);
+        expect(high.post.fogEnabled == 1 && high.post.dofEnabled == 1 &&
+                   high.post.shadowCascades == 4,
+               "High leaves the authored post untouched");
+
+        env.postQualityPreset = 1; // what the shipped build runs by default
+        const rhi::SceneView med = s.MakeView(cam);
+        expect(med.post.fogEnabled == 0 && med.post.dofEnabled == 0 &&
+                   med.post.ssgiEnabled == 0 && med.post.shadowCascades == 3,
+               "Medium degrades the VIEW the way the shipped build always did");
+        expect(StampOf(env) == authored,
+               "...and the AUTHORED post is untouched by it - the preset may not "
+               "mutate a stamped field (it did, every frame, in the runtime only)");
+
+        env.forceShadowCascades = 4; // the --shadow-cascades A/B override
+        expect(s.MakeView(cam).post.shadowCascades == 4,
+               "an explicit cascade override still wins over the preset");
+        env.forceShadowCascades = 0;
+        env.postQualityPreset = 0;
+    }
+
+    fs::remove_all(dir, ec);
+    return ok;
+}
+
+// --- --test-paintcanvas -------------------------------------------------------
+
+bool MorphCacheSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("morphcache: FAILED - {}", what);
+        }
+    };
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "hbe_morphcache";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "Meshes", ec);
+    Renderer renderer; // device-less: uploads return invalid handles (headless contract)
+
+    // --- 0. `.uaf` v8 must actually carry blendshapes -------------------------
+    // Before v8 the importer produced morph targets and WriteMesh dropped them, so
+    // BuildMorphAtlas could never resolve from any asset on disk. Everything below
+    // would be vacuous without this.
+    const fs::path meshFile = dir / "Meshes" / "Head.uaf";
+    constexpr u32 kVerts = 6;
+    {
+        MeshData md;
+        md.name = "head";
+        md.vertices.resize(kVerts);
+        for (u32 i = 0; i < kVerts; ++i)
+            md.vertices[i].position = glm::vec3(static_cast<f32>(i), 0.0f, 0.0f);
+        md.indices = {0, 1, 2, 3, 4, 5};
+        MorphTarget jaw;
+        jaw.name = "jawOpen";
+        jaw.posDelta.assign(kVerts, glm::vec3(0.0f, -1.0f, 0.0f));
+        MorphTarget smile;
+        smile.name = "smile";
+        smile.posDelta.assign(kVerts, glm::vec3(0.25f, 0.0f, 0.0f));
+        md.morphTargets = {jaw, smile};
+        Model model{md};
+        expect(uaf::WriteMesh(meshFile, model), "write a .uaf with two blendshapes");
+        const std::optional<Model> back = uaf::ReadMesh(meshFile);
+        expect(back && back->size() == 1 && (*back)[0].morphTargets.size() == 2,
+               ".uaf v8 round-trips morph targets (pre-v8 dropped them silently)");
+        if (back && !back->empty() && (*back)[0].morphTargets.size() == 2) {
+            expect((*back)[0].morphTargets[0].name == "jawOpen" &&
+                       (*back)[0].morphTargets[1].posDelta.size() == kVerts,
+                   "the blendshape names and per-vertex deltas survive byte-for-byte");
+        }
+    }
+
+    const std::string meshSource = "uaf:Meshes/Head.uaf#0";
+    const std::string primSource = "prim:cube";
+
+    // A scene with three morph entities on the same mesh: a plain one, one whose
+    // Mesh collider forces the CPU model to be staged every time (B3's leak half),
+    // and one on a primitive (which can never have blendshapes).
+    SceneData data;
+    {
+        Scene s;
+        auto& reg = s.Registry();
+        const auto make = [&](const char* n, const std::string& src) {
+            const entt::entity e = s.CreateEntity(n);
+            reg.emplace<Transform>(e);
+            reg.emplace<MeshInstance>(e, MeshInstance{});
+            reg.emplace<MeshRef>(e, MeshRef{src});
+            reg.emplace<MorphState>(e, MorphState{});
+            return e;
+        };
+        make("Face", meshSource);
+        const entt::entity collider = make("FaceCollider", meshSource);
+        RigidBody rb;
+        rb.shape = RigidBody::Shape::Mesh;
+        reg.emplace<RigidBody>(collider, rb);
+        make("Cube", primSource);
+        const fs::path sceneFile = dir / "Morph.hbscene";
+        expect(SaveScene(s, sceneFile), "save the morph test scene");
+        expect(ParseSceneFile(sceneFile, data), "the morph test scene parses");
+    }
+    const auto rowNamed = [&](const char* n) -> const u32 {
+        for (u32 i = 0; i < static_cast<u32>(data.entities.size()); ++i)
+            if (data.entities[i].name == n) return i;
+        return 0u;
+    };
+    const u32 rFace = rowNamed("Face"), rCollider = rowNamed("FaceCollider"),
+              rCube = rowNamed("Cube");
+    expect(data.entities.size() == 3 && data.entities[rFace].hasMorphState,
+           "all three morph entities round-trip");
+
+    ClearInstantiateCaches();
+    expect(MorphAtlasBuildCount() == 0, "the atlas build counter starts (and resets) at zero");
+
+    // THE PRECONDITION FOR BLOCKER B3, reproduced exactly: the GPU mesh is already
+    // cache-resident (some other entity uploaded it, or an earlier spawn did), so
+    // StageAssets has every reason to skip loading the CPU model. Headless uploads
+    // return invalid handles, so the cache is primed by hand here - the mesh handle
+    // is never sampled, only tested for validity.
+    CachePutMesh(meshSource, rhi::MeshHandle{1u}, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)}, "");
+
+    const auto spawn = [&](u32 row, Scene& into, StagedAssets& staged) {
+        const u32 idx = row;
+        StageAssets(data, dir, staged, &idx, 1);
+        Instantiate(into, renderer, data, staged, LoadMode::Additive, nullptr, {}, &idx, 1);
+    };
+
+    // --- 1. FIRST spawn: the model is force-staged despite the resident mesh ---
+    Scene world;
+    {
         StagedAssets staged;
-        StageAssets(data, FindAssetsDir(m), staged);
-        const LoadMode mode =
-            (additive || loadedAny) ? LoadMode::Additive : LoadMode::Replace;
-        Instantiate(scene, renderer, data, staged, mode, createdOut, m.string());
-        loadedAny = true;
+        spawn(rFace, world, staged);
+        expect(staged.models.contains("Meshes/Head.uaf"),
+               "a morph entity whose mesh is already GPU-resident STILL gets its CPU model "
+               "staged (once) - otherwise there is nothing to build an atlas from");
+        expect(MorphAtlasBuildCount() == 1, "exactly one atlas was built");
+        const entt::entity e = world.FindByName("Face");
+        const MorphState* ms = world.Registry().try_get<MorphState>(e);
+        expect(ms && ms->targetNames.size() == 2 && ms->vertexCount == kVerts,
+               "the first spawn resolves both blendshape channels");
+        if (ms && ms->targetNames.size() == 2)
+            expect(ms->targetNames[0] == "jawOpen" && ms->targetNames[1] == "smile",
+                   "in atlas row order");
     }
-    return loadedAny;
+
+    // --- 2. SECOND spawn: blendshapes survive, and NOTHING is rebuilt ---------
+    // This is the regression B3 describes. Before the fix, StageAssets skipped the
+    // model (the mesh is cached), BuildMorphAtlas read from an empty staged.models,
+    // and the entity came back with no channels at all - facial animation silently
+    // dead for the rest of the session.
+    {
+        StagedAssets staged;
+        spawn(rFace, world, staged);
+        expect(!staged.models.contains("Meshes/Head.uaf"),
+               "the second spawn does NOT re-read the model (the atlas is cached now)");
+        expect(MorphAtlasBuildCount() == 1,
+               "no second atlas is built or uploaded - there is no texture release in the "
+               "RHI, so a rebuild per respawn is a permanent leak");
+        u32 resolved = 0;
+        for (const entt::entity e : world.Registry().view<MorphState>()) {
+            const MorphState& ms = world.Registry().get<MorphState>(e);
+            if (ms.targetNames.size() == 2 && ms.vertexCount == kVerts) ++resolved;
+        }
+        expect(resolved == 2, "BOTH spawns of the face have their blendshape channels");
+    }
+
+    // --- 3. The mesh-collider path stops re-minting an atlas per respawn ------
+    // Here StageAssets always loads the model (a Mesh collider needs CPU geometry),
+    // so the old code called UploadTexture again on every single spawn.
+    {
+        for (int i = 0; i < 3; ++i) {
+            StagedAssets staged;
+            spawn(rCollider, world, staged);
+            expect(staged.models.contains("Meshes/Head.uaf"),
+                   "a Mesh collider still stages its CPU geometry every spawn");
+        }
+        expect(MorphAtlasBuildCount() == 1,
+               "three collider respawns still share ONE atlas (the leak is closed)");
+    }
+
+    // --- 4. A mesh with no blendshapes caches its negative -------------------
+    {
+        StagedAssets staged;
+        spawn(rCube, world, staged);
+        expect(MorphAtlasBuildCount() == 1, "a primitive builds no atlas");
+        expect(CacheHasMorph(primSource),
+               "and the 'no blendshapes' answer is CACHED, so it is not re-derived for "
+               "every instance of every prop");
+        const MorphState* ms = world.Registry().try_get<MorphState>(world.FindByName("Cube"));
+        expect(ms && ms->targetNames.empty(), "a primitive resolves no channels");
+    }
+
+    // --- 5. ClearInstantiateCaches drops the atlas cache too -----------------
+    ClearInstantiateCaches();
+    expect(!CacheHasMorph(meshSource) && MorphAtlasBuildCount() == 0,
+           "ClearInstantiateCaches (asset reimport / project switch) clears the atlas "
+           "cache and the counter with it");
+
+    fs::remove_all(dir, ec);
+    if (ok)
+        HBE_INFO("morphcache: .uaf v8 carries blendshapes, a respawned entity keeps its "
+                 "channels without re-reading the model, no atlas is ever built twice "
+                 "(including on the mesh-collider path), and a morph-less mesh caches its "
+                 "negative.");
+    return ok;
+}
+
+bool PaintCanvasSelfTest() {
+    // SavePaintCanvases is the reason a .hbscene can reference paint at all: it
+    // assigns each canvas its `source`, and BuildSceneJson silently SKIPS any
+    // PaintComponent whose source is still empty. A regression here loses an
+    // artist's painting with no error - so it is worth a headless proof.
+    namespace fs = std::filesystem;
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("paintcanvas: FAILED - {}", what);
+        }
+    };
+    std::error_code ec;
+    const fs::path root = fs::temp_directory_path(ec) / "hbe_paintcanvas";
+    fs::remove_all(root, ec);
+    if (!Project::Active().Create(root / "P", "P")) {
+        HBE_ERROR("paintcanvas: FAILED - cannot create scratch project");
+        return false;
+    }
+    const fs::path assets = Project::Active().AssetsDir();
+
+    Scene s;
+    // Two objects share a name (routine: imported meshes do, and a duplicated
+    // object clears its inherited source), one is unique, one already has a
+    // source that must be left alone.
+    for (const char* n : {"Plane", "Plane", "Cube"}) {
+        const entt::entity e = s.CreateEntity(n);
+        paint::EnsureCanvas(s.Registry().emplace<PaintComponent>(e), 64);
+    }
+    {
+        const entt::entity e = s.CreateEntity("Preset");
+        PaintComponent& pc = s.Registry().emplace<PaintComponent>(e);
+        paint::EnsureCanvas(pc, 64);
+        pc.source = "Paint/Explicit.hbpaint";
+    }
+
+    SavePaintCanvases(s, assets, "Zone");
+
+    std::vector<std::string> sources;
+    for (const entt::entity e : s.Registry().view<PaintComponent>())
+        sources.push_back(s.Registry().get<PaintComponent>(e).source);
+    expect(sources.size() == 4, "all four canvases are visited");
+    bool allNamed = true, allOnDisk = true, allUnderPaint = true;
+    for (const std::string& src : sources) {
+        if (src.empty()) { allNamed = false; continue; }
+        if (src.rfind("Paint/", 0) != 0 ||
+            !src.ends_with(".hbpaint"))
+            allUnderPaint = false;
+        if (!fs::exists(assets / src, ec)) allOnDisk = false;
+    }
+    expect(allNamed, "every canvas gets a source (an unnamed one is dropped on save)");
+    expect(allUnderPaint, "sources are Paint/<name>.hbpaint, relative to Assets/");
+    expect(allOnDisk, "every assigned source exists on disk");
+    std::unordered_set<std::string> uniq(sources.begin(), sources.end());
+    expect(uniq.size() == sources.size(),
+           "two objects with the SAME name get DIFFERENT files (no overwrite)");
+    expect(uniq.contains("Paint/Explicit.hbpaint"),
+           "an already-assigned source is never reassigned");
+    expect(uniq.contains("Paint/Zone_Cube.hbpaint"),
+           "a new source is derived from the scene stem + the entity name");
+
+    // A written canvas reloads (the scene's Stage phase does exactly this).
+    PaintComponent back;
+    expect(paint::Load(assets / "Paint/Zone_Cube.hbpaint", back) && back.resolution == 64 &&
+               !back.layers.empty(),
+           "a written canvas reloads with its resolution + layers");
+
+    // Idempotent: a second save must not rename anything.
+    const std::vector<std::string> before = sources;
+    SavePaintCanvases(s, assets, "Zone");
+    std::vector<std::string> after;
+    for (const entt::entity e : s.Registry().view<PaintComponent>())
+        after.push_back(s.Registry().get<PaintComponent>(e).source);
+    expect(before == after, "saving twice does not renumber any canvas");
+
+    fs::remove_all(root, ec);
+    return ok;
 }
 
 } // namespace hbe::scene

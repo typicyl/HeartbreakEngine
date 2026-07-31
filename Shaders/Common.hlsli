@@ -199,6 +199,23 @@ float4 SampleBindlessLod(uint index, float2 uv, float lod)
     return gTextures[NonUniformResourceIndex(index)].SampleLevel(gBindlessSampler, uv, lod);
 }
 
+// POINT-fetches a bindless texel (no filtering, no addressing). For masks whose texel
+// GRID is authoritative rather than its filtered value - the terrain hole mask is
+// indexed by heightfield SAMPLE, so filtering it would blur a hole across the quad
+// boundary and misregister it against the grid it was painted on.
+float4 LoadBindless(uint index, int2 px)
+{
+    return gTextures[NonUniformResourceIndex(index)].Load(int3(px, 0));
+}
+
+// Texel dimensions of a bindless texture (mip 0).
+uint2 BindlessSize(uint index)
+{
+    uint w, h;
+    gTextures[NonUniformResourceIndex(index)].GetDimensions(w, h);
+    return uint2(w, h);
+}
+
 // --- Baked SH-L1 irradiance volume ----------------------------------------
 // The atlas is 4 texels wide (the 4 SH coefficients) x cellCount tall; cell
 // index = x + y*dimX + z*dimX*dimY. Samples at exact texel centres (no filtering).

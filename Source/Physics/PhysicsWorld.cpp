@@ -4,6 +4,7 @@
 #include "Core/Log.h"
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
+#include "Scene/TerrainSystem.h" // heightfield layout + hole-mask semantics
 
 #include <Jolt/Jolt.h>
 
@@ -17,6 +18,7 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Physics/Collision/Shape/HeightFieldShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/CastResult.h>
@@ -35,9 +37,29 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace hbe {
 namespace {
+
+#ifdef JPH_ENABLE_ASSERTS
+// JOLT'S ASSERTS MUST NOT BE A SILENT __debugbreak. Jolt enables assertions in
+// Debug builds only, and its default handler returns true = "break here". With no
+// debugger attached that is an unhandled 0x80000003 and the process dies with one
+// line in the log: an ADDRESS, no file, no condition. That made every Debug-only
+// physics assert look like a mystery crash in whatever ran last.
+//
+// Log it and return false ("do not break") instead, so a Debug run behaves like
+// Release - the assert is reported, loudly and with its condition, and the frame
+// continues. It stays a real signal (HBE_ERROR, so a test harness sees it) without
+// being fatal in a headless run that has no debugger to catch it.
+bool JoltAssertFailed(const char* expr, const char* message, const char* file, u32 line) {
+    HBE_ERROR("Jolt ASSERT: {} ({}:{}) - {}", expr ? expr : "?", file ? file : "?", line,
+              message ? message : "");
+    return false; // do not breakpoint
+}
+#endif
 
 // One-time global Jolt setup (allocator, type factory, collision dispatch).
 void EnsureJoltGlobalInit() {
@@ -45,6 +67,9 @@ void EnsureJoltGlobalInit() {
     if (done) return;
     done = true;
     JPH::RegisterDefaultAllocator();
+#ifdef JPH_ENABLE_ASSERTS
+    JPH::AssertFailed = JoltAssertFailed;
+#endif
     JPH::Factory::sInstance = new JPH::Factory();
     JPH::RegisterTypes();
 }
@@ -134,6 +159,102 @@ JPH::ShapeRefC BuildMeshCollider(const RigidBody& rb, bool dynamic) {
     return res.IsValid() ? res.Get() : JPH::ShapeRefC{};
 }
 
+// --- Terrain heightfield collider ------------------------------------------
+//
+// Vertical headroom (metres) added on each side of the authored height span when a
+// terrain heightfield is created. HeightFieldShape quantizes to 16 bits against the
+// range it was CREATED with and SetHeights SILENTLY CLAMPS anything outside it, so
+// without this pad a terrain that starts flat could never be sculpted upward - the
+// ground would just refuse to rise, with no error anywhere. 64 m of slack costs
+// about 2 mm of quantization on a typical terrain, and sculpting past it is caught
+// and answered with a full shape rebuild (see SyncTerrainColliders).
+constexpr f32 kTerrainHeightPad = 64.0f;
+
+// Heightfield block size. 2 is Jolt's default: it is the finest SetHeights
+// granularity (a brush stroke then recompresses only the 2x2 sample blocks it
+// touched) and the fastest to query; larger blocks trade query speed for a smaller
+// acceleration structure.
+constexpr u32 kTerrainBlockSize = 2;
+
+// A dirty rect at least this fraction of the whole field is answered with a fresh
+// shape instead of SetHeights - at that size the in-place path has no advantage and
+// a rebuild also re-derives the quantization range.
+constexpr f32 kTerrainFullRebuildFraction = 0.7f;
+
+// Writes the heightfield samples for the rect [x0, x0+sx) x [z0, z0+sz) into `out`
+// (row-major, `stride` floats per row).
+//
+// Two substitutions, both mandatory:
+//   * a HOLE becomes Jolt's cNoCollisionValue, so a hole painted in the terrain is a
+//     hole you fall through and not just a hole you can see through;
+//   * samples past GridN() are the PADDING Jolt adds when it rounds the sample count
+//     up to a multiple of the block size. They must stay no-collision, or the
+//     terrain grows a phantom lip along its far edge.
+void FillTerrainSamples(const TerrainComponent& t, u32 x0, u32 z0, u32 sx, u32 sz, f32* out,
+                        u32 stride) {
+    const u32 n = t.GridN();
+    for (u32 j = 0; j < sz; ++j) {
+        const u32 gz = z0 + j;
+        f32* row = out + static_cast<usize>(j) * stride;
+        for (u32 i = 0; i < sx; ++i) {
+            const u32 gx = x0 + i;
+            if (gx >= n || gz >= n ||
+                terrain::IsHole(t, static_cast<i32>(gx), static_cast<i32>(gz))) {
+                row[i] = JPH::HeightFieldShapeConstants::cNoCollisionValue;
+                continue;
+            }
+            row[i] = t.heights[static_cast<usize>(gz) * n + gx];
+        }
+    }
+}
+
+// Builds the (unscaled, terrain-local) heightfield shape for `t`. The surface Jolt
+// derives is `offset + scale * (x, sample, z)`, which is exactly the layout
+// TerrainSystem documents - terrain centred on the entity origin, `heights` indexed
+// [gz * GridN + gx]. Returns null (and logs) when Jolt rejects the field.
+JPH::Ref<JPH::HeightFieldShape> BuildTerrainField(const TerrainComponent& t) {
+    const u32 n = t.GridN();
+    if (n < 3 || t.heights.size() != static_cast<usize>(n) * n) return {};
+
+    const f32 step = terrain::SampleStep(t);
+    const f32 half = terrain::ExtentXZ(t) * 0.5f;
+
+    JPH::HeightFieldShapeSettings settings;
+    settings.mOffset = JPH::Vec3(-half, 0.0f, -half);
+    settings.mScale = JPH::Vec3(step, 1.0f, step);
+    settings.mSampleCount = n;
+    settings.mBlockSize = kTerrainBlockSize;
+    settings.mBitsPerSample = 8; // relative to each block's own range: sub-mm here
+    settings.mHeightSamples.resize(static_cast<usize>(n) * n);
+    FillTerrainSamples(t, 0, 0, n, n, settings.mHeightSamples.data(), n);
+
+    // Widen the quantization range beyond the authored span so later sculpting has
+    // somewhere to go (see kTerrainHeightPad). Jolt only widens: any sample outside
+    // these bounds overrides them.
+    f32 lo = 0.0f, hi = 0.0f;
+    bool any = false;
+    for (const f32 h : settings.mHeightSamples) {
+        if (h == JPH::HeightFieldShapeConstants::cNoCollisionValue) continue;
+        lo = any ? glm::min(lo, h) : h;
+        hi = any ? glm::max(hi, h) : h;
+        any = true;
+    }
+    settings.mMinHeightValue = lo - kTerrainHeightPad;
+    settings.mMaxHeightValue = hi + kTerrainHeightPad;
+
+    // Constructed directly rather than through settings.Create(), because the
+    // concrete HeightFieldShape - not the base Shape the factory hands back - is
+    // what SetHeights lives on, and that reference has to survive.
+    JPH::ShapeSettings::ShapeResult res;
+    JPH::Ref<JPH::HeightFieldShape> field = new JPH::HeightFieldShape(settings, res);
+    if (!res.IsValid()) {
+        HBE_ERROR("Physics: terrain heightfield rejected by Jolt ({} samples/side): {}", n,
+                  res.GetError().c_str());
+        return {};
+    }
+    return field;
+}
+
 // Position/rotation/scale of a world matrix (no shear support).
 void DecomposeWorld(const glm::mat4& m, glm::vec3& pos, glm::quat& rot, glm::vec3& scale) {
     pos = glm::vec3(m[3]);
@@ -182,10 +303,17 @@ private:
         const JPH::Vec3 va = a.GetLinearVelocity(), vb = b.GetLinearVelocity();
         const f32 vRel = std::abs((va - vb).Dot(n));
 
-        const f32 invMa = a.GetMotionProperties() && !a.IsStatic()
-                              ? a.GetMotionProperties()->GetInverseMass() : 0.0f;
-        const f32 invMb = b.GetMotionProperties() && !b.IsStatic()
-                              ? b.GetMotionProperties()->GetInverseMass() : 0.0f;
+        // ORDER MATTERS, and it was backwards. `Body::GetMotionProperties()` asserts
+        // `!IsStatic()` INSIDE the getter, so calling it first and testing IsStatic
+        // second fired that assert on every contact involving a static body - i.e.
+        // most of them. In Release the getter just returns null and the guard held,
+        // so this was invisible outside Debug, where it was a bare __debugbreak that
+        // killed the process. Test the state first, and read the pointer with the
+        // explicitly-unchecked accessor.
+        const f32 invMa = !a.IsStatic() && a.GetMotionPropertiesUnchecked()
+                              ? a.GetMotionPropertiesUnchecked()->GetInverseMass() : 0.0f;
+        const f32 invMb = !b.IsStatic() && b.GetMotionPropertiesUnchecked()
+                              ? b.GetMotionPropertiesUnchecked()->GetInverseMass() : 0.0f;
         const f32 invSum = invMa + invMb;
         if (invSum <= 0.0f) return;              // static vs static: nothing to report
         const f32 reducedMass = 1.0f / invSum;
@@ -246,6 +374,27 @@ struct PhysicsWorld::Impl {
     u32 nextCharId = 1;
     ContactCollector contacts;
 
+    // One static heightfield body per TerrainComponent, keyed by the SAME body key
+    // bodyToEntity uses (GetIndexAndSequenceNumber). The entity finds its record
+    // through TerrainComponent::colliderBodyId; `entity` is stored back so a
+    // DUPLICATED terrain component (which copies colliderBodyId) is detected instead
+    // of hijacking the original's body.
+    //
+    // `field` is the INNER shape. The body may hold a ScaledShape wrapper, but
+    // SetHeights lives on the heightfield itself, so the Ref has to be kept.
+    struct TerrainCollider {
+        entt::entity entity = entt::null;
+        JPH::Ref<JPH::HeightFieldShape> field;
+        u32 sampleCount = 0;   // TerrainComponent::GridN() the shape was built from
+        f32 step = 0.0f;       // XZ sample spacing baked into the shape
+        glm::vec3 scale{1.0f}; // world scale baked into the ScaledShape wrapper
+    };
+    std::unordered_map<u32, TerrainCollider> terrainColliders;
+    // Entities whose heightfield body could not be created (the world is out of
+    // bodies). Creation is retried every frame; this only stops the LOG from
+    // repeating every frame with it.
+    std::unordered_set<u32> terrainBuildFailed;
+
     Impl() {
         constexpr u32 kMaxBodies = 8192;
         constexpr u32 kMaxBodyPairs = 8192;
@@ -256,10 +405,15 @@ struct PhysicsWorld::Impl {
     }
 
     // bodyToEntity keys on GetIndexAndSequenceNumber(), matching what the
-    // collector records.
+    // collector records. Terrain heightfields live in their own map (they are not
+    // RigidBody-driven) but must still resolve, or a raycast against the ground
+    // would report "no entity" - which is exactly what surface painting and
+    // impact routing need to know.
     entt::entity EntityForBody(u32 bodyKey) const {
         const auto it = bodyToEntity.find(bodyKey);
-        return it != bodyToEntity.end() ? it->second : entt::entity{entt::null};
+        if (it != bodyToEntity.end()) return it->second;
+        const auto tit = terrainColliders.find(bodyKey);
+        return tit != terrainColliders.end() ? tit->second.entity : entt::entity{entt::null};
     }
 };
 
@@ -282,7 +436,14 @@ void PhysicsWorld::Clear() {
         bi.DestroyBody(body);
     }
     impl_->bodyToEntity.clear();
-    impl_->characters.clear(); // Refs free the CharacterVirtuals (no system body)
+    for (const auto& [id, rec] : impl_->terrainColliders) {
+        const JPH::BodyID body(id);
+        bi.RemoveBody(body);
+        bi.DestroyBody(body);
+    }
+    impl_->terrainColliders.clear(); // Refs free the heightfield shapes
+    impl_->terrainBuildFailed.clear();
+    impl_->characters.clear();       // Refs free the CharacterVirtuals (no system body)
     impl_->charToEntity.clear();
     // Queued contacts reference bodies that no longer exist; dropping them here
     // stops a scene reload from delivering impacts into the new world.
@@ -382,10 +543,237 @@ bool PhysicsWorld::PopContact(ContactEvent& out) {
     return false;
 }
 
+u32 PhysicsWorld::BodyCount() const {
+    return impl_ ? impl_->system.GetNumBodies() : 0u;
+}
+
+void PhysicsWorld::SyncTerrainColliders(Scene& scene) {
+    auto& reg = scene.Registry();
+    JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+
+    const auto destroy = [&](u32 bodyKey) {
+        const auto it = impl_->terrainColliders.find(bodyKey);
+        if (it == impl_->terrainColliders.end()) return;
+        const JPH::BodyID body(bodyKey);
+        bi.RemoveBody(body);
+        bi.DestroyBody(body);
+        impl_->terrainColliders.erase(it);
+    };
+
+    for (const entt::entity e : reg.view<Transform, TerrainComponent>()) {
+        TerrainComponent& t = reg.get<TerrainComponent>(e);
+        const u32 n = t.GridN();
+        // No heightmap yet. terrain::Update seeds it (EnsureHeights) on the first
+        // build; until then there is nothing to collide against.
+        if (n < 3 || t.heights.size() != static_cast<usize>(n) * n) continue;
+
+        glm::vec3 pos, scale;
+        glm::quat rot;
+        DecomposeWorld(scene.WorldMatrix(e), pos, rot, scale);
+        const f32 step = terrain::SampleStep(t);
+
+        // Find this terrain's record. A copied component points at somebody else's
+        // body, so the record has to agree about whose it is.
+        auto it = impl_->terrainColliders.find(t.colliderBodyId);
+        if (it != impl_->terrainColliders.end() && it->second.entity != e) {
+            it = impl_->terrainColliders.end();
+            t.colliderBodyId = TerrainComponent::kInvalidCollider;
+        }
+
+        // The sample count and the XZ spacing are baked into the heightfield itself,
+        // so a resolution / chunk-count / chunk-size edit means a new shape.
+        if (it != impl_->terrainColliders.end()) {
+            const Impl::TerrainCollider& rec = it->second;
+            if (rec.sampleCount != n || std::abs(rec.step - step) > 1e-6f) {
+                destroy(t.colliderBodyId);
+                t.colliderBodyId = TerrainComponent::kInvalidCollider;
+                it = impl_->terrainColliders.end();
+            }
+        }
+        // World SCALE, by contrast, only lives in the ScaledShape wrapper. Swapping
+        // the wrapper keeps the heightfield (and its acceleration structure) intact,
+        // which matters because dragging the scale gizmo would otherwise rebuild a
+        // 641x641 field every frame - measured at ~11 ms a go.
+        if (it != impl_->terrainColliders.end() &&
+            glm::any(glm::greaterThan(glm::abs(it->second.scale - scale), glm::vec3(1e-4f)))) {
+            Impl::TerrainCollider& rec = it->second;
+            JPH::ShapeRefC shape(rec.field.GetPtr());
+            const bool scaled = std::abs(scale.x - 1.0f) > 1e-4f ||
+                                std::abs(scale.y - 1.0f) > 1e-4f ||
+                                std::abs(scale.z - 1.0f) > 1e-4f;
+            if (scaled) shape = new JPH::ScaledShape(shape, ToJph(scale));
+            bi.SetShape(JPH::BodyID(t.colliderBodyId), shape.GetPtr(),
+                        /*inUpdateMassProperties=*/false, JPH::EActivation::DontActivate);
+            rec.scale = scale;
+        }
+
+        // --- Drain the sculpt dirty rect into the LIVE shape ------------------
+        const bool pending = t.colliderDirtyMaxX >= t.colliderDirtyMinX &&
+                             t.colliderDirtyMaxZ >= t.colliderDirtyMinZ;
+        if (it != impl_->terrainColliders.end() && pending) {
+            Impl::TerrainCollider& rec = it->second;
+            // Jolt rounded the sample count up to a block multiple; SetHeights works
+            // in whole blocks, so snap the rect outward to block boundaries.
+            const u32 sc = rec.field->GetSampleCount();
+            const u32 bs = glm::max(rec.field->GetBlockSize(), 1u);
+            // Clamp to the CURRENT grid before trusting the rect. A layout change
+            // rebuilds the shape (so a stale, too-large rect cannot reach here today),
+            // but SetHeights asserts rather than fails, and that reasoning is exactly
+            // the kind that rots as callers are added.
+            const u32 last = n - 1;
+            const u32 minX = glm::min(static_cast<u32>(t.colliderDirtyMinX), last);
+            const u32 minZ = glm::min(static_cast<u32>(t.colliderDirtyMinZ), last);
+            const u32 maxX = glm::min(static_cast<u32>(t.colliderDirtyMaxX), last);
+            const u32 maxZ = glm::min(static_cast<u32>(t.colliderDirtyMaxZ), last);
+            const u32 x0 = (minX / bs) * bs;
+            const u32 z0 = (minZ / bs) * bs;
+            const u32 x1 = glm::min((maxX / bs + 1) * bs, sc);
+            const u32 z1 = glm::min((maxZ / bs + 1) * bs, sc);
+            const u32 sx = x1 > x0 ? x1 - x0 : 0;
+            const u32 sz = z1 > z0 ? z1 - z0 : 0;
+
+            const f64 covered = static_cast<f64>(sx) * sz;
+            const f64 whole = static_cast<f64>(sc) * sc;
+            bool rebuild = sx == 0 || sz == 0 ||
+                           covered >= whole * static_cast<f64>(kTerrainFullRebuildFraction);
+
+            std::vector<f32> samples;
+            if (!rebuild) {
+                samples.resize(static_cast<usize>(sx) * sz);
+                FillTerrainSamples(t, x0, z0, sx, sz, samples.data(), sx);
+                // SetHeights CLAMPS to the range the shape was created with, without
+                // reporting it - sculpting past the headroom would silently flatten
+                // against an invisible ceiling. Detect it and rebuild with a fresh
+                // range instead.
+                const f32 lo = rec.field->GetMinHeightValue();
+                const f32 hi = rec.field->GetMaxHeightValue();
+                for (const f32 h : samples) {
+                    if (h == JPH::HeightFieldShapeConstants::cNoCollisionValue) continue;
+                    if (h < lo || h > hi) { rebuild = true; break; }
+                }
+            }
+
+            if (rebuild) {
+                destroy(t.colliderBodyId);
+                t.colliderBodyId = TerrainComponent::kInvalidCollider;
+                it = impl_->terrainColliders.end();
+            } else {
+                // THREADING: Jolt documents SetHeights as racing against concurrent
+                // queries, and offers Clone() + SetShape as the escape. We do not need
+                // it: this runs at the top of PhysicsWorld::Update on the main thread,
+                // before system.Update() launches any job, and every caller of
+                // Raycast/RaycastDetailed (camera collision, AI line of sight, combat
+                // line of fire, audio occlusion) is a synchronous main-thread call from
+                // the same frame loop. Nothing may raycast from a worker without
+                // revisiting this.
+                rec.field->SetHeights(x0, z0, sx, sz, samples.data(),
+                                      static_cast<intptr_t>(sx), impl_->tempAlloc);
+                // The shape's bounds moved with the ground; a static body's broadphase
+                // box is cached, so without this a raised hill is invisible to queries.
+                bi.NotifyShapeChanged(JPH::BodyID(t.colliderBodyId), JPH::Vec3::sZero(),
+                                      /*inUpdateMassProperties=*/false,
+                                      JPH::EActivation::DontActivate);
+            }
+            t.colliderDirtyMinX = 0;
+            t.colliderDirtyMinZ = 0;
+            t.colliderDirtyMaxX = -1;
+            t.colliderDirtyMaxZ = -1;
+        }
+
+        // --- Create ----------------------------------------------------------
+        if (it == impl_->terrainColliders.end()) {
+            Impl::TerrainCollider rec;
+            rec.entity = e;
+            rec.field = BuildTerrainField(t);
+            if (!rec.field) continue; // BuildTerrainField logged the reason
+            rec.sampleCount = n;
+            rec.step = step;
+            rec.scale = scale;
+
+            JPH::ShapeRefC shape(rec.field.GetPtr());
+            const bool scaled = std::abs(scale.x - 1.0f) > 1e-4f ||
+                                std::abs(scale.y - 1.0f) > 1e-4f ||
+                                std::abs(scale.z - 1.0f) > 1e-4f;
+            if (scaled) shape = new JPH::ScaledShape(shape, ToJph(scale));
+
+            JPH::BodyCreationSettings bcs(shape, JPH::RVec3(pos.x, pos.y, pos.z), ToJph(rot),
+                                          JPH::EMotionType::Static, Layers::NON_MOVING);
+            // Match what the old per-chunk mesh colliders used (RigidBody defaults),
+            // so the change of shape does not also change how the ground feels.
+            bcs.mFriction = 0.5f;
+            bcs.mRestitution = 0.2f;
+            const JPH::BodyID body = bi.CreateAndAddBody(bcs, JPH::EActivation::DontActivate);
+            if (body.IsInvalid()) {
+                // Creation is retried every frame, so the message must not be. Every
+                // log line is flushed unbuffered (see Core/Log.h) - a per-frame error
+                // here would cost more than the missing collider.
+                if (impl_->terrainBuildFailed.insert(static_cast<u32>(entt::to_integral(e)))
+                        .second) {
+                    HBE_ERROR("Physics: out of bodies - terrain heightfield not created.");
+                }
+                continue;
+            }
+            impl_->terrainBuildFailed.erase(static_cast<u32>(entt::to_integral(e)));
+            const u32 key = body.GetIndexAndSequenceNumber();
+            t.colliderBodyId = key;
+            t.colliderDirtyMinX = 0;
+            t.colliderDirtyMinZ = 0;
+            t.colliderDirtyMaxX = -1; // the fresh shape already has every sample
+            t.colliderDirtyMaxZ = -1;
+            impl_->terrainColliders.emplace(key, std::move(rec));
+            HBE_INFO("Physics: terrain heightfield collider ready ({0}x{0} samples, {1:.2f} m "
+                     "spacing, {2:.0f} m across).",
+                     n, step, terrain::ExtentXZ(t));
+            continue; // created at the right pose already
+        }
+
+        // --- Follow the entity ------------------------------------------------
+        // A static body does not move itself, so a gizmo drag (or an animated
+        // parent) has to be pushed in. Scale was already handled by the wrapper swap.
+        const JPH::BodyID id(t.colliderBodyId);
+        JPH::RVec3 bpos;
+        JPH::Quat brot;
+        bi.GetPositionAndRotation(id, bpos, brot);
+        if (glm::distance(ToGlm(bpos), pos) > 1e-4f ||
+            std::abs(glm::dot(ToGlm(brot), rot)) < 0.999999f) {
+            bi.SetPositionAndRotation(id, JPH::RVec3(pos.x, pos.y, pos.z), ToJph(rot),
+                                      JPH::EActivation::DontActivate);
+        }
+    }
+
+    // --- Reap: entity destroyed, TerrainComponent removed, or the component no
+    // longer claims this body (a rebuild above already re-pointed it).
+    for (auto it = impl_->terrainColliders.begin(); it != impl_->terrainColliders.end();) {
+        const entt::entity e = it->second.entity;
+        const TerrainComponent* t =
+            reg.valid(e) ? reg.try_get<TerrainComponent>(e) : nullptr;
+        if (t && reg.all_of<Transform>(e) && t->colliderBodyId == it->first) {
+            ++it;
+            continue;
+        }
+        const JPH::BodyID body(it->first);
+        bi.RemoveBody(body);
+        bi.DestroyBody(body);
+        it = impl_->terrainColliders.erase(it);
+    }
+}
+
 void PhysicsWorld::Update(Scene& scene, f32 dt) {
     if (!impl_) return;
     auto& reg = scene.Registry();
     JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+
+    // Terrain first: the heightfield is what everything else stands on, so a RUNTIME
+    // sculpt (terrain::Update, which runs before physics on the spine) is collidable in
+    // this frame's step.
+    //
+    // An EDITOR brush stroke is one frame late, and that is inherent to the frame order,
+    // not an oversight: the editor UI pass that runs the brush is invoked ~400 lines
+    // AFTER physics, nav and streaming in Engine::Run, so a stroke reaches the collider
+    // on frame N+1. 16 ms of lag is invisible to a human dragging a brush; the point of
+    // saying it here is that the ordering is known, so nothing gets built on a
+    // "same-frame" guarantee that does not exist.
+    SyncTerrainColliders(scene);
 
     // --- Create bodies for RigidBody components that don't have one yet -----
     for (const entt::entity e : reg.view<Transform, RigidBody>()) {

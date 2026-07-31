@@ -21,7 +21,23 @@ namespace hbe::uaf {
 inline constexpr char kMagic[4] = {'U', 'A', 'F', '1'};
 // v2: material texture refs; v3: emissive; v4: per-submesh .hbmat asset ref;
 // v5: skinned vertices (72B) + optional rig (skeleton + animation clips)
-inline constexpr u32 kVersion = 7; // v7: Audio gains a caption speaker name
+// v8: Mesh gains per-submesh MORPH TARGETS (blendshapes). Before v8 the importer
+//     read them out of the source model and then dropped them on the floor here,
+//     so no `.uaf` on disk could ever resolve a blendshape atlas - facial
+//     animation was dead on the FIRST spawn, not just on a respawn. Reads are
+//     version-gated, so every existing v1-v7 asset still loads (with no morphs,
+//     exactly as it behaves today); re-import a character to get its blendshapes.
+inline constexpr u32 kVersion = 8; // v8: Mesh carries blendshape/morph targets
+
+// A `.uaf` header optionally carries the asset's PACK SLOT (see Assets/SlotIds.h)
+// as a u32 right after the guid. Its presence is a FLAG BIT on the version word,
+// NOT a version bump, and that distinction is load-bearing: an existing v5 asset
+// has to be stampable without claiming to be a v8 asset, or its reader would go
+// looking for the v8 blendshape block that file never had. So the payload version
+// and "does the header reserve a slot field" version independently.
+inline constexpr u32 kSlotFlag = 0x80000000u;
+inline constexpr usize kHeaderSize = 4 + 4 + 4 + 8;          // magic|version|type|guid
+inline constexpr usize kHeaderSizeWithSlot = kHeaderSize + 4; // ...|packSlot
 
 enum class AssetType : u32 {
     Unknown = 0,

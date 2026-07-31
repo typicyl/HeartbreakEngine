@@ -94,9 +94,21 @@ struct BuildSettings {
     bool packAssets = true;
     // LZMS-compress pack contents (smaller packs, slower cook).
     bool compressAssets = true;
-    // Pack only assets referenced by the project's scenes (plus the scenes
-    // and materials themselves) instead of everything under Assets/.
+    // Pack only assets reachable from the project's roots (its scenes, UI
+    // documents, prefabs and settings) instead of everything under Assets/. The
+    // reachability walk is the TRANSITIVE closure in Assets/AssetRefs.h.
     bool onlyReferenced = false;
+    // Escape hatch for a cook that finds a reference naming no file. Default
+    // FALSE: an unresolvable reference means the game is already broken, and
+    // cook time is the last moment a human is present to hear about it, so the
+    // build FAILS with the full list. True downgrades it to a warning and packs
+    // whatever did resolve.
+    //
+    // Deliberately project-file only (no editor checkbox): it exists so a false
+    // positive of the scan cannot hard-block a release at 2am, not as a setting
+    // anyone should live with. Clearing a genuine dangling reference is one
+    // deleted field.
+    bool allowMissingRefs = false;
 
     // In-game UI canvas: scale mode (0 = stretch, 1 = match height,
     // 2 = pixel-perfect) and the reference resolution UI is authored at.
@@ -165,20 +177,92 @@ struct InputIcons {
     bool useGeneralAlways = false;
 };
 
+// One STREAMING TAG, authored per project. The entity carries only the tag's id
+// (Components.h `struct Tag`); everything about HOW that group streams lives
+// here, because the author thinks in groups, not in objects. Per-entity radii
+// were the deleted `.hbworld` design and no content ever used them.
+//
+// The list is ORDER-SIGNIFICANT: a tag's index IS its runtime TagId (see
+// tags::SeedFromProject), so rows are never silently reordered and a row is
+// removed only through tags::RemoveTag, which remaps live entities.
+//
+// Index 0 is always "Untagged": alwaysLoaded, undeletable, and the meaning of an
+// entity with no Tag component at all. tags::Normalize enforces that, drops
+// nameless/duplicate rows, and clamps the hysteresis band.
+struct TagDef {
+    std::string name;
+    // Distance from the streaming focus at which the tag's shards SPAWN, and the
+    // (necessarily larger) distance at which they DESPAWN. The gap is not
+    // optional: with unload <= load the player standing on the boundary spawns
+    // and despawns the same shard every frame, and a spawn is a synchronous
+    // Instantiate. See salvage::EnforceHysteresis (StreamingSalvage.h SALVAGE 2)
+    // for the measured reason this is corrected rather than merely warned about.
+    f32 loadRadius = 120.0f;
+    f32 unloadRadius = 160.0f;
+    i32 priority = 0;         // higher = spawned first when the frame budget throttles
+    bool alwaysLoaded = false; // never streamed; spawns with the level and stays
+    // ONE TAG = ONE GROUP is the DEFAULT (autoShard = false), because it is the model
+    // that matches how a tag reads to an author: everything wearing this tag has one
+    // combined bounding box, and the whole set spawns or despawns together on one
+    // distance test. Nothing is decided per actor.
+    //
+    // Turning autoShard ON instead splits the tag into spatially-coherent shards at
+    // save time, each streamed independently. That is strictly better for VOLUME - a
+    // `Props` tag on 400 crates spread over a city would otherwise have a city-sized
+    // box and so be always resident - but it is no longer "the tag" that streams, and
+    // a tag can then be half-loaded. Turn it on per tag when a tag has grown big
+    // enough that its combined box stops being meaningful; the bake WARNS when a
+    // non-sharded tag's box gets pathologically large (see the coherence diagnostic).
+    //
+    // NOTE the distance test is to the combined BOX, not its centre - a long wall
+    // streams in when you approach either end, not only its middle.
+    bool autoShard = false;
+    f32 shardCell = 0.0f;     // shard grid size; 0 = derive from loadRadius (autoShard only)
+};
+
 struct ProjectSettings {
     std::string name = "Untitled";
     std::string startupScene; // relative path under Assets (optional)
     // Studio/boot splash shown once at startup while the engine warms up (backend
-    // pick, GPU/audio probe, shader warmup). Rendered BEFORE the UI scene exists,
-    // so it stays a standalone scene. Can display live info via {backend}/{gpu}/
-    // {audio}/{version}/{progress} text tokens; has a ProgressBar.
-    std::string studioLoadingScene;
-    // THE game UI: one persistent scene holding ALL screens as UIPanel subtrees
-    // (MainMenu / Settings / HUD / Pause / Loading). Loaded once at boot, kept
-    // resident across gameplay scene swaps; the UIManager shows/hides panels.
-    // The "Loading" panel (with a ProgressBar) is driven by the engine during
-    // level loads. Empty = no menus: the runtime boots straight into startupScene.
-    std::string uiScene;
+    // pick, GPU/audio probe, shader warmup). Rendered BEFORE the UI document
+    // exists. Can display live info via {backend}/{gpu}/{audio}/{version}/
+    // {progress} text tokens; has a ProgressBar.
+    //
+    // A `.hbui` DOCUMENT (was: `studioLoadingScene`, a `.hbscene`). A path still
+    // ending in `.hbscene` is honoured by an explicit LEGACY BRANCH at boot -
+    // see the Engine's boot sequence and Project::ParseSettings. That is a real
+    // branch, not a default string: a half-migrated project must still boot.
+    std::string bootDocument;
+    // THE game UI: ONE `.hbui` DOCUMENT PER SCREEN (MainMenu / Settings / Loading
+    // / HUD / Pause ...), each holding that screen's UIPanel subtree. EVERY entry
+    // is opened at boot and stays RESIDENT for the process lifetime - nothing here
+    // is loaded on demand, so showing a screen is a bool write and can neither
+    // pop in nor flash unstyled. Kept across gameplay scene swaps because both
+    // Replace sweeps spare UIDocMember::screenOwned. The UIManager binds to the
+    // whole set and shows/hides panels BY NAME across it. The "Loading" panel
+    // (with a ProgressBar) is driven by the engine during level loads. Empty =
+    // no menus: the runtime boots straight into startupScene.
+    //
+    // ORDER IS MEANINGFUL, twice over:
+    //   * [0] is THE MENU DOCUMENT: its header `post` block becomes uiScenePost_,
+    //     the look ApplyMenuPost replays whenever a menu is up. Four screens
+    //     cannot each supply "the menu look"; the first entry wins, silently and
+    //     by design (UIDocument.h decision 1).
+    //   * Bind order breaks ties: the first `startVisible` panel is the initial
+    //     screen, and a duplicate panel name resolves to the earlier document.
+    //
+    // A panel name must be UNIQUE across the set, and so must a `UIElement::action`
+    // that the engine addresses globally (`setting:*`, the flow verbs, "caption").
+    // Both are checked at boot; see UIManager::Init and Engine::AuditScreenActions.
+    std::vector<std::string> uiDocuments;
+    // LEGACY MIRROR of uiDocuments[0], kept so a single-document project (and any
+    // downgrade that only knows this key) still boots. Read on load when
+    // `uiDocuments` is absent; written on save as uiDocuments.front(). Nothing in
+    // the engine reads it after ParseSettings - resolve screens through
+    // `uiDocuments`, which is always populated when this is non-empty.
+    //
+    // (was: `uiScene`. Same legacy `.hbscene` branch as bootDocument.)
+    std::string uiDocument;
     BuildSettings build;
     // Project-wide sky/lighting (applied by scene::SetupEnvironment).
     EnvironmentSettings environment;
@@ -195,6 +279,9 @@ struct ProjectSettings {
     // rebind them at runtime (overrides in UserSettings); the interact prompt shows
     // the icon for an action's current binding. Seeded with "Interact" on load.
     std::vector<input::ActionDef> inputActions;
+    // Streaming tags. ALWAYS non-empty after a parse: index 0 is "Untagged"
+    // (see TagDef). A tag's index is its runtime TagId.
+    std::vector<TagDef> tags;
 };
 
 class Project {
@@ -221,6 +308,26 @@ public:
     const std::filesystem::path& Root() const { return root_; }
     std::filesystem::path AssetsDir() const { return root_ / "Assets"; }
     std::filesystem::path ProjectFile() const { return projectFile_; }
+    // THE project's slot ledger - the remembered-pack-slot fallback and the
+    // reservation list for everything that cannot embed an id (Assets/SlotIds.h).
+    //
+    // THERE IS EXACTLY ONE, AND THAT IS THE WHOLE POINT. This used to be two files:
+    // `<Name>.uapmanifest` (written by --pack, and what the importer and the
+    // editor's create-new paths allocated against) and `<Name>.ship.uapmanifest`
+    // (written by --ship). They were two unrelated numberings of the same assets -
+    // measured on the reference project, 237 of 254 shared keys had DIFFERENT slots
+    // in the two files. So every import allocated a number out of the dev space,
+    // stamped it into the asset, and the next ship found that number already owned
+    // by something else and relocated whichever file lost - i.e. a gamma fix on one
+    // texture reshuffled three packs, silently. One asset, one number, one ledger.
+    //
+    // The file keeps its historical `.ship.` name because it is the one that
+    // describes the CURRENTLY SHIPPED layout: adopting it costs nothing, while
+    // adopting the other would renumber everything already in players' hands. This
+    // code does not rename files inside a user's project.
+    std::filesystem::path SlotManifestPath() const {
+        return root_ / (settings_.name + ".ship.uapmanifest");
+    }
     const ProjectSettings& Settings() const { return settings_; }
     ProjectSettings& Settings() { return settings_; }
 

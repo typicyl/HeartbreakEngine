@@ -40,10 +40,57 @@ struct Parent {
     entt::entity entity = entt::null;
 };
 
+// SIBLING ORDER ("order"). The one authoritative answer to "which child comes
+// first" - see Scene/Hierarchy.h for the full contract.
+//
+// WHY A FIELD AND NOT THE ENTITY HANDLE. Every consumer used to sort by the raw
+// `entt::entity` value, which is `index | (version << 20)`: the moment ANY entity
+// has been deleted in the session, entt recycles its index with a bumped version,
+// so a recycled handle compares ABOVE every never-recycled one. A Ctrl+D after any
+// delete draws its whole subtree from the free list and the Hierarchy showed the
+// clone's children scrambled even though the fragment was correct. (`.hbui` hit
+// this first and fixed it with an explicit order list - UI/UIDocument.cpp:585.)
+//
+// And the handle was not stable across a SAVE either: entt's `swap_only` deletion
+// policy moves the last live entity into a destroyed entity's slot, and
+// BuildSceneJson derives its row order from exactly that pool - so deleting one
+// unrelated object permanently reordered siblings in the written file.
+//
+// SEMANTICS. Only COMPARED, never required dense or contiguous: `index` is
+// allocated from Scene's monotonic counter at CreateEntity (so a new entity always
+// sorts last), overwritten by the file's value on load, and renumbered densely
+// within one sibling group by an explicit drag-reorder. Comparison is scoped to a
+// sibling group, so values from different groups never interact.
+//
+// MIGRATION. A `.hbscene` written before this field existed carries no "order";
+// scene::Instantiate then falls back to the entity's FILE ROW INDEX, which is
+// exactly the implicit order those files already had. Every existing file
+// therefore loads identically to before.
+struct HierarchyOrder {
+    i32 index = 0;
+};
+
 // Editor-only visibility: when present, the entity (and everything parented under
 // it) is hidden in the editor viewport but stays fully loaded. Serialized so the
 // hidden setup survives reloads; the runtime ignores it (see Scene::SetEditorView).
 struct EditorHidden {};
+
+// Editor-only, SESSION-ONLY: force an INACTIVE UIPanel to lay out anyway, so the
+// author can look at a screen the game has not shown.
+//
+// A `.hbui` holds several named screens (the reference menu has four) and
+// UIPanel::active is RUNTIME state - it is false on load and only ever set by
+// UIManager as the game flow runs, so a document opened in the editor lays out
+// NOTHING at all (LayoutUI skips an inactive panel's whole subtree). Flipping
+// `active` to look at a screen would work, but `active` is the field the game
+// flow owns; flipping `startVisible` instead would be an AUTHORED edit that
+// CaptureDocument writes to disk. So this is a separate tag, and:
+//   * it is NOT one of the six document keys, so CaptureDocument cannot write it;
+//   * unlike EditorHidden it deliberately gets NO scene serializer key either -
+//     it is which-screen-am-I-looking-at, not project data;
+//   * it is honoured only while Scene::EditorView() is on, so the runtime and a
+//     shipped build cannot be affected by one even if it somehow existed.
+struct EditorUIShow {};
 
 // CPU-simulated, GPU-billboarded particle emitter, simulated by the VFX module stack
 // (Source/Vfx). Drawn as camera-facing quads in one batched pass per blend mode (see
@@ -155,6 +202,35 @@ struct ParticleEmitter {
     bool simulateSize = false;
     f32 sizeVariance = 0.0f;  // 0..1 per-particle size spread
 
+    // Render.GpuExpand: build the billboard quads in the VERTEX SHADER instead of on
+    // the CPU. The simulation is unchanged - only the expansion moves. The CPU then
+    // uploads one 64-byte record per particle instead of six 40-byte world-space
+    // vertices (240 B), which is the measured bottleneck at high counts, and the
+    // 6 MB vertex ring stops truncating the batch at ~26k particles.
+    //
+    // OPT-IN, and it must stay opt-in for now: the GPU path packs colour as half4
+    // (the CPU path keeps float4) and clamps one sub-UV expression the CPU leaves
+    // undefined, so it is visually equivalent but NOT bit-identical - and
+    // --test-vfxcompat pins bit-identity for the default configuration.
+    bool gpuExpand = false;
+
+    // Sim.GpuSim: run the SIMULATION itself in a compute shader (Shaders/VfxSim.hlsl),
+    // not just the billboarding. Implies GPU expansion - the compute-written record
+    // buffer IS what the vertex shader reads, so there is no upload and no per-particle
+    // CPU work of any kind left in the frame.
+    //
+    // OPT-IN, and for a stronger reason than gpuExpand's. This flag CHANGES THE
+    // SIMULATION: a GPU emitter compiles to the v1 module stack instead of the four
+    // Legacy.* compatibility modules, because those are CPU-only by construction (they
+    // read a 25-scalar parameter block and a serial emitter RNG stream - see
+    // Vfx/VfxTypes.h ParticleView). Concretely that means an emitter switched to GPU
+    // simulation loses the six legacy emit SHAPES (v1 spawns in a sphere of emitRadius
+    // with directional spread), and `turbulence` becomes divergence-free curl noise
+    // while `buoyancy`/`vortex` have no v1 equivalent and are dropped. It is a
+    // different, better simulation - not the same one moved - and --test-vfxcompat
+    // still pins the legacy one bit-exactly for everything that has not opted in.
+    bool gpuSim = false;
+
     // --- runtime (NOT serialized) ---
     // Structure-of-arrays pool, sized when the stack is compiled and grown
     // geometrically at spawn time up to `maxParticles` - the old pool was a per-emitter
@@ -166,6 +242,18 @@ struct ParticleEmitter {
     u64 stackSignature = 0;     // structural hash; 0 == never compiled
     u32 textureCache = 0;       // resolved bindless index
     bool textureResolved = false;
+
+    // --- GPU simulation runtime (NOT serialized; see Scene/ParticleGpuSim.h) ---
+    // The pool for a `gpuSim` emitter is a RING of fixed slots inside one shared
+    // device-local buffer, and the CPU holds only these seven words for it - no
+    // per-particle memory and no per-particle work at all.
+    u32 gpuSlotBase = 0;      // element offset of this emitter's block in that buffer
+    u32 gpuCapacity = 0;      // ring slots allocated (0 = not resident)
+    u32 gpuUsed = 0;          // high-water: the update range and the draw count
+    u32 gpuCursor = 0;        // next ring slot a spawn takes
+    u32 gpuTotalSpawned = 0;  // monotonic; min(this, capacity) IS gpuUsed
+    u32 gpuSeed = 0;          // per-emitter RNG key (assigned from the entity id)
+    u32 gpuEpoch = 0;         // suballocation generation; != the context's = re-place me
 };
 
 // Renders a GPU mesh with a metallic-roughness material.
@@ -248,6 +336,15 @@ struct PaintComponent {
     rhi::TextureHandle matTex;      // flattened bindless material+height canvas
     bool dirty = true;              // CPU layers changed -> reflatten + re-upload
     bool gpuReady = false;          // textures created (else this draw ignores paint)
+
+    // The `.hbpaint` named by `source` did NOT load (deleted, renamed, unreadable).
+    // The component still exists so the scene keeps the reference and every authored
+    // setting above - but `layers` is EMPTY BECAUSE IT IS UNKNOWN, not because the
+    // canvas is blank. WritePaintCanvases refuses to write such a canvas back: an
+    // empty `.hbpaint` over a file that was merely locked for a moment turns a
+    // recoverable broken reference into permanent loss. Runtime only, never
+    // serialized.
+    bool canvasMissing = false;
 };
 
 // References a `.hbmat` material asset (path relative to Assets/). When
@@ -294,8 +391,29 @@ struct RigidBody {
 };
 
 // Optional human-readable label (debugging / editor).
+//
+// NOT an identity mechanism. Names are neither unique nor stable (the shipping
+// level has two roots called "Cube"; UIScene has seven "UI Label"s; every
+// runtime prefab clone shares one name by construction). Anything that needs to
+// say "this exact object, across a save/load" uses Guid below.
 struct Name {
     std::string value;
+};
+
+// STABLE PER-ENTITY IDENTITY. Every entity gets one, minted exactly once in
+// Scene::CreateEntity - the single funnel every authored, loaded and spawned
+// entity passes through. Serialized into `.hbscene` as a 16-char hex string
+// under the "guid" key, so it survives save -> load -> save unchanged.
+//
+// The two rules that make it worth having:
+//   * A LOAD adopts the guid in the file (same object, restored).
+//   * A DUPLICATE mints a fresh one (copy/paste, duplicate, prefab
+//     instantiate, spawner burst). A duplicate is a NEW object; carrying the
+//     source's guid forward would silently alias two entities' persisted state.
+// See Scene/EntityGuid.h for the minting/derivation helpers and the invariant
+// that guids are unique among LIVE entities.
+struct Guid {
+    u64 value = 0; // 0 = unset (never true for a live entity)
 };
 
 // Marks the ROOT entity of a placed prefab instance, linking it back to the
@@ -316,23 +434,24 @@ struct SceneSource {
     std::string scene; // display name of the originating scene / cell
 };
 
-// Naughty-Dog-style level layering: a level is authored as three scene files,
-// one per kind. Static = non-moving world geometry (the navmesh + baked-GI
-// source, stays resident); Dynamic = actors / physics / skeletal meshes that
-// move or reload; UI = HUD / menu canvases. A scene file records its kind in
-// the header; the loader stamps every entity from it with a SceneLayer.
+// Per-object layering WITHIN one scene. A level is ONE .hbscene file; each
+// object in it is tagged Static (non-moving world geometry - the navmesh source,
+// and what the painterly pass exempts) or Dynamic (actors / physics / skeletal
+// meshes that move). Full means "no layer tag" and is what a scene FILE header
+// carries, since a file is no longer a layer of anything.
+//
+// There is no UI kind: UI is authored in its own standalone scene (the project's
+// uiScene), not as a layer of a level.
 enum class SceneKind : u8 {
-    Full = 0,  // a standalone, single-file scene (legacy / not part of a level)
+    Full = 0,  // no layer tag (the scene-file header's value)
     Static,
     Dynamic,
-    UI,
 };
 
 inline const char* ToString(SceneKind k) {
     switch (k) {
         case SceneKind::Static:  return "static";
         case SceneKind::Dynamic: return "dynamic";
-        case SceneKind::UI:      return "ui";
         case SceneKind::Full:    break;
     }
     return "full";
@@ -341,16 +460,91 @@ inline const char* ToString(SceneKind k) {
 inline SceneKind SceneKindFromString(const std::string& s) {
     if (s == "static")  return SceneKind::Static;
     if (s == "dynamic") return SceneKind::Dynamic;
-    if (s == "ui")      return SceneKind::UI;
     return SceneKind::Full;
 }
 
-// Runtime tag: which level layer an entity belongs to. Set by the loader from
-// its scene file's kind (NOT per-entity serialized, like SceneSource). Systems
-// query it - the navmesh bakes only Static-layer geometry, so dynamic/skeletal
-// meshes never leak into the walkable surface.
+// Runtime tag: which layer an entity belongs to. Serialized per entity
+// ("sceneLayer"). Systems query it - the navmesh bakes only Static-layer
+// geometry, so dynamic/skeletal meshes never leak into the walkable surface.
 struct SceneLayer {
     SceneKind kind = SceneKind::Static;
+};
+
+// STREAMING GROUP ("tag"). The authoring unit of tag streaming: the author gives
+// an object a tag ("Camp", "Interior_Mill"), the save-time sharder splits each
+// tag into spatially-coherent SHARDS, and the runtime spawns/despawns whole
+// shards by distance. Per-tag streaming CONFIG (load/unload radius, priority,
+// alwaysLoaded, autoShard) lives on the project's tag list, never on the entity.
+//
+// STORAGE. The id is an interned index into the process-wide table in
+// Scene/TagTable.h; the NAME is what serializes, so a `.hbscene` stays diffable,
+// hand-editable and portable between projects. 2 bytes keeps the O(entities)
+// scans (navmesh fingerprint, shard bucketing) cache-friendly the way SceneLayer
+// above already does - a std::string per entity would not.
+//
+// ORTHOGONAL TO SceneLayer, and both survive: SceneLayer selects the navmesh
+// filter and MaterialFlag_PainterlyExempt, Tag selects the streaming group. One
+// is not a repurposing of the other.
+//
+// ABSENCE IS MEANINGFUL: no Tag component == kTagUntagged == always resident,
+// never streamed. tags::Assign is the one mutation site and it REMOVES the
+// component rather than storing id 0, so the two spellings can never disagree.
+//
+// A `.hbui` document's entities can NEVER carry one (tags::Taggable refuses):
+// UI is asset content, outside the streaming world entirely.
+using TagId = u16;
+inline constexpr TagId kTagUntagged = 0; // index 0 of the tag table, always resident
+
+struct Tag {
+    TagId id = kTagUntagged;
+    // BAKED spatial shard index, written by the save-time sharder (P5). -1 =
+    // not yet baked. Carried here (and in the file, under "shard") from P4 so
+    // the shard bake needs no second scene-format change.
+    i32 shard = -1;
+};
+
+// PAINT-STROKE ZONE GROUP. Marks the empty node that collects the 3D paint
+// strokes (real ribbon/quad mesh entities, not the painterly post pass) belonging
+// to ONE streaming zone. See Scene/StrokeZone.h for the whole rule; the short
+// version is that there is one group node per tag, the node itself carries that
+// `Tag`, and every stroke painted on a surface in that zone is parented under it.
+//
+// WHY A COMPONENT AND NOT A NAME. The old code found its single global group by
+// scanning for an entity literally named "Paint Strokes", so renaming the node in
+// the Hierarchy silently forked a second group and two additively-loaded scenes
+// each contributed one.
+//
+// WHY IT IS A BARE MARKER. It used to carry a TagId copied from the node's own Tag,
+// and NOTHING kept the copy in sync: tags::RemoveTag remaps every `Tag` when a tag
+// is deleted, and tags::AssignSubtree rewrites `Tag` from the Inspector. Either one
+// left a group whose copy said "Mill" and whose Tag said something else - after
+// which strokes painted on always-resident terrain could be parented into a
+// streaming atom and despawn with it. The zone is now DERIVED
+// (strokezone::GroupZone = the node's Tag, absent meaning Untagged), which removes
+// the invariant instead of adding a third site that must be kept in lockstep.
+//
+// Still serialized as "strokeGroup": "<tag name>", the same NAME-not-id spelling
+// `Tag` uses - now as a readable echo of that tag, so a `.hbscene` diff says which
+// zone a group collects. Presence is what is parsed back; the id is not.
+struct StrokeGroup {};
+
+// RUNTIME-ONLY shard membership, stamped by the streamer on everything a shard
+// spawn created, and inherited by anything created LATER on behalf of a member
+// (spawn::DoBurst copies it onto each Spawned root). NEVER serialized - not to a
+// `.hbscene`, not to a snapshot - because it describes the current residency of a
+// live world, not authored content. `Tag::shard` is the authored/baked fact; this
+// is the runtime one.
+//
+// WHY IT EXISTS SEPARATELY FROM Tag. Despawn must be a closure over LIVE state, not
+// a replay of the load-time created list: Instantiate itself creates entities after
+// filling that list (modular-character parts), and terrain chunks, destruction
+// debris, world-UI surfaces and spawned NPCs all appear afterwards. Membership has
+// to be readable from the registry at despawn time, which is what this is.
+//
+// `index` is an index into the STREAMER's flat shard vector (which is built from the
+// scene file header, so it is stable for a given binding), not a per-tag ordinal.
+struct StreamShard {
+    u32 index = 0;
 };
 
 // Provenance of a MeshInstance's mesh, so scenes can be saved and reloaded:
@@ -431,6 +625,17 @@ struct Character {
     std::string asset;                       // .hbchar path (relative to Assets/)
     // slot name -> active variant id ("" = the slot is empty/hidden this loadout).
     std::unordered_map<std::string, std::string> activeVariant;
+    // Is `activeVariant` AUTHORED, or was it RESOLVED from the .hbchar's defaults?
+    //
+    // character::Instantiate fills activeVariant from the asset whenever it is empty,
+    // and the serializer used to write the result unconditionally. One load+save later
+    // the entity carried a frozen custom loadout that the author never chose - and
+    // because Instantiate then sees a non-empty map, changing a slot's DEFAULT VARIANT
+    // in the .hbchar could never again reach any already-saved scene. Only a real
+    // equip (character::SetSlotVariant) or a file that already carried overrides sets
+    // this; the serializer writes the map only when it is set. NOT serialized itself -
+    // "the file carried overrides" is exactly "the map was non-empty on parse".
+    bool variantAuthored = false;
     std::string loadout;                     // current named loadout ("" = custom)
     // Runtime: slot -> the child part entity currently spawned (null = none).
     // Rebuilt whenever the loadout changes; NOT serialized.
@@ -481,7 +686,7 @@ struct CameraComponent {
     // Where the camera sits each frame.
     enum class Mode : u8 {
         Static = 0,    // uses the entity's own Transform (default)
-        FirstPerson,   // sits at the target's position + eye offset, faces its forward
+        FirstPerson,   // eye at the target + offset; playerLook aims it (else faces the target)
         ThirdPerson,   // trails the target on a boom (distance behind + pitch up)
         Orbit,         // orbits the target, auto-spinning at spinSpeed
         Distance,      // holds a fixed distance from the target along a set direction
@@ -513,10 +718,19 @@ struct CameraComponent {
     f32 splineSpeed = 0.1f;              // progress per second (0..1 across the path)
     bool splineLoop = true;
 
-    // Third-person player look: when on, the mouse + right gamepad stick orbit
-    // the camera around the target (instead of just trailing its facing). The
-    // character then moves camera-relative (CharacterController) for standard
-    // third-person controls.
+    // Player look (First Person AND Third Person): when on, the mouse + right
+    // gamepad stick aim the camera (instead of it just trailing the target's
+    // facing). The character then moves camera-relative (CharacterController)
+    // for standard third/first-person controls. The two modes accumulate look
+    // through the SAME code and the same fields below - they differ only in
+    // where the camera sits:
+    //   Third Person - the look orbits the target on a boom.
+    //   First Person - the look IS the eye's aim, and its YAW is written onto
+    //                  the target's Transform (the body turns; pitch stays
+    //                  camera-only). While that is happening the camera owns the
+    //                  body's facing, so CharacterController::faceMoveDir is
+    //                  suppressed for that frame (externalFacing below).
+    // With playerLook off, both modes keep their old target-derived aim exactly.
     bool playerLook = true;
     f32  lookSensitivity = 0.2f;         // degrees per mouse pixel
     f32  lookStickSpeed = 160.0f;        // degrees/second at full right-stick
@@ -626,6 +840,19 @@ struct UICanvas {
     f32 emissive = 0.0f;     // 0 = pure lit paper; >0 adds self-glow (readability)
     u32 rtWidth = 0;         // render-target resolution (0 = refWidth/refHeight)
     u32 rtHeight = 0;
+    // --- Interaction (world-space canvases only) ---------------------------------
+    // `occlude`: the page is hidden behind world geometry, i.e. a solid collider
+    // nearer than the page along the pick ray makes it un-clickable (the fix for
+    // "a button behind a wall is pressable"). Clear it for a hologram / a wrist
+    // screen parented to the player / anything deliberately drawn through walls.
+    // NOTE: only entities with a RigidBody (and terrain) occlude - a MeshInstance
+    // with no collider blocks nothing. "If it should block interaction, give it a
+    // collider."
+    bool occlude = true;
+    // Maximum pick distance in meters; 0 = unlimited (the ray's own range).
+    // Deliberately 0 by default: a non-zero default would silently make already
+    // authored pages inert past that distance.
+    f32 interactRange = 0.0f;
     // Runtime only (NOT serialized): the per-canvas UI render target + the hidden
     // lit quad entity (UISurface) that displays it.
     rhi::TextureHandle rtTexture;
@@ -765,6 +992,12 @@ struct UIElement {
 
     bool hovered = false;            // runtime state (UISystem)
     bool clicked = false;            // pressed this frame (runtime state)
+    // HELD for as long as the pointer's button is DOWN over this element - the
+    // press state of the hover/press/release triple. `clicked` is a one-frame
+    // down-EDGE, so a visual driven by it alone flickers for a single frame and a
+    // 3D button the player is holding looks unpressed. RELEASE is the falling edge
+    // of this flag (the per-frame clear puts it back), so no fourth flag is needed.
+    bool held = false;
     bool changed = false;            // value changed this frame (slider/toggle/selector)
     bool dragging = false;           // slider grabbed (persists across frames while held)
     bool prevHovered = false;        // runtime: hover-enter edge (drives hoverSound)
@@ -814,6 +1047,26 @@ struct UIAnimator {
 // destroys everything else). The engine applies it to the persistent UI scene so the
 // menus / HUD stay resident across gameplay scene swaps. NOT serialized.
 struct Persistent {};
+
+// Which OPEN `.hbui` document instance this entity was created by (UI/UIDocument.h).
+// Runtime-only: NEVER serialized into a .hbscene, a .hbprefab or a .hbsave - a
+// document is loaded from its own file, so writing its entities into a scene
+// snapshot would duplicate the whole UI layer on the next restore.
+//
+// `doc` is a bare u32 rather than `ui::DocHandle` ON PURPOSE: Components.h is the
+// bottom of the include graph (Core/Types, RHI, CameraRig, PaintSystem, Schematic,
+// Vfx only) and UI/UIDocument.h includes IT, so naming the alias here would be a
+// cycle. Same precedent as UICanvas::scaleMode storing `u32` instead of
+// ui::ScaleMode. 0 = no document.
+//
+// `screenOwned` is a copy of "this document is the resident screen UI layer",
+// duplicated into the component because the two Replace-sweep predicates that
+// must spare it (scene::Instantiate and Engine::FlowMainMenu) have no access to
+// an Engine or a DocumentSet and must evaluate the test identically.
+struct UIDocMember {
+    u32 doc = 0; // u32 == ui::DocHandle
+    bool screenOwned = false;
+};
 
 // Runtime-only tag: the auto-managed lit quad that displays a worldSpace UICanvas
 // in the 3D scene. Created/pruned by ui::UpdateWorldSurfaces each frame; NEVER
@@ -901,9 +1154,15 @@ struct TerrainComponent {
     std::vector<f32> heights;
 
     // Hole mask: one byte per heightfield sample (GridN^2, same layout as `heights`).
-    // 255 = solid, 0 = hole (terrain pixels there are clipped so cliff/cave models show
-    // through; collision stays). The hole brush paints this; uploaded to `holeMaskTex`
-    // and sampled (terrain-wide UV) by the forward pass. Empty = no holes.
+    // POLARITY: 255 = HOLE, 0 = SOLID. (This comment used to claim the opposite; the
+    // brush at terrain::PaintHole and the clip in MeshPBR.hlsl have always agreed on
+    // 255 = hole, so the comment was the thing that was wrong.) Terrain pixels at a
+    // hole are clipped so cliff/cave models show through, AND the physics heightfield
+    // collider punches the same hole - you can now fall through one.
+    // The hole brush paints this; uploaded to `holeMaskTex` and sampled (terrain-wide
+    // UV) by the forward pass. Empty = no holes. A mask whose size does not match
+    // GridN^2 is STALE (nothing resizes it when the resolution changes) and must be
+    // ignored wholesale rather than partially applied - see terrain::HoleMaskUsable.
     std::vector<u8> holeMask;
     rhi::TextureHandle holeMaskTex; // runtime: GPU upload of holeMask (not serialized)
     bool holeDirty = false;         // runtime: holeMask changed -> re-upload
@@ -924,6 +1183,24 @@ struct TerrainComponent {
     rhi::TextureHandle splatWeightTex;   // runtime upload of splatWeight
     bool splatDirty = false;             // runtime: splatWeight changed -> re-upload
     i32 activeSplatLayer = 0;            // runtime: layer the terrain brush paints
+
+    // --- Physics collider handshake (runtime-only, never serialized) ----------
+    // ONE static Jolt HeightFieldShape body for the WHOLE terrain, owned by
+    // PhysicsWorld and rebuilt only when the grid layout changes. It replaces the
+    // old per-chunk triangle-mesh colliders (256 static bodies / 819k collision
+    // triangles / ~15 MB of retained vertices on the reference 16x16 terrain) and,
+    // unlike them, it TRACKS SCULPTING: `heights` has exactly the row-major layout
+    // Jolt wants, so a brush stroke pushes only the sample blocks it touched
+    // through HeightFieldShape::SetHeights instead of rebuilding anything.
+    //
+    // `colliderDirty*` is the inclusive SAMPLE rect edited since the last push
+    // (max < min = nothing pending). terrain::Sculpt / terrain::PaintHole grow it;
+    // PhysicsWorld drains it. Holes go down the same path - a hole is just a sample
+    // set to Jolt's no-collision value.
+    static constexpr u32 kInvalidCollider = 0xFFFFFFFFu;
+    u32 colliderBodyId = kInvalidCollider; // Jolt body key (managed by PhysicsWorld)
+    i32 colliderDirtyMinX = 0, colliderDirtyMinZ = 0;
+    i32 colliderDirtyMaxX = -1, colliderDirtyMaxZ = -1;
 
     u32 GridN() const { return chunks * resolution + 1; } // samples per side
 };
@@ -966,6 +1243,18 @@ struct IKChain {
     f32 weight = 1.0f;               // 0..1 blend toward the solved pose
     bool enabled = true;
     std::string targetEntity;        // optional: follow this entity's world position
+
+    // RUNTIME, never serialized. `target` is not written to the `.hbscene` while
+    // `targetEntity` is set (it is derived from that entity every frame, so writing
+    // it would make the file a function of how long the editor had been open). The
+    // consequence is that an UNRESOLVED binding - the entity renamed, deleted, or
+    // sitting in a shard that is not resident - leaves `target` at its default
+    // {0,0,0}, and the limb would reach for the WORLD ORIGIN. anim::UpdateSkeletal
+    // clears this flag when the lookup fails, and the solver then skips the chain
+    // and warns once, so a broken binding is a limb that keeps its animated pose and
+    // says so, instead of one that silently snaps across the level.
+    bool targetResolved = true;
+    bool warnedUnresolved = false;
 };
 
 // Inverse kinematics applied AFTER skeletal animation poses the entity: each
@@ -1023,6 +1312,13 @@ struct CharacterController {
     // and the CharacterVirtual body id. Not serialized.
     glm::vec3 desiredVelocity{0.0f}; // horizontal move velocity this frame
     bool jumpRequested = false;      // latched on press, consumed by physics
+    // Set by cam::Update while a FIRST-PERSON player-look camera targets this
+    // entity: the camera owns the body's yaw, so faceMoveDir must not also turn
+    // it (the two would use different facing conventions and fight). Latched by
+    // the camera and CONSUMED by character::Update - the same one-shot shape as
+    // jumpRequested - so the suppression lapses by itself the moment the camera
+    // stops driving this body. Not serialized.
+    bool externalFacing = false;
     f32 velocityY = 0.0f;            // vertical velocity (gravity + jump)
     bool grounded = false;           // touching ground after the last step
     static constexpr u32 kInvalidBody = 0xFFFFFFFFu;
@@ -1440,6 +1736,14 @@ struct Encounter {
     bool everHadAlive = false;  // saw >=1 alive member (so alive==0 => cleared)
     bool clearedEdge = false;   // set the frame it clears
     bool activateRequested = false; // schematic/flag arm request
+    // "my members are absent because the world unloaded them, not because they died."
+    // aliveCount is recomputed every tick from live Spawned tags, and stream::
+    // DespawnShard destroys them - so without this an encounter the player WALKED AWAY
+    // from reads alive==0 with everHadAlive==true on the very next gameplay tick (the
+    // same frame) and fires its cleared cutscene / objective / flag. The player is
+    // awarded a fight they abandoned. Set by stream::DespawnShard for every encounter
+    // whose population it took; cleared as soon as live members exist again.
+    bool membersStreamedOut = false;
 };
 
 // Runtime membership tag stamped on the ROOT of every spawned instance. Ties it to
@@ -1521,6 +1825,16 @@ struct Destructible {
     enum class ChunkState : u8 { Intact = 0, Loose = 1, Detached = 2 };
     bool activated = false;          // chunk entities exist; the root mesh is hidden
     bool structureDirty = false;     // a break happened; the support pass is owed
+    // "activated is TRUE but the chunk entities do not exist" - the state a persisted
+    // break lands in after a shard respawn or a save load. It cannot be represented by
+    // `activated` alone: destruction::Activate refuses to run while activated is true,
+    // and it is also what removes the root's MeshInstance/RigidBody - so a restored
+    // half-broken wall would come back rendering and colliding as PRISTINE while being
+    // internally 100% broken and permanently unbreakable. Set by
+    // world::ApplyEntityState; consumed by destruction::Update (and by any damage entry
+    // point), which rebuilds the chunk entities and re-detaches the restored ones.
+    // Runtime only, never serialized (the persisted `activated` implies it).
+    bool reactivate = false;
     std::vector<u8> chunkState;      // ChunkState per chunk
     std::vector<f32> chunkHp;
     std::vector<entt::entity> chunkEntity; // entt::null until that chunk detaches

@@ -266,10 +266,20 @@ public:
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
     void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
+    bool SupportsGpuCompute() const override { return true; }
+    GpuBufferHandle CreateGpuBuffer(const GpuBufferDesc& desc) override;
+    void* MapGpuBuffer(GpuBufferHandle handle) override;
+    bool ReadGpuBuffer(GpuBufferHandle handle, void* dst, u32 bytes) override;
+    void DestroyGpuBuffer(GpuBufferHandle handle) override;
+    ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
+    void QueueCompute(const ComputeDispatch& d) override;
+    void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
     void UpdateTexture(TextureHandle handle, const TextureDesc& desc) override;
     void DrawShadowPass(const SceneView& view, const DrawItem* items, u32 count) override;
     void SetParticles(const ParticleVertex* alpha, u32 alphaCount,
                       const ParticleVertex* additive, u32 addCount) override;
+    void SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
+                         u32 count) override;
     void DrawScene(const SceneView& view, const DrawItem* items, u32 count) override;
     void DrawUIOverlay(const UIVertex* vertices, u32 count) override;
     TextureHandle CreateUITarget(u32 width, u32 height) override;
@@ -429,6 +439,32 @@ private:
     const ParticleVertex* particleAdd_ = nullptr;
     u32 particleAlphaCount_ = 0;
     u32 particleAddCount_ = 0;
+    // GPU vertex expansion: no vertex input state at all - the VS builds the quad
+    // from gl_VertexIndex out of the record buffer bound on set 2
+    // (Shaders/ParticleGpu.hlsl). D3D12 twin: particleGpuPSO_ / particleGpuPSOAdd_.
+    VkPipeline particleGpuPipeline_ = VK_NULL_HANDLE;    // alpha blend
+    VkPipeline particleGpuPipelineAdd_ = VK_NULL_HANDLE; // additive blend
+    // One group per record BUFFER (SetGpuParticles accumulates): the CpuWrite ring
+    // the CPU-simulated emitters upload into, and the device-local buffer the GPU
+    // simulation's compute pass writes. A batch carries only an element offset, so
+    // the buffer identity has to live here. D3D12 twin: the same array.
+    struct GpuParticleGroup {
+        GpuBufferHandle buffer;
+        const GpuParticleBatch* batches = nullptr;
+        u32 count = 0;
+    };
+    GpuParticleGroup particleGpuGroups_[kMaxGpuParticleGroups]{};
+    u32 particleGpuGroupCount_ = 0;
+    bool particleGpuAlignWarned_ = false;
+    void DrawGpuParticleBatches(VkCommandBuffer cmd, bool additive);
+    // The groups have a ONE-FRAME lifetime: `batches` points into a vector the engine
+    // rebuilds every frame, so a group that survives a frame is a dangling pointer
+    // with a stale count. DrawScene has early returns, so the clear cannot live only
+    // at its end. D3D12's twin is the same method at the same call sites.
+    void ClearGpuParticleGroups() {
+        for (u32 g = 0; g < particleGpuGroupCount_; ++g) particleGpuGroups_[g] = {};
+        particleGpuGroupCount_ = 0;
+    }
 
     VkBuffer       frameUBO_[kMaxFramesInFlight]{};
     VkDeviceMemory frameUBOMem_[kMaxFramesInFlight]{};
@@ -677,6 +713,66 @@ private:
     VolumeParams volParams_{};
     bool EnsureVolumeResources();
     void DispatchVolumeSplat();
+
+    // --- General GPU compute + GPU-writable structured buffers ----------------
+    // The generalisation of the volumetric path above. D3D12 twin:
+    // GpuBufferD3D12 / ComputePipelineD3D12 / ExecuteQueuedCompute in
+    // D3D12Device.cpp - same members, same call points, same frame position.
+    struct GpuBufferVk {
+        // slots == 1 for a device-local buffer; framesInFlight_ for CpuWrite
+        // (per-frame ring, so the CPU can refill without racing the GPU).
+        VkBuffer       buf[kMaxFramesInFlight]{};
+        VkDeviceMemory mem[kMaxFramesInFlight]{};
+        u8*            cpu[kMaxFramesInFlight]{};
+        // Set 2 (binding 0, STORAGE_BUFFER_DYNAMIC) so SetVertexShaderBuffer can
+        // apply a per-batch element base as a dynamic offset - the exact twin of
+        // D3D12 offsetting a root SRV's GPU virtual address.
+        VkDescriptorSet vsSet[kMaxFramesInFlight]{};
+        u32 slots = 1;
+        u32 stride = 0;
+        u32 count = 0;
+        u32 usage = 0;
+        VkDeviceSize bytes = 0;      // logical size (elementCount * stride)
+        VkDeviceSize allocBytes = 0; // bytes + the bind window's padding
+        u32 maxBindElements = 0;     // 0 = only ever bound at offset 0
+        bool alive = false;
+    };
+    struct ComputePipelineVk {
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        VkPipelineLayout      layout = VK_NULL_HANDLE;
+        VkPipeline            pipeline = VK_NULL_HANDLE;
+        VkDescriptorPool      pool = VK_NULL_HANDLE;
+        // One set per (frame slot, queue slot): a set is written at dispatch
+        // record time, so re-using one within a frame would race itself.
+        VkDescriptorSet sets[kMaxFramesInFlight][kMaxQueuedComputeDispatches]{};
+        VkBuffer        cb[kMaxFramesInFlight]{};
+        VkDeviceMemory  cbMem[kMaxFramesInFlight]{};
+        u8*             cbMapped[kMaxFramesInFlight]{};
+        VkDeviceSize    cbStride = 0;
+        u32 constantBytes = 0;
+        u32 uavCount = 0;
+        u32 srvCount = 0;
+        bool alive = false;
+    };
+    struct QueuedComputeVk {
+        ComputeDispatch d;
+        u8 constants[kMaxComputeConstantBytes] = {};
+    };
+    std::vector<GpuBufferVk>       gpuBuffers_;    // handle.id - 1
+    std::vector<u32>               gpuBufferFree_; // recycled indices
+    std::vector<ComputePipelineVk> computePipes_;  // handle.id - 1
+    QueuedComputeVk computeQueue_[kMaxQueuedComputeDispatches];
+    u32 computeQueueCount_ = 0;
+    // Set 2 of pipelineLayout_ (the general VS-visible structured buffer).
+    static constexpr u32 kMaxVsBufferSets = 64;
+    VkDescriptorSetLayout vsBufferLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool      vsBufferPool_ = VK_NULL_HANDLE;
+    GpuBufferHandle vsBuffer_{};
+    u32 vsBufferFirstElement_ = 0;
+    bool vsBufferAlignWarned_ = false;
+    GpuBufferVk* ResolveGpuBuffer(GpuBufferHandle h);
+    bool CreateVsBufferSetLayout();
+    void ExecuteQueuedCompute();
 
     // -- Editor viewport (offscreen scene target) ---------------------------
     VkImage        vpColor_ = VK_NULL_HANDLE;
@@ -1911,9 +2007,18 @@ bool VulkanDevice::CreateMeshPipeline() {
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates = dynamics;
 
-    const VkDescriptorSetLayout setLayouts[2] = {descriptorLayout_, bindlessLayout_};
+    // Set 2 = the general VS-visible structured buffer (SetVertexShaderBuffer).
+    // Purely additive: it does not disturb sets 0/1, and a pipeline whose shaders
+    // never declare set 2 simply never has it bound. Twin of D3D12 root param 6.
+    if (!CreateVsBufferSetLayout()) {
+        vkDestroyShaderModule(device_, vs, nullptr);
+        vkDestroyShaderModule(device_, ps, nullptr);
+        return false;
+    }
+    const VkDescriptorSetLayout setLayouts[3] = {descriptorLayout_, bindlessLayout_,
+                                                 vsBufferLayout_};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    plci.setLayoutCount = 2;
+    plci.setLayoutCount = 3;
     plci.pSetLayouts = setLayouts;
     if (vkCreatePipelineLayout(device_, &plci, nullptr, &pipelineLayout_) != VK_SUCCESS) {
         vkDestroyShaderModule(device_, vs, nullptr);
@@ -2044,6 +2149,59 @@ bool VulkanDevice::CreateMeshPipeline() {
                 HBE_WARN("[Vulkan] Particle pipeline failed; particles disabled.");
                 particlePipeline_ = particlePipelineAdd_ = VK_NULL_HANDLE;
             }
+
+            // GPU-expanded variant: identical blend/depth/attachment state, but an
+            // EMPTY vertex input state - the quad comes from gl_VertexIndex and the
+            // records come from set 2. Failure here leaves the CPU path untouched
+            // (the GPU path is opt-in per emitter), so it is a warning only.
+            VkShaderModule gvs = LoadShaderModule(dir + L"ParticleGpu.vs.spv");
+            VkShaderModule gps = LoadShaderModule(dir + L"ParticleGpu.ps.spv");
+            if (particlePipeline_ != VK_NULL_HANDLE && gvs != VK_NULL_HANDLE &&
+                gps != VK_NULL_HANDLE) {
+                VkPipelineShaderStageCreateInfo gst[2] = {stages[0], stages[1]};
+                gst[0].module = gvs;
+                gst[1].module = gps;
+                VkPipelineVertexInputStateCreateInfo gvi{
+                    VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+                gvi.vertexBindingDescriptionCount = 0;
+                gvi.vertexAttributeDescriptionCount = 0;
+                const auto makeParticleGpu = [&](bool additive, VkPipeline& outPipe) {
+                    VkPipelineColorBlendAttachmentState pcba[3]{};
+                    for (auto& a : pcba) { a.colorWriteMask = rgba; a.blendEnable = VK_FALSE; }
+                    pcba[0].blendEnable = VK_TRUE;
+                    pcba[0].srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+                    pcba[0].dstColorBlendFactor =
+                        additive ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    pcba[0].colorBlendOp = VK_BLEND_OP_ADD;
+                    pcba[0].srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+                    pcba[0].dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+                    pcba[0].alphaBlendOp = VK_BLEND_OP_ADD;
+                    pcba[1].colorWriteMask = 0; // keep G-buffer
+                    pcba[2].colorWriteMask = 0; // keep velocity
+                    VkPipelineColorBlendStateCreateInfo pcb = cb;
+                    pcb.attachmentCount = 3;
+                    pcb.pAttachments = pcba;
+                    VkGraphicsPipelineCreateInfo pp = pci;
+                    pp.pStages = gst;
+                    pp.pVertexInputState = &gvi;
+                    pp.pRasterizationState = &rs;
+                    pp.pDepthStencilState = &pds;
+                    pp.pColorBlendState = &pcb;
+                    return vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pp, nullptr,
+                                                     &outPipe) == VK_SUCCESS;
+                };
+                if (!makeParticleGpu(false, particleGpuPipeline_) ||
+                    !makeParticleGpu(true, particleGpuPipelineAdd_)) {
+                    HBE_WARN("[Vulkan] GPU particle expansion pipeline failed; emitters with "
+                             "gpuExpand draw nothing (CPU path is unaffected).");
+                    particleGpuPipeline_ = particleGpuPipelineAdd_ = VK_NULL_HANDLE;
+                }
+            } else if (particlePipeline_ != VK_NULL_HANDLE) {
+                HBE_WARN("[Vulkan] ParticleGpu shaders missing; GPU particle expansion off.");
+            }
+            if (gvs != VK_NULL_HANDLE) vkDestroyShaderModule(device_, gvs, nullptr);
+            if (gps != VK_NULL_HANDLE) vkDestroyShaderModule(device_, gps, nullptr);
+
             vkDestroyShaderModule(device_, pvs, nullptr);
             vkDestroyShaderModule(device_, pps, nullptr);
         }
@@ -4000,6 +4158,11 @@ void VulkanDevice::BeginFrame() {
     // Volumetric density splat: compute dispatch, which MUST run outside any
     // render pass -> do it here at frame start (no-op unless enabled).
     DispatchVolumeSplat();
+
+    // Queued general compute (GPU particle sim etc.), same constraint, same
+    // point. D3D12Device::BeginFrame calls its twin here too, so both backends
+    // run this frame's compute before any render target is bound.
+    ExecuteQueuedCompute();
 }
 
 void VulkanDevice::ClearBackBuffer(f32 r, f32 g, f32 b, f32 a) {
@@ -4242,12 +4405,532 @@ void VulkanDevice::DispatchVolumeSplat() {
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
 }
 
+// ---------------------------------------------------------------------------
+// General GPU compute + GPU-writable structured buffers
+// ---------------------------------------------------------------------------
+
+VulkanDevice::GpuBufferVk* VulkanDevice::ResolveGpuBuffer(GpuBufferHandle h) {
+    if (!h.IsValid() || h.id > gpuBuffers_.size()) return nullptr;
+    GpuBufferVk& b = gpuBuffers_[h.id - 1];
+    return b.alive ? &b : nullptr;
+}
+
+// Set 2, binding 0: STORAGE_BUFFER_DYNAMIC in the VERTEX stage. Dynamic so the
+// per-batch element base is a bind-time byte offset (D3D12 does it by offsetting
+// the root SRV's GPU virtual address). Its own set index means the dynamic-offset
+// count of set 0 - which already has one, the object UBO - is untouched.
+bool VulkanDevice::CreateVsBufferSetLayout() {
+    if (vsBufferLayout_ != VK_NULL_HANDLE) return true;
+    VkDescriptorSetLayoutBinding b{};
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+    b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1;
+    lci.pBindings = &b;
+    if (vkCreateDescriptorSetLayout(device_, &lci, nullptr, &vsBufferLayout_) != VK_SUCCESS) {
+        HBE_ERROR("[Vulkan] vsBuffer descriptor set layout creation failed.");
+        return false;
+    }
+    VkDescriptorPoolSize ps{};
+    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+    ps.descriptorCount = kMaxVsBufferSets;
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.maxSets = kMaxVsBufferSets;
+    pci.poolSizeCount = 1;
+    pci.pPoolSizes = &ps;
+    pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; // DestroyGpuBuffer frees
+    if (vkCreateDescriptorPool(device_, &pci, nullptr, &vsBufferPool_) != VK_SUCCESS) {
+        HBE_ERROR("[Vulkan] vsBuffer descriptor pool creation failed.");
+        return false;
+    }
+    return true;
+}
+
+GpuBufferHandle VulkanDevice::CreateGpuBuffer(const GpuBufferDesc& desc) {
+    if (desc.elementCount == 0 || desc.elementStride == 0) {
+        HBE_ERROR("[Vulkan] CreateGpuBuffer: zero elementCount/elementStride.");
+        return {};
+    }
+    if ((desc.usage & GpuBufferUsage::ShaderWrite) && (desc.usage & GpuBufferUsage::CpuWrite)) {
+        // Rejected identically on D3D12 (there because the UPLOAD heap cannot
+        // carry ALLOW_UNORDERED_ACCESS); kept symmetric so a desc that works on
+        // one backend works on both.
+        HBE_ERROR("[Vulkan] CreateGpuBuffer: ShaderWrite|CpuWrite is not a legal combination.");
+        return {};
+    }
+    GpuBufferVk b{};
+    b.stride = desc.elementStride;
+    b.count = desc.elementCount;
+    b.usage = desc.usage;
+    b.bytes = static_cast<VkDeviceSize>(desc.elementCount) * desc.elementStride;
+    // A buffer that is bound at a NON-ZERO dynamic offset needs a bounded descriptor
+    // range (VK_WHOLE_SIZE forces the offset to 0 - VUID-...-06715), and that range
+    // must still fit the allocation at the largest offset used (VUID-...-01979). So
+    // over-allocate by exactly one window: every legal element offset then has a full
+    // window behind it. D3D12 needs none of this (root SRVs take any address), which
+    // is why maxBindElements is declared in the desc rather than inferred here.
+    b.maxBindElements = std::min(desc.maxBindElements, desc.elementCount);
+    b.allocBytes =
+        b.bytes + static_cast<VkDeviceSize>(b.maxBindElements) * desc.elementStride;
+    b.slots = (desc.usage & GpuBufferUsage::CpuWrite) ? framesInFlight_ : 1u;
+    b.alive = true;
+
+    VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT; // ReadGpuBuffer
+    if (desc.usage & (GpuBufferUsage::ShaderRead | GpuBufferUsage::ShaderWrite))
+        usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (desc.usage & GpuBufferUsage::VertexBuffer)
+        usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    const VkMemoryPropertyFlags props =
+        (desc.usage & GpuBufferUsage::CpuWrite)
+            ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+    for (u32 i = 0; i < b.slots; ++i) {
+        if (!CreateBuffer(b.allocBytes, usage, props, b.buf[i], b.mem[i])) {
+            HBE_ERROR("[Vulkan] CreateGpuBuffer: allocation failed ({} B).",
+                      static_cast<u64>(b.allocBytes));
+            // No RAII: release the slots that DID succeed before bailing.
+            for (u32 j = 0; j < b.slots; ++j) {
+                if (b.buf[j]) vkDestroyBuffer(device_, b.buf[j], nullptr);
+                if (b.mem[j]) vkFreeMemory(device_, b.mem[j], nullptr);
+            }
+            return {};
+        }
+        if (desc.usage & GpuBufferUsage::CpuWrite) {
+            void* m = nullptr;
+            vkMapMemory(device_, b.mem[i], 0, b.allocBytes, 0, &m);
+            b.cpu[i] = static_cast<u8*>(m);
+        }
+    }
+
+    // One set-2 descriptor per ring slot, written once (the dynamic offset is what
+    // changes per bind). The range is BOUNDED whenever the buffer declares a bind
+    // window: VK_WHOLE_SIZE would force every dynamic offset to 0
+    // (VUID-vkCmdBindDescriptorSets-pDescriptorSets-06715), which is precisely what
+    // the per-batch base needs to be non-zero for. The allocation was padded by one
+    // window above so offset + range never leaves the buffer (VUID-...-01979).
+    if ((desc.usage & GpuBufferUsage::ShaderRead) && CreateVsBufferSetLayout()) {
+        for (u32 i = 0; i < b.slots; ++i) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = vsBufferPool_;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &vsBufferLayout_;
+            if (vkAllocateDescriptorSets(device_, &ai, &b.vsSet[i]) != VK_SUCCESS) {
+                HBE_WARN("[Vulkan] CreateGpuBuffer: out of vsBuffer descriptor sets "
+                         "(max {}); SetVertexShaderBuffer will skip this buffer.",
+                         kMaxVsBufferSets);
+                b.vsSet[i] = VK_NULL_HANDLE;
+                break;
+            }
+            const VkDeviceSize range =
+                b.maxBindElements
+                    ? static_cast<VkDeviceSize>(b.maxBindElements) * b.stride
+                    : VK_WHOLE_SIZE;
+            VkDescriptorBufferInfo bi{b.buf[i], 0, range};
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = b.vsSet[i];
+            w.dstBinding = 0;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
+            w.pBufferInfo = &bi;
+            vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+        }
+    }
+
+    u32 index;
+    if (!gpuBufferFree_.empty()) {
+        index = gpuBufferFree_.back();
+        gpuBufferFree_.pop_back();
+        gpuBuffers_[index] = b;
+    } else {
+        index = static_cast<u32>(gpuBuffers_.size());
+        gpuBuffers_.push_back(b);
+    }
+    return GpuBufferHandle{index + 1};
+}
+
+void* VulkanDevice::MapGpuBuffer(GpuBufferHandle handle) {
+    GpuBufferVk* b = ResolveGpuBuffer(handle);
+    if (!b || !(b->usage & GpuBufferUsage::CpuWrite)) return nullptr;
+    // Callers map BEFORE RenderScene (the QueueCompute idiom), i.e. before
+    // BeginFrame waits on this slot's fence - so wait here, or the CPU could
+    // overwrite memory the GPU is still reading from the frame framesInFlight_
+    // ago. D3D12 needs no equivalent: MoveToNextFrame already waited on the new
+    // slot's fence at the END of the previous EndFrame. The fences are created
+    // SIGNALLED, so the first frame does not block.
+    vkWaitForFences(device_, 1, &inFlight_[frameIndex_], VK_TRUE, UINT64_MAX);
+    return b->cpu[frameIndex_ % b->slots];
+}
+
+bool VulkanDevice::ReadGpuBuffer(GpuBufferHandle handle, void* dst, u32 bytes) {
+    GpuBufferVk* b = ResolveGpuBuffer(handle);
+    if (!b || !dst || bytes == 0 || bytes > b->bytes) return false;
+    const u32 slot = frameIndex_ % b->slots;
+    if (b->cpu[slot]) { std::memcpy(dst, b->cpu[slot], bytes); return true; }
+
+    // Device-local: flush, copy into a host-visible staging buffer on a one-shot
+    // command buffer, wait, map. Debug/validation only (see the RHI comment).
+    WaitForGpuIdle();
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+    if (!CreateBuffer(bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                      staging, stagingMem)) {
+        return false;
+    }
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = commandPool_;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    vkAllocateCommandBuffers(device_, &cbai, &cmd);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkBufferMemoryBarrier pre{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    pre.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    pre.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    pre.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    pre.buffer = b->buf[slot];
+    pre.offset = 0;
+    pre.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &pre, 0, nullptr);
+    VkBufferCopy region{0, 0, bytes};
+    vkCmdCopyBuffer(cmd, b->buf[slot], staging, 1, &region);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
+
+    void* mapped = nullptr;
+    bool ok = false;
+    if (vkMapMemory(device_, stagingMem, 0, bytes, 0, &mapped) == VK_SUCCESS && mapped) {
+        std::memcpy(dst, mapped, bytes);
+        vkUnmapMemory(device_, stagingMem);
+        ok = true;
+    }
+    vkDestroyBuffer(device_, staging, nullptr);
+    vkFreeMemory(device_, stagingMem, nullptr);
+    return ok;
+}
+
+void VulkanDevice::DestroyGpuBuffer(GpuBufferHandle handle) {
+    GpuBufferVk* b = ResolveGpuBuffer(handle);
+    if (!b) return;
+    WaitForGpuIdle(); // may still be referenced by in-flight command buffers
+    if (vsBuffer_.id == handle.id) vsBuffer_ = {};
+    for (u32 g = 0; g < particleGpuGroupCount_; ++g) {
+        if (particleGpuGroups_[g].buffer.id == handle.id) particleGpuGroups_[g] = {};
+    }
+    for (u32 i = 0; i < b->slots; ++i) {
+        if (b->vsSet[i]) vkFreeDescriptorSets(device_, vsBufferPool_, 1, &b->vsSet[i]);
+        b->vsSet[i] = VK_NULL_HANDLE;
+        if (b->buf[i]) vkDestroyBuffer(device_, b->buf[i], nullptr);
+        if (b->mem[i]) vkFreeMemory(device_, b->mem[i], nullptr); // implicitly unmaps
+        b->buf[i] = VK_NULL_HANDLE;
+        b->mem[i] = VK_NULL_HANDLE;
+        b->cpu[i] = nullptr;
+    }
+    b->alive = false;
+    gpuBufferFree_.push_back(handle.id - 1);
+}
+
+ComputePipelineHandle VulkanDevice::CreateComputePipeline(const ComputePipelineDesc& desc) {
+    if (!desc.shaderName || desc.uavCount > kMaxComputeUavs || desc.srvCount > kMaxComputeSrvs ||
+        desc.constantBytes > kMaxComputeConstantBytes) {
+        HBE_ERROR("[Vulkan] CreateComputePipeline: invalid desc.");
+        return {};
+    }
+    ComputePipelineVk p{};
+    p.constantBytes = desc.constantBytes;
+    p.uavCount = desc.uavCount;
+    p.srvCount = desc.srvCount;
+
+    // Layout in the order the binding convention documents: binding 0 = constants
+    // UBO, bindings 1..uavCount = the UAVs, then the SRVs. DXC lowers both
+    // RWStructuredBuffer and StructuredBuffer to SPIR-V storage buffers, so the
+    // descriptor type is the same for both halves; only the HLSL differs.
+    VkDescriptorSetLayoutBinding b[1 + kMaxComputeUavs + kMaxComputeSrvs]{};
+    u32 n = 0;
+    b[n].binding = 0;
+    b[n].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    b[n].descriptorCount = 1;
+    b[n].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    ++n;
+    for (u32 i = 0; i < desc.uavCount + desc.srvCount; ++i, ++n) {
+        b[n].binding = n;
+        b[n].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b[n].descriptorCount = 1;
+        b[n].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = n;
+    lci.pBindings = b;
+    if (vkCreateDescriptorSetLayout(device_, &lci, nullptr, &p.setLayout) != VK_SUCCESS) return {};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &p.setLayout;
+    if (vkCreatePipelineLayout(device_, &plci, nullptr, &p.layout) != VK_SUCCESS) {
+        vkDestroyDescriptorSetLayout(device_, p.setLayout, nullptr);
+        return {};
+    }
+
+    const std::string name(desc.shaderName);
+    const std::wstring wname(name.begin(), name.end());
+    const std::wstring dir = ExecutableDir() + L"shaders\\";
+    VkShaderModule cs = LoadShaderModule(dir + wname + L".cs.spv");
+    if (cs == VK_NULL_HANDLE) {
+        // The fog/ssgi precedent: a kernel missing from cmake/ShaderCompile.cmake
+        // produces no file at all. Fail loudly rather than silently dormant.
+        HBE_ERROR("[Vulkan] {}.cs.spv missing - is it registered in cmake/ShaderCompile.cmake?",
+                  name);
+        vkDestroyPipelineLayout(device_, p.layout, nullptr);
+        vkDestroyDescriptorSetLayout(device_, p.setLayout, nullptr);
+        return {};
+    }
+    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = cs;
+    cpci.stage.pName = desc.entryPoint ? desc.entryPoint : "CSMain";
+    cpci.layout = p.layout;
+    const VkResult pr =
+        vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &cpci, nullptr, &p.pipeline);
+    vkDestroyShaderModule(device_, cs, nullptr);
+    if (pr != VK_SUCCESS) {
+        HBE_ERROR("[Vulkan] vkCreateComputePipelines failed for {}.", name);
+        vkDestroyPipelineLayout(device_, p.layout, nullptr);
+        vkDestroyDescriptorSetLayout(device_, p.setLayout, nullptr);
+        return {};
+    }
+
+    // No RAII: any bail-out from here on must release everything built above.
+    const auto abandon = [&]() -> ComputePipelineHandle {
+        for (u32 i = 0; i < framesInFlight_; ++i) {
+            if (p.cb[i]) vkDestroyBuffer(device_, p.cb[i], nullptr);
+            if (p.cbMem[i]) vkFreeMemory(device_, p.cbMem[i], nullptr);
+        }
+        if (p.pool) vkDestroyDescriptorPool(device_, p.pool, nullptr);
+        if (p.pipeline) vkDestroyPipeline(device_, p.pipeline, nullptr);
+        if (p.layout) vkDestroyPipelineLayout(device_, p.layout, nullptr);
+        if (p.setLayout) vkDestroyDescriptorSetLayout(device_, p.setLayout, nullptr);
+        return {};
+    };
+
+    // Per-frame constants ring: one aligned block per queue slot, so a frame's
+    // dispatches never overwrite each other's constants.
+    const VkDeviceSize minAlign = deviceProps_.limits.minUniformBufferOffsetAlignment;
+    p.cbStride = AlignUp(desc.constantBytes ? desc.constantBytes : 4u, minAlign);
+    const VkMemoryPropertyFlags hostVis =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkDeviceSize cbBytes = p.cbStride * kMaxQueuedComputeDispatches;
+    for (u32 i = 0; i < framesInFlight_; ++i) {
+        if (!CreateBuffer(cbBytes, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hostVis, p.cb[i],
+                          p.cbMem[i])) {
+            return abandon();
+        }
+        void* m = nullptr;
+        vkMapMemory(device_, p.cbMem[i], 0, cbBytes, 0, &m);
+        p.cbMapped[i] = static_cast<u8*>(m);
+    }
+
+    // One descriptor set per (frame slot, queue slot).
+    const u32 setCount = framesInFlight_ * kMaxQueuedComputeDispatches;
+    VkDescriptorPoolSize ps[2]{};
+    u32 psN = 0;
+    ps[psN].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    ps[psN].descriptorCount = setCount;
+    ++psN;
+    if (desc.uavCount + desc.srvCount) {
+        ps[psN].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        ps[psN].descriptorCount = setCount * (desc.uavCount + desc.srvCount);
+        ++psN;
+    }
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.maxSets = setCount;
+    pci.poolSizeCount = psN;
+    pci.pPoolSizes = ps;
+    if (vkCreateDescriptorPool(device_, &pci, nullptr, &p.pool) != VK_SUCCESS) return abandon();
+    for (u32 f = 0; f < framesInFlight_; ++f) {
+        VkDescriptorSetLayout layouts[kMaxQueuedComputeDispatches];
+        for (u32 i = 0; i < kMaxQueuedComputeDispatches; ++i) layouts[i] = p.setLayout;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = p.pool;
+        ai.descriptorSetCount = kMaxQueuedComputeDispatches;
+        ai.pSetLayouts = layouts;
+        if (vkAllocateDescriptorSets(device_, &ai, p.sets[f]) != VK_SUCCESS) return abandon();
+    }
+
+    p.alive = true;
+    computePipes_.push_back(p);
+    HBE_INFO("[Vulkan] Compute pipeline '{}' ready ({} UAV, {} SRV, {} B constants).", name,
+             desc.uavCount, desc.srvCount, desc.constantBytes);
+    return ComputePipelineHandle{static_cast<u32>(computePipes_.size())};
+}
+
+void VulkanDevice::QueueCompute(const ComputeDispatch& d) {
+    if (!d.pipeline.IsValid() || d.pipeline.id > computePipes_.size()) return;
+    if (computeQueueCount_ >= kMaxQueuedComputeDispatches) {
+        HBE_WARN("[Vulkan] QueueCompute: more than {} dispatches this frame; dropping.",
+                 kMaxQueuedComputeDispatches);
+        return;
+    }
+    QueuedComputeVk& q = computeQueue_[computeQueueCount_++];
+    q.d = d;
+    q.d.constantBytes = std::min(d.constantBytes, kMaxComputeConstantBytes);
+    if (d.constants && q.d.constantBytes) std::memcpy(q.constants, d.constants, q.d.constantBytes);
+    q.d.constants = nullptr; // the copy above is what the dispatch reads
+}
+
+// Runs every dispatch queued since the last frame. Called from BeginFrame, which
+// on Vulkan is the only place compute CAN go (ClearBackBuffer opens a render pass
+// that stays open through DrawScene). D3D12's BeginFrame calls its twin at the
+// same point so the two frame timelines line up.
+void VulkanDevice::ExecuteQueuedCompute() {
+    if (computeQueueCount_ == 0 || !frameActive_) { computeQueueCount_ = 0; return; }
+    VkCommandBuffer cmd = commandBuffers_[frameIndex_];
+
+    // Cross-frame write-after-read guard, the buffer twin of the volume splat's
+    // image barrier: a device-local buffer is ONE allocation shared by every frame
+    // in flight, so this frame's compute write must not begin before the previous
+    // frame's vertex read finished. A barrier's first scope spans everything
+    // already submitted on this (single) queue.
+    {
+        VkMemoryBarrier war{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        war.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        war.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd,
+                             VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &war, 0, nullptr, 0,
+                             nullptr);
+    }
+
+    for (u32 qi = 0; qi < computeQueueCount_; ++qi) {
+        const QueuedComputeVk& q = computeQueue_[qi];
+        ComputePipelineVk& p = computePipes_[q.d.pipeline.id - 1];
+        if (!p.alive) continue;
+
+        const u32 uavN = std::min(q.d.uavCount, p.uavCount);
+        const u32 srvN = std::min(q.d.srvCount, p.srvCount);
+        GpuBufferVk* uav[kMaxComputeUavs] = {};
+        GpuBufferVk* srv[kMaxComputeSrvs] = {};
+        bool ok = true;
+        for (u32 i = 0; i < uavN && ok; ++i) {
+            uav[i] = ResolveGpuBuffer(q.d.uavs[i]);
+            ok = uav[i] != nullptr;
+        }
+        for (u32 i = 0; i < srvN && ok; ++i) {
+            srv[i] = ResolveGpuBuffer(q.d.srvs[i]);
+            ok = srv[i] != nullptr;
+        }
+        if (!ok) continue;
+
+        // Constants into this (frame, queue) slot, then write the set. The set is
+        // private to this slot, so writing it here cannot race a pending submit.
+        const VkDeviceSize cbOff = p.cbStride * qi;
+        if (q.d.constantBytes) {
+            // The slot is strided by the PIPELINE's declared block; the copy is sized
+            // by the DISPATCH's. QueueCompute only clamps the latter against
+            // kMaxComputeConstantBytes, so a dispatch that passes more than its
+            // pipeline declared would write into the next queue slot's block.
+            std::memcpy(p.cbMapped[frameIndex_] + cbOff, q.constants,
+                        std::min(q.d.constantBytes, p.constantBytes));
+        }
+        VkDescriptorSet set = p.sets[frameIndex_][qi];
+        VkDescriptorBufferInfo infos[1 + kMaxComputeUavs + kMaxComputeSrvs]{};
+        VkWriteDescriptorSet writes[1 + kMaxComputeUavs + kMaxComputeSrvs]{};
+        u32 w = 0;
+        infos[w] = {p.cb[frameIndex_], cbOff, p.cbStride};
+        writes[w] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        writes[w].dstSet = set;
+        writes[w].dstBinding = 0;
+        writes[w].descriptorCount = 1;
+        writes[w].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[w].pBufferInfo = &infos[w];
+        ++w;
+        for (u32 i = 0; i < uavN; ++i, ++w) {
+            const u32 s = frameIndex_ % uav[i]->slots;
+            infos[w] = {uav[i]->buf[s], 0, VK_WHOLE_SIZE};
+            writes[w] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[w].dstSet = set;
+            writes[w].dstBinding = 1 + i;
+            writes[w].descriptorCount = 1;
+            writes[w].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[w].pBufferInfo = &infos[w];
+        }
+        for (u32 i = 0; i < srvN; ++i, ++w) {
+            const u32 s = frameIndex_ % srv[i]->slots;
+            infos[w] = {srv[i]->buf[s], 0, VK_WHOLE_SIZE};
+            writes[w] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            writes[w].dstSet = set;
+            // The layout reserves p.uavCount UAV bindings; skip any the caller
+            // left unbound so the SRV bindings stay at their declared indices.
+            writes[w].dstBinding = 1 + p.uavCount + i;
+            writes[w].descriptorCount = 1;
+            writes[w].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[w].pBufferInfo = &infos[w];
+        }
+        vkUpdateDescriptorSets(device_, w, writes, 0, nullptr);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0,
+                                nullptr);
+        vkCmdDispatch(cmd, std::max(1u, q.d.groupsX), std::max(1u, q.d.groupsY),
+                      std::max(1u, q.d.groupsZ));
+
+        // Compute -> compute, so a following dispatch observes these writes
+        // (D3D12's twin is the per-UAV D3D12_RESOURCE_BARRIER_TYPE_UAV).
+        if (qi + 1 < computeQueueCount_) {
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                                 nullptr);
+        }
+    }
+
+    // Compute writes -> this frame's vertex reads (attribute fetch and/or the
+    // set-2 structured-buffer read). D3D12 expresses this as a resource-state
+    // transition inside TransitionGpuBuffer.
+    VkMemoryBarrier post{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    post.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    post.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                         0, 1, &post, 0, nullptr, 0, nullptr);
+
+    computeQueueCount_ = 0; // one frame only, like SetParticles
+}
+
+void VulkanDevice::SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) {
+    vsBuffer_ = handle;
+    vsBufferFirstElement_ = firstElement;
+}
+
 void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 count) {
-    if (!meshPipelineReady_ || !renderPassActive_) return;
+    // Every return from here drops this frame's GPU-particle groups. They point into
+    // an engine-owned vector that is rebuilt each frame, so carrying one over would
+    // dangle - and the group array would fill up and warn-and-drop permanently.
+    if (!meshPipelineReady_ || !renderPassActive_) {
+        ClearGpuParticleGroups();
+        return;
+    }
     const bool drawSky = (view.skyIndex != 0) && skyPipeline_ != VK_NULL_HANDLE;
     // Without the post stack there is nothing to resolve, so an empty scene
     // can skip the pass entirely (legacy behavior).
-    if ((count == 0 || !items) && !drawSky && !postReady_) return;
+    if ((count == 0 || !items) && !drawSky && !postReady_) {
+        ClearGpuParticleGroups();
+        return;
+    }
 
     VkCommandBuffer cmd = commandBuffers_[frameIndex_];
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
@@ -4255,6 +4938,39 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     // Bind the bindless texture set (set 1) once for the whole pass.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
                             &bindlessSet_, 0, nullptr);
+
+    // General VS-visible structured buffer (set 2). The per-batch base rides in
+    // the DYNAMIC OFFSET - never in a firstInstance - which is the exact twin of
+    // D3D12 adding it to root param 6's GPU virtual address.
+    if (GpuBufferVk* vb = ResolveGpuBuffer(vsBuffer_)) {
+        const u32 s = frameIndex_ % vb->slots;
+        const VkDeviceSize off = static_cast<VkDeviceSize>(vsBufferFirstElement_) * vb->stride;
+        const VkDeviceSize align = deviceProps_.limits.minStorageBufferOffsetAlignment;
+        // A buffer that declared no bind window carries a VK_WHOLE_SIZE descriptor,
+        // whose dynamic offset must be 0 (VUID-...-06715). Binding it anywhere else
+        // is the caller's error, not something to paper over silently.
+        if (off != 0 && vb->maxBindElements == 0) {
+            if (!vsBufferAlignWarned_) {
+                vsBufferAlignWarned_ = true;
+                HBE_ERROR("[Vulkan] SetVertexShaderBuffer: firstElement != 0 on a buffer "
+                          "created without GpuBufferDesc::maxBindElements; bind skipped.");
+            }
+        } else if (vb->vsSet[s] != VK_NULL_HANDLE && off < vb->bytes &&
+                   (align == 0 || (off % align) == 0)) {
+            const u32 dyn = static_cast<u32>(off);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1,
+                                    &vb->vsSet[s], 1, &dyn);
+        } else if (vb->vsSet[s] != VK_NULL_HANDLE && off < vb->bytes && !vsBufferAlignWarned_) {
+            // Deterministic + loud rather than a silent per-backend divergence:
+            // D3D12 root SRVs take any byte offset, Vulkan dynamic storage-buffer
+            // offsets must be a multiple of minStorageBufferOffsetAlignment.
+            vsBufferAlignWarned_ = true;
+            HBE_ERROR("[Vulkan] SetVertexShaderBuffer: firstElement*stride ({}) is not a "
+                      "multiple of minStorageBufferOffsetAlignment ({}); bind skipped.",
+                      static_cast<u64>(off), static_cast<u64>(align));
+        }
+    }
+    vsBuffer_ = {}; // one frame only, like SetParticles
 
     // Temporal AA: jitter the camera sub-pixel each frame (matches D3D12); the
     // TAA resolve reprojects + accumulates. Kept in the backend (renderer is
@@ -4496,11 +5212,26 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, particlePipeline_);
             vkCmdDraw(cmd, aN, 1, 0, 0);
         }
+        // GPU-expanded ALPHA batches ride between the two CPU draws so the overall
+        // order stays "all alpha, then all additive" - identical to D3D12.
+        DrawGpuParticleBatches(cmd, false);
         if (addN) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, particlePipelineAdd_);
             vkCmdDraw(cmd, addN, 1, aN, 0);
         }
+        DrawGpuParticleBatches(cmd, true);
+    } else if (particleGpuPipeline_ != VK_NULL_HANDLE && particleGpuGroupCount_ > 0) {
+        // No CPU billboards this frame, but there are GPU-expanded ones. Set 0 has
+        // to be bound here because the block above (which normally does it) is
+        // skipped; set 1 is already bound for the whole pass.
+        const u32 zeroOffset = 0;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
+                                &descriptorSets_[frameIndex_], 1, &zeroOffset);
+        DrawGpuParticleBatches(cmd, false);
+        DrawGpuParticleBatches(cmd, true);
     }
+    // One frame only, like SetParticles.
+    ClearGpuParticleGroups();
 
     // GPU profiler: delta scene->here = the particle billboard draws ONLY (alpha +
     // additive), the same window D3D12 measures. It is written INSIDE the still-open
@@ -4522,6 +5253,80 @@ void VulkanDevice::SetParticles(const ParticleVertex* alpha, u32 alphaCount,
     particleAlphaCount_ = alphaCount;
     particleAdd_ = additive;
     particleAddCount_ = addCount;
+}
+
+// APPENDS a group rather than replacing one - see the contract in RHI.h. D3D12's
+// twin is character-for-character the same body.
+void VulkanDevice::SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
+                                   u32 count) {
+    if (!records.IsValid() || !batches || count == 0) return;
+    if (particleGpuGroupCount_ >= kMaxGpuParticleGroups) {
+        HBE_WARN("[Vulkan] SetGpuParticles: more than {} record buffers this frame; dropping.",
+                 kMaxGpuParticleGroups);
+        return;
+    }
+    GpuParticleGroup& g = particleGpuGroups_[particleGpuGroupCount_++];
+    g.buffer = records;
+    g.batches = batches;
+    g.count = count;
+}
+
+// One draw per emitter. The per-batch base rides in set 2's DYNAMIC OFFSET - never
+// in a firstInstance, which is 0 here as it is on D3D12 (see the SV_InstanceID /
+// gl_InstanceIndex note in RHI.h). D3D12's twin adds the identical byte offset to
+// root param 6's GPU virtual address.
+void VulkanDevice::DrawGpuParticleBatches(VkCommandBuffer cmd, bool additive) {
+    if (particleGpuPipeline_ == VK_NULL_HANDLE || particleGpuGroupCount_ == 0) return;
+    const VkDeviceSize align = deviceProps_.limits.minStorageBufferOffsetAlignment;
+
+    bool pipeSet = false;
+    for (u32 g = 0; g < particleGpuGroupCount_; ++g) {
+        const GpuParticleGroup& grp = particleGpuGroups_[g];
+        if (!grp.batches || grp.count == 0) continue;
+        GpuBufferVk* rb = ResolveGpuBuffer(grp.buffer);
+        if (!rb || rb->stride == 0) continue;
+        const u32 slot = frameIndex_ % rb->slots;
+        if (rb->vsSet[slot] == VK_NULL_HANDLE) continue;
+
+        // Clamp identically to D3D12: the batch may not exceed the descriptor's bind
+        // window. Doing it at the seam (not only at the producers) is what guarantees
+        // the two backends draw the same particles even if a producer ever slips.
+        const u32 maxCount = rb->maxBindElements > kGpuParticleEmitterElements
+                                 ? rb->maxBindElements - kGpuParticleEmitterElements
+                                 : 0u;
+        for (u32 i = 0; i < grp.count; ++i) {
+            const GpuParticleBatch& b = grp.batches[i];
+            if (b.count == 0 || (b.additive != 0) != additive) continue;
+            const u32 count = maxCount ? std::min(b.count, maxCount) : b.count;
+            const VkDeviceSize off = static_cast<VkDeviceSize>(b.recordFirst) * rb->stride;
+            const VkDeviceSize need =
+                static_cast<VkDeviceSize>(kGpuParticleEmitterElements + count) * rb->stride;
+            if (off + need > rb->bytes) continue;
+            if (align != 0 && (off % align) != 0) {
+                // Loud and deterministic rather than a silent per-backend divergence:
+                // D3D12 root SRVs take any offset, Vulkan dynamic storage-buffer
+                // offsets do not. Every producer 256-byte-aligns its emitter blocks
+                // (rhi::kGpuParticleBlockAlign), which covers the largest limit the
+                // spec permits, so reaching this branch means a producer regressed.
+                if (!particleGpuAlignWarned_) {
+                    particleGpuAlignWarned_ = true;
+                    HBE_ERROR("[Vulkan] GPU particle batch offset {} is not a multiple of "
+                              "minStorageBufferOffsetAlignment ({}); batch skipped.",
+                              static_cast<u64>(off), static_cast<u64>(align));
+                }
+                continue;
+            }
+            if (!pipeSet) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  additive ? particleGpuPipelineAdd_ : particleGpuPipeline_);
+                pipeSet = true;
+            }
+            const u32 dyn = static_cast<u32>(off);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2,
+                                    1, &rb->vsSet[slot], 1, &dyn);
+            vkCmdDraw(cmd, count * 6u, 1, 0, 0);
+        }
+    }
 }
 
 void VulkanDevice::DrawUIOverlay(const UIVertex* vertices, u32 count) {
@@ -4836,10 +5641,23 @@ u64 VulkanDevice::GetTextureUIHandle(TextureHandle handle) {
     if (auto it = uiTextureIds_.find(handle.index); it != uiTextureIds_.end()) {
         return it->second;
     }
-    const auto view = slotViews_.find(handle.index);
-    if (view == slotViews_.end()) return 0;
+    // A UI TARGET is handed to ImGui through its UNORM attachView, not the SRGB
+    // sampleView that slotViews_ holds: the target carries the UI shader's raw
+    // display-space output, and the swapchain the editor presents to is non-sRGB,
+    // so an sRGB read would decode once with no re-encode and the `.hbui` authoring
+    // canvas would render measurably darker than the same document in the Game tab.
+    // The BINDLESS slot keeps the SRGB view - the lit world page IS an albedo map.
+    VkImageView srcView = VK_NULL_HANDLE;
+    if (const auto uit = uiTargets_.find(handle.index); uit != uiTargets_.end()) {
+        srcView = uit->second.attachView;
+    } else {
+        const auto view = slotViews_.find(handle.index);
+        if (view == slotViews_.end()) return 0;
+        srcView = view->second;
+    }
+    if (srcView == VK_NULL_HANDLE) return 0;
     VkDescriptorSet ds = ImGui_ImplVulkan_AddTexture(
-        bindlessSampler_, view->second, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        bindlessSampler_, srcView, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     const u64 id = reinterpret_cast<u64>(ds);
     uiTextureIds_[handle.index] = id;
     return id;
@@ -5537,6 +6355,34 @@ VulkanDevice::~VulkanDevice() {
     if (volPipelineLayout_) vkDestroyPipelineLayout(device_, volPipelineLayout_, nullptr);
     if (volSetLayout_) vkDestroyDescriptorSetLayout(device_, volSetLayout_, nullptr);
 
+    // General GPU buffers + compute pipelines (CreateGpuBuffer /
+    // CreateComputePipeline). Vulkan has no RAII, so everything is released by
+    // hand here - this site has NO D3D12 counterpart (its ComPtr members and the
+    // gpuBuffers_/computePipes_ vectors release themselves). Device is idle.
+    for (GpuBufferVk& gb : gpuBuffers_) {
+        if (!gb.alive) continue;
+        for (u32 i = 0; i < gb.slots; ++i) {
+            if (gb.buf[i]) vkDestroyBuffer(device_, gb.buf[i], nullptr);
+            if (gb.mem[i]) vkFreeMemory(device_, gb.mem[i], nullptr); // implicitly unmaps
+        }
+        gb.alive = false;
+    }
+    gpuBuffers_.clear();
+    for (ComputePipelineVk& cp : computePipes_) {
+        for (u32 i = 0; i < framesInFlight_; ++i) {
+            if (cp.cb[i]) vkDestroyBuffer(device_, cp.cb[i], nullptr);
+            if (cp.cbMem[i]) vkFreeMemory(device_, cp.cbMem[i], nullptr);
+        }
+        if (cp.pool) vkDestroyDescriptorPool(device_, cp.pool, nullptr);
+        if (cp.pipeline) vkDestroyPipeline(device_, cp.pipeline, nullptr);
+        if (cp.layout) vkDestroyPipelineLayout(device_, cp.layout, nullptr);
+        if (cp.setLayout) vkDestroyDescriptorSetLayout(device_, cp.setLayout, nullptr);
+    }
+    computePipes_.clear();
+    // vsSet_ descriptors are owned by this pool; destroying it frees them all.
+    if (vsBufferPool_) vkDestroyDescriptorPool(device_, vsBufferPool_, nullptr);
+    if (vsBufferLayout_) vkDestroyDescriptorSetLayout(device_, vsBufferLayout_, nullptr);
+
     if (ssgiPipe_) vkDestroyPipeline(device_, ssgiPipe_, nullptr);
     if (painterlyPipe_) vkDestroyPipeline(device_, painterlyPipe_, nullptr);
     if (brushStrokesPipe_) vkDestroyPipeline(device_, brushStrokesPipe_, nullptr);
@@ -5559,6 +6405,9 @@ VulkanDevice::~VulkanDevice() {
     if (uiPipeline_) vkDestroyPipeline(device_, uiPipeline_, nullptr);
     if (particlePipeline_) vkDestroyPipeline(device_, particlePipeline_, nullptr);
     if (particlePipelineAdd_) vkDestroyPipeline(device_, particlePipelineAdd_, nullptr);
+    // No RAII on this side: the D3D12 twin's ComPtrs release themselves, these do not.
+    if (particleGpuPipeline_) vkDestroyPipeline(device_, particleGpuPipeline_, nullptr);
+    if (particleGpuPipelineAdd_) vkDestroyPipeline(device_, particleGpuPipelineAdd_, nullptr);
     if (strokeSurfacePipe_) vkDestroyPipeline(device_, strokeSurfacePipe_, nullptr);
 
     // World-UI targets (their images/views are owned here, not by textures_).

@@ -18,6 +18,7 @@ namespace hbe {
 class Renderer;
 struct PaintComponent;
 struct MeshData;
+struct TerrainComponent;
 
 namespace paint {
 
@@ -97,6 +98,19 @@ struct Dab {
 // returns the nearest hit (both faces). False when the ray misses.
 bool RaycastMesh(const MeshData& mesh, const glm::vec3& localOrigin,
                  const glm::vec3& localDir, PaintHit& out);
+
+// TERRAIN is the one paintable surface RaycastMesh can never answer for. Chunk
+// meshes are generated straight into GPU buffers and the CPU copy is dropped, so a
+// chunk has no MeshRef, no cacheable source and no MeshData - which is why the brush
+// used to bail out before it ever reached the code that knew about terrain.
+//
+// This answers the same question from the heightmap instead: march the height
+// function (terrain::RaycastLocal), then report the TERRAIN-WIDE canvas UV that
+// TerrainSystem bakes into every chunk vertex, so one canvas covers the whole
+// terrain seamlessly and the UV density is a constant 1/extent. The ray and the
+// resulting PaintHit are in TERRAIN-local space (chunks sit at identity under it).
+bool RaycastTerrain(const TerrainComponent& t, const glm::vec3& localOrigin,
+                    const glm::vec3& localDir, PaintHit& out);
 
 // A custom brush definition: a handful of parameters that bake into a grayscale
 // tip stamp (a real brush mark, not a plain disc). Authored in the Art Editor's

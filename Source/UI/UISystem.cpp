@@ -323,6 +323,44 @@ void SolveElementFromRect(UIElement& el, const Rect& parent, const Rect& desired
     el.offset = pivotPoint - (regionMin + regionSize * el.pivot);
 }
 
+// LayoutFlow mirrors UILayoutGroup::Kind (UISystem.h cannot see Components.h).
+// Pinned here so adding a Kind without adding a LayoutFlow is a build error.
+static_assert(static_cast<u8>(UILayoutGroup::Kind::Vertical) ==
+                  static_cast<u8>(LayoutFlow::Vertical) &&
+              static_cast<u8>(UILayoutGroup::Kind::Horizontal) ==
+                  static_cast<u8>(LayoutFlow::Horizontal) &&
+              static_cast<u8>(UILayoutGroup::Kind::Grid) ==
+                  static_cast<u8>(LayoutFlow::Grid),
+              "ui::LayoutFlow must mirror UILayoutGroup::Kind");
+
+LayoutOwnership LayoutGroupOwnership(const Scene& scene, entt::entity e) {
+    LayoutOwnership own;
+    const entt::registry& reg = scene.Registry();
+    if (e == entt::null || !reg.valid(e)) return own;
+    const UIElement* el = reg.try_get<UIElement>(e);
+    if (!el) return own;
+
+    // A fitContent group rewrites its OWN far edges after its children lay out.
+    if (const UILayoutGroup* self = reg.try_get<UILayoutGroup>(e); self && self->fitContent)
+        own.selfFitsContent = true;
+
+    const Parent* p = reg.try_get<Parent>(e);
+    if (!p || !reg.valid(p->entity)) return own;
+    const UILayoutGroup* lg = reg.try_get<UILayoutGroup>(p->entity);
+    if (!lg) return own;
+    // THE ESCAPE CLASS, verbatim from the layout walk: a stretch or fullscreen
+    // child recurses un-positioned, so its RectTransform is honoured normally.
+    if (el->fullscreen || el->anchorMin != el->anchorMax) return own;
+
+    own.positionOwned = true;
+    own.group = p->entity;
+    own.flow = static_cast<LayoutFlow>(lg->kind);
+    // Grid slots are exactly cellSize; Vertical/Horizontal slots take the child's
+    // own natural size, so only its position is the group's.
+    own.sizeOwned = lg->kind == UILayoutGroup::Kind::Grid;
+    return own;
+}
+
 namespace {
 // Rebuilds a parent -> children map over everything that can appear in a UI tree.
 void BuildChildrenMap(entt::registry& reg,
@@ -344,14 +382,70 @@ Rect IntersectRects(const Rect& a, const Rect& b) {
 }
 } // namespace
 
+bool CanvasAncestryActive(const entt::registry& reg, entt::entity canvas,
+                          bool editorForced) {
+    if (!reg.valid(canvas)) return false;
+    // Walk ANCESTORS only - the canvas's own `visible` flag is the caller's
+    // business (layout, the pick and the surface pass each already test it).
+    int depth = 0;
+    const Parent* p0 = reg.try_get<Parent>(canvas);
+    for (entt::entity cur = (p0 && reg.valid(p0->entity)) ? p0->entity : entt::null;
+         cur != entt::null && depth < 64; ++depth) {
+        if (const UIPanel* panel = reg.try_get<UIPanel>(cur);
+            panel && !panel->active && !(editorForced && reg.all_of<EditorUIShow>(cur)))
+            return false;
+        if (const UIElement* el = reg.try_get<UIElement>(cur); el && !el->visible)
+            return false;
+        // A fully-faded group is an invisible click trap; matches the walk's own
+        // `gOpacity <= 0.001f` rule. `interactable` alone is NOT checked here: it
+        // must not stop the page from DRAWING, only from being pressed, and that
+        // half is already folded per-element inside the walk.
+        if (const UICanvasGroup* cg = reg.try_get<UICanvasGroup>(cur);
+            cg && cg->opacity <= 0.001f)
+            return false;
+        const Parent* pp = reg.try_get<Parent>(cur);
+        cur = (pp && reg.valid(pp->entity)) ? pp->entity : entt::null;
+    }
+    return true;
+}
+
+bool IsGlobalAction(const std::string& a) {
+    if (a.rfind("setting:", 0) == 0) return true;
+    static const char* kVerbs[] = {"play", "menu",  "restart", "settings",
+                                   "back", "quit",  "caption"};
+    for (const char* v : kVerbs)
+        if (a == v) return true;
+    return false;
+}
+
 // Shared walk over a prebuilt children map (the map is the expensive part; the
 // walk itself is cheap and runs once per frame).
+//
+// `docFilter` (0 = every tree, the runtime) restricts the walk to the TREE ROOTS
+// carrying UIDocMember{docFilter} - the dedicated `.hbui` editor's authoring
+// build. Only the two ROOT-SELECTION loops consult it: a document is a set of
+// whole subtrees, so filtering roots filters everything under them, and the
+// recursive walk is untouched (i.e. byte-identical for docFilter == 0).
 static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
                          const CanvasConfig& legacyConfig,
                          const std::unordered_map<u32, std::vector<entt::entity>>& children,
-                         std::vector<LayoutItem>& out) {
+                         std::vector<LayoutItem>& out, u32 docFilter = 0) {
     out.clear();
     auto& reg = scene.Registry();
+    // EditorUIShow (a session-only tag) lets the editor look at an INACTIVE panel.
+    // Gated on EditorView so neither the runtime nor a shipped build can be
+    // affected by one, AND on UIAuthoringView so PLAY MODE isn't either: EditorView
+    // stays true for the whole editor process (it drives EditorHidden culling), so
+    // on its own it left the authored screen force-visible while playing, stacked
+    // over whatever the game flow actually showed. See Scene::SetUIAuthoringView.
+    const bool editorView = scene.EditorView() && scene.UIAuthoringView();
+
+    // Root membership test for the editor's document-scoped build.
+    const auto inDoc = [&](entt::entity e) {
+        if (docFilter == 0) return true;
+        const UIDocMember* m = reg.try_get<UIDocMember>(e);
+        return m != nullptr && m->doc == docFilter;
+    };
 
     // Walks one UI subtree, laying out parents before children (depth-first).
     // `canvasEntity` tags each item with the UICanvas it lays out under
@@ -364,8 +458,12 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
                           const Rect& clip, bool hasClip, f32 gOpacity,
                           bool gInteractive, const Rect* forced) -> void {
         // An inactive panel (a named screen the UIManager toggles) hides its whole
-        // subtree: skip laying it or its descendants out at all.
-        if (const UIPanel* panel = reg.try_get<UIPanel>(e); panel && !panel->active) return;
+        // subtree: skip laying it or its descendants out at all. The editor may
+        // force ONE such screen visible for authoring (EditorUIShow) - session-only
+        // view state, never serialized, never honoured outside the editor.
+        if (const UIPanel* panel = reg.try_get<UIPanel>(e);
+            panel && !panel->active && !(editorView && reg.all_of<EditorUIShow>(e)))
+            return;
         // A hidden element hides its ENTIRE subtree, not just its own quad: skip the
         // layout here so descendants are neither drawn nor hit-tested (both consume
         // this one walk). Mirrors the UIPanel.active gate above.
@@ -388,6 +486,8 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
             LayoutItem item;
             item.entity = e;
             item.parentRect = parentRect;
+            if (const Parent* p = reg.try_get<Parent>(e); p && reg.valid(p->entity))
+                item.parentEntity = p->entity;
             item.rect = forced ? *forced : ComputeElementRect(*el, parentRect);
             item.canvas = canvas;
             item.canvasEntity = canvasEntity;
@@ -546,6 +646,7 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
         const glm::vec2 canvas = EffectiveCanvas(legacyConfig, targetSize);
         const Rect root{0.0f, 0.0f, canvas.x, canvas.y};
         for (const entt::entity e : reg.view<UIElement>()) {
+            if (!inDoc(e)) continue; // editor document-scoped build
             if (!underCanvas(e) && !hasElementAncestor(e)) {
                 walk(walk, e, root, canvas, entt::null, Rect{}, false, 1.0f, true, nullptr);
             }
@@ -555,7 +656,14 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
     // Canvas trees, ascending sortOrder.
     std::vector<entt::entity> canvases;
     for (const entt::entity e : reg.view<UICanvas>()) {
-        if (reg.get<UICanvas>(e).visible) canvases.push_back(e);
+        if (!inDoc(e)) continue; // editor document-scoped build
+        if (!reg.get<UICanvas>(e).visible) continue;
+        // A canvas is walked FROM ITSELF, so the UIPanel::active / element-visible
+        // gates inside the walk never see anything above it. Without this, a
+        // world-space page authored under the `Settings` screen root kept laying
+        // out (and therefore kept taking picks) after the screen was popped.
+        if (!CanvasAncestryActive(reg, e, editorView)) continue;
+        canvases.push_back(e);
     }
     std::sort(canvases.begin(), canvases.end(), [&](entt::entity a, entt::entity b) {
         const int sa = reg.get<UICanvas>(a).sortOrder;
@@ -600,7 +708,8 @@ void LayoutUI(Scene& scene, glm::vec2 targetSize, const CanvasConfig& legacyConf
         // Entity-keyed caches can hold dead entries after structural churn; the
         // per-entry hash makes them self-correcting, so only prune when bloated.
         if (ctx.textCache.size() > 4 * (ctx.layout.size() + 16)) ctx.textCache.clear();
-        if (ctx.surfaceInv.size() > 64) ctx.surfaceInv.clear();
+        // (surfaceInv is pruned per-pick by stamp in ui::PickWorldPage - a blunt
+        // clear here re-inverted every live page on any UI structure change.)
     }
     LayoutUIImpl(scene, targetSize, legacyConfig, ctx.children, ctx.layout);
 }
@@ -614,20 +723,29 @@ static bool IsInteractive(UIElement::Type t) {
 
 // One laid-out interactive element vs the resolved pointer (shared by the
 // legacy and cached interaction paths). Returns true when any flag was touched.
+// `setHover` is false for the element that only receives the WHEEL (a ScrollView
+// under a Button): the hover highlight still belongs to exactly one element.
 static bool ApplyPointerToElement(UIElement& el, const LayoutItem& item,
                                   glm::vec2 pointer, bool pressed, bool down,
-                                  f32 wheel) {
+                                  f32 wheel, bool setHover = true) {
     // Disabled widgets and non-interactive UICanvasGroup subtrees ignore the
     // pointer entirely (no hover, no click). Return false so the caller doesn't
     // add them to the touched list.
     if (!el.enabled || !item.groupInteractive) {
         el.hovered = false;
+        el.held = false;
         return false;
     }
     // Content clipped away by an ancestor ScrollView can't be hovered/clicked.
     if (item.hasClip && !item.clip.Contains(pointer)) return false;
     const bool over = item.rect.Contains(pointer);
-    el.hovered = over;
+    if (setHover) el.hovered = over;
+    // PRESS state, for as long as the button is down over the element. This is what
+    // makes a 3D button look pressed while the player holds Interact; `clicked` is
+    // one frame and would flicker. Not gated on `setHover`: the wheel-only target
+    // is not being pressed either way, and this keeps "held" and "hovered" the same
+    // element. RELEASE needs no flag - it is this going false.
+    if (setHover) el.held = over && down;
     bool touched = over;
     switch (el.type) {
         case UIElement::Type::Button:
@@ -697,6 +815,136 @@ static bool ApplyPointerToElement(UIElement& el, const LayoutItem& item,
     return touched;
 }
 
+// ONE WINNER PER POINTER PER FRAME - the shared hit-test, used by both the legacy
+// and the cached interaction paths.
+//
+// Before this, EVERY overlapping element under the pointer hovered and clicked:
+// there was no topmost rule, no break, no consumed flag, so a Button drawn over a
+// Toggle pressed both, and a menu overlay clicked straight through to whatever sat
+// behind it. Three rules, in order:
+//
+//   1. A LATCHED DRAG CANNOT BE STOLEN. A Slider grabbed last frame keeps the
+//      pointer while the button is held, even when the pointer leaves its track
+//      and even if something else is now on top.
+//   2. TOPMOST WINS, and SCREEN SPACE BEATS WORLD SPACE. LayoutUI emits in draw
+//      order (canvas-less roots, then canvases by ascending sortOrder, depth-first
+//      parents-before-children), so topmost = the LAST eligible item - hence the
+//      reverse walk. A screen overlay is by definition in front of the 3D world,
+//      so a screen winner suppresses every world page this frame.
+//   3. THE WHEEL BUBBLES SEPARATELY. Scroll lists are made of buttons; if the
+//      wheel followed the hover winner, a list would stop scrolling wherever a
+//      Button happened to be under the cursor. The wheel goes to the topmost
+//      ScrollView under the pointer, which may be an ancestor of the hover winner.
+static void ApplyPointerPass(Scene& scene, const std::vector<LayoutItem>& layout,
+                             glm::vec2 pointerNorm, const PointerState* pointers,
+                             bool pressed, bool down, f32 wheel,
+                             std::vector<entt::entity>* touched) {
+    auto& reg = scene.Registry();
+    const bool hasPointer = pointerNorm.x >= 0.0f && pointerNorm.y >= 0.0f;
+    const bool editorView = scene.EditorView();
+    // Reticle mode: world pages are pressed with the Interact action, not LMB.
+    const bool worldOverride = pointers && pointers->worldButtonOverride;
+    const bool worldPressed = worldOverride ? pointers->worldPressed : pressed;
+    const bool worldDown = worldOverride ? pointers->worldDown : down;
+
+    // Resolves an item to its pointer position; false = this item is not a
+    // candidate at all (invisible, non-interactive, editor-hidden, or its canvas
+    // has no pointer this frame).
+    const auto resolve = [&](const LayoutItem& item, glm::vec2& pointer,
+                             bool& world) -> bool {
+        if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) return false;
+        const UIElement& el = reg.get<UIElement>(item.entity);
+        if (!el.visible || !IsInteractive(el.type)) return false;
+        if (editorView && scene.IsEditorHidden(item.entity)) return false;
+        world = item.canvasEntity != entt::null && reg.valid(item.canvasEntity) &&
+                reg.all_of<UICanvas>(item.canvasEntity) &&
+                reg.get<UICanvas>(item.canvasEntity).worldSpace;
+        if (world) {
+            if (!pointers) return false;
+            const auto pit =
+                pointers->worldCanvasPx.find(static_cast<u32>(item.canvasEntity));
+            if (pit == pointers->worldCanvasPx.end()) return false;
+            pointer = pit->second;
+        } else {
+            if (!hasPointer) return false;
+            pointer = pointerNorm * item.canvas;
+        }
+        return true;
+    };
+    // Eligible AND actually under the pointer.
+    const auto over = [&](const LayoutItem& item, glm::vec2 pointer) -> bool {
+        const UIElement& el = reg.get<UIElement>(item.entity);
+        if (!el.enabled || !item.groupInteractive) return false;
+        if (item.hasClip && !item.clip.Contains(pointer)) return false;
+        return item.rect.Contains(pointer);
+    };
+
+    const usize n = layout.size();
+    const LayoutItem* winner = nullptr;   // hover / press / drag
+    glm::vec2 winnerPointer{0.0f};
+    bool winnerWorld = false;
+    const LayoutItem* wheelItem = nullptr; // wheel only
+    glm::vec2 wheelPointer{0.0f};
+    bool wheelWorld = false;
+
+    // 1. Latched drag.
+    for (usize i = n; i-- > 0;) {
+        const LayoutItem& item = layout[i];
+        glm::vec2 p; bool w = false;
+        if (!resolve(item, p, w)) continue;
+        const UIElement& el = reg.get<UIElement>(item.entity);
+        if (!el.dragging || !el.enabled || !item.groupInteractive) continue;
+        if (!(w ? worldDown : down)) continue;
+        winner = &item; winnerPointer = p; winnerWorld = w;
+        break;
+    }
+    // 2. Topmost, screen space before world space.
+    for (int space = 0; space < 2 && !winner; ++space) {
+        for (usize i = n; i-- > 0;) {
+            const LayoutItem& item = layout[i];
+            glm::vec2 p; bool w = false;
+            if (!resolve(item, p, w)) continue;
+            if (w != (space == 1)) continue;
+            if (!over(item, p)) continue;
+            winner = &item; winnerPointer = p; winnerWorld = w;
+            break;
+        }
+    }
+    // 3. Wheel target: topmost ScrollView under the pointer, same space priority.
+    if (wheel != 0.0f) {
+        for (int space = 0; space < 2 && !wheelItem; ++space) {
+            for (usize i = n; i-- > 0;) {
+                const LayoutItem& item = layout[i];
+                glm::vec2 p; bool w = false;
+                if (!resolve(item, p, w)) continue;
+                if (w != (space == 1)) continue;
+                if (reg.get<UIElement>(item.entity).type != UIElement::Type::ScrollView)
+                    continue;
+                if (!over(item, p)) continue;
+                wheelItem = &item; wheelPointer = p; wheelWorld = w;
+                break;
+            }
+        }
+    }
+
+    const auto apply = [&](const LayoutItem& item, glm::vec2 pointer, bool world, bool pr,
+                           bool dn, f32 wh, bool setHover) {
+        UIElement& el = reg.get<UIElement>(item.entity);
+        (void)world;
+        if (ApplyPointerToElement(el, item, pointer, pr, dn, wh, setHover) && touched)
+            touched->push_back(item.entity);
+    };
+    if (winner) {
+        const bool sameWheel = wheelItem == winner;
+        apply(*winner, winnerPointer, winnerWorld, winnerWorld ? worldPressed : pressed,
+              winnerWorld ? worldDown : down, sameWheel ? wheel : 0.0f, true);
+        if (wheelItem && !sameWheel)
+            apply(*wheelItem, wheelPointer, wheelWorld, false, false, wheel, false);
+    } else if (wheelItem) {
+        apply(*wheelItem, wheelPointer, wheelWorld, false, false, wheel, true);
+    }
+}
+
 void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
                        glm::vec2 targetSize, const CanvasConfig& config,
                        const PointerState* pointers) {
@@ -706,6 +954,8 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
     const bool pressed = input.WasMousePressed(MouseButton::Left);
     const bool down = input.IsMouseDown(MouseButton::Left);
     const f32 wheel = input.MouseWheel();
+    const bool anyDown =
+        down || (pointers && pointers->worldButtonOverride && pointers->worldDown);
 
     // Clear per-frame hover/click/changed. `dragging` persists across frames while the
     // button is held, so it's only cleared on release (below), not here.
@@ -713,34 +963,15 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
         UIElement& el = reg.get<UIElement>(e);
         el.hovered = false;
         el.clicked = false;
+        el.held = false;
         el.changed = false;
-        if (!down) el.dragging = false; // mouse released -> end any slider drag
+        if (!anyDown) el.dragging = false; // released -> end any slider drag
     }
     if (!hasPointer && !hasWorldPointer) return;
 
     static thread_local std::vector<LayoutItem> layout;
     LayoutUI(scene, targetSize, config, layout);
-    const bool editorView = scene.EditorView();
-    for (const LayoutItem& item : layout) {
-        UIElement& el = reg.get<UIElement>(item.entity);
-        if (!el.visible || !IsInteractive(el.type)) continue;
-        if (editorView && scene.IsEditorHidden(item.entity)) continue; // editor-hidden
-        // Resolve the pointer for THIS element's canvas: a world-space canvas
-        // uses its ray-picked canvas-pixel pointer (absent = ray missed the page
-        // -> not hovered); everything else maps the screen pointer as before.
-        glm::vec2 pointer;
-        if (item.canvasEntity != entt::null && reg.all_of<UICanvas>(item.canvasEntity) &&
-            reg.get<UICanvas>(item.canvasEntity).worldSpace) {
-            if (!pointers) continue;
-            const auto pit = pointers->worldCanvasPx.find(static_cast<u32>(item.canvasEntity));
-            if (pit == pointers->worldCanvasPx.end()) continue;
-            pointer = pit->second;
-        } else {
-            if (!hasPointer) continue;
-            pointer = pointerNorm * item.canvas;
-        }
-        ApplyPointerToElement(el, item, pointer, pressed, down, wheel);
-    }
+    ApplyPointerPass(scene, layout, pointerNorm, pointers, pressed, down, wheel, nullptr);
 }
 
 void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
@@ -751,6 +982,8 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
     const bool pressed = input.WasMousePressed(MouseButton::Left);
     const bool down = input.IsMouseDown(MouseButton::Left);
     const f32 wheel = input.MouseWheel();
+    const bool anyDown =
+        down || (pointers && pointers->worldButtonOverride && pointers->worldDown);
 
     // Clear per-frame flags ONLY on the elements touched last frame (instead of
     // a full registry scan). `dragging` persists while the button is held.
@@ -759,8 +992,9 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
         UIElement& el = reg.get<UIElement>(e);
         el.hovered = false;
         el.clicked = false;
+        el.held = false;
         el.changed = false;
-        if (!down) el.dragging = false;
+        if (!anyDown) el.dragging = false;
     }
     ctx.interactives.clear();
     if (!hasPointer && !hasWorldPointer) return;
@@ -768,28 +1002,8 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
     // Hit-test against LAST frame's layout (ctx.layout, filled by BuildVertices)
     // - the effective behavior of the old two-walk code, since animations run
     // after interaction. Empty on the very first frame (nothing to hit).
-    const bool editorView = scene.EditorView();
-    for (const LayoutItem& item : ctx.layout) {
-        if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) continue;
-        UIElement& el = reg.get<UIElement>(item.entity);
-        if (!el.visible || !IsInteractive(el.type)) continue;
-        if (editorView && scene.IsEditorHidden(item.entity)) continue;
-        glm::vec2 pointer;
-        if (item.canvasEntity != entt::null && reg.valid(item.canvasEntity) &&
-            reg.all_of<UICanvas>(item.canvasEntity) &&
-            reg.get<UICanvas>(item.canvasEntity).worldSpace) {
-            if (!pointers) continue;
-            const auto pit =
-                pointers->worldCanvasPx.find(static_cast<u32>(item.canvasEntity));
-            if (pit == pointers->worldCanvasPx.end()) continue;
-            pointer = pit->second;
-        } else {
-            if (!hasPointer) continue;
-            pointer = pointerNorm * item.canvas;
-        }
-        if (ApplyPointerToElement(el, item, pointer, pressed, down, wheel))
-            ctx.interactives.push_back(item.entity);
-    }
+    ApplyPointerPass(scene, ctx.layout, pointerNorm, pointers, pressed, down, wheel,
+                     &ctx.interactives);
 }
 
 static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
@@ -797,7 +1011,8 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
                               glm::vec2 targetSize, const CanvasConfig& config,
                               std::vector<rhi::UIVertex>& out,
                               std::vector<WorldUIBatch>* worldOut,
-                              const std::vector<LayoutItem>& layout, UIContext* ctx) {
+                              const std::vector<LayoutItem>& layout, UIContext* ctx,
+                              bool allToOut = false) {
     out.clear();
     SharedFont().Initialize(renderer); // lazy one-time bake (preload usually beat us)
 
@@ -826,8 +1041,12 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
         if (editorView && scene.IsEditorHidden(item.entity)) continue; // editor-hidden
         // Route: world-canvas items -> that canvas's texture batch; no worldOut
         // (boot splash) or no RT yet -> skip them (never the screen overlay).
+        // `allToOut` (the editor's document-scoped authoring build) bypasses the
+        // routing entirely: ONE buffer, world-space canvases included, because the
+        // authoring surface IS a single texture and a page the author is editing
+        // must be visible on it.
         std::vector<rhi::UIVertex>* dest = &out;
-        if (item.canvasEntity != entt::null) {
+        if (!allToOut && item.canvasEntity != entt::null) {
             if (const UICanvas* c = reg.try_get<UICanvas>(item.canvasEntity);
                 c && c->worldSpace) {
                 const auto bit = worldBatch.find(static_cast<u32>(item.canvasEntity));
@@ -885,11 +1104,15 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
         const auto partTex = [&](const std::string& rel) -> u32 {
             return rel.empty() ? 0u : LoadUITexture(renderer, assetsDir, rel);
         };
+        // PRESSED = the click edge OR the whole hold. `clicked` alone made the
+        // pressed skin visible for exactly one frame, which reads as a flicker on a
+        // screen button and as nothing at all on a 3D button the player is holding.
+        const bool pressedState = el.clicked || el.held;
         const auto stateFill = [&](const glm::vec4& base) -> glm::vec4 {
             glm::vec4 f = base;
             if (disabled)
                 f = el.disabledColor.a > 0.0f ? el.disabledColor : base;
-            else if (el.clicked)
+            else if (pressedState)
                 f = el.pressedColor.a > 0.0f ? el.pressedColor
                                              : base * glm::vec4(0.72f, 0.72f, 0.72f, 1.0f);
             else if (el.hovered)
@@ -935,7 +1158,7 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
                 std::string activeRel = el.texture;
                 const std::string* stateRel = nullptr;
                 if (disabled && !el.disabledTexture.empty()) stateRel = &el.disabledTexture;
-                else if (el.clicked && !el.pressedTexture.empty()) stateRel = &el.pressedTexture;
+                else if (pressedState && !el.pressedTexture.empty()) stateRel = &el.pressedTexture;
                 else if (el.hovered && !el.hoverTexture.empty()) stateRel = &el.hoverTexture;
                 if (stateRel) {
                     const u32 t = partTex(*stateRel);
@@ -1186,6 +1409,53 @@ void BuildVertices(Scene& scene, Renderer& renderer,
     ctx.stats.verts = static_cast<u32>(out.size());
 }
 
+void BuildDocumentVertices(Scene& scene, Renderer& renderer,
+                           const std::filesystem::path& assetsDir,
+                           glm::vec2 targetSize, const CanvasConfig& docConfig,
+                           u32 doc, std::vector<rhi::UIVertex>& out,
+                           std::vector<LayoutItem>& outLayout) {
+    out.clear();
+    outLayout.clear();
+    if (doc == 0) return;
+    auto& reg = scene.Registry();
+
+    // LayoutUIImpl WRITES contentExtent/viewExtent on ScrollViews (the auto
+    // content measurement the wheel clamp and auto-scroll read). This is an EXTRA
+    // layout pass, at the AUTHORING canvas size, inside a frame whose runtime pass
+    // already ran - so snapshot those two fields and put them back, or a document
+    // with a ScrollView would have its runtime scroll limits follow the editor
+    // panel's canvas for a frame. Nothing else in the layout or the emission
+    // writes to a UIElement (verified), so this is the whole exposure.
+    struct SavedScroll {
+        entt::entity e;
+        glm::vec2 content;
+        glm::vec2 view;
+    };
+    static thread_local std::vector<SavedScroll> saved;
+    saved.clear();
+    for (const entt::entity e : reg.view<UIElement>()) {
+        const UIElement& el = reg.get<UIElement>(e);
+        if (el.type == UIElement::Type::ScrollView)
+            saved.push_back({e, el.contentExtent, el.viewExtent});
+    }
+
+    // Uncached children map (the editor's own pass must not touch the runtime
+    // UIContext, and one map rebuild for one document is nothing).
+    static thread_local std::unordered_map<u32, std::vector<entt::entity>> children;
+    BuildChildrenMap(reg, children);
+    LayoutUIImpl(scene, targetSize, docConfig, children, outLayout, doc);
+    BuildVerticesImpl(scene, renderer, assetsDir, targetSize, docConfig, out,
+                      /*worldOut*/ nullptr, outLayout, /*ctx*/ nullptr,
+                      /*allToOut*/ true);
+
+    for (const SavedScroll& s : saved) {
+        if (UIElement* el = reg.try_get<UIElement>(s.e)) {
+            el->contentExtent = s.content;
+            el->viewExtent = s.view;
+        }
+    }
+}
+
 void ClearTextureCache(Scene* scene) {
     UITexCache().clear(); // path->index cache (project switch / re-import)
     if (!scene) return;
@@ -1251,6 +1521,360 @@ void PreloadUIAssets(Scene& scene, Renderer& renderer,
         HBE_INFO("UI preload: {} texture ref(s), {} font(s) in {:.1f} ms.", textures,
                  fonts, ms);
     }
+}
+
+// --- --test-uisolve: the direct-manipulation math gate ----------------------
+//
+// Everything the dedicated `.hbui` editor's drag loop does reduces to
+// ComputeElementRect / SolveElementFromRect plus one classification
+// (LayoutGroupOwnership). That is the whole pipeline minus the mouse, and it is
+// genuinely headless - so it is tested, rather than eyeballed.
+bool ManipulationSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const std::string& what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("uisolve: FAILED - {}", what);
+        }
+    };
+    const auto near2 = [](glm::vec2 a, glm::vec2 b, f32 eps = 0.002f) {
+        return std::fabs(a.x - b.x) <= eps && std::fabs(a.y - b.y) <= eps;
+    };
+    const auto nearRect = [&](const Rect& a, const Rect& b, f32 eps = 0.002f) {
+        return near2({a.x0, a.y0}, {b.x0, b.y0}, eps) && near2({a.x1, a.y1}, {b.x1, b.y1}, eps);
+    };
+
+    // --- 1) SolveElementFromRect is the inverse of ComputeElementRect ---------
+    // Deterministic LCG fuzz: anchors (including inverted and degenerate ones),
+    // pivots, sizes, offsets, and parent rects that are not at the origin.
+    {
+        u32 s = 0x51ed270bu;
+        const auto rnd = [&s]() {
+            s = s * 1664525u + 1013904223u;
+            return static_cast<f32>((s >> 8) & 0xffffu) / 65535.0f;
+        };
+        const f32 anchorPick[] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+        int cases = 0;
+        for (int i = 0; i < 4000; ++i) {
+            UIElement el;
+            el.anchorMin = {anchorPick[static_cast<int>(rnd() * 4.999f)],
+                            anchorPick[static_cast<int>(rnd() * 4.999f)]};
+            el.anchorMax = {anchorPick[static_cast<int>(rnd() * 4.999f)],
+                            anchorPick[static_cast<int>(rnd() * 4.999f)]};
+            el.pivot = {rnd(), rnd()};
+            const Rect parent{rnd() * 400.0f - 200.0f, rnd() * 400.0f - 200.0f, 0.0f, 0.0f};
+            const Rect p{parent.x0, parent.y0, parent.x0 + 100.0f + rnd() * 1800.0f,
+                         parent.y0 + 100.0f + rnd() * 1000.0f};
+            // A target rect the drag loop could plausibly ask for, including ones
+            // outside the parent (dragging an element off the edge is legal).
+            const f32 w = 8.0f + rnd() * 900.0f, h = 8.0f + rnd() * 500.0f;
+            const f32 x = p.x0 + rnd() * 1400.0f - 300.0f;
+            const f32 y = p.y0 + rnd() * 900.0f - 200.0f;
+            const Rect desired{x, y, x + w, y + h};
+
+            const glm::vec2 aMin = el.anchorMin, aMax = el.anchorMax, piv = el.pivot;
+            SolveElementFromRect(el, p, desired);
+            expect(el.anchorMin == aMin && el.anchorMax == aMax && el.pivot == piv,
+                   "a solve changed the anchors or the pivot");
+            // UNCONDITIONAL: the inverse holds for any `desired` with a
+            // non-negative size, including an INVERTED anchor region (anchorMax <
+            // anchorMin), because both sides clamp regionSize the same way. No
+            // case is skipped - if that ever stops being true the drag loop has a
+            // silent dead zone and this must fail rather than filter.
+            expect(nearRect(ComputeElementRect(el, p), desired),
+                   "solve -> compute did not reproduce the rect");
+            ++cases;
+        }
+        expect(cases == 4000, "the fuzz did not run every case");
+    }
+
+    // --- 2) fullscreen is a no-op on BOTH sides ------------------------------
+    {
+        UIElement el;
+        el.fullscreen = true;
+        el.offset = {11.0f, 22.0f};
+        el.size = {33.0f, 44.0f};
+        const Rect p{10.0f, 20.0f, 1930.0f, 1100.0f};
+        expect(nearRect(ComputeElementRect(el, p), p), "fullscreen rect is not the parent's");
+        SolveElementFromRect(el, p, Rect{0.0f, 0.0f, 5.0f, 5.0f});
+        expect(el.offset == glm::vec2(11.0f, 22.0f) && el.size == glm::vec2(33.0f, 44.0f),
+               "solving a fullscreen element wrote to it");
+    }
+
+    // --- 3) RE-ANCHORING: write the anchors, re-solve the SAME rect ----------
+    // This IS the anchor widget: presets and the draggable diamonds both work by
+    // keeping the rect the author can see and re-deriving offset/size for the new
+    // anchors. If it is not bit-stable the element visibly jumps on every preset
+    // click, so the guarantee is pinned at full float precision, not an epsilon.
+    {
+        const Rect p{0.0f, 0.0f, 1920.0f, 1080.0f};
+        const glm::vec2 presets[] = {{0, 0}, {0.5f, 0}, {1, 0}, {0, 0.5f}, {0.5f, 0.5f},
+                                     {1, 0.5f}, {0, 1}, {0.5f, 1}, {1, 1}};
+        UIElement el;
+        el.anchorMin = el.anchorMax = {0.5f, 0.5f};
+        el.pivot = {0.5f, 0.5f};
+        el.size = {320.0f, 96.0f};
+        el.offset = {-40.0f, 210.0f};
+        const Rect start = ComputeElementRect(el, p);
+        for (const glm::vec2 a : presets) {
+            // point anchors
+            const Rect keep = ComputeElementRect(el, p);
+            el.anchorMin = el.anchorMax = a;
+            el.pivot = a;
+            SolveElementFromRect(el, p, keep);
+            const Rect after = ComputeElementRect(el, p);
+            expect(after.x0 == keep.x0 && after.y0 == keep.y0 && after.x1 == keep.x1 &&
+                       after.y1 == keep.y1,
+                   "a point-anchor preset moved the element");
+        }
+        // stretch presets: an anchor SPREAD must also preserve the rect
+        const glm::vec2 spreadMin[] = {{0, 0}, {0, 0}, {0, 0.5f}};
+        const glm::vec2 spreadMax[] = {{1, 1}, {1, 0}, {1, 0.5f}};
+        for (int i = 0; i < 3; ++i) {
+            const Rect keep = ComputeElementRect(el, p);
+            el.anchorMin = spreadMin[i];
+            el.anchorMax = spreadMax[i];
+            el.pivot = (spreadMin[i] + spreadMax[i]) * 0.5f;
+            SolveElementFromRect(el, p, keep);
+            const Rect after = ComputeElementRect(el, p);
+            expect(after.x0 == keep.x0 && after.y0 == keep.y0 && after.x1 == keep.x1 &&
+                       after.y1 == keep.y1,
+                   "a stretch-anchor preset moved the element");
+        }
+        // ...and after all that churn the rect is still the one we started with.
+        expect(nearRect(ComputeElementRect(el, p), start),
+               "the rect drifted across a chain of re-anchors");
+        // A stretched element must RESPOND to a parent resize (that is the whole
+        // point of stretching) while a point-anchored one must not.
+        {
+            UIElement str;
+            str.anchorMin = {0.0f, 0.0f};
+            str.anchorMax = {1.0f, 1.0f};
+            str.pivot = {0.5f, 0.5f};
+            SolveElementFromRect(str, p, Rect{100.0f, 100.0f, 1820.0f, 980.0f});
+            const Rect wide = ComputeElementRect(str, Rect{0.0f, 0.0f, 2560.0f, 1080.0f});
+            expect(std::fabs(wide.x1 - wide.x0 - 1720.0f - 640.0f) < 0.01f,
+                   "a stretched element did not follow a wider parent");
+            UIElement pt;
+            pt.anchorMin = pt.anchorMax = {0.5f, 0.5f};
+            pt.pivot = {0.5f, 0.5f};
+            SolveElementFromRect(pt, p, Rect{100.0f, 100.0f, 420.0f, 200.0f});
+            const Rect same = ComputeElementRect(pt, Rect{0.0f, 0.0f, 2560.0f, 1080.0f});
+            expect(std::fabs(same.Size().x - 320.0f) < 0.01f &&
+                       std::fabs(same.Size().y - 100.0f) < 0.01f,
+                   "a point-anchored element resized with its parent");
+        }
+    }
+
+    // --- 4) the snap helper is idempotent -----------------------------------
+    // The editor snaps a candidate coordinate to a grid every frame of a drag; a
+    // non-idempotent snap makes a held drag creep.
+    {
+        const auto snap = [](f32 v, f32 step) { return std::round(v / step) * step; };
+        for (int i = -400; i <= 400; ++i) {
+            const f32 v = static_cast<f32>(i) * 1.37f;
+            for (const f32 step : {1.0f, 4.0f, 8.0f, 25.0f}) {
+                const f32 a = snap(v, step);
+                expect(snap(a, step) == a, "snap is not idempotent");
+            }
+        }
+    }
+
+    // --- 5) LayoutGroupOwnership vs what LayoutUI ACTUALLY did ---------------
+    // The predicate exists to stop the editor writing a rect layout discards, so
+    // it is cross-checked against the real layout walk instead of against a
+    // second copy of the escape rule.
+    {
+        for (int k = 0; k < 3; ++k) {
+            Scene scene;
+            auto& reg = scene.Registry();
+            const entt::entity root = scene.CreateEntity("root");
+            UIElement& rel = reg.emplace<UIElement>(root);
+            rel.type = UIElement::Type::Panel;
+            rel.anchorMin = {0.0f, 0.0f};
+            rel.anchorMax = {0.0f, 0.0f};
+            rel.pivot = {0.0f, 0.0f};
+            rel.size = {800.0f, 600.0f};
+            UILayoutGroup& lg = reg.emplace<UILayoutGroup>(root);
+            lg.kind = static_cast<UILayoutGroup::Kind>(k);
+            lg.spacing = 6.0f;
+            lg.columns = 2;
+            lg.cellSize = {120.0f, 40.0f};
+
+            // three managed children + one stretch-class escapee + one fullscreen
+            entt::entity kids[5];
+            for (int i = 0; i < 5; ++i) {
+                kids[i] = scene.CreateEntity("kid");
+                reg.emplace<Parent>(kids[i]).entity = root;
+                UIElement& el = reg.emplace<UIElement>(kids[i]);
+                el.type = UIElement::Type::Label;
+                el.anchorMin = el.anchorMax = {0.0f, 0.0f};
+                el.pivot = {0.0f, 0.0f};
+                el.size = {90.0f + static_cast<f32>(i) * 7.0f, 30.0f};
+                el.offset = {17.0f * static_cast<f32>(i + 1), 300.0f}; // ignored if managed
+            }
+            reg.get<UIElement>(kids[3]).anchorMax = {1.0f, 0.0f}; // stretch on x
+            reg.get<UIElement>(kids[4]).fullscreen = true;
+
+            std::vector<LayoutItem> layout;
+            CanvasConfig cfg;
+            cfg.mode = ScaleMode::Stretch;
+            cfg.refWidth = 1920.0f;
+            cfg.refHeight = 1080.0f;
+            LayoutUI(scene, glm::vec2(1920.0f, 1080.0f), cfg, layout);
+
+            const auto itemFor = [&](entt::entity e) -> const LayoutItem* {
+                for (const LayoutItem& it : layout)
+                    if (it.entity == e) return &it;
+                return nullptr;
+            };
+            const LayoutItem* rit = itemFor(root);
+            expect(rit != nullptr, "the layout-group root did not lay out");
+            if (!rit) continue;
+
+            for (int i = 0; i < 5; ++i) {
+                const LayoutOwnership own = LayoutGroupOwnership(scene, kids[i]);
+                const LayoutItem* it = itemFor(kids[i]);
+                expect(it != nullptr, "a layout-group child did not lay out");
+                if (!it) continue;
+                // What the child's OWN RectTransform would have produced.
+                const Rect self = ComputeElementRect(reg.get<UIElement>(kids[i]), it->parentRect);
+                const bool overwritten = !nearRect(self, it->rect, 0.01f);
+                if (i < 3) {
+                    expect(own.positionOwned,
+                           "a group-placed child was reported as authorable");
+                    expect(overwritten, "layout did NOT overwrite a rect we refuse to edit");
+                    expect(own.group == root, "the reported owning group is wrong");
+                    expect(own.sizeOwned == (k == 2), "sizeOwned disagrees with Grid-ness");
+                    if (k == 2) {
+                        expect(near2(it->rect.Size(), lg.cellSize, 0.01f),
+                               "a Grid slot is not cellSize");
+                    } else {
+                        expect(near2(it->rect.Size(), self.Size(), 0.01f),
+                               "a Vertical/Horizontal slot did not keep the child's size");
+                    }
+                } else {
+                    expect(!own.positionOwned,
+                           "a stretch/fullscreen escapee was reported as group-owned");
+                    expect(!overwritten,
+                           "layout overwrote a rect the predicate calls authorable");
+                }
+            }
+            // The group element itself: fitContent off here, so its own rect is a
+            // pure ComputeElementRect result and authorable.
+            expect(!LayoutGroupOwnership(scene, root).selfFitsContent,
+                   "a non-fitContent group reported itself as content-fitted");
+            expect(!LayoutGroupOwnership(scene, root).positionOwned,
+                   "a root reported a position owner");
+        }
+        // fitContent: the group's own far edges ARE rewritten after its children.
+        {
+            Scene scene;
+            auto& reg = scene.Registry();
+            const entt::entity root = scene.CreateEntity("root");
+            UIElement& rel = reg.emplace<UIElement>(root);
+            rel.anchorMin = rel.anchorMax = {0.0f, 0.0f};
+            rel.pivot = {0.0f, 0.0f};
+            rel.size = {40.0f, 40.0f}; // deliberately too small for its children
+            UILayoutGroup& lg = reg.emplace<UILayoutGroup>(root);
+            lg.kind = UILayoutGroup::Kind::Vertical;
+            lg.fitContent = true;
+            for (int i = 0; i < 3; ++i) {
+                const entt::entity kid = scene.CreateEntity("kid");
+                reg.emplace<Parent>(kid).entity = root;
+                UIElement& el = reg.emplace<UIElement>(kid);
+                el.anchorMin = el.anchorMax = {0.0f, 0.0f};
+                el.pivot = {0.0f, 0.0f};
+                el.size = {200.0f, 50.0f};
+            }
+            std::vector<LayoutItem> layout;
+            CanvasConfig cfg;
+            cfg.mode = ScaleMode::Stretch;
+            LayoutUI(scene, glm::vec2(1920.0f, 1080.0f), cfg, layout);
+            const LayoutOwnership own = LayoutGroupOwnership(scene, root);
+            expect(own.selfFitsContent, "a fitContent group did not report itself");
+            bool grew = false;
+            for (const LayoutItem& it : layout)
+                if (it.entity == root) grew = it.rect.Size().y > 60.0f;
+            expect(grew, "fitContent did not rewrite the group's own far edge");
+        }
+        // NESTED: a fitContent group that is ITSELF a managed child of another
+        // group - the ordinary settings-menu shape (a column of fit-to-content
+        // rows). Both ownerships apply at once, and the editor's Editable() used to
+        // return on the first one and offer resize handles whose write layout threw
+        // away on the same frame.
+        {
+            Scene scene;
+            auto& reg = scene.Registry();
+            const entt::entity outer = scene.CreateEntity("outer");
+            {
+                UIElement& el = reg.emplace<UIElement>(outer);
+                el.anchorMin = el.anchorMax = {0.0f, 0.0f};
+                el.pivot = {0.0f, 0.0f};
+                el.size = {800.0f, 600.0f};
+                UILayoutGroup& lg = reg.emplace<UILayoutGroup>(outer);
+                lg.kind = UILayoutGroup::Kind::Vertical;
+                lg.spacing = 4.0f;
+            }
+            const entt::entity row = scene.CreateEntity("row");
+            reg.emplace<Parent>(row).entity = outer;
+            {
+                UIElement& el = reg.emplace<UIElement>(row);
+                el.anchorMin = el.anchorMax = {0.0f, 0.0f};
+                el.pivot = {0.0f, 0.0f};
+                el.size = {40.0f, 40.0f}; // deliberately smaller than its children
+                UILayoutGroup& lg = reg.emplace<UILayoutGroup>(row);
+                lg.kind = UILayoutGroup::Kind::Horizontal;
+                lg.fitContent = true;
+            }
+            for (int i = 0; i < 2; ++i) {
+                const entt::entity cell = scene.CreateEntity("cell");
+                reg.emplace<Parent>(cell).entity = row;
+                UIElement& el = reg.emplace<UIElement>(cell);
+                el.anchorMin = el.anchorMax = {0.0f, 0.0f};
+                el.pivot = {0.0f, 0.0f};
+                el.size = {150.0f, 30.0f};
+            }
+            const LayoutOwnership own = LayoutGroupOwnership(scene, row);
+            expect(own.positionOwned && own.selfFitsContent,
+                   "a fitContent group inside another group must report BOTH "
+                   "ownerships - the editor combines them to decide what may be "
+                   "dragged");
+            expect(!own.sizeOwned, "a Horizontal parent does not own its child's size");
+
+            std::vector<LayoutItem> layout;
+            CanvasConfig cfg;
+            cfg.mode = ScaleMode::Stretch;
+            LayoutUI(scene, glm::vec2(1920.0f, 1080.0f), cfg, layout);
+            const LayoutItem* rowIt = nullptr;
+            for (const LayoutItem& it : layout)
+                if (it.entity == row) rowIt = &it;
+            expect(rowIt != nullptr, "the nested group did not lay out");
+            // THE GATE: its authored 40x40 is honoured by NEITHER axis - the parent
+            // group places it and fitContent sizes it - so an editor that offered a
+            // resize would be writing into a field layout overwrites every frame.
+            if (rowIt)
+                expect(rowIt->rect.Size().x > 200.0f,
+                       "fitContent did not rewrite a NESTED group's far edge (the "
+                       "resize refusal depends on this)");
+        }
+        // No group at all: nothing is owned.
+        {
+            Scene scene;
+            auto& reg = scene.Registry();
+            const entt::entity a = scene.CreateEntity("a");
+            reg.emplace<UIElement>(a);
+            const entt::entity b = scene.CreateEntity("b");
+            reg.emplace<Parent>(b).entity = a;
+            reg.emplace<UIElement>(b);
+            expect(!LayoutGroupOwnership(scene, b).positionOwned,
+                   "a plain parent was reported as a layout group");
+            expect(!LayoutGroupOwnership(scene, entt::null).positionOwned,
+                   "entt::null was reported as owned");
+        }
+    }
+
+    return ok;
 }
 
 } // namespace hbe::ui

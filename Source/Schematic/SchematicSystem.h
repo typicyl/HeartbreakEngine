@@ -73,11 +73,39 @@ void RegisterBakedSchematics();
 inline f32 BakedF(const Value& v) { return v.type == PinType::Bool ? (v.b ? 1.0f : 0.0f) : v.f; }
 // Bool view of a Value (non-zero floats are true).
 inline bool BakedB(const Value& v) { return v.type == PinType::Bool ? v.b : (v.f != 0.0f); }
-// Entity an Entity-typed Value refers to; an unset/invalid one resolves to `self`.
-inline entt::entity BakedEnt(const Value& v, entt::entity self) {
-    return (v.type == PinType::Entity && v.entity != 0xFFFFFFFFu)
-               ? static_cast<entt::entity>(v.entity)
-               : self;
+// Entity an Entity-typed Value refers to. An UNSET pin resolves to `self` (an
+// unconnected Entity input operates on the graph's own entity, which is the
+// documented behaviour). A pin that IS set but names an entity that no longer exists
+// resolves to entt::null - never to `self`, because "kill the target" must not become
+// "kill myself" the moment the target despawns.
+//
+// WHY THE REGISTRY IS A PARAMETER. `Value::entity` is raw u32 handle bits with no
+// version discipline of its own, and it can be carried across frames (a stored
+// variable, an OnDeath instigator payload). EnTT bumps an id's version on destroy, so
+// the stale handle reads as INVALID rather than as a different object - but only if
+// somebody asks. entt::registry::try_get on an invalid handle is an ENTT_ASSERT in
+// Debug and an out-of-bounds sparse-set index in Release. Despawning shards turns
+// that from a latent hazard into a routine one, so the check lives here, at the one
+// place both the interpreter and the transpiled C++ resolve a pin.
+inline entt::entity BakedEnt(const entt::registry& reg, const Value& v, entt::entity self) {
+    if (v.type == PinType::Entity && v.entity != 0xFFFFFFFFu) {
+        const entt::entity e = static_cast<entt::entity>(v.entity);
+        return reg.valid(e) ? e : entt::null;
+    }
+    return self;
+}
+
+// Component lookup that tolerates a null/dead handle. Every schematic node that
+// touches a component goes through this rather than raw try_get, for the reason
+// above. Both overloads, because the interpreter reads through a const registry for
+// its pure nodes and writes through a mutable one for its exec nodes.
+template <typename T>
+inline T* BakedGet(entt::registry& reg, entt::entity e) {
+    return (e != entt::null && reg.valid(e)) ? reg.try_get<T>(e) : nullptr;
+}
+template <typename T>
+inline const T* BakedGet(const entt::registry& reg, entt::entity e) {
+    return (e != entt::null && reg.valid(e)) ? reg.try_get<T>(e) : nullptr;
 }
 // Maps a key name ("W", "Space", "Left", ...) to a Key (KeyDown nodes / generated code).
 Key KeyFromName(const std::string& s);

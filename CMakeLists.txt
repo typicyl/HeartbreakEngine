@@ -19,6 +19,10 @@ set(HBE_CORE_SOURCES
 
 set(HBE_ASSET_SOURCES
     "Source/Assets/AssetFormats.cpp"
+    "Source/Assets/AssetRefs.cpp"
+    "Source/Assets/AssetRefsTest.cpp"
+    "Source/Assets/SlotIds.cpp"
+    "Source/Assets/SlotIdsTest.cpp"
     "Source/Assets/Fracture.cpp"
     "Source/Assets/MeshGenerator.cpp"
     "Source/Assets/StrokeGen.cpp"
@@ -38,19 +42,25 @@ set(HBE_ASSET_SOURCES
 
 set(HBE_SCENE_SOURCES
     "Source/Scene/Scene.cpp"
+    "Source/Scene/EntityGuid.cpp"
     "Source/Scene/AnimationSystem.cpp"
     "Source/Scene/CameraRig.cpp"
     "Source/Scene/CameraSystem.cpp"
     "Source/Scene/CharacterController.cpp"
     "Source/Scene/CharacterSystem.cpp"
     "Source/Scene/FacialSystem.cpp"
+    "Source/Scene/Hierarchy.cpp"
     "Source/Scene/TerrainSystem.cpp"
     "Source/Scene/PaintSystem.cpp"
     "Source/Scene/ParticleSystem.cpp"
-    "Source/Scene/Level.cpp"
+    "Source/Scene/ParticleGpuSim.cpp"
     "Source/Scene/SceneSerializer.cpp"
     "Source/Scene/SceneStreamer.cpp"
-    "Source/Scene/StreamingWorld.cpp"
+    "Source/Scene/StreamPolicy.cpp"
+    "Source/Scene/StrokeZone.cpp"
+    "Source/Scene/TagShard.cpp"
+    "Source/Scene/TagStreaming.cpp"
+    "Source/Scene/TagTable.cpp"
     "Source/Scene/WorldState.cpp")
 
 set(HBE_PHYSICS_SOURCES
@@ -58,6 +68,11 @@ set(HBE_PHYSICS_SOURCES
 
 set(HBE_NAV_SOURCES
     "Source/Navigation/GridNav.cpp")
+
+# The unified pick pass (world-UI pages + 3D interactables, one ray, one winner).
+set(HBE_INTERACT_SOURCES
+    "Source/Interaction/Pick.cpp"
+    "Source/Interaction/Interact3DTest.cpp")
 
 set(HBE_GAME_SOURCES
     "Source/Game/GameSystems.cpp"
@@ -92,6 +107,7 @@ set(HBE_UI_SOURCES
     "Source/UI/Subtitles.cpp"
     "Source/UI/UISystem.cpp"
     "Source/UI/UIAnimation.cpp"
+    "Source/UI/UIDocument.cpp"
     "Source/UI/UIManager.cpp"
     "Source/UI/UIWorld.cpp"
     "Source/UI/UIFocus.cpp"
@@ -117,7 +133,11 @@ set(HBE_GL_SOURCES     "Source/RHI/GL/GLDevice.cpp"
 # Editor-only sources (added only to hbe_editor).
 set(HBE_EDITOR_SOURCES
     "Source/Editor/Editor.cpp"
+    "Source/Editor/SaveDispatch.cpp"
+    "Source/Editor/SceneSaveTest.cpp"
+    "Source/Editor/PasteParentTest.cpp"
     "Source/Editor/DialogueEditor.cpp"
+    "Source/Editor/UIEditor.cpp"
     "Source/Editor/Importer.cpp"
     "Source/Editor/MeshThumbnail.cpp"
     "Source/Editor/MovieRender.cpp"
@@ -132,6 +152,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_SCENE_SOURCES}
     ${HBE_PHYSICS_SOURCES}
     ${HBE_NAV_SOURCES}
+    ${HBE_INTERACT_SOURCES}
     ${HBE_GAME_SOURCES}
     ${HBE_VFX_SOURCES}
     ${HBE_AUDIO_SOURCES}

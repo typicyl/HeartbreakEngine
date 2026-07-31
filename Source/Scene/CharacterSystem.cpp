@@ -145,6 +145,9 @@ void SpawnSlot(Scene& scene, Renderer& renderer, const fs::path& assetsDir, entt
 void ResolveLoadout(Cached& c, Character& ch, const std::string& loadout) {
     ch.loadout = loadout;
     ch.activeVariant.clear();
+    // Everything below is DERIVED from the .hbchar, so the map is no longer authored;
+    // the serializer must not freeze it into the scene (see Character::variantAuthored).
+    ch.variantAuthored = false;
     const CharacterLoadout* lo = c.asset.FindLoadout(loadout);
     for (const CharacterSlot& s : c.asset.slots) {
         std::string variant = c.asset.DefaultVariant(s.name);
@@ -154,6 +157,34 @@ void ResolveLoadout(Cached& c, Character& ch, const std::string& loadout) {
         }
         ch.activeVariant[s.name] = variant;
     }
+}
+
+// Unions the live parts' bounds onto the ROOT.
+//
+// Parts are parented to the root with an IDENTITY transform (skinning happens in
+// the shared skeleton's space), so their local AABBs are already in the root's
+// space and the union is exact. Without this the root - which is the entity an
+// author puts `Interactable` on, and the one docs/NarrativeSystem.md tells them to
+// use - had NO AABB at all: interact::Pick then fell back to a 0.75 m cube at the
+// rig PIVOT (the feet, half underground), so aiming at an NPC's head or chest
+// missed it entirely. Culling gets the same benefit.
+void UpdateRootBounds(entt::registry& reg, entt::entity root) {
+    const Character* ch = reg.try_get<Character>(root);
+    if (!ch) return;
+    glm::vec3 lo(1e30f), hi(-1e30f);
+    bool any = false;
+    for (const auto& [slot, part] : ch->liveParts) {
+        if (!reg.valid(part)) continue;
+        const AABB* bb = reg.try_get<AABB>(part);
+        if (!bb) continue;
+        lo = glm::min(lo, glm::min(bb->min, bb->max));
+        hi = glm::max(hi, glm::max(bb->min, bb->max));
+        any = true;
+    }
+    if (any)
+        reg.emplace_or_replace<AABB>(root, AABB{lo, hi});
+    else
+        reg.remove<AABB>(root);
 }
 
 } // namespace
@@ -166,6 +197,7 @@ void ClearParts(Scene& scene, entt::entity root) {
     for (auto& [slot, part] : ch->liveParts)
         if (reg.valid(part)) reg.destroy(part);
     ch->liveParts.clear();
+    UpdateRootBounds(reg, root);
 }
 
 void Instantiate(Scene& scene, Renderer& renderer, entt::entity root, const fs::path& assetsDir) {
@@ -197,6 +229,7 @@ void Instantiate(Scene& scene, Renderer& renderer, entt::entity root, const fs::
     ClearParts(scene, root);
     for (const CharacterSlot& s : c->asset.slots)
         SpawnSlot(scene, renderer, assetsDir, root, *c, *ch, s.name, ch->activeVariant[s.name]);
+    UpdateRootBounds(reg, root);
 }
 
 void SetLoadout(Scene& scene, Renderer& renderer, entt::entity root, const fs::path& assetsDir,
@@ -212,6 +245,7 @@ void SetLoadout(Scene& scene, Renderer& renderer, entt::entity root, const fs::p
     ClearParts(scene, root);
     for (const CharacterSlot& s : c->asset.slots)
         SpawnSlot(scene, renderer, assetsDir, root, *c, *ch, s.name, ch->activeVariant[s.name]);
+    UpdateRootBounds(reg, root);
 }
 
 void SetSlotVariant(Scene& scene, Renderer& renderer, entt::entity root, const fs::path& assetsDir,
@@ -224,6 +258,10 @@ void SetSlotVariant(Scene& scene, Renderer& renderer, entt::entity root, const f
     if (!c) return;
     ch->loadout.clear(); // now a custom loadout
     SpawnSlot(scene, renderer, assetsDir, root, *c, *ch, slot, variant);
+    // A real equip: this map is now the author's / the player's choice and MUST
+    // survive save+load, unlike a set that was merely resolved from the defaults.
+    ch->variantAuthored = true;
+    UpdateRootBounds(reg, root);
 }
 
 void ClearCache() { Cache().clear(); }

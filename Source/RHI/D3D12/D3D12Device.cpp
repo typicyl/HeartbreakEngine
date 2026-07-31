@@ -146,7 +146,11 @@ D3D12_HEAP_PROPERTIES HeapProps(D3D12_HEAP_TYPE type) {
     return p;
 }
 
-D3D12_RESOURCE_DESC BufferDesc(u64 size) {
+// `flags` defaults to NONE so every pre-existing call site is byte-identical;
+// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS is what a compute-writable
+// structured buffer needs (CreateGpuBuffer).
+D3D12_RESOURCE_DESC BufferDesc(u64 size,
+                               D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
     D3D12_RESOURCE_DESC d{};
     d.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
     d.Width = size;
@@ -156,7 +160,7 @@ D3D12_RESOURCE_DESC BufferDesc(u64 size) {
     d.Format = DXGI_FORMAT_UNKNOWN;
     d.SampleDesc.Count = 1;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    d.Flags = flags;
     return d;
 }
 
@@ -173,9 +177,10 @@ ComPtr<ID3D12Resource> CreateUploadBuffer(ID3D12Device* device, u64 size) {
 
 // Creates a DEFAULT-heap (device-local / VRAM) buffer in the given state.
 ComPtr<ID3D12Resource> CreateDefaultBuffer(ID3D12Device* device, u64 size,
-                                           D3D12_RESOURCE_STATES state) {
+                                           D3D12_RESOURCE_STATES state,
+                                           D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) {
     const D3D12_HEAP_PROPERTIES hp = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
-    const D3D12_RESOURCE_DESC rd = BufferDesc(size);
+    const D3D12_RESOURCE_DESC rd = BufferDesc(size, flags);
     ComPtr<ID3D12Resource> res;
     device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, state, nullptr,
                                     IID_PPV_ARGS(&res));
@@ -345,10 +350,20 @@ public:
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
     void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
+    bool SupportsGpuCompute() const override { return true; }
+    GpuBufferHandle CreateGpuBuffer(const GpuBufferDesc& desc) override;
+    void* MapGpuBuffer(GpuBufferHandle handle) override;
+    bool ReadGpuBuffer(GpuBufferHandle handle, void* dst, u32 bytes) override;
+    void DestroyGpuBuffer(GpuBufferHandle handle) override;
+    ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
+    void QueueCompute(const ComputeDispatch& d) override;
+    void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
     void UpdateTexture(TextureHandle handle, const TextureDesc& desc) override;
     void DrawShadowPass(const SceneView& view, const DrawItem* items, u32 count) override;
     void SetParticles(const ParticleVertex* alpha, u32 alphaCount,
                       const ParticleVertex* additive, u32 addCount) override;
+    void SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
+                         u32 count) override;
     void DrawScene(const SceneView& view, const DrawItem* items, u32 count) override;
     void DrawUIOverlay(const UIVertex* vertices, u32 count) override;
     TextureHandle CreateUITarget(u32 width, u32 height) override;
@@ -489,6 +504,56 @@ private:
     bool EnsureVolumeResources();
     void DispatchVolumeSplat();
 
+    // --- General GPU compute + GPU-writable structured buffers ----------------
+    // The generalisation of the volumetric path above: buffers a compute kernel
+    // writes and the vertex shader reads. Vulkan twin: GpuBufferVk /
+    // ComputePipelineVk / ExecuteQueuedCompute in VulkanDevice.cpp.
+    struct GpuBufferD3D12 {
+        // slots == 1 for a device-local buffer; kMaxBackBuffers for CpuWrite
+        // (per-frame ring, so the CPU can refill without racing the GPU).
+        ComPtr<ID3D12Resource> res[kMaxBackBuffers];
+        u8*  cpu[kMaxBackBuffers] = {};
+        D3D12_RESOURCE_STATES state[kMaxBackBuffers] = {};
+        u32  slots = 1;
+        u32  stride = 0;
+        u32  count = 0;
+        u32  usage = 0;
+        u64  bytes = 0;
+        // Root SRVs take any GPU virtual address, so D3D12 needs no padding and no
+        // bounded view. It still records the window Vulkan is forced to bound the
+        // descriptor by, and clamps the draw to it, so the two backends cannot
+        // disagree about the tail of an oversized batch.
+        u32  maxBindElements = 0;
+        bool alive = false;
+    };
+    struct ComputePipelineD3D12 {
+        ComPtr<ID3D12RootSignature> rootSig;
+        ComPtr<ID3D12PipelineState> pso;
+        u32 constantBytes = 0;
+        u32 uavCount = 0;
+        u32 srvCount = 0;
+        bool alive = false;
+    };
+    // Dispatch queued this frame, with its constants COPIED (the caller's pointer
+    // does not have to outlive QueueCompute).
+    struct QueuedComputeD3D12 {
+        ComputeDispatch d;
+        u8 constants[kMaxComputeConstantBytes] = {};
+    };
+    std::vector<GpuBufferD3D12>      gpuBuffers_;      // handle.id - 1
+    std::vector<u32>                 gpuBufferFree_;   // recycled indices
+    std::vector<ComputePipelineD3D12> computePipes_;   // handle.id - 1
+    QueuedComputeD3D12 computeQueue_[kMaxQueuedComputeDispatches];
+    u32 computeQueueCount_ = 0;
+    // SetVertexShaderBuffer: applied at the top of DrawScene (root param 6).
+    GpuBufferHandle vsBuffer_{};
+    u32 vsBufferFirstElement_ = 0;
+    GpuBufferD3D12* ResolveGpuBuffer(GpuBufferHandle h);
+    // Buffers live in COMMON and are promoted implicitly, but a UAV->read change
+    // needs a real barrier (promotion only happens FROM common).
+    void TransitionGpuBuffer(GpuBufferD3D12& b, u32 slot, D3D12_RESOURCE_STATES to);
+    void ExecuteQueuedCompute();
+
     // -- 3D painterly surface strokes (instanced cards, PBR-lit) ---------------
     ComPtr<ID3D12PipelineState> strokeSurfacePSO_; // depth-test LE, no write, alpha-over
     bool strokeSurfaceReady_ = false;
@@ -530,6 +595,31 @@ private:
     const ParticleVertex* particleAdd_ = nullptr;
     u32 particleAlphaCount_ = 0;
     u32 particleAddCount_ = 0;
+    // GPU vertex expansion: no vertex buffer, no input layout - the VS builds the
+    // quad from SV_VertexID out of the record buffer (Shaders/ParticleGpu.hlsl).
+    // Vulkan twin: particleGpuPipeline_ / particleGpuPipelineAdd_.
+    ComPtr<ID3D12PipelineState> particleGpuPSO_;    // alpha blend
+    ComPtr<ID3D12PipelineState> particleGpuPSOAdd_; // additive blend
+    // One group per record BUFFER (SetGpuParticles accumulates): the CpuWrite ring
+    // the CPU-simulated emitters upload into, and the device-local buffer the GPU
+    // simulation's compute pass writes. A batch carries only an element offset, so
+    // the buffer identity has to live here. Vulkan twin: the same array.
+    struct GpuParticleGroup {
+        GpuBufferHandle buffer;
+        const GpuParticleBatch* batches = nullptr;
+        u32 count = 0;
+    };
+    GpuParticleGroup particleGpuGroups_[kMaxGpuParticleGroups]{};
+    u32 particleGpuGroupCount_ = 0;
+    void DrawGpuParticleBatches(bool additive);
+    // The groups have a ONE-FRAME lifetime: `batches` points into a vector the engine
+    // rebuilds every frame, so a group that survives a frame is a dangling pointer
+    // with a stale count. DrawScene has early returns, so the clear cannot live only
+    // at its end. Vulkan's twin is the same method at the same call sites.
+    void ClearGpuParticleGroups() {
+        for (u32 g = 0; g < particleGpuGroupCount_; ++g) particleGpuGroups_[g] = {};
+        particleGpuGroupCount_ = 0;
+    }
 
     // -- Cascaded shadow maps (depth-only pass into a 2x2 atlas) -------------
     static constexpr u32 kShadowDim = 4096;     // atlas; one cascade per 2048 tile
@@ -1030,6 +1120,13 @@ void D3D12Device::BeginFrame() {
     instanceHead_ = 0;
     if (gpuProfile_) { gpuCount_ = 0; GpuMark("start"); } // GPU profiler: frame origin
     uiWorldVertexHead_ = 0; // world-UI canvases bump-allocate here across the frame
+
+    // Queued compute (GPU particle sim etc.). Runs here, at frame start, before
+    // any render target is bound - the SAME point VulkanDevice::BeginFrame runs
+    // its queue, where Vulkan's "no compute inside a render pass" rule forces it.
+    // Must follow the constantHead_ reset above: dispatch constants come out of
+    // this frame's arena.
+    ExecuteQueuedCompute();
 
     if (!viewportReady_) {
         // Legacy direct-to-swapchain path (no editor viewport).
@@ -1632,7 +1729,7 @@ bool D3D12Device::CreateMeshPipeline() {
     volRange.RegisterSpace = 6;
     volRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER params[6] = {};
+    D3D12_ROOT_PARAMETER params[7] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1662,6 +1759,17 @@ bool D3D12Device::CreateMeshPipeline() {
     params[5].DescriptorTable.NumDescriptorRanges = 1;
     params[5].DescriptorTable.pDescriptorRanges = &volRange;
     params[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // General VS-visible structured buffer (StructuredBuffer<T> gVfxRecords,
+    // t2 space1) - SetVertexShaderBuffer. A ROOT SRV, like the bone (param 3) and
+    // instance (param 4) palettes: its GPU virtual address can be offset freely
+    // per draw, which is how a per-batch record base is expressed WITHOUT a
+    // firstInstance (Vulkan's twin is a dynamic storage-buffer offset on set 2).
+    // Only shaders that declare t2 space1 read it; every other pass leaves it
+    // unbound, exactly like the volume SRV table above.
+    params[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[6].Descriptor.ShaderRegister = 2;
+    params[6].Descriptor.RegisterSpace = 1;
+    params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
     // Static samplers: s0 = anisotropic wrap (materials), s1 = linear clamp
     // (post-process sampling; wrap would bleed opposite screen edges).
@@ -1686,7 +1794,7 @@ bool D3D12Device::CreateMeshPipeline() {
     samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 6;
+    rsDesc.NumParameters = 7;
     rsDesc.pParameters = params;
     rsDesc.NumStaticSamplers = 2;
     rsDesc.pStaticSamplers = samplers;
@@ -2093,6 +2201,49 @@ bool D3D12Device::CreateMeshPipeline() {
                 return SUCCEEDED(device_->CreateGraphicsPipelineState(&pp, IID_PPV_ARGS(&out)));
             };
             ok = makeParticlePSO(false, particlePSO_) && makeParticlePSO(true, particlePSOAdd_);
+
+            // GPU-expanded variant: same blend/depth/RT state, but NO input layout
+            // and no vertex buffer - the VS reads the record buffer through root
+            // param 6 and builds the quad from SV_VertexID. Failing to build it
+            // leaves the CPU path fully intact (it is opt-in per emitter), so this
+            // is a warning, not a failure of the whole particle block.
+            const std::vector<u8> gvs = ReadBinaryFile(dir + L"ParticleGpu.vs.dxil");
+            const std::vector<u8> gps = ReadBinaryFile(dir + L"ParticleGpu.ps.dxil");
+            if (ok && !gvs.empty() && !gps.empty()) {
+                const auto makeGpuPSO = [&](bool additive, ComPtr<ID3D12PipelineState>& out) {
+                    D3D12_GRAPHICS_PIPELINE_STATE_DESC pp = pso;
+                    pp.VS = {gvs.data(), gvs.size()};
+                    pp.PS = {gps.data(), gps.size()};
+                    pp.InputLayout = {nullptr, 0}; // SV_VertexID only
+                    pp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                    pp.DepthStencilState.DepthEnable = TRUE;
+                    pp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+                    pp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+                    D3D12_RENDER_TARGET_BLEND_DESC& rt = pp.BlendState.RenderTarget[0];
+                    rt.BlendEnable = TRUE;
+                    rt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+                    rt.DestBlend = additive ? D3D12_BLEND_ONE : D3D12_BLEND_INV_SRC_ALPHA;
+                    rt.BlendOp = D3D12_BLEND_OP_ADD;
+                    rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    rt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                    rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                    if (postPipelinesReady_) {
+                        pp.BlendState.IndependentBlendEnable = TRUE;
+                        pp.BlendState.RenderTarget[1].RenderTargetWriteMask = 0;
+                        pp.BlendState.RenderTarget[2].RenderTargetWriteMask = 0;
+                    }
+                    return SUCCEEDED(device_->CreateGraphicsPipelineState(&pp, IID_PPV_ARGS(&out)));
+                };
+                if (!makeGpuPSO(false, particleGpuPSO_) || !makeGpuPSO(true, particleGpuPSOAdd_)) {
+                    HBE_WARN("[D3D12] GPU particle expansion pipeline unavailable; "
+                             "emitters with gpuExpand fall back to nothing (CPU path is "
+                             "unaffected).");
+                    particleGpuPSO_.Reset();
+                    particleGpuPSOAdd_.Reset();
+                }
+            } else if (ok) {
+                HBE_WARN("[D3D12] ParticleGpu shaders missing; GPU particle expansion off.");
+            }
         }
         for (u32 i = 0; ok && i < backBufferCount_; ++i) {
             particleVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kParticleVertexBufferSize);
@@ -3487,13 +3638,339 @@ void D3D12Device::DispatchVolumeSplat() {
     if (uavb.UAV.pResource) cmdList_->ResourceBarrier(1, &uavb);
 }
 
+// ---------------------------------------------------------------------------
+// General GPU compute + GPU-writable structured buffers
+// ---------------------------------------------------------------------------
+
+D3D12Device::GpuBufferD3D12* D3D12Device::ResolveGpuBuffer(GpuBufferHandle h) {
+    if (!h.IsValid() || h.id > gpuBuffers_.size()) return nullptr;
+    GpuBufferD3D12& b = gpuBuffers_[h.id - 1];
+    return b.alive ? &b : nullptr;
+}
+
+void D3D12Device::TransitionGpuBuffer(GpuBufferD3D12& b, u32 slot,
+                                      D3D12_RESOURCE_STATES to) {
+    // UPLOAD-heap buffers are permanently GENERIC_READ - transitioning one is
+    // invalid, so CpuWrite buffers are simply never transitioned.
+    if (b.usage & GpuBufferUsage::CpuWrite) return;
+    if (b.state[slot] == to || !b.res[slot]) return;
+    auto bar = TransitionBarrier(b.res[slot].Get(), b.state[slot], to);
+    cmdList_->ResourceBarrier(1, &bar);
+    b.state[slot] = to;
+}
+
+GpuBufferHandle D3D12Device::CreateGpuBuffer(const GpuBufferDesc& desc) {
+    if (desc.elementCount == 0 || desc.elementStride == 0) {
+        HBE_ERROR("[D3D12] CreateGpuBuffer: zero elementCount/elementStride.");
+        return {};
+    }
+    if ((desc.usage & GpuBufferUsage::ShaderWrite) && (desc.usage & GpuBufferUsage::CpuWrite)) {
+        // D3D12 forbids ALLOW_UNORDERED_ACCESS on the UPLOAD heap; a GPU-written
+        // buffer must be device-local. Rejected on both backends identically.
+        HBE_ERROR("[D3D12] CreateGpuBuffer: ShaderWrite|CpuWrite is not a legal combination.");
+        return {};
+    }
+    GpuBufferD3D12 b{};
+    b.stride = desc.elementStride;
+    b.count = desc.elementCount;
+    b.usage = desc.usage;
+    b.bytes = static_cast<u64>(desc.elementCount) * desc.elementStride;
+    b.maxBindElements = std::min(desc.maxBindElements, desc.elementCount);
+    b.slots = (desc.usage & GpuBufferUsage::CpuWrite) ? backBufferCount_ : 1u;
+    b.alive = true;
+
+    for (u32 i = 0; i < b.slots; ++i) {
+        if (desc.usage & GpuBufferUsage::CpuWrite) {
+            b.res[i] = CreateUploadBuffer(device_.Get(), b.bytes);
+            if (!b.res[i]) { HBE_ERROR("[D3D12] CreateGpuBuffer: upload alloc failed."); return {}; }
+            void* m = nullptr;
+            D3D12_RANGE noRead{0, 0};
+            b.res[i]->Map(0, &noRead, &m);
+            b.cpu[i] = static_cast<u8*>(m);
+            b.state[i] = D3D12_RESOURCE_STATE_GENERIC_READ;
+        } else {
+            const D3D12_RESOURCE_FLAGS flags =
+                (desc.usage & GpuBufferUsage::ShaderWrite)
+                    ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                    : D3D12_RESOURCE_FLAG_NONE;
+            b.res[i] = CreateDefaultBuffer(device_.Get(), b.bytes,
+                                           D3D12_RESOURCE_STATE_COMMON, flags);
+            if (!b.res[i]) { HBE_ERROR("[D3D12] CreateGpuBuffer: default alloc failed."); return {}; }
+            b.state[i] = D3D12_RESOURCE_STATE_COMMON;
+        }
+        if (desc.debugName) {
+            const std::wstring wn(desc.debugName, desc.debugName + std::strlen(desc.debugName));
+            b.res[i]->SetName(wn.c_str());
+        }
+    }
+
+    u32 index;
+    if (!gpuBufferFree_.empty()) {
+        index = gpuBufferFree_.back();
+        gpuBufferFree_.pop_back();
+        gpuBuffers_[index] = std::move(b);
+    } else {
+        index = static_cast<u32>(gpuBuffers_.size());
+        gpuBuffers_.push_back(std::move(b));
+    }
+    return GpuBufferHandle{index + 1};
+}
+
+void* D3D12Device::MapGpuBuffer(GpuBufferHandle handle) {
+    GpuBufferD3D12* b = ResolveGpuBuffer(handle);
+    if (!b || !(b->usage & GpuBufferUsage::CpuWrite)) return nullptr;
+    return b->cpu[frameIndex_ % b->slots];
+}
+
+bool D3D12Device::ReadGpuBuffer(GpuBufferHandle handle, void* dst, u32 bytes) {
+    GpuBufferD3D12* b = ResolveGpuBuffer(handle);
+    if (!b || !dst || bytes == 0 || bytes > b->bytes) return false;
+    const u32 slot = frameIndex_ % b->slots;
+    if (b->cpu[slot]) { std::memcpy(dst, b->cpu[slot], bytes); return true; }
+
+    // Device-local: flush, copy into a READBACK buffer on the synchronous upload
+    // list, wait, map. Debug/validation only (see the RHI comment).
+    WaitForGpuIdle();
+    const D3D12_HEAP_PROPERTIES hp = HeapProps(D3D12_HEAP_TYPE_READBACK);
+    const D3D12_RESOURCE_DESC rd = BufferDesc(bytes);
+    ComPtr<ID3D12Resource> staging;
+    if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&staging)))) {
+        return false;
+    }
+    uploadAlloc_->Reset();
+    uploadList_->Reset(uploadAlloc_.Get(), nullptr);
+    const D3D12_RESOURCE_STATES prev = b->state[slot];
+    if (prev != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        auto toSrc = TransitionBarrier(b->res[slot].Get(), prev,
+                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+        uploadList_->ResourceBarrier(1, &toSrc);
+    }
+    uploadList_->CopyBufferRegion(staging.Get(), 0, b->res[slot].Get(), 0, bytes);
+    if (prev != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        auto back = TransitionBarrier(b->res[slot].Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, prev);
+        uploadList_->ResourceBarrier(1, &back);
+    }
+    uploadList_->Close();
+    ID3D12CommandList* lists[] = {uploadList_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    const u64 fv = ++uploadFenceValue_;
+    queue_->Signal(uploadFence_.Get(), fv);
+    if (uploadFence_->GetCompletedValue() < fv) {
+        uploadFence_->SetEventOnCompletion(fv, uploadEvent_);
+        ::WaitForSingleObjectEx(uploadEvent_, INFINITE, FALSE);
+    }
+    void* mapped = nullptr;
+    D3D12_RANGE readRange{0, bytes};
+    if (FAILED(staging->Map(0, &readRange, &mapped)) || !mapped) return false;
+    std::memcpy(dst, mapped, bytes);
+    D3D12_RANGE noWrite{0, 0};
+    staging->Unmap(0, &noWrite);
+    return true;
+}
+
+void D3D12Device::DestroyGpuBuffer(GpuBufferHandle handle) {
+    GpuBufferD3D12* b = ResolveGpuBuffer(handle);
+    if (!b) return;
+    WaitForGpuIdle(); // may still be referenced by in-flight command lists
+    if (vsBuffer_.id == handle.id) vsBuffer_ = {};
+    for (u32 g = 0; g < particleGpuGroupCount_; ++g) {
+        if (particleGpuGroups_[g].buffer.id == handle.id) particleGpuGroups_[g] = {};
+    }
+    for (u32 i = 0; i < b->slots; ++i) {
+        if (b->cpu[i] && b->res[i]) b->res[i]->Unmap(0, nullptr);
+        b->cpu[i] = nullptr;
+        b->res[i].Reset();
+    }
+    b->alive = false;
+    gpuBufferFree_.push_back(handle.id - 1);
+}
+
+ComputePipelineHandle D3D12Device::CreateComputePipeline(const ComputePipelineDesc& desc) {
+    if (!desc.shaderName || desc.uavCount > kMaxComputeUavs || desc.srvCount > kMaxComputeSrvs ||
+        desc.constantBytes > kMaxComputeConstantBytes) {
+        HBE_ERROR("[D3D12] CreateComputePipeline: invalid desc.");
+        return {};
+    }
+    ComputePipelineD3D12 p{};
+    p.constantBytes = desc.constantBytes;
+    p.uavCount = desc.uavCount;
+    p.srvCount = desc.srvCount;
+
+    // Root signature, in the order the binding convention documents:
+    // [0] root CBV b0, [1 .. uavCount] root UAVs u0.., then root SRVs t0...
+    // Root descriptors (not tables) mean no descriptor heap is needed and each
+    // buffer's GPU virtual address can be offset freely - the same trick the
+    // bone/instance palettes use on the graphics side.
+    D3D12_ROOT_PARAMETER cp[1 + kMaxComputeUavs + kMaxComputeSrvs]{};
+    u32 n = 0;
+    cp[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    cp[n].Descriptor.ShaderRegister = 0; // b0
+    cp[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    ++n;
+    for (u32 i = 0; i < desc.uavCount; ++i, ++n) {
+        cp[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        cp[n].Descriptor.ShaderRegister = i; // u<i>
+        cp[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    for (u32 i = 0; i < desc.srvCount; ++i, ++n) {
+        cp[n].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        cp[n].Descriptor.ShaderRegister = i; // t<i>
+        cp[n].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC rd{};
+    rd.NumParameters = n;
+    rd.pParameters = cp;
+    rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; // compute: no input assembler
+    ComPtr<ID3DBlob> sig, err;
+    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+        if (err) HBE_ERROR("[D3D12] Compute RootSig ({}): {}", desc.shaderName,
+                           static_cast<const char*>(err->GetBufferPointer()));
+        return {};
+    }
+    if (FAILED(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                            IID_PPV_ARGS(&p.rootSig)))) {
+        return {};
+    }
+
+    const std::string name(desc.shaderName);
+    const std::wstring wname(name.begin(), name.end());
+    const std::wstring dir = ExecutableDir() + L"shaders\\";
+    const std::vector<u8> cs = ReadBinaryFile(dir + wname + L".cs.dxil");
+    if (cs.empty()) {
+        // The fog/ssgi precedent: a kernel missing from cmake/ShaderCompile.cmake
+        // produces no file at all. Fail loudly rather than silently dormant.
+        HBE_ERROR("[D3D12] {}.cs.dxil missing - is it registered in cmake/ShaderCompile.cmake?",
+                  name);
+        return {};
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC cpso{};
+    cpso.pRootSignature = p.rootSig.Get();
+    cpso.CS = {cs.data(), cs.size()};
+    if (FAILED(device_->CreateComputePipelineState(&cpso, IID_PPV_ARGS(&p.pso)))) {
+        HBE_ERROR("[D3D12] CreateComputePipelineState failed for {}.", name);
+        return {};
+    }
+    p.alive = true;
+    computePipes_.push_back(std::move(p));
+    HBE_INFO("[D3D12] Compute pipeline '{}' ready ({} UAV, {} SRV, {} B constants).", name,
+             desc.uavCount, desc.srvCount, desc.constantBytes);
+    return ComputePipelineHandle{static_cast<u32>(computePipes_.size())};
+}
+
+void D3D12Device::QueueCompute(const ComputeDispatch& d) {
+    if (!d.pipeline.IsValid() || d.pipeline.id > computePipes_.size()) return;
+    if (computeQueueCount_ >= kMaxQueuedComputeDispatches) {
+        HBE_WARN("[D3D12] QueueCompute: more than {} dispatches this frame; dropping.",
+                 kMaxQueuedComputeDispatches);
+        return;
+    }
+    QueuedComputeD3D12& q = computeQueue_[computeQueueCount_++];
+    q.d = d;
+    q.d.constantBytes = std::min(d.constantBytes, kMaxComputeConstantBytes);
+    if (d.constants && q.d.constantBytes) std::memcpy(q.constants, d.constants, q.d.constantBytes);
+    q.d.constants = nullptr; // the copy above is what the dispatch reads
+}
+
+// Runs every dispatch queued since the last frame. Called from BeginFrame, at the
+// same point in the frame as the Vulkan twin, so both backends' compute work sits
+// before any render pass and their GPU timelines stay comparable.
+void D3D12Device::ExecuteQueuedCompute() {
+    if (computeQueueCount_ == 0) return;
+    for (u32 qi = 0; qi < computeQueueCount_; ++qi) {
+        const QueuedComputeD3D12& q = computeQueue_[qi];
+        ComputePipelineD3D12& p = computePipes_[q.d.pipeline.id - 1];
+        if (!p.alive) continue;
+
+        // Transition every bound buffer BEFORE the root descriptors are set:
+        // barriers are queue operations, root descriptors are per-draw state.
+        GpuBufferD3D12* uav[kMaxComputeUavs] = {};
+        GpuBufferD3D12* srv[kMaxComputeSrvs] = {};
+        const u32 uavN = std::min(q.d.uavCount, p.uavCount);
+        const u32 srvN = std::min(q.d.srvCount, p.srvCount);
+        bool ok = true;
+        for (u32 i = 0; i < uavN; ++i) {
+            uav[i] = ResolveGpuBuffer(q.d.uavs[i]);
+            if (!uav[i]) { ok = false; break; }
+            TransitionGpuBuffer(*uav[i], frameIndex_ % uav[i]->slots,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
+        for (u32 i = 0; ok && i < srvN; ++i) {
+            srv[i] = ResolveGpuBuffer(q.d.srvs[i]);
+            if (!srv[i]) { ok = false; break; }
+            TransitionGpuBuffer(*srv[i], frameIndex_ % srv[i]->slots,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        if (!ok) continue;
+
+        cmdList_->SetComputeRootSignature(p.rootSig.Get());
+        cmdList_->SetPipelineState(p.pso.Get());
+        u32 rp = 0;
+        if (p.constantBytes) {
+            D3D12_GPU_VIRTUAL_ADDRESS gpu{};
+            void* cpu = AllocConstants(p.constantBytes, gpu);
+            if (!cpu) continue; // constant arena full this frame
+            // The allocation is sized by the PIPELINE's declared block; the copy is
+            // sized by the DISPATCH's. QueueCompute only clamps the latter against
+            // kMaxComputeConstantBytes, so a dispatch that passes more than its
+            // pipeline declared would run off the end of the frame constant arena.
+            std::memcpy(cpu, q.constants, std::min(q.d.constantBytes, p.constantBytes));
+            cmdList_->SetComputeRootConstantBufferView(rp, gpu);
+        }
+        ++rp;
+        for (u32 i = 0; i < uavN; ++i, ++rp) {
+            const u32 s = frameIndex_ % uav[i]->slots;
+            cmdList_->SetComputeRootUnorderedAccessView(
+                rp, uav[i]->res[s]->GetGPUVirtualAddress());
+        }
+        // The root signature reserves p.uavCount UAV params; skip any the caller
+        // left unbound so the SRV params stay at their declared indices.
+        rp += (p.uavCount - uavN);
+        for (u32 i = 0; i < srvN; ++i, ++rp) {
+            const u32 s = frameIndex_ % srv[i]->slots;
+            cmdList_->SetComputeRootShaderResourceView(
+                rp, srv[i]->res[s]->GetGPUVirtualAddress());
+        }
+        cmdList_->Dispatch(std::max(1u, q.d.groupsX), std::max(1u, q.d.groupsY),
+                           std::max(1u, q.d.groupsZ));
+
+        // UAV barriers so a following dispatch (or this frame's draws) observes
+        // the writes. The Vulkan twin does this with one VkMemoryBarrier.
+        D3D12_RESOURCE_BARRIER ub[kMaxComputeUavs]{};
+        u32 ubN = 0;
+        for (u32 i = 0; i < uavN; ++i) {
+            const u32 s = frameIndex_ % uav[i]->slots;
+            ub[ubN].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            ub[ubN].UAV.pResource = uav[i]->res[s].Get();
+            ++ubN;
+        }
+        if (ubN) cmdList_->ResourceBarrier(ubN, ub);
+    }
+    computeQueueCount_ = 0; // one frame only, like SetParticles
+}
+
+void D3D12Device::SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) {
+    vsBuffer_ = handle;
+    vsBufferFirstElement_ = firstElement;
+}
+
 void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 count) {
-    if (!meshPipelineReady_) return;
+    // Every return from here drops this frame's GPU-particle groups. They point into
+    // an engine-owned vector that is rebuilt each frame, so carrying one over would
+    // dangle - and the group array would fill up and warn-and-drop permanently.
+    if (!meshPipelineReady_) {
+        ClearGpuParticleGroups();
+        return;
+    }
     DispatchVolumeSplat(); // volumetric density splat (no-op unless enabled)
     const bool drawSky = (view.skyIndex != 0) && skyPSO_;
     // Without the post stack there is nothing to resolve, so an empty scene
     // can skip the pass entirely (legacy behavior).
-    if ((count == 0 || !items) && !drawSky && !postReady_) return;
+    if ((count == 0 || !items) && !drawSky && !postReady_) {
+        ClearGpuParticleGroups();
+        return;
+    }
 
     cmdList_->SetGraphicsRootSignature(meshRootSig_.Get());
     cmdList_->SetPipelineState(meshPSO_.Get());
@@ -3508,6 +3985,20 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         3, boneArenas_[frameIndex_]->GetGPUVirtualAddress());
     cmdList_->SetGraphicsRootShaderResourceView(
         4, instanceArenas_[frameIndex_]->GetGPUVirtualAddress());
+
+    // General VS-visible structured buffer (root param 6, t2 space1). The
+    // per-batch base is folded into the GPU virtual address, NOT into a
+    // firstInstance - see the SetVertexShaderBuffer contract in RHI.h.
+    if (GpuBufferD3D12* vb = ResolveGpuBuffer(vsBuffer_)) {
+        const u32 s = frameIndex_ % vb->slots;
+        const u64 off = static_cast<u64>(vsBufferFirstElement_) * vb->stride;
+        if (off < vb->bytes) {
+            TransitionGpuBuffer(*vb, s, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            cmdList_->SetGraphicsRootShaderResourceView(
+                6, vb->res[s]->GetGPUVirtualAddress() + off);
+        }
+    }
+    vsBuffer_ = {}; // one frame only, like SetParticles
 
     // Temporal AA: jitter the camera sub-pixel each frame so successive frames
     // sample different positions; the TAA resolve reprojects + accumulates them.
@@ -3757,11 +4248,24 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
             cmdList_->SetPipelineState(particlePSO_.Get());
             cmdList_->DrawInstanced(aN, 1, 0, 0);
         }
+        // GPU-expanded ALPHA batches ride between the two CPU draws so the overall
+        // order stays "all alpha, then all additive" - the same blend ordering the
+        // single-batch CPU path has always produced.
+        DrawGpuParticleBatches(false);
         if (addN) {
             cmdList_->SetPipelineState(particlePSOAdd_.Get());
             cmdList_->DrawInstanced(addN, 1, aN, 0);
         }
+        DrawGpuParticleBatches(true);
+    } else {
+        // No CPU billboards this frame, but there may still be GPU-expanded ones.
+        cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        DrawGpuParticleBatches(false);
+        DrawGpuParticleBatches(true);
     }
+    // One frame only, like SetParticles. Cleared here (not in the block above) so a
+    // frame with batches but no CPU verts still drops them.
+    ClearGpuParticleGroups();
 
     // GPU profiler: delta scene->here = the particle billboard draws ONLY (alpha + additive).
     // Split out of "scene" so VFX cost is measurable and regression-testable on its own.
@@ -3781,6 +4285,69 @@ void D3D12Device::SetParticles(const ParticleVertex* alpha, u32 alphaCount,
     particleAlphaCount_ = alphaCount;
     particleAdd_ = additive;
     particleAddCount_ = addCount;
+}
+
+// APPENDS a group rather than replacing one - see the contract in RHI.h. Vulkan's
+// twin is character-for-character the same body.
+void D3D12Device::SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
+                                  u32 count) {
+    if (!records.IsValid() || !batches || count == 0) return;
+    if (particleGpuGroupCount_ >= kMaxGpuParticleGroups) {
+        HBE_WARN("[D3D12] SetGpuParticles: more than {} record buffers this frame; dropping.",
+                 kMaxGpuParticleGroups);
+        return;
+    }
+    GpuParticleGroup& g = particleGpuGroups_[particleGpuGroupCount_++];
+    g.buffer = records;
+    g.batches = batches;
+    g.count = count;
+}
+
+// One draw per emitter. The per-batch base is folded into root param 6's GPU
+// VIRTUAL ADDRESS - never into a firstInstance, which is 0 here as it is on the
+// Vulkan side (see the SV_InstanceID / gl_InstanceIndex note in RHI.h). Vulkan's
+// twin expresses the identical offset as a dynamic storage-buffer offset on set 2.
+void D3D12Device::DrawGpuParticleBatches(bool additive) {
+    if (!particleGpuPSO_ || particleGpuGroupCount_ == 0) return;
+
+    bool psoSet = false;
+    for (u32 g = 0; g < particleGpuGroupCount_; ++g) {
+        const GpuParticleGroup& grp = particleGpuGroups_[g];
+        if (!grp.batches || grp.count == 0) continue;
+        GpuBufferD3D12* rb = ResolveGpuBuffer(grp.buffer);
+        if (!rb || rb->stride == 0) continue;
+
+        const u32 slot = frameIndex_ % rb->slots;
+        // The simulation buffer arrives from compute in UNORDERED_ACCESS; this is
+        // the transition that makes the VS's read of the very same bytes legal.
+        TransitionGpuBuffer(*rb, slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        const D3D12_GPU_VIRTUAL_ADDRESS base = rb->res[slot]->GetGPUVirtualAddress();
+
+        // Clamp identically to Vulkan, where the batch physically cannot exceed the
+        // descriptor's bind window. D3D12 has no such limit, so without this the two
+        // backends would draw different particle counts for an oversized batch.
+        const u32 maxCount = rb->maxBindElements > kGpuParticleEmitterElements
+                                 ? rb->maxBindElements - kGpuParticleEmitterElements
+                                 : 0u;
+        for (u32 i = 0; i < grp.count; ++i) {
+            const GpuParticleBatch& b = grp.batches[i];
+            if (b.count == 0 || (b.additive != 0) != additive) continue;
+            const u32 count = maxCount ? std::min(b.count, maxCount) : b.count;
+            const u64 off = static_cast<u64>(b.recordFirst) * rb->stride;
+            // The record block plus its particles must fit; a malformed batch is
+            // skipped rather than read out of bounds.
+            const u64 need =
+                static_cast<u64>(kGpuParticleEmitterElements + count) * rb->stride;
+            if (off + need > rb->bytes) continue;
+            if (!psoSet) {
+                cmdList_->SetPipelineState(additive ? particleGpuPSOAdd_.Get()
+                                                    : particleGpuPSO_.Get());
+                psoSet = true;
+            }
+            cmdList_->SetGraphicsRootShaderResourceView(6, base + off);
+            cmdList_->DrawInstanced(count * 6u, 1, 0, 0);
+        }
+    }
 }
 
 void D3D12Device::DrawUIOverlay(const UIVertex* vertices, u32 count) {
@@ -3863,7 +4430,15 @@ TextureHandle D3D12Device::CreateUITarget(u32 width, u32 height) {
     device_->CreateRenderTargetView(tex.Get(), &rv, rh);
 
     uiTargets_[slot] = UITarget{tex, rtvIndex, width, height, true};
-    slotTextures_[slot] = SlotTexture{tex.Get(), DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, 1};
+    // slotTextures_ is what GetTextureUIHandle builds ImGui's OWN SRV from, and for
+    // a UI target it has no other consumer (UpdateTexture and the volume-UAV paths
+    // never see one). Record it UNORM, NOT the bindless SRV's _SRGB: the target
+    // holds the UI shader's raw display-space output, and the swapchain the editor
+    // presents to is non-sRGB, so an sRGB read would DECODE once with no re-encode
+    // and the authoring canvas would render measurably darker than the same
+    // document in the Game tab. The bindless SRV above keeps _SRGB - the lit world
+    // page IS sampled as an albedo map and must decode.
+    slotTextures_[slot] = SlotTexture{tex.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1};
     textures_.push_back(tex);
     HBE_INFO("[D3D12] world-UI target {}x{} (slot {}).", width, height, slot);
     return TextureHandle{slot};

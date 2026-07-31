@@ -40,6 +40,11 @@ public:
     // Drops all bodies (e.g. when reloading a scene).
     void Clear();
 
+    // Live Jolt body count, terrain heightfields included. Diagnostics + leak
+    // checks: sculpting terrain repeatedly must not grow this (the heightfield is
+    // edited in place, so it stays at one body per terrain).
+    u32 BodyCount() const;
+
     // -- Scripting hooks ------------------------------------------------------
     // Direct body control for gameplay code. No-ops when the entity has no
     // live body yet (bodies are created lazily during Update).
@@ -91,6 +96,17 @@ public:
     bool PopContact(ContactEvent& out);
 
 private:
+    // Creates / updates / reaps the ONE static Jolt HeightFieldShape body per
+    // TerrainComponent. Runs at the top of Update (so a sculpt landing this frame is
+    // collidable this frame) and, like RigidBody creation, runs even while paused so
+    // the editor can walk and paint on terrain without pressing Simulate.
+    //
+    // Terrain deliberately does NOT go through RigidBody: a heightfield is not a
+    // triangle soup, it can be edited in place per sample block, and the old
+    // per-chunk mesh colliders were both 256x more bodies and never rebuilt after a
+    // brush stroke (collision silently diverged from the visible ground).
+    void SyncTerrainColliders(Scene& scene);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
     bool running_ = true;

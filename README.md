@@ -4,7 +4,7 @@ A from-scratch 3D game engine built on a clean, backend-agnostic **RHI (Render
 Hardware Interface)**. One renderer drives **three** graphics backends —
 **Direct3D 12**, **Vulkan**, and **OpenGL 4.6** — behind a single bindless
 interface. On top of it sits an **EnTT** ECS, **Jolt** physics, a fiber job
-system, world streaming, real-time grid-A\* navigation, a photorealistic HDR
+system, real-time grid-A\* navigation, a photorealistic HDR
 renderer, a **visual-scripting** system (schematics, transpiled to C++ for
 shipping), a branching **narrative** stack (dialogue graphs, cutscenes,
 interaction), **modular characters**, **destruction**, an **adaptive music**
@@ -34,7 +34,7 @@ editor.
 - [Rendering & photorealism](#rendering--photorealism)
 - [The painterly look](#the-painterly-look)
 - [Day / night / weather sky](#day--night--weather-sky)
-- [Scenes, levels & streaming](#scenes-levels--streaming)
+- [Scenes & levels](#scenes--levels)
 - [Schematics (visual scripting)](#schematics-visual-scripting)
 - [Gameplay systems](#gameplay-systems)
 - [Narrative: dialogue, cutscenes & interaction](#narrative-dialogue-cutscenes--interaction)
@@ -148,7 +148,6 @@ HeartbreakRuntime.exe --width 1920 --height 1080
 |---|---|
 | `--project <file.hbproj>` | Open a project directly (automation / file association) |
 | `--model <file>` | Load a glTF/GLB/OBJ/FBX/DAE/PLY/STL directly |
-| `--world <file.hbworld>` | Stream a world manifest |
 | `--import <file>` | Headless content import into the project's `Assets/` |
 | `--play` | Boot straight into play mode |
 | `--pack` | Cook asset packs and exit |
@@ -172,9 +171,10 @@ HeartbreakRuntime.exe --width 1920 --height 1080
 
 **Headless self-tests**
 
-`--navtest`, `--worldtest`, `--uiworldtest`, `--fracturetest`,
+`--navtest`, `--uiworldtest`, `--fracturetest`,
 `--destructiontest`, `--test-seamweld`, `--test-readback`, `--test-vfxstack`,
-`--test-vfxcompat`
+`--test-vfxcompat`, `--test-vfxsim`, `--test-gpucompute`, `--test-entityguid`,
+`--test-noleveltypes`
 
 **Offline capture**: `--render-movie` (see
 [Cinematics & movie rendering](#cinematics--movie-rendering)). `Esc` quits.
@@ -220,8 +220,8 @@ Source/
   Assets/      Mesh, MeshGenerator, ModelLoader (Assimp), UAF/UAP (.uaf/.uap), VFS,
                AssetFormats (the format registry), MaterialAsset (.hbmat),
                AudioEvent (.hbevent), MusicGraph (.hbmusic), Fracture (.hbfrac)
-  Scene/       EnTT ECS: Components, Scene, Level, SceneSerializer, SceneStreamer,
-               StreamingWorld, AnimationSystem, CameraSystem, CameraRig,
+  Scene/       EnTT ECS: Components, Scene, SceneSerializer, SceneStreamer,
+               EntityGuid, AnimationSystem, CameraSystem, CameraRig,
                CharacterController, TerrainSystem, PaintSystem, ParticleSystem,
                WorldState
   Vfx/         VfxTypes (attribute model), VfxStack (module stack), VfxLegacy
@@ -333,30 +333,45 @@ in **Project Settings** (time of day, day length, dynamic sky, cloud
 coverage/density, overcast, wind) and serialized in the `.hbproj`; forceable per
 run with `--time` / `--daynight` / `--clouds`.
 
-## Scenes, levels & streaming
+## Scenes & levels
 
 - **Scenes** (`.hbscene`) — JSON serialization of every component; a Scene
   manager lists them, marks the startup scene, and loads / streams / renames /
   duplicates / deletes. Serialization is a three-phase Parse → Stage →
   Instantiate, with `runtimeTags` gating runtime-only state into `.hbsave`.
-- **Levels** — a Naughty-Dog-style **level** is a pair of scene files (static +
-  dynamic) with the UI separate; `Engine::LoadLevel` composes them, and the
-  navmesh bakes the static half.
-- **World streaming** — distance-based world partition: cells (each a `.hbscene`)
-  load within `loadRadius` and unload past `unloadRadius` (hysteresis), loaded
-  **asynchronously on the job system** so streaming never stalls the frame.
-  Described by a `.hbworld` manifest.
+- **Levels** — a **level is ONE `.hbscene`**. There is no static/dynamic file
+  pair and no separate level loader: every object carries its own **Static /
+  Dynamic** tag (set in the Inspector, saved per entity), which is what the
+  navmesh filter and the painterly exemption read. UI lives in its own standalone
+  scene (the project's `uiScene`), never inside a level. Proof:
+  `--test-noleveltypes`.
+- **No world streaming yet** — the old `.hbworld` distance-based cell streamer
+  was removed; it was authored-but-unused (no project ever shipped a `.hbworld`).
+  Streaming returns as **tag streaming** (`docs/Design-TagStreaming.md`), which
+  spawns and despawns by tag rather than by cell. The measured behaviours worth
+  keeping from the old streamer — load/unload hysteresis, the one-finalize-per-frame
+  budget and its ~1–2 s jank note, and the "is the world settled" predicate — are
+  preserved verbatim in `Scene/StreamingSalvage.h`.
 - **World state** — per-area persistent state, so revisited areas remember what
   changed.
+- **Entity identity** — every entity carries a stable 64-bit **guid**, minted in
+  `Scene::CreateEntity` and serialized as `"guid"` in the `.hbscene`. It survives
+  save → load → save unchanged, and a **duplicate mints a fresh one** (copy/paste,
+  duplicate, prefab instantiate, spawner burst), so persisted per-entity state can
+  never alias two objects. Entity **names are not identity** — they are neither
+  unique nor stable. Scenes written before the field existed get a guid derived
+  deterministically from (file, entity index) on load, so they are stable across
+  reloads until the first save writes real ones. Proof: `--test-entityguid`.
 - **Prefabs** (`.hbprefab`) — save a subtree as a reusable prefab; browse and
   instantiate it (reuses the copy/paste plumbing).
 - **Keyframe animation** — AnimationTrack + a Timeline panel with
   scrubbing/keys/transport.
 
-> **Known gap:** `.hbworld` is **not** registered in `AssetFormats`, and
-> `StreamingWorld` reads it with `std::ifstream` rather than `vfs::ReadFile`, so
-> world streaming does not currently work from a packed/shipped build. Editor
-> and loose-file use are unaffected.
+> **Note:** a save/load/save cycle **reverses** a scene file's entity array
+> (`BuildSceneJson` gathers by walking EnTT pools, which iterate in reverse
+> insertion order). Content is preserved exactly — identity is the guid, not the
+> index — and two round trips return byte-for-byte to the original, but every
+> save churns the whole file in a diff.
 
 ## Schematics (visual scripting)
 
@@ -612,7 +627,7 @@ A Unity-style dockable layout: **Viewport** (scene to an offscreen target) +
 Hierarchy (drag-drop reparenting), Inspector, Asset browser (icon grid + folders,
 right-click context menu, universal drag-drop), Asset Viewer, Scenes, Audio
 Mixer, **Music**, **Art Editor**, **Schematic Editor**, **Dialogue Editor**,
-**Cutscene Timeline**, **Character Editor**, Post Process, Navigation, Streaming,
+**Cutscene Timeline**, **Character Editor**, Post Process, Navigation,
 Stats, Timeline, Project Settings. A **Window** menu shows/hides every panel with
 Show All / Reset Layout.
 
@@ -635,7 +650,7 @@ Show All / Reset Layout.
   mid-execution without blocking the worker** (the fiber parks and resumes later,
   possibly on another thread). `jobs::ParallelFor` / `Kick`+`Wait` /
   `RunDetached`. Skeletal animation poses every character across the workers, and
-  streaming loads run on them.
+  the editor's additive scene loads run on them.
 - **Navigation** — an in-house real-time **grid A\*** pathfinder (`GridNav`,
   auto-rebuilt from static geometry each frame, no bake and no external nav
   dependency); `NavigationAgent`s steer along paths with local avoidance around

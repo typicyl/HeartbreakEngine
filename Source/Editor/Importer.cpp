@@ -4,6 +4,7 @@
 #include "Assets/AssetFormats.h" // the single source of truth for source formats
 #include "Assets/MaterialAsset.h"
 #include "Assets/ModelLoader.h"
+#include "Assets/SlotIds.h" // the pack slot is assigned HERE, at import
 #include "Assets/UAF.h"
 #include "Core/Log.h"
 #include "Project/Project.h"
@@ -475,6 +476,12 @@ bool IsSupportedSource(const fs::path& path) {
 
 std::optional<fs::path> Import(const fs::path& src, const fs::path& assetsDir) {
     const std::string e = LowerExt(src);
+    // THE moment a pack slot is minted. Everything this call writes gets an id
+    // before it returns - and that is deliberately measured by "written at or
+    // after this mark" rather than "the file we return", because one model import
+    // also writes a `.uaf` per texture and a `.hbmat` per material that the
+    // caller never sees. Files older than the mark are never touched.
+    const auto importMark = slots::MarkNow();
     fs::path out = assetsDir / (src.stem().string() + ".uaf");
     // The output name is the source STEM, so different sources sharing a base name
     // (e.g. track.mp3 + track.wav, or model.glb + model.png) map to one .uaf and the
@@ -496,6 +503,22 @@ std::optional<fs::path> Import(const fs::path& src, const fs::path& assetsDir) {
     }
 
     if (!ok) return std::nullopt;
+    // Assign the pack slot(s). A RE-import keeps the number the manifest
+    // remembers for that path (overwriting a `.uaf` clears its header field), so
+    // re-importing a texture to fix its gamma does not reshuffle the packs.
+    if (Project::HasActive()) {
+        // `assetsDir` is the DESTINATION folder, which is routinely a subfolder of
+        // the project's Assets/ (the asset browser imports into wherever you are).
+        // Pack keys are relative to the ROOT, always, so stamp from there.
+        const fs::path assetsRoot = Project::Active().AssetsDir();
+        std::error_code rec;
+        const std::string rel = fs::relative(assetsDir, assetsRoot, rec).generic_string();
+        if (!rec && !rel.empty() && rel.rfind("..", 0) != 0) {
+            const u32 n = slots::StampNewAssets(assetsRoot,
+                                                Project::Active().SlotManifestPath(), importMark);
+            if (n > 1) HBE_INFO("Importer: assigned pack slots to {} new asset(s).", n);
+        }
+    }
     HBE_INFO("Importer: '{}' -> '{}'", src.filename().string(), out.filename().string());
     return out;
 }

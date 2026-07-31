@@ -3,6 +3,8 @@
 #include "Assets/VFS.h"
 #include "Core/Log.h"
 #include "Scene/PostSettingsSerialization.h"
+#include "Scene/StreamingSalvage.h" // salvage::DefaultUnloadRadius (SALVAGE 2)
+#include "Scene/TagTable.h" // tags::Normalize / Reset / SeedFromProject
 
 #include <nlohmann/json.hpp>
 
@@ -29,9 +31,36 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     s.name = j.value("name", "Untitled");
     s.startupScene = j.value("startupScene", "");
     // Legacy keys (mainMenuScene/hudScene/loadingScene) are silently ignored:
-    // those screens are UIPanels inside uiScene now.
-    s.studioLoadingScene = j.value("studioLoadingScene", "");
-    s.uiScene = j.value("uiScene", "");
+    // those screens are UIPanels inside the UI document now.
+    //
+    // The UI slots take a `.hbui` DOCUMENT and fall back to the pre-document
+    // `.hbscene` key. Unlike the three above, this fallback is NOT a silent
+    // drop - the resolved path keeps its extension and the boot sequence
+    // BRANCHES on it, running the old additive scene load for a `.hbscene` and
+    // adopting the result as a document. Silently ignoring these the way
+    // mainMenuScene is ignored would leave a half-migrated project with no menu
+    // at all, because uiManagerMode_ is set at exactly one site.
+    // Save() writes only the new keys, so the first save migrates the file.
+    s.bootDocument = j.value("bootDocument", j.value("studioLoadingScene", ""));
+    s.uiDocument = j.value("uiDocument", j.value("uiScene", ""));
+    // SCREEN LIST. `uiDocuments` (one .hbui per screen) is authoritative when
+    // present; otherwise it is SEEDED from the single-document key above, so a
+    // project that never migrates boots byte-identically to before. The struct
+    // default and the fallback here are the same value - an EMPTY vector - which
+    // is the rule this codebase has been bitten by twice.
+    s.uiDocuments.clear();
+    if (const auto it = j.find("uiDocuments"); it != j.end() && it->is_array()) {
+        for (const json& e : *it)
+            if (e.is_string() && !e.get<std::string>().empty())
+                s.uiDocuments.push_back(e.get<std::string>());
+    }
+    if (s.uiDocuments.empty()) {
+        if (!s.uiDocument.empty()) s.uiDocuments.push_back(s.uiDocument);
+    } else {
+        // The legacy mirror always names the MENU document, so the two keys can
+        // never disagree about which screen supplies `post`.
+        s.uiDocument = s.uiDocuments.front();
+    }
     s.musicGraph = j.value("musicGraph", "");
     s.musicStartState = j.value("musicStartState", "");
     // Reset before reading so a re-parse REPLACES rather than appends (the same
@@ -69,6 +98,37 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     } else {
         s.inputActions.push_back({"Interact", {Key::E, static_cast<u32>(Gamepad_X)}});
     }
+    // Streaming tags. Cleared first for the same reason inputActions is (the
+    // reused settings_ member), and NORMALIZED after the read rather than
+    // trusted: tags::Normalize is what guarantees index 0 is "Untagged", drops
+    // nameless/duplicate rows, and enforces the load/unload hysteresis band on
+    // every row (salvage::EnforceHysteresis - a degenerate band thrashes
+    // spawn/despawn every frame, so it is corrected, not warned about and kept).
+    //
+    // Absent and present-but-empty are the SAME here, deliberately, unlike
+    // inputActions: the list can never legitimately be empty, because
+    // "Untagged" has to exist for an untagged entity to mean anything. So there
+    // is nothing to seed and nothing to preserve - Normalize supplies index 0
+    // either way.
+    s.tags.clear();
+    if (const auto it = j.find("tags"); it != j.end() && it->is_array()) {
+        for (const json& jt : *it) {
+            if (!jt.is_object()) continue;
+            TagDef t;
+            t.name = jt.value("name", "");
+            t.loadRadius = jt.value("loadRadius", 120.0f);
+            t.unloadRadius = jt.value("unloadRadius", salvage::DefaultUnloadRadius(t.loadRadius));
+            t.priority = jt.value("priority", 0);
+            t.alwaysLoaded = jt.value("alwaysLoaded", false);
+            // MUST match TagDef's in-struct default (Project.h). A `.value(key, X)`
+            // fallback is a SECOND default: disagree with the struct and a tag row that
+            // omits the key silently behaves differently from a freshly created one.
+            t.autoShard = jt.value("autoShard", false);
+            t.shardCell = jt.value("shardCell", 0.0f);
+            if (!t.name.empty()) s.tags.push_back(std::move(t));
+        }
+    }
+    tags::Normalize(s.tags);
     s.audioBuses.clear();
     if (const auto it = j.find("audioBuses"); it != j.end() && it->is_array()) {
         for (const json& jb : *it) {
@@ -103,6 +163,7 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         b.packAssets = it->value("packAssets", true);
         b.compressAssets = it->value("compressAssets", true);
         b.onlyReferenced = it->value("onlyReferenced", false);
+        b.allowMissingRefs = it->value("allowMissingRefs", false);
         b.uiScaleMode = it->value("uiScaleMode", 1u);
         b.uiRefWidth = it->value("uiRefWidth", 1920u);
         b.uiRefHeight = it->value("uiRefHeight", 1080u);
@@ -173,6 +234,11 @@ bool Project::Open(const fs::path& projectFile) {
     }
 
     ParseSettings(j, settings_);
+    // The tag table is process-wide, so it MUST be rebuilt from the list we just
+    // read - an in-process project switch would otherwise keep the previous
+    // project's ids and silently mis-map every tag in the new one. Same bug class
+    // as the inputActions clear above, one level up.
+    tags::SeedFromProject(settings_.tags);
 
     projectFile_ = fs::absolute(projectFile);
     root_ = projectFile_.parent_path();
@@ -201,6 +267,7 @@ bool Project::OpenPacked(const fs::path& mountDir) {
     }
 
     ParseSettings(j, settings_);
+    tags::SeedFromProject(settings_.tags); // see Open()
     root_ = fs::absolute(mountDir);
     projectFile_ = root_ / "__project.hbproj"; // synthetic (lives in the pack)
     vfs::SetSearchRoot(AssetsDir());
@@ -219,6 +286,12 @@ bool Project::Create(const fs::path& directory, const std::string& name) {
     root_ = fs::absolute(directory);
     settings_.name = name;
     settings_.startupScene.clear();
+    // Create does not go through ParseSettings, so it resets the tag list here -
+    // otherwise a new project would inherit the previously open one's tags (and
+    // Save() below would write them into the fresh `.hbproj`).
+    settings_.tags.clear();
+    tags::Normalize(settings_.tags); // supplies "Untagged" at index 0
+    tags::SeedFromProject(settings_.tags);
     projectFile_ = root_ / (name + ".hbproj");
 
     fs::create_directories(AssetsDir(), ec);
@@ -233,8 +306,15 @@ bool Project::Save() const {
     json j;
     j["name"] = settings_.name;
     j["startupScene"] = settings_.startupScene;
-    j["studioLoadingScene"] = settings_.studioLoadingScene;
-    j["uiScene"] = settings_.uiScene;
+    // New keys only - the legacy uiScene/studioLoadingScene are read on load and
+    // dropped on the first save, which is how a project migrates itself.
+    j["bootDocument"] = settings_.bootDocument;
+    // Both keys, always. `uiDocuments` is the truth; `uiDocument` is its first
+    // entry, emitted so an older reader (or anything still keyed on the old slot)
+    // gets the MENU document rather than a silently blank slot.
+    j["uiDocuments"] = settings_.uiDocuments;
+    j["uiDocument"] = settings_.uiDocuments.empty() ? settings_.uiDocument
+                                                    : settings_.uiDocuments.front();
     j["musicGraph"] = settings_.musicGraph;
     j["musicStartState"] = settings_.musicStartState;
     const auto writeGlyphs = [](const DeviceGlyphs& g) {
@@ -261,6 +341,22 @@ bool Project::Save() const {
                            {"pad", a.defaults.pad}});
         j["inputActions"] = std::move(arr);
     }
+    {
+        // Written UNCONDITIONALLY, including "Untagged" at index 0, so the file
+        // shows the whole authored order (a tag's index IS its runtime id) and is
+        // hand-editable. A re-parse folds the "Untagged" row back into index 0
+        // via tags::Normalize rather than appending a second one.
+        json arr = json::array();
+        for (const TagDef& t : settings_.tags)
+            arr.push_back({{"name", t.name},
+                           {"loadRadius", t.loadRadius},
+                           {"unloadRadius", t.unloadRadius},
+                           {"priority", t.priority},
+                           {"alwaysLoaded", t.alwaysLoaded},
+                           {"autoShard", t.autoShard},
+                           {"shardCell", t.shardCell}});
+        j["tags"] = std::move(arr);
+    }
     j["engine"] = "HeartbreakEngine";
     j["version"] = 1;
     const BuildSettings& b = settings_.build;
@@ -275,6 +371,7 @@ bool Project::Save() const {
                   {"packAssets", b.packAssets},
                   {"compressAssets", b.compressAssets},
                   {"onlyReferenced", b.onlyReferenced},
+                  {"allowMissingRefs", b.allowMissingRefs},
                   {"uiScaleMode", b.uiScaleMode},
                   {"uiRefWidth", b.uiRefWidth},
                   {"uiRefHeight", b.uiRefHeight},

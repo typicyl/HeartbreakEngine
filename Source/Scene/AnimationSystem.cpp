@@ -21,9 +21,10 @@
 
 namespace hbe::anim {
 
-void Sample(const AnimationTrack& track, Transform& out) {
+void Sample(const AnimationTrack& track, Transform& out) { SampleAt(track, track.time, out); }
+
+void SampleAt(const AnimationTrack& track, f32 t, Transform& out) {
     if (track.keys.empty()) return;
-    const f32 t = track.time;
 
     const auto& keys = track.keys;
     if (t <= keys.front().time) {
@@ -51,7 +52,7 @@ void Sample(const AnimationTrack& track, Transform& out) {
     out.scale = glm::mix(a.scale, b.scale, f);
 }
 
-void Update(Scene& scene, f32 dt) {
+void Update(Scene& scene, f32 dt, bool simulating) {
     auto& reg = scene.Registry();
     for (const entt::entity e : reg.view<Transform, AnimationTrack>()) {
         AnimationTrack& track = reg.get<AnimationTrack>(e);
@@ -63,7 +64,11 @@ void Update(Scene& scene, f32 dt) {
                 track.time = std::fmod(track.time, track.duration);
             } else {
                 track.time = track.duration;
-                track.playing = false;
+                // `playing` is AUTHORED and SERIALIZED. Clearing it in the editor at
+                // rest wrote a runtime value over the author's - see anim::Update's
+                // header comment. Holding at the end looks identical and touches
+                // nothing the save writes.
+                if (simulating) track.playing = false;
             }
         } else if (track.time < 0.0f) { // negative speed
             track.time = track.loop ? track.time + track.duration : 0.0f;
@@ -353,7 +358,8 @@ void ClearRigCache() {
     MMCache().clear();
 }
 
-void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt) {
+void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt,
+                    bool simulating) {
     auto& reg = scene.Registry();
 
     // Each animator's work is independent (it writes only its own Animator /
@@ -371,7 +377,22 @@ void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt
         for (IKChain& chain : ik.chains) {
             if (chain.targetEntity.empty()) continue;
             const entt::entity te = FindEntityByName(scene, chain.targetEntity);
-            if (te != entt::null) chain.target = glm::vec3(scene.WorldMatrix(te)[3]);
+            chain.targetResolved = te != entt::null;
+            if (chain.targetResolved) {
+                chain.target = glm::vec3(scene.WorldMatrix(te)[3]);
+                chain.warnedUnresolved = false; // it came back
+            } else if (!chain.warnedUnresolved) {
+                // ONCE per chain per break. The `.hbscene` deliberately omits
+                // `target` while `targetEntity` is set (see IKChain), so an
+                // unresolved binding has no authored vec3 to fall back on - the
+                // solver below skips the chain rather than aim it at the world
+                // origin, and this is the only thing that says why.
+                chain.warnedUnresolved = true;
+                HBE_WARN("IK: chain '{}' targets entity '{}', which is not in the "
+                         "scene. The chain is DISABLED until it resolves (renamed, "
+                         "deleted, or in a shard that is not resident?).",
+                         chain.endJoint, chain.targetEntity);
+            }
         }
     }
 
@@ -410,7 +431,9 @@ void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt
             an.time += dt * an.speed;
             if (an.time > clip->duration) {
                 if (an.loop) an.time = std::fmod(an.time, clip->duration);
-                else { an.time = clip->duration; an.playing = false; }
+                // Same rule as anim::Update: hold, do not clear the authored flag,
+                // when the editor is merely previewing.
+                else { an.time = clip->duration; if (simulating) an.playing = false; }
             } else if (an.time < 0.0f) {
                 an.time = an.loop ? an.time + clip->duration : 0.0f;
             }
@@ -573,6 +596,10 @@ void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt
             bool any = false;
             for (const IKChain& chain : ik->chains) {
                 if (!chain.enabled || chain.weight <= 0.0f) continue;
+                // A chain bound to an entity that is not in the scene has no
+                // meaningful target (see IKChain::targetResolved): keep the animated
+                // pose rather than reach for {0,0,0}.
+                if (!chain.targetEntity.empty() && !chain.targetResolved) continue;
                 const i32 end = FindJointCanonical(skeleton, chain.endJoint);
                 if (end < 0 || static_cast<usize>(end) >= jointCount) continue;
                 const i32 mid = skeleton.joints[static_cast<usize>(end)].parent;

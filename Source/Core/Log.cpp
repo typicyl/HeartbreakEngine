@@ -2,6 +2,7 @@
 #include "Core/Log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <deque>
 #include <mutex>
@@ -35,6 +36,9 @@ void RecordLine(std::string_view message) {
 std::mutex g_fileMutex;
 std::FILE* g_logFile = nullptr;
 bool g_logFileTried = false;
+// See the note on SetTraceEnabled in Log.h: trace lines are per-frame diagnostics, and
+// every log line here is flushed and recorded into the boot screen's {log} ring.
+std::atomic<bool> g_traceEnabled{false};
 
 std::FILE* LogFile() {
     if (g_logFileTried) return g_logFile;
@@ -50,6 +54,9 @@ std::FILE* LogFile() {
     return g_logFile;
 }
 } // namespace
+
+void SetTraceEnabled(bool enabled) { g_traceEnabled.store(enabled, std::memory_order_relaxed); }
+bool TraceEnabled() { return g_traceEnabled.load(std::memory_order_relaxed); }
 
 void FlushLog() {
     std::fflush(stdout);
@@ -84,6 +91,11 @@ const char* LevelTag(LogLevel level) {
 } // namespace
 
 void LogWrite(LogLevel level, std::string_view message) {
+    // Trace off = write nothing, flush nothing, record nothing. Two unbuffered fflushes
+    // plus an OutputDebugStringA per line is not something a per-frame diagnostic may
+    // pay, and RecordLine below backs the boot/loading screen's {log} token, which must
+    // not read as shard-spawn spam. See SetTraceEnabled in Log.h.
+    if (level == LogLevel::Trace && !g_traceEnabled.load(std::memory_order_relaxed)) return;
     std::string line = std::string(LevelTag(level)) + " " + std::string(message) + "\n";
 
     std::FILE* out = (level == LogLevel::Error || level == LogLevel::Warn) ? stderr : stdout;

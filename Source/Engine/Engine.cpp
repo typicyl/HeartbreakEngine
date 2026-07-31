@@ -21,11 +21,12 @@
 #include "Scene/AnimationSystem.h"
 #include "Scene/CameraSystem.h"
 #include "Scene/CharacterController.h"
-#include "Scene/Level.h"
 #include "Scene/ParticleSystem.h"
+#include "Scene/PaintSystem.h" // --test-terraincollide: terrain brush raycast + dab
 #include "Scene/TerrainSystem.h"
 #include "Scene/SceneSerializer.h"
-#include "Scene/StreamingWorld.h"
+#include "Scene/TagShard.h" // save-time spatial shard bake (--tagstreamtest builds one)
+#include "Scene/TagTable.h" // tags::Intern/Normalize (the synthetic test world's tags)
 #include "Scene/WorldState.h" // per-area revisit state (capture on exit, replay on entry)
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
@@ -46,11 +47,14 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -117,42 +121,6 @@ LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
 }
 #endif
 
-// Applies a graphics-quality preset (0 High, 1 Medium, 2 Low) by DEGRADING the
-// authored post stack: it only ever disables passes, never enables anything the
-// author turned off, and never touches look values (bloom/intensities/exposure).
-// High = exactly as authored. Painterly is the art style, not a perf knob -
-// untouched. Re-applied every frame AFTER the project stamp + volumes so it wins
-// for the frame without ever editing the authored data.
-void ApplyGraphicsPreset(rhi::PostSettings& p, int preset) {
-    if (preset <= 0) return; // High: the authored look, exactly
-    // Medium (default in shipped builds): drop the heaviest SCREEN-SPACE passes -
-    // they cost the most at native fullscreen resolution and are the least missed.
-    p.ssgiEnabled = 0;
-    p.motionBlurEnabled = 0;
-    p.ssrEnabled = 0;   // screen-space reflections
-    p.fogEnabled = 0;   // volumetric fog raymarch
-    // DoF + SSAO are the remaining COVERAGE-SCALED costs (they ramp with lit-geometry
-    // screen fill = the daytime dip). Dropping them frees the ~2ms to hold 120 with the
-    // full-res painterly intact. Painterly is untouched (it's the art style).
-    p.dofEnabled = 0;
-    p.ssaoEnabled = 0;
-    // Shadows are "the dominant DAYTIME GPU cost" (see Common.hlsli ShadowFactor): each
-    // cascade re-rasterizes every caster (cost = cascades x casters, a per-draw descriptor
-    // bind on Vulkan). Drop the 4th (farthest, coarsest) cascade at Medium - the split
-    // scheme redistributes over 3 slices in Scene::MakeView so the full shadow DISTANCE is
-    // kept, only distant shadows get slightly coarser. ~25% off the whole shadow pass.
-    p.shadowCascades = 3;
-    if (preset >= 2) { // Low: minimal post; TAA falls back to cheap FXAA
-        p.ssrEnabled = 0;
-        p.dofEnabled = 0;
-        p.ssaoEnabled = 0;
-        p.shadowCascades = 2; // half the shadow-render cost; distant shadows softer
-        if (p.taaEnabled) {
-            p.taaEnabled = 0;
-            p.fxaaEnabled = 1;
-        }
-    }
-}
 
 // Maps a build-settings backend string to the RHI enum.
 rhi::GraphicsAPI ApiFromString(const std::string& s) {
@@ -161,23 +129,25 @@ rhi::GraphicsAPI ApiFromString(const std::string& s) {
     return rhi::GraphicsAPI::D3D12;
 }
 
-// Unit vector pointing TOWARD the sun for a time of day (hours, [0,24)). The arc
-// is overhead at noon and underfoot at midnight, rising near 6am and setting near
-// 6pm, tilted by `lat` so it crosses toward the south rather than dead overhead.
-glm::vec3 SunDirFromTime(f32 hours) {
-    const f32 ang = (hours - 12.0f) / 12.0f * 3.14159265f; // 0 at noon, +/-PI midnight
-    const f32 ax = std::sin(ang);   // -1 at 6am, +1 at 6pm (rises -X, sets +X)
-    const f32 ay = std::cos(ang);   // +1 noon (up), -1 midnight (down)
-    const f32 lat = 0.55f;          // ~31 degrees of southward tilt
-    const glm::vec3 v(ax, ay * std::cos(lat), -ay * std::sin(lat));
-    return glm::normalize(v);
-}
-
-// Day/night cycle: advances timeOfDay (when a day length is set) and drives the
-// sun direction/colour/intensity + ambient from it, so the analytic sky and the
-// scene lighting stay in sync as the sun moves. Writes BOTH env.sun and any
-// DirectionalLight component (which overrides env.sun in the view fill), so the
-// cycle wins regardless of how the scene authored its sun. No-op unless dynamicSky.
+// Day/night cycle: advances timeOfDay (when a day length is set) and points the
+// sun where that hour puts it, so the analytic sky and the scene lighting stay in
+// sync as the sun moves. No-op unless dynamicSky.
+//
+// IT WRITES DIRECTION AND NOTHING ELSE, and that is the fix, not an omission.
+// This function used to REPLACE env.ambientIntensity, env.sun.colour/intensity and
+// every DirectionalLightComponent's colour/intensity with absolute constants, every
+// frame. The effect was that with `dynamicSky` on, a scene's authored ambient,
+// exposure and sun were DEAD DATA - overwritten before anything read them - so
+// ambient swept 0.12 -> 1.0 and back once per day cycle no matter what the level
+// author typed, and a sealed interior authored at 0.63 ambient rendered at 1.0.
+// The curve is now applied as a MULTIPLIER at read time in Scene::MakeView, over
+// the authored values, so authored lighting is authorable again and the inspector
+// keeps showing the numbers the file holds.
+//
+// Direction stays here because the cycle genuinely owns it: a sun that does not
+// move is not a day/night cycle, and the shadow cascades + analytic sky both need
+// the moved sun. The components are written (not just env.sun) so the editor's
+// light gizmo points where the light actually points.
 void UpdateDayNight(Scene& scene, f32 dt) {
     SceneEnvironment& env = scene.Environment();
     if (env.dynamicSky == 0) return;
@@ -186,27 +156,12 @@ void UpdateDayNight(Scene& scene, f32 dt) {
         env.timeOfDay = std::fmod(env.timeOfDay, 24.0f);
         if (env.timeOfDay < 0.0f) env.timeOfDay += 24.0f;
     }
-    const glm::vec3 toSun = SunDirFromTime(env.timeOfDay);
-    const glm::vec3 fromLight = -toSun; // DirectionalLight points FROM the light
-    const f32 elev = toSun.y;           // sun height, -1..1
-    const f32 day = glm::clamp(elev * 6.0f + 0.15f, 0.0f, 1.0f); // 0 night, 1 day
-    const f32 warm = glm::clamp(1.0f - glm::max(elev, 0.0f) * 3.0f, 0.0f, 1.0f);
-    const glm::vec3 color = glm::mix(glm::vec3(1.0f, 0.97f, 0.92f),
-                                     glm::vec3(1.0f, 0.5f, 0.22f), warm);
-    const f32 intensity = 4.5f * day;                          // dims to ~0 at night
+    // One shared evaluation of the curve (scene::EvalDayNight) - MakeView reads the
+    // same function off the same timeOfDay, so the two can no longer disagree.
+    const glm::vec3 fromLight = -EvalDayNight(env.timeOfDay).toSun; // lights point FROM the sun
     env.sun.direction = fromLight;
-    env.sun.color = color;
-    env.sun.intensity = intensity;
-    env.ambientIntensity = glm::mix(0.12f, 1.0f, day);         // dim moonlit floor at night
-    // Exposure is forced deterministically in Scene::MakeView (after Post Volumes),
-    // so a dark night can't be auto-exposed back into daylight.
     auto view = scene.Registry().view<DirectionalLightComponent>();
-    for (const entt::entity e : view) {
-        DirectionalLightComponent& dl = view.get<DirectionalLightComponent>(e);
-        dl.direction = fromLight;
-        dl.color = color;
-        dl.intensity = intensity;
-    }
+    for (const entt::entity e : view) view.get<DirectionalLightComponent>(e).direction = fromLight;
 }
 
 // The ordered backends to try at boot for the current platform: a matching build
@@ -250,6 +205,7 @@ int Engine::Run(const EngineConfig& configIn) {
         Project::Active().Open(std::filesystem::path(config.projectPath));
     }
     playOnBoot_ = config.playOnBoot;
+    tagStreamTest_ = config.tagStreamTest;
     forceTimeOfDay_ = config.forceTimeOfDay;
     forceDayLength_ = config.forceDayLength;
     forceClouds_ = config.forceClouds;
@@ -627,6 +583,509 @@ int Engine::Run(const EngineConfig& configIn) {
         return code;
     }
 
+    // Terrain-collider smoke test (headless: no window, no GPU, no assets).
+    //
+    // Terrain collision used to be one static triangle-mesh body PER CHUNK, built
+    // once when the chunk was created and never touched again - so every brush
+    // stroke left the collider describing ground that was no longer there. It is now
+    // a single Jolt HeightFieldShape per terrain, edited in place. This test pins the
+    // five properties that has to have: right heights, holes that are actually holes,
+    // sculpt edits that land, a CharacterController that stands on it, and no body
+    // growth however much you sculpt.
+    //
+    // Deliberately headless-only: the collider is built from TerrainComponent::heights,
+    // never from the chunk MESHES, so no renderer is needed to exercise it.
+    if (config.terrainCollideTest) {
+        int code = 0;
+        const auto fail = [&code](const std::string& why) {
+            HBE_ERROR("TerrainCollideTest FAIL: {}", why);
+            code = 1;
+        };
+
+        Scene tscene;
+        entt::registry& tr = tscene.Registry();
+        const entt::entity te = tscene.CreateEntity("Terrain");
+        // Non-trivial placement, so a bug in world placement cannot hide behind an
+        // identity transform.
+        const glm::vec3 origin(10.0f, 1.0f, -5.0f);
+        Transform tt;
+        tt.position = origin;
+        tr.emplace<Transform>(te, tt);
+
+        TerrainComponent tc;
+        tc.chunks = 4;
+        tc.resolution = 16;  // GridN = 65: ODD on purpose, so Jolt's round-up to a
+        tc.chunkSize = 8.0f; // block multiple (66) and its no-collision padding run.
+        tc.height = 0.0f;
+        tr.emplace<TerrainComponent>(te, tc);
+
+        TerrainComponent& t = tr.get<TerrainComponent>(te);
+        terrain::EnsureHeights(t);
+        const i32 gridN = static_cast<i32>(t.GridN());
+        const f32 step = terrain::SampleStep(t);
+        const f32 half = terrain::ExtentXZ(t) * 0.5f;
+
+        // KNOWN SHAPE: a ramp descending along -X, meeting a flat plateau at x >= 0.
+        // Not flat, so a collider that quietly collapsed to one plane is caught; and
+        // the plateau gives the character somewhere to stand that is not a slope it
+        // would slide off (which is a Jolt CharacterVirtual behaviour, not a collider
+        // property, and would be testing the wrong thing).
+        constexpr f32 kSlope = 0.25f;
+        const auto shapeAt = [&](f32 lx) { return lx < 0.0f ? kSlope * lx : 0.0f; };
+        for (i32 gz = 0; gz < gridN; ++gz) {
+            for (i32 gx = 0; gx < gridN; ++gx) {
+                t.heights[static_cast<usize>(gz) * gridN + gx] =
+                    shapeAt(-half + static_cast<f32>(gx) * step);
+            }
+        }
+        terrain::MarkColliderDirty(t, 0, 0, gridN - 1, gridN - 1);
+
+        PhysicsWorld phys;
+        phys.SetRunning(false); // EDIT mode: the collider must exist without Simulate
+        phys.Update(tscene, 1.0f / 60.0f);
+
+        // Downward probe at terrain-local (lx,lz); returns the world hit or nullopt.
+        const auto probe = [&](f32 lx, f32 lz) -> std::optional<PhysicsWorld::RayHit> {
+            const glm::vec3 ro(origin.x + lx, origin.y + shapeAt(lx) + 10.0f, origin.z + lz);
+            const PhysicsWorld::RayHit h =
+                phys.RaycastDetailed(ro, glm::vec3(0.0f, -1.0f, 0.0f), 40.0f);
+            if (!h.hit) return std::nullopt;
+            return h;
+        };
+        const auto expectedY = [&](f32 lx) { return origin.y + shapeAt(lx); };
+
+        // 1. The collider exists, is exactly ONE body, and raycasts return the
+        //    authored heights (and name the terrain entity, which is what surface
+        //    painting and impact routing ask for).
+        if (t.colliderBodyId == TerrainComponent::kInvalidCollider) {
+            fail("no heightfield collider was created for the terrain.");
+        } else if (phys.BodyCount() != 1) {
+            fail(std::format("expected 1 body for a 4x4-chunk terrain, got {}.",
+                             phys.BodyCount()));
+        }
+        u32 bodyAtStart = t.colliderBodyId;
+        {
+            const f32 xs[] = {0.0f, 8.0f, -8.0f, -14.0f, 15.5f};
+            const f32 zs[] = {0.0f, -4.0f, 4.0f, -12.0f, 12.0f};
+            for (int i = 0; i < 5; ++i) {
+                const auto h = probe(xs[i], zs[i]);
+                if (!h) {
+                    fail(std::format("ray at local ({:.1f},{:.1f}) MISSED solid ground.", xs[i],
+                                     zs[i]));
+                    continue;
+                }
+                const f32 want = expectedY(xs[i]);
+                if (std::abs(h->point.y - want) > 0.05f) {
+                    fail(std::format("ray at local ({:.1f},{:.1f}) hit y={:.3f}, want {:.3f}.",
+                                     xs[i], zs[i], h->point.y, want));
+                }
+                if (h->entity != te) fail("ground hit did not resolve to the terrain entity.");
+                if (h->normal.y < 0.5f) {
+                    fail(std::format("ground normal points the wrong way ({:.2f}).", h->normal.y));
+                }
+            }
+        }
+        HBE_INFO("TerrainCollideTest: {0}x{0} samples, {1:.2f} m spacing, {2:.0f} m across -> "
+                 "1 static heightfield body; heights match the authored ramp.",
+                 gridN, step, terrain::ExtentXZ(t));
+
+        // 2. A painted HOLE is a hole in the collider - you fall through it - and it
+        //    is LOCAL: ground a few metres away still catches the ray.
+        terrain::PaintHole(t, -8.0f, -8.0f, 2.0f, /*erase=*/false);
+        phys.Update(tscene, 1.0f / 60.0f);
+        if (probe(-8.0f, -8.0f)) {
+            fail("ray through a painted hole HIT - the hole is not in the collider.");
+        }
+        if (!probe(-8.0f + 4.0f, -8.0f)) {
+            fail("a hole removed collision 4 m away from itself.");
+        }
+        if (t.colliderBodyId != bodyAtStart) {
+            fail("punching a hole replaced the body instead of editing the shape.");
+        }
+        HBE_INFO("TerrainCollideTest: hole at local (-8,-8) r=2 -> ray MISSES there, still hits "
+                 "4 m away, same body.");
+
+        // 2b. A WRONG-SIZED hole mask must be ignored wholesale, not partially
+        //     applied. This is not hypothetical: the shipped reference project carries
+        //     641^2 heights against a 385^2 mask (nothing resizes the mask when the
+        //     resolution changes), and the GPU upload path partial-fills it. Applying
+        //     that to a collider would scatter holes at the wrong coordinates - i.e.
+        //     invisible pits the player falls through.
+        {
+            const std::vector<u8> good = t.holeMask;
+            t.holeMask.assign(good.size() / 3 + 7, 255); // stale + entirely "hole"
+            terrain::MarkColliderDirty(t, 0, 0, gridN - 1, gridN - 1);
+            phys.Update(tscene, 1.0f / 60.0f);
+            if (terrain::HoleMaskUsable(t)) fail("a wrong-sized hole mask reported as usable.");
+            int missed = 0;
+            const f32 xs[] = {0.0f, -8.0f, 6.0f, -13.0f};
+            const f32 zs[] = {0.0f, -8.0f, 6.0f, 11.0f};
+            for (int i = 0; i < 4; ++i)
+                if (!probe(xs[i], zs[i])) ++missed;
+            if (missed != 0) {
+                fail(std::format("a stale hole mask punched {} phantom hole(s) in the collider.",
+                                 missed));
+            } else {
+                HBE_INFO("TerrainCollideTest: stale (wrong-sized) hole mask ignored -> ground "
+                         "stays solid everywhere, including where the real hole was.");
+            }
+            t.holeMask = good; // restore the real mask
+            terrain::MarkColliderDirty(t, 0, 0, gridN - 1, gridN - 1);
+            phys.Update(tscene, 1.0f / 60.0f);
+            if (probe(-8.0f, -8.0f)) fail("restoring the hole mask did not restore the hole.");
+            // The two mask swaps above dirtied the WHOLE field, which is deliberately
+            // answered with a fresh shape (in-place editing has no advantage at that
+            // size). Re-baseline before the "no rebuild" assertions below, which are
+            // about SCULPT STROKES - the interactive case that must not rebuild.
+            bodyAtStart = t.colliderBodyId;
+        }
+
+        // 2c. TWISTED QUADS: the collider, the sampler and the renderer must share ONE
+        //     surface. The ramp above is piecewise linear in x and constant in z, so its
+        //     twist term (h00 + h11 - h01 - h10) is identically ZERO in every quad - which
+        //     means it cannot see a triangulation mismatch at all, and one was live: the
+        //     chunk builder split quads on the ANTI-diagonal while Jolt splits on the MAIN
+        //     diagonal. The two surfaces agree at every sample and differ in the quad
+        //     INTERIOR by half the twist, so the player walked up invisible bumps whose
+        //     worst case is the full corner-height difference. A doubly-sinusoidal field
+        //     has a non-zero twist in every quad and pins all four consumers together.
+        {
+            const std::vector<u8> savedMask = t.holeMask;
+            t.holeMask.clear(); // holes are tested elsewhere; keep this phase about geometry
+            const auto twist = [&](f32 lx, f32 lz) {
+                return 2.0f * std::sin(lx * 0.7f) * std::sin(lz * 0.7f);
+            };
+            for (i32 gz = 0; gz < gridN; ++gz) {
+                for (i32 gx = 0; gx < gridN; ++gx) {
+                    t.heights[static_cast<usize>(gz) * gridN + gx] =
+                        twist(-half + static_cast<f32>(gx) * step, -half + static_cast<f32>(gz) * step);
+                }
+            }
+            terrain::MarkColliderDirty(t, 0, 0, gridN - 1, gridN - 1);
+            phys.Update(tscene, 1.0f / 60.0f);
+
+            // Probe QUAD CENTRES and quad interiors - the only places the two
+            // triangulations disagree. Sample offsets deliberately straddle the diagonal
+            // (0.25 is in one triangle, 0.75 in the other, 0.5 is on it).
+            f32 worstColl = 0.0f, worstNav = 0.0f;
+            int probes = 0, misses = 0;
+            for (i32 gz = 2; gz < gridN - 3; gz += 5) {
+                for (i32 gx = 2; gx < gridN - 3; gx += 5) {
+                    for (const glm::vec2 off : {glm::vec2(0.5f, 0.5f), glm::vec2(0.25f, 0.75f),
+                                                glm::vec2(0.75f, 0.25f)}) {
+                        const f32 lx = -half + (static_cast<f32>(gx) + off.x) * step;
+                        const f32 lz = -half + (static_cast<f32>(gz) + off.y) * step;
+                        ++probes;
+                        // What the SAMPLER says (this is what paint raycasts and what
+                        // nav's analytic provider evaluate).
+                        f32 sh = 0.0f, dhdx = 0.0f, dhdz = 0.0f;
+                        bool hole = false;
+                        if (!terrain::SampleSurface(t, lx, lz, sh, dhdx, dhdz, hole)) {
+                            fail("SampleSurface rejected a point inside the footprint.");
+                            continue;
+                        }
+                        // What the COLLIDER says.
+                        const glm::vec3 ro(origin.x + lx, origin.y + 20.0f, origin.z + lz);
+                        const PhysicsWorld::RayHit h =
+                            phys.RaycastDetailed(ro, glm::vec3(0.0f, -1.0f, 0.0f), 60.0f);
+                        if (!h.hit) { ++misses; continue; }
+                        worstColl = std::max(worstColl, std::abs(h.point.y - (origin.y + sh)));
+                        // And what SampleHeight says (the brush raycast's own path) - it
+                        // must be the same function, not a bilinear third opinion.
+                        worstNav = std::max(worstNav, std::abs(terrain::SampleHeight(t, lx, lz) - sh));
+                    }
+                }
+            }
+            if (misses != 0) {
+                fail(std::format("{} of {} twisted-quad probes missed the collider.", misses,
+                                 probes));
+            }
+            // 8-bit-per-block quantization over a 128 m height range is the floor here.
+            if (worstColl > 0.02f) {
+                fail(std::format("collider and terrain::SampleSurface disagree by {:.4f} m on a "
+                                 "twisted quad ({} probes) - the triangulations do not match.",
+                                 worstColl, probes));
+            } else if (worstNav > 1e-4f) {
+                fail(std::format("SampleHeight and SampleSurface disagree by {:.5f} m - the "
+                                 "brush raycast is on a different surface than nav/physics.",
+                                 worstNav));
+            } else {
+                HBE_INFO("TerrainCollideTest: twisted field (sin*sin), {} quad-interior probes -> "
+                         "collider vs sampler within {:.4f} m, SampleHeight vs SampleSurface "
+                         "within {:.5f} m. Render/collide/paint/nav share one surface.",
+                         probes, worstColl, worstNav);
+            }
+
+            // Restore the ramp + mask for the sculpt phases below, which expect it.
+            for (i32 gz = 0; gz < gridN; ++gz) {
+                for (i32 gx = 0; gx < gridN; ++gx) {
+                    t.heights[static_cast<usize>(gz) * gridN + gx] =
+                        shapeAt(-half + static_cast<f32>(gx) * step);
+                }
+            }
+            t.holeMask = savedMask;
+            terrain::MarkColliderDirty(t, 0, 0, gridN - 1, gridN - 1);
+            phys.Update(tscene, 1.0f / 60.0f);
+            bodyAtStart = t.colliderBodyId; // full-field dirty rects rebuild by design
+        }
+
+        // 3. A SCULPT edit changes what subsequent raycasts return, in place. This is
+        //    the bug the whole change exists for: the old per-chunk mesh collider was
+        //    never rebuilt, so collision silently diverged from the visible ground.
+        const auto beforeHit = probe(8.0f, 8.0f);
+        const f32 beforeY = beforeHit ? beforeHit->point.y : 0.0f;
+        constexpr f32 kRaise = 3.0f;
+        terrain::SculptHeights(t, 8.0f, 8.0f, 3.0f, kRaise, terrain::Brush::Raise, 0.0f);
+        phys.Update(tscene, 1.0f / 60.0f);
+        {
+            const glm::vec3 ro(origin.x + 8.0f, origin.y + shapeAt(8.0f) + 20.0f, origin.z + 8.0f);
+            const PhysicsWorld::RayHit h =
+                phys.RaycastDetailed(ro, glm::vec3(0.0f, -1.0f, 0.0f), 60.0f);
+            const f32 want = expectedY(8.0f) + kRaise;
+            if (!h.hit) {
+                fail("ray missed sculpted ground entirely.");
+            } else if (std::abs(h.point.y - want) > 0.05f) {
+                fail(std::format("sculpt did not reach the collider: hit y={:.3f} (was {:.3f}), "
+                                 "want {:.3f}.",
+                                 h.point.y, beforeY, want));
+            } else {
+                HBE_INFO("TerrainCollideTest: sculpt +{:.1f} m at local (8,8) -> collider height "
+                         "{:.3f} -> {:.3f} (want {:.3f}), no rebuild.",
+                         kRaise, beforeY, h.point.y, want);
+            }
+        }
+        if (t.colliderBodyId != bodyAtStart) {
+            fail("a sculpt stroke replaced the body instead of editing the shape in place.");
+        }
+
+        // 4. LEAK CHECK. A brush stroke is dozens of edits per second; if each one
+        //    made a shape or a body, an afternoon of sculpting would exhaust Jolt.
+        for (int i = 0; i < 200; ++i) {
+            const f32 lx = -6.0f + static_cast<f32>(i % 13);
+            const f32 lz = -6.0f + static_cast<f32>((i / 13) % 13);
+            terrain::SculptHeights(t, lx, lz, 1.5f, 0.01f, terrain::Brush::Raise, 0.0f);
+            phys.Update(tscene, 1.0f / 60.0f);
+        }
+        if (phys.BodyCount() != 1) {
+            fail(std::format("200 sculpt edits grew the world to {} bodies.", phys.BodyCount()));
+        } else if (t.colliderBodyId != bodyAtStart) {
+            fail("200 sculpt edits churned the body id (shape rebuilt, not edited).");
+        } else {
+            HBE_INFO("TerrainCollideTest: 200 sculpt edits -> still 1 body, same shape.");
+        }
+
+        // 4b. World SCALE only lives in the ScaledShape wrapper, so changing it must
+        //     swap the wrapper and KEEP the heightfield. Otherwise dragging the scale
+        //     gizmo rebuilds a 641x641 field every frame (measured ~12 ms a go).
+        {
+            tr.get<Transform>(te).scale = glm::vec3(1.0f, 2.0f, 1.0f);
+            phys.Update(tscene, 1.0f / 60.0f);
+            const f32 lx = -12.0f, lz = 5.0f;
+            const glm::vec3 ro(origin.x + lx, origin.y + 10.0f, origin.z + lz);
+            const PhysicsWorld::RayHit h =
+                phys.RaycastDetailed(ro, glm::vec3(0.0f, -1.0f, 0.0f), 60.0f);
+            const f32 want = origin.y + 2.0f * shapeAt(lx); // Y doubled, XZ untouched
+            if (!h.hit) {
+                fail("ray missed a Y-scaled terrain entirely.");
+            } else if (std::abs(h.point.y - want) > 0.05f) {
+                fail(std::format("Y-scaled terrain hit y={:.3f}, want {:.3f}.", h.point.y, want));
+            } else if (t.colliderBodyId != bodyAtStart) {
+                fail("a scale change rebuilt the heightfield instead of swapping the wrapper.");
+            } else {
+                HBE_INFO("TerrainCollideTest: scale (1,2,1) -> hit y={:.3f} (want {:.3f}), "
+                         "wrapper swapped, heightfield kept.",
+                         h.point.y, want);
+            }
+            tr.get<Transform>(te).scale = glm::vec3(1.0f); // back to 1:1 for the rest
+            phys.Update(tscene, 1.0f / 60.0f);
+        }
+
+        // 5. A CharacterController STANDS on it. Dropped from 5 m over ground the
+        //    sculpt loop above did not touch; the capsule centre must settle half a
+        //    capsule above whatever the heightfield says is there.
+        const entt::entity pe = tscene.CreateEntity("Player");
+        CharacterController cc;
+        const f32 spawnLx = 12.0f, spawnLz = -10.0f;
+        Transform pt;
+        pt.position = glm::vec3(origin.x + spawnLx, origin.y + shapeAt(spawnLx) + 5.0f,
+                                origin.z + spawnLz);
+        tr.emplace<Transform>(pe, pt);
+        tr.emplace<CharacterController>(pe, cc);
+        phys.SetRunning(true);
+        for (int i = 0; i < 300; ++i) phys.Update(tscene, 1.0f / 60.0f); // 5 s
+        {
+            const CharacterController& pc = tr.get<CharacterController>(pe);
+            const glm::vec3 p = tr.get<Transform>(pe).position;
+            // Expected from where it ACTUALLY ended up: a 14-degree ramp lets it creep.
+            const f32 groundY = origin.y + shapeAt(p.x - origin.x);
+            const f32 want = groundY + cc.height * 0.5f;
+            const f32 drift = glm::distance(glm::vec2(p.x, p.z),
+                                            glm::vec2(pt.position.x, pt.position.z));
+            if (!pc.grounded) {
+                fail(std::format("CharacterController never landed (y={:.2f}, want {:.2f}).", p.y,
+                                 want));
+            } else if (std::abs(p.y - want) > 0.15f) {
+                fail(std::format("CharacterController rests at y={:.3f}, want {:.3f}.", p.y, want));
+            } else {
+                HBE_INFO("TerrainCollideTest: CharacterController fell 5 m and stands at "
+                         "y={:.3f} (ground {:.3f} + half capsule {:.2f}), drifted {:.2f} m.",
+                         p.y, groundY, cc.height * 0.5f, drift);
+            }
+        }
+
+        // 6. SURFACE PAINTING. The other half of the reported bug: the brush resolved
+        //    its target mesh through MeshRef, terrain chunks are procedural and have
+        //    none, so paint::RaycastMesh was never given any terrain geometry and the
+        //    brush returned one line before the code that knew about terrain. It now
+        //    goes through paint::RaycastTerrain, and this checks the three things that
+        //    has to get right: the hit point (cross-checked against the INDEPENDENT
+        //    Jolt heightfield raycast), the terrain-wide canvas UV, and that a dab at
+        //    that UV actually lands pigment on the canvas.
+        {
+            // An oblique ray, as a camera would give: nothing here is axis-aligned, so
+            // a hit that agreed only for straight-down rays would not pass.
+            const glm::vec3 aimLocal(2.0f, 0.0f, 3.0f);
+            const glm::vec3 ro = origin + glm::vec3(-11.0f, 26.0f, -19.0f);
+            const glm::vec3 aimWorld =
+                origin + glm::vec3(aimLocal.x, shapeAt(aimLocal.x), aimLocal.z);
+            const glm::vec3 rd = glm::normalize(aimWorld - ro);
+
+            paint::PaintHit hit;
+            const glm::mat4 invWorld = glm::inverse(tscene.WorldMatrix(te));
+            const bool got = paint::RaycastTerrain(
+                t, glm::vec3(invWorld * glm::vec4(ro, 1.0f)),
+                glm::vec3(invWorld * glm::vec4(rd, 0.0f)), hit);
+            const PhysicsWorld::RayHit jolt = phys.RaycastDetailed(ro, rd, 200.0f);
+            if (!got) {
+                fail("the paint brush still cannot raycast terrain (RaycastTerrain missed).");
+            } else if (!jolt.hit) {
+                fail("physics missed the same terrain ray the brush hit.");
+            } else {
+                const glm::vec3 brushWorld = glm::vec3(tscene.WorldMatrix(te) *
+                                                       glm::vec4(hit.localPos, 1.0f));
+                const f32 disagree = glm::distance(brushWorld, jolt.point);
+                if (disagree > 0.05f) {
+                    fail(std::format("brush hit and heightfield hit disagree by {:.3f} m.",
+                                     disagree));
+                }
+                if (jolt.entity != te) fail("terrain ray did not resolve to the terrain entity.");
+                // Terrain-wide canvas UV: the WHOLE terrain maps to [0,1]^2 (that is
+                // what makes one canvas cover every chunk seamlessly).
+                const f32 extent = terrain::ExtentXZ(t);
+                const glm::vec2 wantUv((hit.localPos.x + extent * 0.5f) / extent,
+                                       (hit.localPos.z + extent * 0.5f) / extent);
+                if (glm::distance(hit.uv, wantUv) > 1e-4f || hit.uv.x < 0.0f ||
+                    hit.uv.x > 1.0f || hit.uv.y < 0.0f || hit.uv.y > 1.0f) {
+                    fail(std::format("terrain canvas UV wrong: ({:.4f},{:.4f}).", hit.uv.x,
+                                     hit.uv.y));
+                }
+                if (std::abs(hit.uvPerWorld - 1.0f / extent) > 1e-6f) {
+                    fail("terrain UV density is not 1/extent (brush size would be wrong).");
+                }
+                if (hit.localNormal.y < 0.5f) fail("terrain paint normal points the wrong way.");
+
+                // And the dab lands. This is the end of the chain the user reported as
+                // broken - a stroke on the ground that leaves no paint.
+                PaintComponent canvas;
+                paint::EnsureCanvas(canvas, 256);
+                paint::Dab dab;
+                dab.color = glm::vec4(1.0f, 0.2f, 0.1f, 1.0f);
+                dab.flow = 1.0f;
+                const paint::BrushTip tip = paint::MakeBrushTip(paint::BrushDef{}, 64);
+                usize before = 0, after = 0;
+                for (const u8 c : canvas.layers[0].color) before += c;
+                paint::Stamp(canvas, 0, hit.uv, 1.0f * hit.uvPerWorld, tip, 0.0f, dab);
+                for (const u8 c : canvas.layers[0].color) after += c;
+                if (after <= before) {
+                    fail("a brush dab at the terrain hit UV left the canvas untouched.");
+                } else {
+                    HBE_INFO("TerrainCollideTest: paint ray on terrain -> hit agrees with the "
+                             "heightfield to {:.4f} m, canvas UV ({:.3f},{:.3f}), dab landed.",
+                             disagree, hit.uv.x, hit.uv.y);
+                }
+            }
+        }
+
+        // 7. Destroying the terrain destroys its body (no orphan collider left behind
+        //    for the player to walk on after the ground is gone).
+        tr.destroy(te);
+        phys.Update(tscene, 1.0f / 60.0f);
+        if (phys.BodyCount() != 0) {
+            fail(std::format("terrain destroyed but {} body(ies) survive.", phys.BodyCount()));
+        } else {
+            HBE_INFO("TerrainCollideTest: terrain entity destroyed -> 0 bodies.");
+        }
+
+        // 7. COST, at the scale that matters. The reference project's terrain is
+        //    16x16 chunks of 32 m at resolution 40 => 641x641 samples over 512 m, the
+        //    same field that cost 819,200 collision triangles as chunk mesh colliders.
+        //    Sculpting is interactive (a stroke is one edit per frame while the mouse
+        //    is down), so the per-edit number is the one that decides whether this is
+        //    usable, and it has to be measured rather than assumed.
+        {
+            using clock = std::chrono::steady_clock;
+            Scene bscene;
+            entt::registry& br = bscene.Registry();
+            const entt::entity be = bscene.CreateEntity("BigTerrain");
+            br.emplace<Transform>(be, Transform{});
+            TerrainComponent big;
+            big.chunks = 16;
+            big.resolution = 40;
+            big.chunkSize = 32.0f;
+            big.height = 0.0f;
+            br.emplace<TerrainComponent>(be, big);
+            TerrainComponent& bt = br.get<TerrainComponent>(be);
+            terrain::EnsureHeights(bt);
+            terrain::MarkColliderDirty(bt, 0, 0, static_cast<i32>(bt.GridN()) - 1,
+                                       static_cast<i32>(bt.GridN()) - 1);
+
+            PhysicsWorld bphys;
+            bphys.SetRunning(false);
+            const auto t0 = clock::now();
+            bphys.Update(bscene, 1.0f / 60.0f); // builds the shape from scratch
+            const f64 buildMs = std::chrono::duration<f64, std::milli>(clock::now() - t0).count();
+
+            // The editor's default brush: radius 5 m, strength 6 units/s at 60 fps.
+            constexpr int kEdits = 200;
+            f64 sculptMs = 0.0, pushMs = 0.0;
+            for (int i = 0; i < kEdits; ++i) {
+                const f32 lx = -120.0f + static_cast<f32>(i) * 1.2f;
+                const f32 lz = -60.0f + static_cast<f32>(i % 40) * 3.0f;
+                const auto s0 = clock::now();
+                terrain::SculptHeights(bt, lx, lz, 5.0f, 0.1f, terrain::Brush::Raise, 0.0f);
+                const auto s1 = clock::now();
+                bphys.Update(bscene, 1.0f / 60.0f);
+                const auto s2 = clock::now();
+                sculptMs += std::chrono::duration<f64, std::milli>(s1 - s0).count();
+                pushMs += std::chrono::duration<f64, std::milli>(s2 - s1).count();
+            }
+            if (bphys.BodyCount() != 1) {
+                fail(std::format("reference-scale terrain ended with {} bodies.",
+                                 bphys.BodyCount()));
+            }
+
+            // IDLE cost. SyncTerrainColliders is now on the per-frame spine, and the
+            // engine has roughly 0.4 ms of CPU headroom in Release - so the cost when
+            // NOTHING is being sculpted is the number that has to be small, and it has
+            // to be measured rather than assumed.
+            constexpr int kIdle = 2000;
+            const auto i0 = clock::now();
+            for (int i = 0; i < kIdle; ++i) bphys.Update(bscene, 1.0f / 60.0f);
+            const f64 idleMs =
+                std::chrono::duration<f64, std::milli>(clock::now() - i0).count() / kIdle;
+
+            HBE_INFO("TerrainCollideTest COST ({0}x{0} samples / 512 m, r=5 m brush): initial "
+                     "shape build {1:.2f} ms; per sculpt edit {2:.3f} ms heightmap + {3:.3f} ms "
+                     "collider = {4:.3f} ms; idle frame (nothing dirty) {5:.4f} ms.",
+                     bt.GridN(), buildMs, sculptMs / kEdits, pushMs / kEdits,
+                     (sculptMs + pushMs) / kEdits, idleMs);
+        }
+
+        HBE_INFO("TerrainCollideTest: {}", code == 0 ? "ALL PASS" : "FAILED");
+        jobs::Shutdown();
+        return code;
+    }
+
     // Navigation smoke test: a headless (no window/GPU) check of the real-time
     // grid A* pathfinder routing around static + dynamic obstacles.
     if (config.navTest) {
@@ -700,8 +1159,633 @@ int Engine::Run(const EngineConfig& configIn) {
                 code = 1;
             }
         }
+
+        // --- TERRAIN as a nav surface, and a SCULPT that costs no rebuild ---------
+        // A terrain-ONLY world is a valid world (there is no static mesh here at all),
+        // which is exactly what the "AI has no walkable surface" report was about.
+        {
+            Scene ts;
+            entt::registry& tr = ts.Registry();
+            const entt::entity te = ts.CreateEntity("Terrain");
+            tr.emplace<Transform>(te, Transform{});
+            TerrainComponent tc;
+            tc.chunks = 8;
+            tc.resolution = 8;   // GridN = 65, 64 m across
+            tc.chunkSize = 8.0f;
+            tc.height = 0.0f;    // flat, then sculpted below
+            tr.emplace<TerrainComponent>(te, tc);
+            terrain::EnsureHeights(tr.get<TerrainComponent>(te));
+
+            nav::GridNav gn;
+            const bool ready = gn.EnsureBuilt(ts, {});
+            const glm::vec3 A(-26, 0, -26), B(26, 0, 26);
+            const auto crosses = [&](const std::vector<glm::vec3>& p) {
+                return !p.empty() && glm::distance(glm::vec2(p.back().x, p.back().z),
+                                                   glm::vec2(B.x, B.z)) < 2.0f;
+            };
+            const auto path = gn.FindPath(A, B, {});
+            if (ready && gn.TerrainCount() == 1 && gn.TriangleCount() == 0 && crosses(path)) {
+                HBE_INFO("NavTerrainTest PASS: terrain-only world is walkable - A* crossed 64 m "
+                         "of heightfield in {} corners with ZERO triangles stored (analytic).",
+                         static_cast<u32>(path.size()));
+            } else {
+                HBE_ERROR("NavTerrainTest FAIL: ready={} terrains={} tris={} crossed={}.", ready,
+                          gn.TerrainCount(), gn.TriangleCount(), crosses(path));
+                code = 1;
+            }
+
+            // Off the terrain there must be NO ground: an edge-clamped heightmap sampled
+            // past its border would invent an infinite skirt of walkable floor.
+            if (gn.GroundAt(500.0f, 500.0f, 0.0f).has_value()) {
+                HBE_ERROR("NavTerrainTest FAIL: found walkable ground 500 m outside the terrain.");
+                code = 1;
+            }
+
+            // SCULPT MID-PATH: nav borrows `heights`, so a stroke must be visible
+            // immediately and must NOT trigger a full rebuild.
+            const u32 rebuildsBefore = gn.RebuildCount();
+            const f32 flatY = gn.GroundAt(0.0f, 0.0f, 0.0f).value_or(-999.0f);
+            terrain::SculptHeights(tr.get<TerrainComponent>(te), 0.0f, 0.0f, 6.0f, 4.0f,
+                                   terrain::Brush::Raise, 0.0f);
+            gn.EnsureBuilt(ts, {});
+            const f32 raisedY = gn.GroundAt(0.0f, 0.0f, 4.0f).value_or(-999.0f);
+            if (gn.RebuildCount() != rebuildsBefore) {
+                HBE_ERROR("NavSculptTest FAIL: a sculpt stroke triggered {} full rebuild(s).",
+                          gn.RebuildCount() - rebuildsBefore);
+                code = 1;
+            } else if (raisedY - flatY < 3.0f) {
+                HBE_ERROR("NavSculptTest FAIL: sculpt did not reach navigation ({:.2f} -> {:.2f}).",
+                          flatY, raisedY);
+                code = 1;
+            } else {
+                HBE_INFO("NavSculptTest PASS: +4 m sculpt visible to nav same call ({:.2f} -> "
+                         "{:.2f} m) with 0 rebuilds - the borrow works.",
+                         flatY, raisedY);
+            }
+
+            // A painted HOLE is not walkable ground, for AI as it is for the player.
+            terrain::PaintHole(tr.get<TerrainComponent>(te), -16.0f, -16.0f, 3.0f, /*erase=*/false);
+            gn.EnsureBuilt(ts, {});
+            if (gn.GroundAt(-16.0f, -16.0f, 0.0f).has_value()) {
+                HBE_ERROR("NavHoleTest FAIL: a painted hole is still walkable ground for AI.");
+                code = 1;
+            } else if (!gn.GroundAt(-16.0f + 8.0f, -16.0f, 0.0f).has_value()) {
+                HBE_ERROR("NavHoleTest FAIL: a hole removed walkable ground 8 m away.");
+                code = 1;
+            } else {
+                HBE_INFO("NavHoleTest PASS: painted hole is a hole for AI too; ground 8 m away "
+                         "still walkable.");
+            }
+        }
+
+        // --- SLOPE LIMIT: a cliff is a wall, a gentle ramp is a road ---------------
+        // maxSlopeDeg is the terrain half of "AI must not climb what a human could not".
+        // NOTE ON PARAMS: at the DEFAULTS the STEP rule is stricter than the slope rule
+        // and would mask it completely - maxStep 0.5 m over a cellSize 0.5 m cell is a
+        // 45 deg ceiling, below maxSlopeDeg's 50 deg, so every slope this test could
+        // reject would already have been rejected as a step. maxStep is raised to 2 m
+        // here so the ONLY thing that can refuse the steep ramp is the slope test.
+        {
+            Scene ps;
+            entt::registry& pr = ps.Registry();
+            const entt::entity te = ps.CreateEntity("Ramp");
+            pr.emplace<Transform>(te, Transform{});
+            TerrainComponent tc;
+            tc.chunks = 8;
+            tc.resolution = 8; // GridN = 65, 64 m across, 1 m sample step
+            tc.chunkSize = 8.0f;
+            tc.height = 0.0f;
+            pr.emplace<TerrainComponent>(te, tc);
+            TerrainComponent& t = pr.get<TerrainComponent>(te);
+            terrain::EnsureHeights(t);
+
+            // Ground at y=0 for x<=0, then a ramp of the given gradient up to an 8 m
+            // plateau. Authored directly (not sculpted) so the gradient under test is
+            // exact rather than whatever a brush falloff happens to produce.
+            const auto ramp = [&](f32 tanTheta) {
+                const i32 n = static_cast<i32>(t.GridN());
+                const f32 step = terrain::SampleStep(t);
+                const f32 half = terrain::ExtentXZ(t) * 0.5f;
+                for (i32 gz = 0; gz < n; ++gz)
+                    for (i32 gx = 0; gx < n; ++gx) {
+                        const f32 lx = -half + static_cast<f32>(gx) * step;
+                        t.heights[static_cast<usize>(gz) * n + gx] =
+                            lx <= 0.0f ? 0.0f : std::min(8.0f, lx * tanTheta);
+                    }
+            };
+
+            nav::GridNav gn;
+            nav::GridNavParams sp;   // cellSize 0.5, maxSlopeDeg 50
+            sp.maxStep = 2.0f;       // see the note above
+            gn.SetParams(sp);
+
+            const glm::vec3 A(-20, 0, 0), B(28, 8, 0);
+            const auto reaches = [&](const std::vector<glm::vec3>& p) {
+                return !p.empty() && glm::distance(glm::vec2(p.back().x, p.back().z),
+                                                   glm::vec2(B.x, B.z)) < 2.0f;
+            };
+            const auto maxCornerX = [](const std::vector<glm::vec3>& p) {
+                f32 m = -1e9f;
+                for (const glm::vec3& q : p) m = std::max(m, q.x);
+                return m;
+            };
+
+            ramp(0.4663f); // 25 deg - inside maxSlopeDeg
+            gn.EnsureBuilt(ps, {});
+            const bool gentleGround = gn.GroundAt(8.0f, 0.0f, 3.7f).has_value();
+            const bool climbed = reaches(gn.FindPath(A, B, {}));
+
+            ramp(2.1445f); // 65 deg - a cliff
+            gn.EnsureBuilt(ps, {});
+            const bool steepGround = gn.GroundAt(2.0f, 0.0f, 4.0f).has_value();
+            const std::vector<glm::vec3> refused = gn.FindPath(A, B, {});
+            const f32 stoppedAt = maxCornerX(refused);
+
+            if (gentleGround && climbed && !steepGround && !reaches(refused) && stoppedAt < 1.5f) {
+                HBE_INFO("NavSlopeTest PASS: a 25 deg ramp is walkable ground and A* climbed it "
+                         "to the plateau; the same ramp at 65 deg is not ground at all and the "
+                         "path stopped at the foot of it (x={:.1f}).",
+                         stoppedAt);
+            } else {
+                HBE_ERROR("NavSlopeTest FAIL: gentleGround={} climbed={} steepGround={} "
+                          "steepReached={} stoppedAt={:.1f}.",
+                          gentleGround, climbed, steepGround, reaches(refused), stoppedAt);
+                code = 1;
+            }
+        }
+
+        // --- A HOLE is routed AROUND, not just "no ground under one sample" -------
+        // NavHoleTest proves GroundAt refuses a hole; this proves the PLANNER does the
+        // useful thing with that - an agent crossing a corridor with a hole in it walks
+        // around the hole instead of into it.
+        {
+            Scene hs;
+            entt::registry& hr = hs.Registry();
+            const entt::entity te = hs.CreateEntity("Terrain");
+            hr.emplace<Transform>(te, Transform{});
+            TerrainComponent tc;
+            tc.chunks = 8;
+            tc.resolution = 8;
+            tc.chunkSize = 8.0f;
+            tc.height = 0.0f; // flat, so the ONLY thing in the way is the hole
+            hr.emplace<TerrainComponent>(te, tc);
+            TerrainComponent& t = hr.get<TerrainComponent>(te);
+            terrain::EnsureHeights(t);
+
+            nav::GridNav gn;
+            gn.EnsureBuilt(hs, {});
+            const glm::vec3 A(-20, 0, 0), B(20, 0, 0); // straight line through the origin
+            const auto offAxis = [](const std::vector<glm::vec3>& p) {
+                f32 m = 0.0f;
+                for (const glm::vec3& q : p) m = std::max(m, std::fabs(q.z));
+                return m;
+            };
+            const auto nearestToHole = [](const std::vector<glm::vec3>& p) {
+                f32 m = 1e9f;
+                for (const glm::vec3& q : p)
+                    m = std::min(m, glm::distance(glm::vec2(q.x, q.z), glm::vec2(0.0f)));
+                return m;
+            };
+            const f32 offFlat = offAxis(gn.FindPath(A, B, {}));
+
+            terrain::PaintHole(t, 0.0f, 0.0f, 4.0f, /*erase=*/false);
+            gn.EnsureBuilt(hs, {});
+            const std::vector<glm::vec3> around = gn.FindPath(A, B, {});
+            const bool arrives = !around.empty() &&
+                                 glm::distance(glm::vec2(around.back().x, around.back().z),
+                                               glm::vec2(B.x, B.z)) < 2.0f;
+            const f32 clearance = nearestToHole(around);
+            if (offFlat < 2.0f && arrives && clearance > 3.0f) {
+                HBE_INFO("NavHolePathTest PASS: flat terrain paths straight ({:.1f} m off axis); "
+                         "an r=4 painted hole diverted the path {:.1f} m off axis and no corner "
+                         "came closer than {:.1f} m to the hole.",
+                         offFlat, offAxis(around), clearance);
+            } else {
+                HBE_ERROR("NavHolePathTest FAIL: offFlat={:.1f} arrives={} clearance={:.1f}.",
+                          offFlat, arrives, clearance);
+                code = 1;
+            }
+        }
+
+        // --- AN AGENT ACTUALLY WALKS SCULPTED TERRAIN ------------------------------
+        // Everything above queries the planner. This drives the real per-frame path -
+        // nav::UpdateAgents - across ground that exists only because a BRUSH put it
+        // there, and checks the agent rode the sculpted surface the whole way rather
+        // than gliding at its old height.
+        {
+            Scene ws;
+            entt::registry& wr = ws.Registry();
+            const entt::entity te = ws.CreateEntity("Terrain");
+            wr.emplace<Transform>(te, Transform{});
+            TerrainComponent tc;
+            tc.chunks = 8;
+            tc.resolution = 8;
+            tc.chunkSize = 8.0f;
+            tc.height = 0.0f;
+            wr.emplace<TerrainComponent>(te, tc);
+            TerrainComponent& t = wr.get<TerrainComponent>(te);
+            terrain::EnsureHeights(t);
+            // One broad SCULPT stroke: a 4 m mound spanning almost the whole terrain, so
+            // walking around it costs far more than walking over it (83 m of detour
+            // against 58 m plus an 8 m climb penalty) and the agent has to climb. The
+            // smoothstep falloff peaks at 1.5*amount/radius = 0.21 -> ~12 deg, well
+            // inside both maxSlopeDeg and the step rule at the DEFAULT params.
+            terrain::SculptHeights(t, 0.0f, 0.0f, 28.0f, 4.0f, terrain::Brush::Raise, 0.0f);
+
+            nav::GridNav gn;
+            gn.EnsureBuilt(ws, {});
+            const glm::vec3 A(-29, 0, 0), B(29, 0, 0);
+            const entt::entity ag = ws.CreateEntity("Walker");
+            Transform at;
+            at.position = glm::vec3(A.x, terrain::SampleHeight(t, A.x, A.z), A.z);
+            wr.emplace<Transform>(ag, at);
+            NavigationAgent na;
+            na.target = B;
+            na.hasTarget = true;
+            na.speed = 5.0f;
+            wr.emplace<NavigationAgent>(ag, na);
+
+            f32 reachedAt = -1.0f, peakY = -1e9f, worstDrift = 0.0f;
+            for (int i = 0; i < 2400; ++i) {
+                nav::UpdateAgents(ws, gn, 1.0f / 60.0f);
+                const glm::vec3 p = wr.get<Transform>(ag).position;
+                peakY = std::max(peakY, p.y);
+                // The sculpted surface under the agent's own feet, from the heightmap the
+                // brush wrote - so this is "did it ride the ground the artist made", not
+                // "did nav agree with itself".
+                worstDrift = std::max(worstDrift,
+                                      std::fabs(p.y - terrain::SampleHeight(t, p.x, p.z)));
+                if (glm::distance(glm::vec2(p.x, p.z), glm::vec2(B.x, B.z)) < 1.0f) {
+                    reachedAt = static_cast<f32>(i) / 60.0f;
+                    break;
+                }
+            }
+            if (reachedAt >= 0.0f && peakY > 2.0f && worstDrift < 0.1f) {
+                HBE_INFO("NavAgentTerrainTest PASS: agent walked 58 m of SCULPTED terrain in "
+                         "{:.1f}s, climbed to {:.2f} m over the mound, and stayed within {:.3f} m "
+                         "of the brushed surface the whole way.",
+                         reachedAt, peakY, worstDrift);
+            } else {
+                HBE_ERROR("NavAgentTerrainTest FAIL: reachedAt={:.1f} peakY={:.2f} drift={:.3f}.",
+                          reachedAt, peakY, worstDrift);
+                code = 1;
+            }
+        }
+
+        // --- STREAMED shard geometry: enters and leaves the index, no rebuild ------
+        // The reported gap: a streamed prop was invisible to AI, so agents walked
+        // through spawned geometry. Also covers the CLEARANCE rule - a prop TALLER than
+        // `climb` used to be ignored entirely (walls not walkable so skipped, roof out
+        // of climb range), which left the headline bug only half fixed.
+        {
+            Scene ss;
+            entt::registry& sr = ss.Registry();
+            const entt::entity floor = ss.CreateEntity("Floor");
+            Transform ft;
+            ft.scale = glm::vec3(40.0f, 1.0f, 40.0f);
+            sr.emplace<Transform>(floor, ft);
+            sr.emplace<MeshInstance>(floor, MeshInstance{});
+            sr.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
+
+            nav::GridNav gn;
+            gn.EnsureBuilt(ss, {});
+            const u32 baseRebuilds = gn.RebuildCount();
+            const int baseTris = gn.TriangleCount();
+            const glm::vec3 A(-14, 0, 0), B(14, 0, 0);
+            // Straight line A->B passes through the origin; a wall there must divert it.
+            const auto straightish = [&](const std::vector<glm::vec3>& p) {
+                f32 maxOff = 0.0f;
+                for (const glm::vec3& q : p) maxOff = std::max(maxOff, std::abs(q.z));
+                return maxOff;
+            };
+            const f32 offClear = straightish(gn.FindPath(A, B, {}));
+
+            // Spawn a shard holding a 3 m tall, 1 m thin wall across the path. 3 m is
+            // deliberately taller than GridNavParams::climb (2 m).
+            const entt::entity shard = ss.CreateEntity("StreamedWall");
+            Transform wt;
+            wt.position = glm::vec3(0.0f, 1.5f, 0.0f);
+            wt.scale = glm::vec3(1.0f, 3.0f, 24.0f);
+            sr.emplace<Transform>(shard, wt);
+            sr.emplace<MeshInstance>(shard, MeshInstance{});
+            sr.emplace<MeshRef>(shard, MeshRef{"prim:cube"});
+            sr.emplace<StreamShard>(shard, StreamShard{7});
+            gn.EnsureBuilt(ss, {});
+
+            const bool indexed = gn.HasStreamedShard(7) && gn.StreamedBlockCount() == 1 &&
+                                 gn.TriangleCount() > baseTris;
+            const bool noRebuild = gn.RebuildCount() == baseRebuilds;
+            const f32 offWall = straightish(gn.FindPath(A, B, {}));
+            if (indexed && noRebuild && offWall > 6.0f && offClear < 2.0f) {
+                HBE_INFO("NavShardTest PASS: streamed shard indexed incrementally ({} -> {} tris, "
+                         "0 rebuilds); a 3 m wall (taller than climb) diverted the path {:.1f} m "
+                         "off the straight line (was {:.1f} m).",
+                         baseTris, gn.TriangleCount(), offWall, offClear);
+            } else {
+                HBE_ERROR("NavShardTest FAIL: indexed={} noRebuild={} offWall={:.1f} "
+                          "offClear={:.1f} blocks={}.",
+                          indexed, noRebuild, offWall, offClear, gn.StreamedBlockCount());
+                code = 1;
+            }
+
+            // Despawn: the triangles must LEAVE the index, still with no full rebuild.
+            sr.destroy(shard);
+            gn.EnsureBuilt(ss, {});
+            const f32 offGone = straightish(gn.FindPath(A, B, {}));
+            if (!gn.HasStreamedShard(7) && gn.StreamedBlockCount() == 0 &&
+                gn.TriangleCount() == baseTris && gn.RebuildCount() == baseRebuilds &&
+                offGone < 2.0f) {
+                HBE_INFO("NavShardTest PASS: despawn removed the block ({} tris again, 0 "
+                         "rebuilds) and the path went straight through ({:.1f} m off).",
+                         gn.TriangleCount(), offGone);
+            } else {
+                HBE_ERROR("NavShardTest FAIL (despawn): blocks={} tris={} rebuilds={} "
+                          "offGone={:.1f}.",
+                          gn.StreamedBlockCount(), gn.TriangleCount(),
+                          gn.RebuildCount() - baseRebuilds, offGone);
+                code = 1;
+            }
+        }
+
+        // --- A MOVED static mesh must invalidate the index -------------------------
+        // With only entity ids in the fingerprint, dragging a wall with the gizmo left
+        // nav holding its OLD triangles forever.
+        {
+            Scene ms;
+            entt::registry& mr = ms.Registry();
+            const entt::entity floor = ms.CreateEntity("Floor");
+            Transform ft;
+            ft.scale = glm::vec3(40.0f, 1.0f, 40.0f);
+            mr.emplace<Transform>(floor, ft);
+            mr.emplace<MeshInstance>(floor, MeshInstance{});
+            mr.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
+            const entt::entity wall = ms.CreateEntity("Wall");
+            Transform wt;
+            wt.position = glm::vec3(0.0f, 1.5f, 0.0f);
+            wt.scale = glm::vec3(1.0f, 3.0f, 24.0f);
+            mr.emplace<Transform>(wall, wt);
+            mr.emplace<MeshInstance>(wall, MeshInstance{});
+            mr.emplace<MeshRef>(wall, MeshRef{"prim:cube"});
+
+            nav::GridNav gn;
+            gn.EnsureBuilt(ms, {});
+            const auto offOf = [&](const std::vector<glm::vec3>& p) {
+                f32 m = 0.0f;
+                for (const glm::vec3& q : p) m = std::max(m, std::abs(q.z));
+                return m;
+            };
+            const f32 blocked = offOf(gn.FindPath({-14, 0, 0}, {14, 0, 0}, {}));
+            const u32 before = gn.RebuildCount();
+            mr.get<Transform>(wall).position = glm::vec3(0.0f, 1.5f, 200.0f); // gizmo drag
+            // A PLACEMENT change is caught by the amortized heavy fingerprint tier, so the
+            // contract is "within kHeavyFingerprintPeriod frames", not "next frame" - the
+            // per-frame cost of checking every static mesh's world matrix was 0.216 ms,
+            // more than half the frame's whole CPU headroom. Assert the real window: it
+            // must happen, and it must happen inside that many EnsureBuilt calls.
+            int framesToNotice = -1;
+            for (int i = 1; i <= 16; ++i) {
+                gn.EnsureBuilt(ms, {});
+                if (gn.RebuildCount() > before) { framesToNotice = i; break; }
+            }
+            const f32 moved = offOf(gn.FindPath({-14, 0, 0}, {14, 0, 0}, {}));
+            if (blocked > 6.0f && moved < 2.0f && framesToNotice > 0 && framesToNotice <= 8) {
+                HBE_INFO("NavStaleTest PASS: moving a static wall rebuilt the index after {} "
+                         "frame(s) (path went {:.1f} m off -> {:.1f} m off).",
+                         framesToNotice, blocked, moved);
+            } else {
+                HBE_ERROR("NavStaleTest FAIL: blocked={:.1f} moved={:.1f} framesToNotice={}.",
+                          blocked, moved, framesToNotice);
+                code = 1;
+            }
+        }
+
+        // --- An UNREACHABLE target must not cost a query every frame ---------------
+        // The pathology: `ag.path.empty()` was tested first and unconditionally, so an
+        // agent whose goal is walled off re-ran a full maxExpand query at frame rate
+        // (~4.7 ms/frame, against ~0.4 ms of headroom) forever.
+        {
+            Scene us;
+            entt::registry& ur = us.Registry();
+            const entt::entity floor = us.CreateEntity("Floor");
+            Transform ft;
+            ft.scale = glm::vec3(20.0f, 1.0f, 20.0f);
+            ur.emplace<Transform>(floor, ft);
+            ur.emplace<MeshInstance>(floor, MeshInstance{});
+            ur.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
+            nav::GridNav gn;
+            gn.EnsureBuilt(us, {});
+            const entt::entity ag = us.CreateEntity("StuckAgent");
+            Transform at;
+            at.position = glm::vec3(0.0f, 0.0f, 0.0f);
+            ur.emplace<Transform>(ag, at);
+            NavigationAgent na;
+            na.target = glm::vec3(4000.0f, 0.0f, 4000.0f); // far off the mesh: unreachable
+            na.hasTarget = true;
+            ur.emplace<NavigationAgent>(ag, na);
+
+            u32 queries = 0;
+            constexpr int kFrames = 240; // 4 s at 60 Hz
+            for (int i = 0; i < kFrames; ++i) {
+                nav::UpdateAgents(us, gn, 1.0f / 60.0f);
+                queries += gn.LastQueryCount();
+            }
+            // At ~3 Hz the honest ceiling over 4 s is ~13; anything near kFrames means
+            // the empty-path branch is still bypassing the cooldown.
+            if (queries <= 20) {
+                HBE_INFO("NavBudgetTest PASS: an agent with an unreachable target issued {} A* "
+                         "queries in {} frames (~{:.1f} Hz), not one per frame.",
+                         queries, kFrames, queries * 60.0f / kFrames);
+            } else {
+                HBE_ERROR("NavBudgetTest FAIL: {} queries in {} frames - the re-plan cooldown is "
+                          "being bypassed.",
+                          queries, kFrames);
+                code = 1;
+            }
+        }
+
         jobs::Shutdown();
         return code;
+    }
+
+    // Navigation COST harness. Reports the per-frame nav band and the per-query cost, and
+    // where two implementations of one hot path both still exist in this binary it times
+    // BOTH - so the before/after is a measurement in one process rather than a claim
+    // about a build that is no longer here.
+    if (config.navBench) {
+        using bclock = std::chrono::high_resolution_clock;
+        const auto msOf = [](bclock::duration d) {
+            return std::chrono::duration<f64, std::milli>(d).count();
+        };
+
+        // A world shaped like the reference project's problem case: a big terrain (the
+        // walkable floor), a few thousand static meshes, and a couple of thousand
+        // entities owned by stream shards.
+        Scene bs;
+        entt::registry& br = bs.Registry();
+        const entt::entity te = bs.CreateEntity("Terrain");
+        br.emplace<Transform>(te, Transform{});
+        TerrainComponent btc;
+        btc.chunks = 16;
+        btc.resolution = 40; // GridN = 641, matching the reference project
+        btc.chunkSize = 32.0f;
+        btc.height = 6.0f;
+        br.emplace<TerrainComponent>(te, btc);
+        terrain::EnsureHeights(br.get<TerrainComponent>(te));
+
+        constexpr int kStatic = 2000, kStreamed = 2000, kShards = 40;
+        for (int i = 0; i < kStatic; ++i) {
+            const entt::entity e = bs.CreateEntity("S" + std::to_string(i));
+            Transform t;
+            t.position = glm::vec3(static_cast<f32>((i % 50) * 8 - 200), 0.5f,
+                                   static_cast<f32>((i / 50) * 8 - 160));
+            br.emplace<Transform>(e, t);
+            br.emplace<MeshInstance>(e, MeshInstance{});
+            br.emplace<MeshRef>(e, MeshRef{"prim:cube"});
+        }
+        for (int i = 0; i < kStreamed; ++i) {
+            const entt::entity e = bs.CreateEntity("D" + std::to_string(i));
+            Transform t;
+            t.position = glm::vec3(static_cast<f32>((i % 50) * 8 - 196), 0.5f,
+                                   static_cast<f32>((i / 50) * 8 - 156));
+            br.emplace<Transform>(e, t);
+            br.emplace<MeshInstance>(e, MeshInstance{});
+            br.emplace<MeshRef>(e, MeshRef{"prim:cube"});
+            br.emplace<StreamShard>(e, StreamShard{static_cast<u32>(i % kShards)});
+        }
+
+        nav::GridNav gn;
+        const auto tBuild = bclock::now();
+        gn.EnsureBuilt(bs, {});
+        const f64 firstBuildMs = msOf(bclock::now() - tBuild);
+        HBE_INFO("NavBench: world = 641^2 terrain (512 m) + {} static + {} streamed meshes in {} "
+                 "shards -> {} tris, {} terrain surface(s), {} block(s). First build {:.2f} ms.",
+                 kStatic, kStreamed, kShards, gn.TriangleCount(), gn.TerrainCount(),
+                 gn.StreamedBlockCount(), firstBuildMs);
+
+        // 1. Steady-state per-frame cost: EnsureBuilt with nothing changed. Split into the
+        //    cheap streamed gate (what runs now) and the full per-shard content
+        //    fingerprint (what ran every frame before).
+        constexpr int kFrames = 400;
+        auto t0 = bclock::now();
+        for (int i = 0; i < kFrames; ++i) gn.EnsureBuilt(bs, {});
+        const f64 steadyMs = msOf(bclock::now() - t0) / kFrames;
+
+        t0 = bclock::now();
+        for (int i = 0; i < kFrames; ++i) gn.BenchStreamPoll(bs, {}, /*forceFull=*/true);
+        const f64 fullPollMs = msOf(bclock::now() - t0) / kFrames;
+        t0 = bclock::now();
+        for (int i = 0; i < kFrames; ++i) gn.BenchStreamPoll(bs, {}, /*forceFull=*/false);
+        const f64 gatePollMs = msOf(bclock::now() - t0) / kFrames;
+
+        // 2. A terrain SCULPT must not cost a rebuild.
+        const u32 rb0 = gn.RebuildCount();
+        t0 = bclock::now();
+        for (int i = 0; i < 100; ++i) {
+            terrain::SculptHeights(br.get<TerrainComponent>(te), static_cast<f32>(i % 40) - 20.0f,
+                                   0.0f, 4.0f, 0.05f, terrain::Brush::Raise, 0.0f);
+            gn.EnsureBuilt(bs, {});
+        }
+        const f64 sculptFrameMs = msOf(bclock::now() - t0) / 100.0;
+        const u32 sculptRebuilds = gn.RebuildCount() - rb0;
+
+        // 3. Query cost, and the obstacle-index win. 50 obstacles, like the budget note.
+        std::vector<nav::GridObstacle> obs;
+        for (int i = 0; i < 50; ++i)
+            obs.push_back({glm::vec3(static_cast<f32>(i % 10) * 6.0f - 30.0f, 0.0f,
+                                     static_cast<f32>(i / 10) * 6.0f - 15.0f),
+                           2.0f});
+        // Start and goal must sit ON the ground: this terrain undulates +/-6 m, and a
+        // start point 4 m above the surface is farther than `climb` from every walkable
+        // cell, so the query would (correctly) find nothing and time nothing.
+        // ...and they must be in the OPEN: the prop grid is on 8 m centres, so a point
+        // that lands on one puts the agent inside a cube, where the clearance test
+        // legitimately rejects its whole neighbourhood. +4 m sits mid-gap.
+        const TerrainComponent& btr = br.get<TerrainComponent>(te);
+        const glm::vec3 QA(-124.0f, terrain::SampleHeight(btr, -124.0f, -124.0f), -124.0f);
+        const glm::vec3 QB(108.0f, terrain::SampleHeight(btr, 108.0f, 100.0f), 100.0f);
+        t0 = bclock::now();
+        int corners = 0;
+        constexpr int kQueries = 20;
+        for (int i = 0; i < kQueries; ++i) corners = static_cast<int>(gn.FindPath(QA, QB, obs).size());
+        const f64 queryMs = msOf(bclock::now() - t0) / kQueries;
+
+        // Ground sample with and without the clearance test, so the cost of making
+        // non-walkable geometry block (the tall-prop fix) is a number and not a guess.
+        {
+            constexpr int kG = 200000;
+            volatile f32 acc = 0.0f;
+            auto tg = bclock::now();
+            for (int i = 0; i < kG; ++i) {
+                const f32 x = static_cast<f32>(i % 600) * 0.5f - 150.0f;
+                const f32 z = static_cast<f32>((i / 600) % 600) * 0.5f - 150.0f;
+                acc += gn.BenchGround(x, z, 0.0f, false).value_or(0.0f);
+            }
+            const f64 plainNs = msOf(bclock::now() - tg) * 1e6 / kG;
+            tg = bclock::now();
+            for (int i = 0; i < kG; ++i) {
+                const f32 x = static_cast<f32>(i % 600) * 0.5f - 150.0f;
+                const f32 z = static_cast<f32>((i / 600) % 600) * 0.5f - 150.0f;
+                acc += gn.BenchGround(x, z, 0.0f, true).value_or(0.0f);
+            }
+            const f64 clearNs = msOf(bclock::now() - tg) * 1e6 / kG;
+            HBE_INFO("NavBench: ground sample {:.1f} ns (no clearance) vs {:.1f} ns (with "
+                     "clearance - the tall-prop blocker test).",
+                     plainNs, clearNs);
+        }
+
+        // Obstacle test in isolation: the grid vs the linear scan it replaced.
+        constexpr int kSamples = 200000;
+        volatile int sink = 0;
+        t0 = bclock::now();
+        for (int i = 0; i < kSamples; ++i) {
+            const f32 x = static_cast<f32>(i % 400) * 0.5f - 100.0f;
+            const f32 z = static_cast<f32>((i / 400) % 400) * 0.5f - 100.0f;
+            if (nav::GridNav::BenchLinearBlocked(obs, 0.4f, x, z)) ++sink;
+        }
+        const f64 linearNs = msOf(bclock::now() - t0) * 1e6 / kSamples;
+        nav::GridNav::ObstacleGrid probe;
+        probe.Build(obs, 0.4f);
+        t0 = bclock::now();
+        for (int i = 0; i < kSamples; ++i) {
+            const f32 x = static_cast<f32>(i % 400) * 0.5f - 100.0f;
+            const f32 z = static_cast<f32>((i / 400) % 400) * 0.5f - 100.0f;
+            if (probe.Blocked(x, z)) ++sink;
+        }
+        const f64 gridNs = msOf(bclock::now() - t0) * 1e6 / kSamples;
+
+        // 4. A stuck agent: the pathology was one full query PER FRAME, forever.
+        const entt::entity ag = bs.CreateEntity("Stuck");
+        Transform at;
+        at.position = glm::vec3(0.0f, terrain::SampleHeight(btr, 0.0f, 0.0f), 0.0f);
+        br.emplace<Transform>(ag, at);
+        NavigationAgent na;
+        na.target = glm::vec3(9000.0f, 0.0f, 9000.0f); // unreachable
+        na.hasTarget = true;
+        br.emplace<NavigationAgent>(ag, na);
+        u32 stuckQueries = 0;
+        t0 = bclock::now();
+        for (int i = 0; i < 300; ++i) {
+            gn.EnsureBuilt(bs, {});
+            nav::UpdateAgents(bs, gn, 1.0f / 60.0f);
+            stuckQueries += gn.LastQueryCount();
+        }
+        const f64 stuckFrameMs = msOf(bclock::now() - t0) / 300.0;
+
+        HBE_INFO("NavBench RESULTS (Release, {} static tris, {} streamed entities, 50 obstacles):",
+                 gn.TriangleCount(), kStreamed);
+        HBE_INFO("  steady-state EnsureBuilt (nothing changed) : {:.4f} ms/frame", steadyMs);
+        HBE_INFO("  streamed poll, FULL fingerprint (was)      : {:.4f} ms/frame", fullPollMs);
+        HBE_INFO("  streamed poll, cheap gate (is)             : {:.4f} ms/frame", gatePollMs);
+        HBE_INFO("  terrain sculpt + EnsureBuilt               : {:.4f} ms/frame, {} rebuild(s)",
+                 sculptFrameMs, sculptRebuilds);
+        HBE_INFO("  one ~330 m A* query ({} corners)            : {:.3f} ms", corners, queryMs);
+        HBE_INFO("  obstacle test, linear scan (was)           : {:.2f} ns/sample", linearNs);
+        HBE_INFO("  obstacle test, XZ grid (is)                : {:.2f} ns/sample", gridNs);
+        HBE_INFO("  stuck agent, whole nav band                : {:.4f} ms/frame ({} queries in "
+                 "300 frames)",
+                 stuckFrameMs, stuckQueries);
+        jobs::Shutdown();
+        return 0;
     }
 
     // Resolve the boot backend order: an explicit --d3d12/--vulkan/--opengl pins a
@@ -799,12 +1883,9 @@ int Engine::Run(const EngineConfig& configIn) {
     physics_ = &physics;
     audio_ = &audio;
 
-    // The pathfinder + current level live for the whole run; the pointers let the
-    // editor inspect them and the runtime switch levels.
+    // The pathfinder lives for the whole run; the pointer lets the editor inspect it.
     nav::GridNav gridNav;
     gridNav_ = &gridNav; // real-time A* the agents path on (auto-builds, no bake)
-    scene::Level level;
-    currentLevel_ = &level;
 
     bool sceneBuilt = false;
 
@@ -816,19 +1897,33 @@ int Engine::Run(const EngineConfig& configIn) {
     // the latest line as each step completes.
     bool studioSplash = false;
     if (!onInit_ && Project::HasActive() &&
-        !Project::Active().Settings().studioLoadingScene.empty()) {
-        const std::filesystem::path studio =
-            Project::Active().AssetsDir() / Project::Active().Settings().studioLoadingScene;
-        if (vfs::Exists(studio) && scene::LoadScene(scene, renderer, studio)) {
+        !Project::Active().Settings().bootDocument.empty()) {
+        const std::string& rel = Project::Active().Settings().bootDocument;
+        const std::filesystem::path studio = Project::Active().AssetsDir() / rel;
+        // LEGACY BRANCH, decided by EXTENSION at load. A `.hbui` opens as a
+        // document (spared by every Replace sweep, so FlowAfterBoot closes it
+        // explicitly); a `.hbscene` runs the old Replace load, which is disposed
+        // implicitly by FlowMainMenu's non-Persistent sweep exactly as before.
+        const bool isDoc = std::filesystem::path(rel).extension() == ".hbui";
+        bool loaded = false;
+        if (vfs::Exists(studio)) {
+            if (isDoc) {
+                bootDoc_ = docs_.Open(scene, &renderer, studio, /*screenOwned*/ true);
+                loaded = bootDoc_ != 0;
+            } else {
+                loaded = scene::LoadScene(scene, renderer, studio);
+            }
+        }
+        if (loaded) {
             flowActive_ = true;
             gameState_ = GameState::Booting;
             sceneBuilt = true;
             studioSplash = true;
-            HBE_INFO("Boot: studio splash shown; warming up...");
+            HBE_INFO("Boot: studio splash shown ({}); warming up...",
+                     isDoc ? "document" : "legacy scene");
             PresentBootSplash(0.05f); // visible immediately, before the IBL bake
         } else {
-            HBE_WARN("Studio scene '{}' failed to load; skipping splash.",
-                     Project::Active().Settings().studioLoadingScene);
+            HBE_WARN("Boot document '{}' failed to load; skipping splash.", rel);
         }
     }
 
@@ -838,39 +1933,137 @@ int Engine::Run(const EngineConfig& configIn) {
     scene::SetupEnvironment(scene, renderer);
     if (studioSplash) PresentBootSplash(0.5f); // refresh: IBL done, log advanced
 
-    // Persistent UI scene: load ALL screens (UIPanel subtrees) ONCE and keep them
-    // resident across gameplay scene swaps (tag Persistent so the gameplay Replace
-    // spares them). The UIManager shows/hides panels. This is THE game-UI path;
-    // without it the runtime boots straight into the startup scene below.
-    if (!onInit_ && Project::HasActive() && !Project::Active().Settings().uiScene.empty()) {
-        const std::filesystem::path uip =
-            Project::Active().AssetsDir() / Project::Active().Settings().uiScene;
-        scene::SceneData uiData;
-        if (vfs::Exists(uip) && scene::ParseSceneFile(uip, uiData)) {
-            scene::StagedAssets uiStaged;
-            scene::StageAssets(uiData, Project::Active().AssetsDir(), uiStaged);
-            std::vector<entt::entity> uiEnts;
-            scene::Instantiate(scene, renderer, uiData, uiStaged, scene::LoadMode::Additive,
-                               &uiEnts, "__ui");
-            for (const entt::entity e : uiEnts) scene.Registry().emplace<Persistent>(e);
+    // THE resident UI layer: open the `.hbui` document holding ALL screens
+    // (UIPanel subtrees) ONCE and keep it resident across gameplay scene swaps.
+    // Residency is structural now - both Replace sweeps spare
+    // UIDocMember::screenOwned - so there is no Persistent-stamping loop here any
+    // more. The UIManager binds to the document and shows/hides its panels. This
+    // is THE game-UI path; without it the runtime boots straight into the startup
+    // scene below.
+    if (!onInit_ && Project::HasActive() &&
+        !Project::Active().Settings().uiDocuments.empty()) {
+        // ONE DOCUMENT PER SCREEN, ALL RESIDENT. Opened here, in project order,
+        // and never closed - showing a screen later is a bool write, so there is
+        // no on-demand load to hitch, pop in or flash unstyled. Every open passes
+        // a real Renderer* and preload = true, which is the contract that makes
+        // that claim true (InstantiateDocument -> ui::PreloadUIAssets bakes the
+        // font atlas and resolves every texture before the first frame).
+        const std::vector<std::string>& rels = Project::Active().Settings().uiDocuments;
+        u32 count = 0;
+        u32 failures = 0;
+        std::string names;
+        for (const std::string& rel : rels) {
+            if (rel.empty()) continue;
+            const std::filesystem::path uip = Project::Active().AssetsDir() / rel;
+            const bool isDoc = std::filesystem::path(rel).extension() == ".hbui";
+            ui::DocHandle h = 0;
+            u32 here = 0;
+            bool legacy = false;
+            if (vfs::Exists(uip)) {
+                if (isDoc) {
+                    h = docs_.Open(scene, &renderer, uip, /*screenOwned*/ true,
+                                   /*preload*/ true);
+                    if (h != 0) {
+                        const ui::DocumentInstance* inst = docs_.Get(h);
+                        here = inst ? static_cast<u32>(inst->entities.size()) : 0;
+                    }
+                } else {
+                    // LEGACY BRANCH - a `.hbproj` that still points at the
+                    // pre-document UI `.hbscene`. Load it exactly as before, then
+                    // ADOPT the result as a document so UIManager::Bind, the sweep
+                    // predicates and the snapshot skips all behave identically to a
+                    // migrated project. Without this branch a half-migrated project
+                    // boots with uiManagerMode_ false and NO MENU AT ALL.
+                    scene::SceneData uiData;
+                    if (scene::ParseSceneFile(uip, uiData)) {
+                        scene::StagedAssets uiStaged;
+                        scene::StageAssets(uiData, Project::Active().AssetsDir(), uiStaged);
+                        std::vector<entt::entity> uiEnts;
+                        scene::Instantiate(scene, renderer, uiData, uiStaged,
+                                           scene::LoadMode::Additive, &uiEnts, "__ui");
+                        ui::DocData header;
+                        header.post = uiData.post;
+                        header.ambientIntensity = uiData.ambientIntensity;
+                        header.exposure = uiData.exposure;
+                        h = docs_.AdoptLegacy(scene, uiEnts, uip, header,
+                                              /*screenOwned*/ true);
+                        here = static_cast<u32>(uiEnts.size());
+                        legacy = true;
+                    }
+                }
+            }
+            if (h == 0) {
+                HBE_WARN("UI screen document '{}' failed to load.", rel);
+                ++failures;
+                continue;
+            }
+            // The MENU document is the FIRST one that opens, and its MANDATORY
+            // post block is the menu look. Four screens cannot each supply one;
+            // the rest of their headers' `post` is ignored, by design.
+            if (uiDocs_.empty()) {
+                // AdoptLegacy stores the scene's post into the same header slot,
+                // so one read covers both branches.
+                if (const ui::DocData* d = docs_.Header(h)) {
+                    uiScenePost_ = d->post;
+                    uiScenePostValid_ = true;
+                }
+            }
+            uiDocs_.push_back(h);
+            count += here;
+            if (!names.empty()) names += ", ";
+            names += rel;
+            if (legacy) names += " (legacy scene)";
+        }
+        if (!uiDocs_.empty()) {
+            uiManager_.Bind(uiDocs_);
             uiManager_.Init(scene);
             uiManagerMode_ = true;
+            // NO INITIAL SCREEN = A DEAD BLACK BOOT, and it is one renamed file
+            // away. Only MainMenu.hbui carries startVisible; if that ONE entry
+            // goes stale (a rename, a moved file, the "+ Add screen" row's empty
+            // slot) the other three still open, uiManagerMode_ still latches, and
+            // FlowMainMenu shows NOTHING while parking the game in MainMenu with a
+            // free cursor - a black screen with zero interactive elements and no
+            // way out. Pre-split this was loud and recoverable (the single
+            // document failed, uiDocs_ stayed empty, FlowAfterBoot fell through to
+            // FlowPlay). Restore that property: adopt the first reachable panel,
+            // and if even that is impossible, hand the boot back to FlowPlay.
+            if (uiManager_.Initial().empty()) {
+                const std::string first = uiManager_.FirstPanelName();
+                if (!first.empty()) {
+                    HBE_ERROR("Boot: no screen document declares a startVisible panel "
+                              "(is the main menu screen missing from the project?); "
+                              "falling back to the first reachable screen '{}'.",
+                              first);
+                    uiManager_.SetInitial(first);
+                } else {
+                    HBE_ERROR("Boot: the resident screen set contains NO named panel; "
+                              "booting straight into the game instead of an empty menu.");
+                    uiManagerMode_ = false;
+                    flowActive_ = false;
+                    sceneBuilt = false;
+                }
+            }
+        }
+        if (!uiDocs_.empty() && uiManagerMode_) {
+            AuditScreenActions(scene);
             flowActive_ = true;
             sceneBuilt = true; // UI-only overlay; the gameplay world loads on Play
-            // Keep the UI scene's authored post: this additive load does not apply
-            // it (correctly - additive must not clobber the world's environment),
-            // but the MENU is that scene, so its look is what should be on screen.
-            uiScenePost_ = uiData.post;
-            uiScenePostValid_ = true;
             if (!studioSplash) { // no splash: go straight to the initial (menu) panel
                 uiManager_.ShowInitial(scene);
                 gameState_ = GameState::MainMenu;
                 ApplyMenuPost();
             }
-            HBE_INFO("Boot: persistent UI scene '{}' loaded ({} entities).",
-                     Project::Active().Settings().uiScene, static_cast<u32>(uiEnts.size()));
-        } else {
-            HBE_WARN("UI scene '{}' failed to load.", Project::Active().Settings().uiScene);
+            HBE_INFO("Boot: {} resident UI screen document(s) loaded ({} entities): {}.",
+                     uiDocs_.size(), count, names);
+            // A MISSING SCREEN IS A SHIPPING BLOCKER, not a warning: every flow verb
+            // that targets it becomes a dead button in the shipped build.
+            if (failures > 0)
+                HBE_ERROR("Boot: {} UI screen document(s) FAILED to load; those screens "
+                          "are missing and every button that opens one is dead.",
+                          failures);
+        } else if (uiDocs_.empty()) {
+            HBE_WARN("No UI screen document loaded ({} configured).", rels.size());
         }
     }
 
@@ -902,17 +2095,9 @@ int Engine::Run(const EngineConfig& configIn) {
     if (!sceneBuilt && Project::HasActive() && !Project::Active().Settings().startupScene.empty()) {
         const std::filesystem::path startup =
             Project::Active().AssetsDir() / Project::Active().Settings().startupScene;
-        if (vfs::Exists(startup)) { // pack-aware (shipped builds have no loose files)
-            // A level layer file (<name>.static/.dynamic) loads the whole level
-            // via the Level class; a plain scene (incl. a UI/menu scene) loads on
-            // its own.
-            if (scene::IsLevelMember(startup)) {
-                LoadLevel(scene::ResolveLevel(startup).base);
-                sceneBuilt = currentLevel_->Loaded();
-            } else {
-                sceneBuilt = scene::LoadScene(scene, renderer, startup);
-            }
-        }
+        // A level is ONE .hbscene: no layer files, no two-file loader.
+        if (vfs::Exists(startup)) // pack-aware (shipped builds have no loose files)
+            sceneBuilt = scene::LoadScene(scene, renderer, startup);
         if (!sceneBuilt) {
             HBE_WARN("Startup scene '{}' failed to load.",
                      Project::Active().Settings().startupScene);
@@ -929,7 +2114,8 @@ int Engine::Run(const EngineConfig& configIn) {
         scene::SpawnStress(scene, renderer, config.stressCount, config.stressShared);
     }
     if (config.stressParticles > 0) {
-        scene::SpawnParticleStress(scene, config.stressParticles);
+        scene::SpawnParticleStress(scene, config.stressParticles, config.gpuParticles,
+                                   config.gpuSimParticles);
     }
 
     if (config.forceDof) scene.Environment().post.dofEnabled = 1;
@@ -942,51 +2128,6 @@ int Engine::Run(const EngineConfig& configIn) {
         if (config.forcePainterlyRadius >= 0.0f) p.painterlyRadius = config.forcePainterlyRadius;
         HBE_INFO("Painterly forced ON (stroke size {:.1f}, strokes {}).", p.painterlyRadius,
                  p.painterlyStrokes ? "on" : "off");
-    }
-
-    // World streaming (distance-based partition): a .hbworld manifest, or the
-    // built-in smoke test (a line of cells the focus sweeps across). Loads run
-    // on the job system; the focus point is the camera at runtime.
-    StreamingWorld streamingWorld;
-    streamingWorld_ = &streamingWorld; // editor loads/inspects it via GetStreamingWorld()
-    if (config.worldTest) {
-        const std::filesystem::path tmp =
-            std::filesystem::temp_directory_path() / "hbe_worldtest";
-        std::error_code wec;
-        std::filesystem::create_directories(tmp, wec);
-        const std::filesystem::path cellScene = tmp / "cell.hbscene";
-        {
-            // One reusable floor cell, placed per-cell via StreamingCell::offset.
-            Scene tmpScene;
-            const entt::entity e = tmpScene.CreateEntity("Floor");
-            Transform tf;
-            tf.scale = glm::vec3(8.0f, 1.0f, 8.0f); // a walkable patch (survives erosion)
-            tmpScene.Registry().emplace<Transform>(e, tf);
-            MeshInstance mi;
-            mi.baseColor = glm::vec4(0.85f, 0.32f, 0.22f, 1.0f);
-            tmpScene.Registry().emplace<MeshInstance>(e, mi);
-            tmpScene.Registry().emplace<MeshRef>(e, MeshRef{"prim:plane"});
-            scene::SaveScene(tmpScene, cellScene);
-        }
-        std::vector<StreamingCell> cells;
-        for (int i = 0; i < 12; ++i) {
-            StreamingCell c;
-            c.name = "cell_" + std::to_string(i);
-            c.scene = cellScene.string();
-            c.center = glm::vec3(static_cast<f32>(i) * 20.0f, 0.0f, 0.0f);
-            c.offset = c.center;
-            c.loadRadius = 25.0f;
-            c.unloadRadius = 35.0f;
-            cells.push_back(std::move(c));
-        }
-        streamingWorld.SetCells(std::move(cells), tmp);
-        HBE_INFO("StreamingWorld: smoke test, 12 cells along +X.");
-    } else if (!config.worldPath.empty()) {
-        const std::filesystem::path assetsDir =
-            Project::HasActive()
-                ? Project::Active().AssetsDir()
-                : std::filesystem::path(config.worldPath).parent_path();
-        streamingWorld.LoadManifest(config.worldPath, assetsDir);
     }
 
     // NavigationAgents path on GridNav (the real-time A*), which auto-builds from
@@ -1108,18 +2249,44 @@ int Engine::Run(const EngineConfig& configIn) {
     // One-time application init (e.g. the editor wires up ImGui here).
     if (onInit_) onInit_(*this);
 
+    // --fixed-dt: pin the simulation clock (see EngineConfig::fixedDt). After onInit_
+    // so a test harness that sets its own fixed dt still wins.
+    if (config.fixedDt > 0.0f && renderFixedDt_ <= 0.0f) renderFixedDt_ = config.fixedDt;
+
     using clock = std::chrono::high_resolution_clock;
     auto last = clock::now();
     auto fpsLast = last;
     u32 fpsFrames = 0;
     // Per-window CPU phase timers (ms accumulated; averaged + reset each Perf report).
     f64 accGpMs = 0.0, accFacialMs = 0.0, accRenderMs = 0.0;
+    // Particle VERTEX EXPANSION, timed on its own. It is the phase
+    // ParticleEmitter::gpuExpand moves off the CPU, so folding it into any other
+    // bucket would make the one change this timer exists to measure invisible.
+    f64 accVfxBuildMs = 0.0;
+    // Particle SIMULATION (particle::Update: spawn scheduling + the module kernels),
+    // timed separately from expansion for the same reason expansion is timed
+    // separately from everything else. This is the phase ParticleEmitter::gpuSim
+    // moves into a compute shader; without its own bucket the one change it exists to
+    // measure would only ever show up as a diffuse frame-time difference.
+    f64 accVfxSimMs = 0.0;
+    // Interaction pick (ray + ONE physics occlusion cast + the page loop).
+    f64 accPickMs = 0.0;
+    u64 accPickCasts = 0;
+    // TAG STREAMING, on its own. It is the one phase whose whole design claim is "this
+    // costs almost nothing per frame", so it needs its own number rather than being
+    // hidden inside a bucket that already measures milliseconds.
+    f64 accStreamMs = 0.0;
+    // NAVIGATION, on its own, for the same reason: its acceptance criterion is a
+    // per-frame millisecond budget, and its cost scales with agents and with how many
+    // A* queries the frame budget let through - neither of which is visible in any
+    // other bucket. `accNavQueries` is reported alongside so a suspicious millisecond
+    // count can be attributed to query volume rather than guessed at.
+    f64 accNavMs = 0.0;
+    u64 accNavQueries = 0;
     std::vector<rhi::UIVertex> uiVertices; // reused each frame
     std::vector<ui::WorldUIBatch> worldUIBatches;      // world-canvas triangles (reused)
     std::vector<Renderer::WorldUIDraw> worldUIDraws;   // -> renderer, one frame each
     std::vector<rhi::ParticleVertex> particleAlpha, particleAdd; // reused each frame
-    glm::vec3 streamFocus(0.0f);           // last streaming focus (for stats log)
-    f32 worldTestT = 0.0f;                 // smoke-test focus-sweep clock
     cam::CameraState cameraState;          // persistent camera smoothing/blend state
     bool prevGameCamEnabled = false;       // rising edge -> snap the camera
     bool musicStarted = false;             // adaptive music armed while the game runs
@@ -1127,6 +2294,17 @@ int Engine::Run(const EngineConfig& configIn) {
     f32 dtSmooth = 0.0f;                   // EMA of frame delta (motion smoothing)
     f32 winMaxDt = 0.0f;                   // worst frame in the current report window
     u32 winJank = 0;                       // frames slower than 45 FPS this window
+
+    // --- Tag streaming test (--tagstreamtest N) -----------------------------
+    // Builds and binds the synthetic world before the first frame, so the sweep runs
+    // against a real renderer. A setup failure exits non-zero rather than running a
+    // meaningless test.
+    int tagStreamTestExit = 0;
+    if (tagStreamTest_ > 0 && !BeginTagStreamTest()) {
+        HBE_ERROR("--tagstreamtest: setup failed; not running the sweep.");
+        tagStreamTestExit = 1;
+        tagStreamTest_ = 0;
+    }
 
     // --- Benchmark mode (--benchmark N) -------------------------------------
     // Collect RAW per-frame times (never the smoothed dt - the EMA is for motion,
@@ -1180,6 +2358,13 @@ int Engine::Run(const EngineConfig& configIn) {
             }
         }
 
+        // --tagstreamtest: advance the swept focus and sample the frame time. Runs here,
+        // before anything reads streamFocusOverride_, and uses the RAW frame time for
+        // the same reason the benchmark does - the clamp and EMA below exist to stop a
+        // hitch teleporting the simulation, and a measurement that smooths its own
+        // spikes is measuring the smoothing.
+        if (tagStreamTestActive_ && !StepTagStreamTest(trueFrameMs)) break;
+
         // Periodic FPS report.
         if (++fpsFrames >= 1) {
             const f32 elapsed = std::chrono::duration<f32>(now - fpsLast).count();
@@ -1198,17 +2383,59 @@ int Engine::Run(const EngineConfig& configIn) {
                          rs.shadowCulled, us.elements, us.verts,
                          us.textLayouts, us.mapRebuilds);
                 HBE_INFO("  CPU phases (avg/frame): gameplay {:.2f} ms | facial {:.2f} ms | "
-                         "renderScene-submit {:.2f} ms",
-                         accGpMs / fpsFrames, accFacialMs / fpsFrames, accRenderMs / fpsFrames);
-                accGpMs = accFacialMs = accRenderMs = 0.0;
+                         "vfx-sim {:.3f} ms | vfx-expand {:.3f} ms | stream {:.3f} ms | "
+                         "nav {:.3f} ms ({:.2f} A*/frame) | pick {:.4f} ms ({:.2f} "
+                         "cast/frame) | renderScene-submit {:.2f} ms | cpu-particles {}",
+                         accGpMs / fpsFrames, accFacialMs / fpsFrames,
+                         accVfxSimMs / fpsFrames, accVfxBuildMs / fpsFrames,
+                         accStreamMs / fpsFrames, accNavMs / fpsFrames,
+                         static_cast<f64>(accNavQueries) / fpsFrames,
+                         accPickMs / fpsFrames,
+                         static_cast<f64>(accPickCasts) / fpsFrames, accRenderMs / fpsFrames,
+                         particle::LiveCount(scene));
+                if (gridNav.Ready()) {
+                    HBE_INFO("  Navigation: {} static tri(s) | {} terrain surface(s) | "
+                             "{} streamed block(s) | {} full rebuild(s) since boot",
+                             gridNav.StaticTriangleCount(), gridNav.TerrainCount(),
+                             gridNav.StreamedBlockCount(), gridNav.RebuildCount());
+                }
+                // Streaming, when a level is actually bound. `resident/total` is the
+                // whole point of the feature in one number; the maxima are the WINDOW's
+                // worst single finalize/despawn and worst evaluation - the cost the
+                // salvaged one-per-frame budget exists to keep bounded. Window, not
+                // lifetime: one 12 ms finalize at level start would otherwise make every
+                // later line report it forever, which says nothing about a NEW
+                // regression during play. (--tagstreamtest reports the since-bind ones.)
+                if (tagStream_.IsBound() && tagStream_.ShardCount() > 0) {
+                    const stream::StreamStats& ss = tagStream_.Stats();
+                    HBE_INFO("  Streaming: {}/{} shard(s) resident | {} spawn / {} despawn "
+                             "(since bind) | {} eval | window max: eval {:.3f} ms, "
+                             "structural {:.2f} ms | {} deferred shard(s){}",
+                             tagStream_.ResidentShardCount(), tagStream_.ShardCount(),
+                             ss.spawns, ss.despawns, ss.evaluations, ss.winMaxEvalMs,
+                             ss.winMaxStructuralMs, ss.deferredFinalizes,
+                             tagStream_.Enabled() ? "" : " | DISABLED (all pinned loaded)");
+                    tagStream_.ResetWindowStats();
+                }
+                // GPU simulation, when any emitter uses it. `slots` is what the
+                // compute pass ran over and `spawned` is this frame's births - the two
+                // numbers that say whether the ring is sized right (spawned*lifetime
+                // should sit just under slots).
+                if (const particle::GpuSim::Stats& gs = gpuSim_.GetStats(); gs.emitters > 0) {
+                    HBE_INFO("  GPU vfx sim: {} emitters | {} slots | {} spawned/frame | "
+                             "{} groups{}",
+                             gs.emitters, gs.slots, gs.spawned, gs.groups,
+                             gs.dropped ? std::format(" | {} DROPPED (no room)", gs.dropped)
+                                        : std::string());
+                }
+                accGpMs = accFacialMs = accRenderMs = accVfxBuildMs = accVfxSimMs = 0.0;
+                accStreamMs = 0.0;
+                accPickMs = 0.0;
+                accPickCasts = 0;
+                accNavMs = 0.0;
+                accNavQueries = 0;
                 winMaxDt = 0.0f;
                 winJank = 0;
-                if (streamingWorld.Active()) {
-                    const StreamingWorld::Stats st = streamingWorld.GetStats();
-                    HBE_INFO("Streaming: {}/{} cells loaded, {} loading, {} entities "
-                             "(focus x={:.0f}).",
-                             st.loaded, st.cells, st.loading, st.entities, streamFocus.x);
-                }
                 fpsFrames = 0;
                 fpsLast = now;
             }
@@ -1222,8 +2449,18 @@ int Engine::Run(const EngineConfig& configIn) {
         // Developer overlay (only when the project opts in via BuildSettings):
         // Ctrl+` toggles it; while open, function keys run dev actions. Ships in
         // the runtime build (gated by the flag), no editor required.
-        const bool devEnabled =
-            Project::HasActive() && Project::Active().Settings().build.devMenu;
+        //
+        // `!onInit_` = RUNTIME ONLY. This block is inside Engine::Run, which the EDITOR
+        // also drives, and it had no editor gate at all - so with devMenu:true (which
+        // the reference project sets) Ctrl+` then F9 ran LoadGame inside the editor.
+        // LoadGame does scene::Instantiate(LoadMode::Replace): it DESTROYED the authored
+        // world and put a checkpoint snapshot in its place, while the editor went on
+        // believing currentScenePath_ still described the registry. The next Ctrl+S
+        // wrote the snapshot over the level. The dev-menu scene rows (LoadGameplayScene)
+        // were a second door to the same state. The editor has its own menus for all of
+        // this; the overlay is a shipped-build affordance and now says so.
+        const bool devEnabled = !onInit_ && Project::HasActive() &&
+                                Project::Active().Settings().build.devMenu;
         // Suppress the dev overlay chord + its function keys while listening for a
         // rebind, so pressing Ctrl+` (or a dev F-key) during a rebind neither toggles
         // the overlay nor fires a dev action.
@@ -1233,7 +2470,7 @@ int Engine::Run(const EngineConfig& configIn) {
         if (devEnabled && !actionMap_.Rebinding() && input.IsKeyDownRaw(Key::Ctrl) &&
             input.WasKeyPressedRaw(Key::Grave)) {
             devMenuOpen_ = !devMenuOpen_;
-            if (devMenuOpen_) { DevMenuScanLevels(); devMenuSel_ = 0; } // fresh level list on open
+            if (devMenuOpen_) { DevMenuScanScenes(); devMenuSel_ = 0; } // fresh scene list on open
         }
         if (devEnabled && devMenuOpen_ && !actionMap_.Rebinding()) {
             RebuildDevMenu(); // reflects live values; consumed by BuildDevOverlay this frame
@@ -1269,14 +2506,21 @@ int Engine::Run(const EngineConfig& configIn) {
         const std::filesystem::path assetsDir =
             Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
 
-        anim::Update(scene, dt); // keyframe tracks pose entities first
+        // `physics.IsRunning()` is the engine's one answer to "is the simulation
+        // running?" - it is what already gates motion matching and facial animation
+        // just below, for the same reason: in edit mode those systems would overwrite
+        // AUTHORED component values with runtime ones. Animation keeps previewing at
+        // rest (the Timeline transport is a live preview); the flag only stops it from
+        // clearing the authored `playing` when a non-looping clip runs out.
+        const bool simulating = physics.IsRunning();
+        anim::Update(scene, dt, simulating); // keyframe tracks pose entities first
         // Build/refresh any dirty chunked terrain (cheap when nothing changed).
         terrain::Update(scene, renderer);
         // Motion matching picks each animator's clip from movement intent BEFORE
         // the skeletal pose is sampled (play mode / runtime only).
         if (physics.IsRunning()) anim::UpdateMotionMatching(scene, assetsDir, dt);
         // Skeletal animation: advance Animators and rebuild joint palettes.
-        anim::UpdateSkeletal(scene, assetsDir, dt);
+        anim::UpdateSkeletal(scene, assetsDir, dt, simulating);
         // Facial: lip-sync + blink + expression -> MorphState.weights (consumed by
         // CollectDrawItems -> the vertex shader's pre-skin morph accumulation). Play/
         // runtime only: in edit mode it would overwrite authored MorphState weights.
@@ -1287,6 +2531,17 @@ int Engine::Run(const EngineConfig& configIn) {
         }
 
         // The project's canvas configuration (scale mode + reference size).
+        //
+        // DELIBERATELY the PROJECT's, not the open document's, even though a
+        // `.hbui` carries its own `canvas` block. This config is the fallback for
+        // CANVAS-LESS roots, and that set is not only the document's: the
+        // dialogue choice buttons and the interact prompt are created bare
+        // (no Parent, no UICanvas, no UIDocMember) and lay out against exactly
+        // this. Routing it through a document would silently move transient
+        // gameplay UI onto the menu's basis. The document's block is the basis
+        // the EDITOR lays it out against, which is what makes a document
+        // self-describing; the migrator seeds the two from the same place so
+        // they agree by construction.
         ui::CanvasConfig uiConfig;
         if (Project::HasActive()) {
             const BuildSettings& build = Project::Active().Settings().build;
@@ -1300,21 +2555,105 @@ int Engine::Run(const EngineConfig& configIn) {
         // UI interaction BEFORE scripts, so buttons report fresh hover/click
         // state to gameplay code this frame.
         {
-            glm::vec2 pointerNorm(-1.0f, -1.0f);
-            if (uiPointerExternal_) {
-                // Editor-fed: normalized coords over the Game image.
-                pointerNorm = {uiPointerU_, uiPointerV_};
-            } else if (window.Width() > 0 && window.Height() > 0) {
-                pointerNorm = {input.MouseX() / window.Width(),
-                               input.MouseY() / window.Height()};
-            }
-            // World-space ("physical") UI is point-and-click: ray-pick the pages
-            // only while the cursor is FREE. A locked (recentered) cursor would be
-            // a de-facto crosshair, which is not the interaction model.
+            // THE POINTER, resolved by device and cursor state.
+            //
+            //   cursor FREE (menu, dialogue choice, editor) -> the cursor itself,
+            //     driving screen canvases AND world pages, pressed with LMB.
+            //   cursor LOCKED (first-person gameplay)       -> the RETICLE, screen
+            //     centre, driving world pages ONLY, pressed with the "Interact"
+            //     ACTION (LMB is fire).
+            //   GAMEPAD                                     -> the RETICLE in EITHER
+            //     cursor state (a pad moves no mouse, and focus navigation never
+            //     lands on a world page), unless a screen focus ring is live - then
+            //     the pad is navigating a menu and screen space beats world space.
+            //
+            // The policy itself lives in interact::ResolvePointer - one pure
+            // function, so the rule has exactly ONE definition and
+            // --test-3dinteract exercises the shipped one rather than a copy.
+            interact::PointerInputs pin;
+            pin.external = uiPointerExternal_;
+            pin.externalNorm = {uiPointerU_, uiPointerV_}; // editor Game panel
+            pin.cursorLocked = IsCursorLocked();
+            pin.padActive = input_ && input_->LastInputWasGamepad();
+            // Last frame's focus ring. A one-frame lag on "the pad is in a menu" is
+            // invisible; ui::UpdateNavigation runs later in this same block.
+            pin.screenFocusActive = uiCtx_.focusVisible && uiCtx_.focused != entt::null;
+            if (window.Width() > 0 && window.Height() > 0)
+                pin.cursorNorm = {input.MouseX() / window.Width(),
+                                  input.MouseY() / window.Height()};
+            const interact::PointerMode pmode = interact::ResolvePointer(pin);
+            glm::vec2 pointerNorm = pmode.worldPointer;
+            const glm::vec2 screenPointer = pmode.screenPointer;
+            // THE PAGE HALF IS SUPPRESSED TOO. `considerObjects` below covered only
+            // the object half, so during a cutscene the reticle sat wherever the
+            // cutscene camera pointed and ANY Interact press - including the press
+            // that skips the cutscene - activated whatever world Button happened to
+            // be framed; and during a dialogue choice a click BETWEEN the choice
+            // buttons went through into a world page behind them.
+            //
+            // Deliberately NARROWER than InteractionsSuppressed(): `menuOpen` is
+            // NOT in this list. Screen-beats-world already handles menus, and
+            // folding it in would kill a world-space pause page - the exact content
+            // this system exists to make possible.
+            if (dialogueNode_ != 0 || cutsceneTime_ >= 0.0f || actionMap_.Rebinding() ||
+                devMenuOpen_ || game::DialoguePending() || game::CutscenePending())
+                pointerNorm = glm::vec2(-1.0f);
+
+            // ONE PICK PASS for both world UI pages and 3D interactables: one ray,
+            // one occlusion raycast, one winner. UpdateInteractions reads the same
+            // result for the object half, so a wall terminal that is both a page and
+            // an Interactable can never light up twice.
             ui::PointerState pointers;
-            if (!IsCursorLocked())
-                ui::ComputeWorldPointers(scene, renderer.GetCamera(), pointerNorm, pointers,
-                                         uiCtx_);
+            {
+                const auto _pk = clock::now();
+                interact::Params pp;
+                // A suppressed interactable must not be a candidate at all: if it
+                // were, it could win the ray and shadow a world UI page behind it
+                // that IS live (a pause menu page, a diegetic screen).
+                pp.considerObjects = !InteractionsSuppressed();
+                pp.maxRange = 100.0f;
+                // The player, for the Interactable proximity GATE and the
+                // not-aiming fallback (nearest CharacterController, as before).
+                auto players = scene.Registry().view<Transform, CharacterController>();
+                if (players.begin() != players.end()) {
+                    pp.hasAnchor = true;
+                    pp.anchor = glm::vec3(scene.WorldMatrix(*players.begin())[3]);
+                    // ...and the player's own capsule must not occlude the player's
+                    // own ray (a third-person camera sits behind it).
+                    pp.anchorEntity = *players.begin();
+                }
+                const interact::OccludeFn occ = [&physics](const glm::vec3& o,
+                                                           const glm::vec3& d, f32 m) {
+                    const PhysicsWorld::RayHit h = physics.RaycastDetailed(o, d, m);
+                    interact::Block b;
+                    b.hit = h.hit;
+                    b.distance = h.distance;
+                    b.entity = h.entity;
+                    return b;
+                };
+                const interact::AcceptFn acc = [&](entt::entity e) {
+                    return InteractableAvailable(scene, e);
+                };
+                pick_ = interact::Pick(scene, renderer.GetCamera(), pointerNorm, occ, acc,
+                                       pp, &uiCtx_);
+                if (pick_.kind == interact::Hit::Kind::Page)
+                    pointers.worldCanvasPx[static_cast<u32>(pick_.entity)] = pick_.canvasPx;
+                if (pmode.useInteractAction) {
+                    // Reticle-driven pages are pressed with the Interact ACTION -
+                    // the same verb, key and glyph as "[E] Talk" on a 3D object, and
+                    // rebindable/pad-bound with it. LMB stays fire.
+                    pointers.worldButtonOverride = true;
+                    pointers.worldPressed =
+                        input_ && actionMap_.Pressed(input, "Interact");
+                    pointers.worldDown = input_ && actionMap_.Down(input, "Interact");
+                }
+                pickMs_ = std::chrono::duration<f64, std::milli>(clock::now() - _pk).count();
+                pickPages_ = pick_.pagesTested;
+                pickRaycasts_ = pick_.raycasts;
+                accPickMs += pickMs_;
+                accPickCasts += pick_.raycasts;
+            }
+            pointerNorm = screenPointer;
             // Cached interaction: hit-tests last frame's layout + clears flags on
             // the touched list only (no full registry scans).
             ui::UpdateInteraction(scene, input, pointerNorm, &pointers, uiCtx_);
@@ -1366,6 +2705,20 @@ int Engine::Run(const EngineConfig& configIn) {
         // contact left undrained would be delivered a frame late (or dropped when
         // the queue caps).
         if (physics.IsRunning()) destruction::Update(scene, renderer, physics, dt);
+        // TAG STREAMING. This slot is not arbitrary - it is the only defensible one:
+        //   * AFTER physics.Update, so this frame's lazy reaps have already run and the
+        //     Jolt bodies / CharacterVirtuals / audio voices of LAST frame's despawns
+        //     are gone before more entities are destroyed;
+        //   * BEFORE gameplay::Update, because spawn::Update creates and destroys
+        //     entities there and combat::Update runs the one-shot death dispatch. A
+        //     despawn placed after it can take an entity that combat just named in a
+        //     queued game::DeathRec, and that record is read NEXT frame by
+        //     schematic::Update through a handle nobody re-validates.
+        {
+            const auto _st = clock::now();
+            UpdateTagStreaming(scene, renderer);
+            accStreamMs += std::chrono::duration<f64, std::milli>(clock::now() - _st).count();
+        }
         // Gameplay band: AI + spawning/encounters + combat + player fire. Runs
         // after physics (fresh positions for line-of-sight and hit tests) and
         // BEFORE nav::UpdateAgents so an AI-set NavigationAgent target steers the
@@ -1381,10 +2734,17 @@ int Engine::Run(const EngineConfig& configIn) {
         // grid auto-rebuilds from static geometry (no bake) and re-plans around
         // moving NavigationObstacles.
         if (physics.IsRunning()) {
+            const auto _nt = clock::now();
             const std::filesystem::path navAssets =
                 Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
             gridNav.EnsureBuilt(scene, navAssets);
             nav::UpdateAgents(scene, gridNav, dt);
+            // The nav band has its own accumulator because it is the one band whose cost
+            // is driven by AGENT COUNT and by whether targets are reachable, not by scene
+            // size - and because the acceptance criterion for this system is stated as a
+            // per-frame millisecond budget. Without a number here it cannot be checked.
+            accNavMs += std::chrono::duration<f64, std::milli>(clock::now() - _nt).count();
+            accNavQueries += gridNav.LastQueryCount();
         }
         // Control rebinding (from a "rebind:<action>" UI button): capture the next
         // key/button and persist. Runs regardless of physics so it works in menus.
@@ -1592,31 +2952,32 @@ int Engine::Run(const EngineConfig& configIn) {
             if (!prevGameCamEnabled) cameraState.valid = false;
             const cam::RaycastFn camRay = [&physics](const glm::vec3& o, const glm::vec3& d,
                                                      f32 m) { return physics.Raycast(o, d, m); };
+            // PLAYER LOOK IS GATED ON THE CURSOR LOCK. Mouse deltas accumulate in
+            // both cursor states (Input_Win32 feeds the locked raw delta and the
+            // free-cursor move into the same accumulator), so without this the
+            // same motion that picks a menu item or a dialogue choice also spins
+            // the camera behind it. UpdateGameFlow ran earlier this frame and has
+            // already applied the free-cursor policy, so IsCursorLocked() is this
+            // frame's answer. The editor never locks the cursor - that would trap
+            // it away from the panels - so play-in-editor keeps look enabled.
+            const bool lookEnabled = !flowActive_ || IsCursorLocked();
             if (cam::Update(scene, renderer.GetCamera(), cameraState, dt, input, camRay,
-                            renderer.GetCamera().Aspect())) {
+                            renderer.GetCamera().Aspect(), lookEnabled)) {
                 renderer.SetOrbitEnabled(false); // the game camera owns the view
             }
         }
         prevGameCamEnabled = gameCameraEnabled_;
 
-        // Stream cells around the focus (camera at runtime; a sweep in the
-        // smoke test). Async loads land on the job system; this only finalizes
-        // finished loads and unloads departed cells.
-        if (streamingWorld.Active()) {
-            glm::vec3 focus = renderer.GetCamera().Position();
-            if (config.worldTest) {
-                worldTestT += dt;
-                const f32 span = 220.0f; // ping-pong the focus over 0..span
-                const f32 p = std::fmod(worldTestT * 24.0f, 2.0f * span);
-                focus = glm::vec3(p > span ? (2.0f * span - p) : p, 0.0f, 0.0f);
-            }
-            streamFocus = focus;
-            streamingWorld.Update(scene, renderer, focus);
-        }
         // Particles: simulate (spawn + integrate) and build this frame's billboards
         // against the camera basis. Emit even in the editor so emitters preview live.
-        particle::Update(scene, dt, true);
         {
+            const auto _st = clock::now();
+            particle::Update(scene, dt, true);
+            accVfxSimMs += std::chrono::duration<f64, std::milli>(clock::now() - _st).count();
+        }
+        {
+            const auto _pt = clock::now();
+            f64 mapWaitMs = 0.0; // GPU back-pressure, subtracted below (see the map site)
             const glm::vec3 fwd = renderer.GetCamera().Forward();
             glm::vec3 pRight = glm::cross(fwd, glm::vec3(0.0f, 1.0f, 0.0f));
             pRight = glm::dot(pRight, pRight) > 1e-6f ? glm::normalize(pRight)
@@ -1625,8 +2986,66 @@ int Engine::Run(const EngineConfig& configIn) {
             particle::BuildVertices(scene, renderer, assetsDir, pRight, pUp, particleAlpha,
                                     particleAdd);
             // 3D text objects (WorldText) ride the same depth-tested quad batch.
+            // They are arbitrary font-atlas glyph quads with no particle and no
+            // emitter behind them, so they stay on the CPU path by construction.
             ui::AppendWorldText(scene, renderer, assetsDir, pRight, pUp, particleAlpha);
             renderer.SetParticles(particleAlpha, particleAdd);
+
+            // GPU vertex expansion for emitters that opted in: upload 64-byte
+            // records instead of six 40-byte world-space vertices and let the VS
+            // build the quads. Mapped BEFORE RenderScene, like the QueueCompute
+            // idiom - Vulkan's MapGpuBuffer waits on this slot's fence here.
+            if (particle::AnyGpuExpand(scene)) {
+                if (!gpuParticleBuffer_.IsValid() && !gpuParticleFailed_) {
+                    rhi::GpuBufferDesc bd;
+                    bd.elementCount = kGpuParticleRecordElements;
+                    bd.elementStride = sizeof(vfx::GpuParticle);
+                    bd.usage = rhi::GpuBufferUsage::ShaderRead | rhi::GpuBufferUsage::CpuWrite;
+                    // One emitter batch is one bind, so this is the Vulkan descriptor
+                    // range AND the per-emitter ceiling both backends clamp to.
+                    bd.maxBindElements = rhi::kMaxGpuParticleBatchElements;
+                    bd.debugName = "VfxParticleRecords";
+                    gpuParticleBuffer_ = renderer.CreateGpuBuffer(bd);
+                    gpuParticleFailed_ = !gpuParticleBuffer_.IsValid();
+                    if (gpuParticleFailed_) {
+                        HBE_WARN("Particles: GPU expansion buffer unavailable; gpuExpand "
+                                 "emitters will not draw (CPU emitters are unaffected).");
+                    }
+                }
+                if (gpuParticleBuffer_.IsValid()) {
+                    // The map is NOT expansion work and is excluded from the phase
+                    // timer: Vulkan's MapGpuBuffer waits on this ring slot's fence
+                    // (D3D12 already waited at the end of the previous EndFrame), so
+                    // leaving it in would report GPU back-pressure as CPU cost and
+                    // make the two backends' vfx-expand numbers incomparable.
+                    const auto _mapStart = clock::now();
+                    void* dst = renderer.MapGpuBuffer(gpuParticleBuffer_);
+                    mapWaitMs = std::chrono::duration<f64, std::milli>(clock::now() - _mapStart)
+                                    .count();
+                    if (dst) {
+                        particle::BuildGpuRecords(scene, renderer, assetsDir, pRight, pUp, dst,
+                                                  kGpuParticleRecordElements,
+                                                  gpuParticleBatches_);
+                        renderer.SetGpuParticles(gpuParticleBuffer_, gpuParticleBatches_);
+                    }
+                }
+            }
+
+            // GPU SIMULATION. One step further out than the block above: these
+            // emitters have no CPU pool and nothing is uploaded per particle - the
+            // compute dispatches queued here write the very buffer the vertex shader
+            // then reads. Queued BEFORE RenderScene because both backends execute the
+            // compute queue in their BeginFrame (Vulkan cannot record compute inside a
+            // render pass) - the same rule SetVolumeParticles follows. It is inside
+            // the vfx-expand timer on purpose: this IS the phase, and what the timer
+            // should show is it collapsing to O(emitters).
+            if (particle::AnyGpuSim(scene)) {
+                if (gpuSim_.Update(scene, renderer, assetsDir, pRight, pUp, dt, &mapWaitMs)) {
+                    renderer.SetGpuParticles(gpuSim_.Records(), gpuSim_.Batches());
+                }
+            }
+            accVfxBuildMs +=
+                std::chrono::duration<f64, std::milli>(clock::now() - _pt).count() - mapWaitMs;
         }
 
         // Volumetric VFX: feed the density-splat compute. Blobs come from every
@@ -1715,11 +3134,27 @@ int Engine::Run(const EngineConfig& configIn) {
         // DEGRADES the authored post (High = untouched); brightness is a +/-1
         // photographic-stop multiplier applied at the VIEW level, never written
         // into the scene/volume exposure (which stays author-driven).
+        //
+        // DECLARED, NOT STAMPED. This used to CALL ApplyGraphicsPreset on
+        // scene.Environment().post, i.e. it overwrote six of the authored post flags
+        // (ssgi/motionBlur/ssr/fog/dof/ssao) plus shadowCascades in the live scene,
+        // every frame, in the runtime only. Three consequences, all bad: the editor
+        // could not be made to show what ships without duplicating the table; the
+        // shipped game's `.hbsave` recorded the DEGRADED stack as though the author
+        // had written it (save at Low, and Low is baked in forever); and `post` is
+        // one of the five fields --test-lightingparity stamps, so the runtime was
+        // silently mutating the very value the parity test compares.
+        //
+        // The preset is now DECLARED on the environment and applied at READ time in
+        // Scene::MakeView - after Post Volumes, exactly where it was applied before,
+        // and to the same values, so the rendered result is unchanged. The authored
+        // data is left alone, which is what lets the editor preview the shipped look
+        // by simply declaring the same preset (View > Preview shipped quality).
         if (!onInit_) {
-            ApplyGraphicsPreset(scene.Environment().post, userSettings_.graphicsPreset);
-            if (config.forceShadowCascades > 0) // TEMP perf A/B: override the preset
-                scene.Environment().post.shadowCascades =
-                    static_cast<u32>(config.forceShadowCascades);
+            scene.Environment().postQualityPreset = userSettings_.graphicsPreset;
+            // TEMP perf A/B: an explicit cascade count wins over the preset's.
+            scene.Environment().forceShadowCascades =
+                config.forceShadowCascades > 0 ? static_cast<u32>(config.forceShadowCascades) : 0u;
             renderer.SetUserExposureScale(
                 std::exp2(userSettings_.brightness * 2.0f - 1.0f)); // 0.5x..2x, 0.5=neutral
         }
@@ -1745,10 +3180,11 @@ int Engine::Run(const EngineConfig& configIn) {
     }
 
     if (settingsDirty_) { userSettings_.Save(userSettingsDir_); settingsDirty_ = false; }
-    streamingWorld.UnloadAll(scene); // drain in-flight loads, destroy entities
-    streamingWorld_ = nullptr;
+    // Drop the streaming binding before the scene/renderer go away. Reset() drains any
+    // staging job first, so no worker is left writing into freed shards while the job
+    // system is being shut down.
+    tagStream_.Reset();
     gridNav_ = nullptr;
-    currentLevel_ = nullptr;
     renderer.Shutdown();
     jobs::Shutdown();
     window_ = nullptr;
@@ -1758,39 +3194,511 @@ int Engine::Run(const EngineConfig& configIn) {
     physics_ = nullptr;
     audio_ = nullptr;
     HBE_INFO("Heartbreak Engine shut down cleanly.");
-    return 0;
+    // --tagstreamtest exits NON-ZERO on a failed setup or a failed assertion, so a build
+    // script can gate on it instead of having to read the log.
+    if (tagStreamTestFailed_) tagStreamTestExit = 1;
+    return tagStreamTestExit;
 }
 
-bool Engine::HasLevel() const { return currentLevel_ && currentLevel_->Loaded(); }
+// --- Tag streaming ------------------------------------------------------------
 
-void Engine::LoadLevel(const std::filesystem::path& base) {
-    if (!currentLevel_ || !scene_ || !renderer_) return;
-    const std::filesystem::path assets = Project::HasActive()
-                                             ? Project::Active().AssetsDir()
-                                             : base.parent_path();
-    // Switching mid-play (e.g. the dev-menu "skip to zone") must not strand a running
-    // conversation or a cutscene owning the camera: Unload destroys their entities, so
-    // tear down the narrative runtime first (mirrors LoadGame/FlowMainMenu).
+const std::vector<glm::vec3>& Engine::StreamFoci(const Scene& scene, const Renderer& renderer) {
+    if (streamFocusOverride_) {
+        streamFoci_.assign(1, *streamFocusOverride_);
+        return streamFoci_;
+    }
+    stream::FocusPoints(scene, renderer.GetCamera().Position(), streamFoci_);
+    return streamFoci_;
+}
+
+void Engine::UpdateTagStreaming(Scene& scene, Renderer& renderer) {
+    if (!tagStream_.IsBound()) return; // no level bound: one branch, nothing else
+    // WHEN streaming may run. In the shipping runtime that is Playing AND LOADING - and
+    // Loading is not an oversight. The loading screen's reveal gate waits on
+    // Streamer::IsSettled, so a streamer that does not run behind the curtain can never
+    // settle: the screen would sit at 90% until the timeout and then reveal a world with
+    // holes in it. (The design doc says "gated on Playing"; that is the one place it is
+    // wrong, and this is why.) Anything else - MainMenu, Boot - has no bound level, so
+    // the guard above already covers it.
+    //
+    // THE GUARD IS POSITIVE, NOT AN EXCLUSION, and that is a correction. It used to
+    // read `if (flowActive_ && ... ) return;` on the reasoning that "in the EDITOR
+    // flowActive_ is false and the editor loads scenes itself, so nothing is bound and
+    // this never runs". Both halves were wrong: flowActive_ IS false under the editor,
+    // which made the `&&` false and SKIPPED the early-out entirely, and the dev overlay
+    // (F9 / the scene rows) could bind a level from inside the editor. Streaming then
+    // ran on the authoring world and despawned shards by camera distance, and a Ctrl+S
+    // wrote the surviving fragment over the level - silently, because the save-time
+    // shard bake re-derives itself from whatever is live.
+    //
+    // So: streaming needs a POSITIVE reason to run. Playing and Loading are the two in
+    // the shipping runtime (Loading is not an oversight - see above), plus the explicit
+    // test driver. Anything else - MainMenu, Boot, and every editor frame - returns.
+    if (!tagStreamTestActive_ && gameState_ != GameState::Playing &&
+        gameState_ != GameState::Loading)
+        return;
+    // And the editor's AUTHORING world never streams at all, whatever gameState_ says.
+    // onInit_ is set only by the editor (see its other uses); --tagstreamtest runs
+    // headless with no hook, so it is unaffected.
+    if (onInit_ && !tagStreamTestActive_) return;
+    tagStream_.Update(scene, renderer, StreamFoci(scene, renderer));
+}
+
+// --- --tagstreamtest ----------------------------------------------------------
+// A SYNTHETIC world, and the reason is not convenience. The reference project has
+// nothing to stream: 17 of its 18 entities total ~18 KB, and the 18th is a Terrain
+// component - one monolithic 16-chunk thing that no tag can subdivide and that IS the
+// world floor. Measuring streaming there would measure nothing. So this builds content
+// designed to be streamed, exactly as the deleted `--worldtest` built its own world,
+// and every number it prints is about THIS world. A green --tagstreamtest says the
+// feature works; it says nothing whatsoever about the reference project's frame time.
+//
+// The shape: `objects` props spread along X in `kTagCount` semantic tags, each of which
+// the save-time bake splits into spatially-coherent shards. A focus point sweeps the
+// whole span and back while the renderer runs normally, so the frame times are real
+// frame times with a real GPU, not a headless estimate.
+// The world is a chain of ISLANDS - clusters of content separated by empty ground -
+// because that is the shape real levels have and the shape sharding exists for. A
+// CONTINUOUS line of props does not work as a test: the grid clustering unions every
+// pair of touching cells, so a 2400 m line of "Props" correctly bakes to ONE
+// 2400 m shard, which is always in range and therefore never streams. (The bake's
+// validator says exactly that, loudly, which is worth knowing - it caught this test's
+// first draft.) Islands spaced further apart than the clustering cell are what produce
+// many small shards, and many small shards are what streaming is.
+namespace {
+constexpr u32 kStreamTestTagCount = 4;
+constexpr f32 kStreamTestLoadRadius = 90.0f;
+// Island spacing must exceed the clustering cell (which defaults to the load radius) by
+// enough that two islands' cells are not even 8-neighbours, or they merge into one shard.
+constexpr f32 kStreamTestIslandSpacing = 320.0f;
+constexpr f32 kStreamTestPropSpacing = 4.0f; // within an island
+constexpr u32 kStreamTestWarmupFrames = 240;  // discarded: PSO compiles, first-touch faults
+constexpr u32 kStreamTestSampleFrames = 240;  // per measurement window
+constexpr f32 kStreamTestSweepSeconds = 18.0f; // each direction; sets the focus speed
+} // namespace
+
+bool Engine::BeginTagStreamTest() {
+    if (!scene_ || !renderer_ || tagStreamTest_ == 0) return false;
+    const u32 objects = glm::max(tagStreamTest_, 12u);
+
+    // TAKE THE WORLD OVER. The game flow would otherwise reach FlowMainMenu/FlowPlay on
+    // the first frame and Replace-load the project's own startup scene over the
+    // synthetic one. Documents are spared by every Replace sweep (that is what makes the
+    // UI layer resident), so they have to be closed explicitly or they render on top of
+    // the measurement.
+    flowActive_ = false;
+    gameState_ = GameState::None;
+    if (bootDoc_ != 0) {
+        docs_.Close(*scene_, bootDoc_);
+        bootDoc_ = 0;
+    }
+    // EVERY screen, not just the menu one: with a per-screen split, closing only
+    // the first would leave three residual documents rendering over the benchmark.
+    if (!uiDocs_.empty()) {
+        for (const ui::DocHandle h : uiDocs_) docs_.Close(*scene_, h);
+        uiDocs_.clear();
+        uiManager_.Bind(uiDocs_);
+        uiManagerMode_ = false;
+    }
+
+    std::error_code ec;
+    tagStreamTestDir_ = std::filesystem::temp_directory_path(ec) / "hbe_tagstreamtest";
+    std::filesystem::remove_all(tagStreamTestDir_, ec);
+    std::filesystem::create_directories(tagStreamTestDir_, ec);
+    const std::filesystem::path level = tagStreamTestDir_ / "TagStreamTest.hbscene";
+
+    // The tag list. Semantic names, deliberately - the whole premise of the bake is
+    // that authors tag by MEANING and the sharder makes it spatial. "Ground" is
+    // alwaysLoaded so the test also proves an always-loaded tag never streams.
+    tagStreamTestTags_.clear();
+    {
+        TagDef untagged;
+        untagged.name = tags::kUntaggedName;
+        tagStreamTestTags_.push_back(untagged);
+        const char* names[kStreamTestTagCount] = {"Props", "Enemies", "Debris", "Signage"};
+        for (const char* n : names) {
+            TagDef d;
+            d.name = n;
+            d.loadRadius = kStreamTestLoadRadius;
+            d.unloadRadius = 0.0f; // Normalize derives the band (SALVAGE 2)
+            d.priority = 0;
+            tagStreamTestTags_.push_back(d);
+        }
+        tagStreamTestTags_[2].priority = 5; // "Enemies" load first under the throttle
+        TagDef ground;
+        ground.name = "Ground";
+        ground.alwaysLoaded = true;
+        tagStreamTestTags_.push_back(ground);
+        tags::Normalize(tagStreamTestTags_);
+        tags::SeedFromProject(tagStreamTestTags_);
+    }
+
+    // Author the world in a scratch Scene, bake it, save it. Building it as a FILE (not
+    // straight into the live registry) is not a detour - it is the only honest test,
+    // because streaming loads slices of a parsed file and the bake result IS the file.
+    {
+        Scene authoring;
+        entt::registry& reg = authoring.Registry();
+        const TagId ids[kStreamTestTagCount] = {tags::Intern("Props"), tags::Intern("Enemies"),
+                                                tags::Intern("Debris"), tags::Intern("Signage")};
+        const TagId ground = tags::Intern("Ground");
+
+        const auto prop = [&](const std::string& name, const glm::vec3& p, TagId tag,
+                              const glm::vec3& half) {
+            const entt::entity e = authoring.CreateEntity(name);
+            Transform t;
+            t.position = p;
+            reg.emplace<Transform>(e, t);
+            reg.emplace<AABB>(e, AABB{-half, half});
+            MeshInstance mi;
+            reg.emplace<MeshInstance>(e, mi);
+            reg.emplace<MeshRef>(e, MeshRef{"prim:cube"});
+            if (tag != kTagUntagged) tags::Assign(reg, e, tag);
+            return e;
+        };
+
+        // Islands of content along X, each holding a square cluster of props.
+        const u32 islands = glm::clamp(objects / 40u, 6u, 16u);
+        const u32 perIsland = glm::max(objects / islands, 4u);
+        const u32 side = static_cast<u32>(std::ceil(std::sqrt(static_cast<f32>(perIsland))));
+        tagStreamIslands_ = islands;
+        tagStreamSpan_ = static_cast<f32>(islands - 1) * kStreamTestIslandSpacing;
+        u32 made = 0;
+        for (u32 isl = 0; isl < islands; ++isl) {
+            const f32 cx = static_cast<f32>(isl) * kStreamTestIslandSpacing;
+            // A floor under each island, in the alwaysLoaded tag: ground must never
+            // stream out from under the focus, and that is what alwaysLoaded means.
+            prop("Ground_" + std::to_string(isl), {cx, -1.0f, 0.0f}, ground,
+                 glm::vec3(60.0f, 0.5f, 60.0f));
+            for (u32 k = 0; k < perIsland; ++k, ++made) {
+                const f32 ox = (static_cast<f32>(k % side) - static_cast<f32>(side) * 0.5f) *
+                               kStreamTestPropSpacing;
+                const f32 oz = (static_cast<f32>(k / side) - static_cast<f32>(side) * 0.5f) *
+                               kStreamTestPropSpacing;
+                // Cycle the tags WITHIN each island, so every tag appears in every
+                // island and is therefore SCATTERED across the whole world - the case a
+                // literal "one tag = one streaming group" cannot handle at all, and the
+                // exact reason the save-time sharder exists.
+                const TagId tag = ids[made % kStreamTestTagCount];
+                const entt::entity e = prop("Prop_" + std::to_string(made),
+                                            {cx + ox, 0.5f, oz}, tag, glm::vec3(0.5f));
+                // A quarter of them carry runtime state, so the sweep exercises
+                // capture/restore and not only spawn/despawn.
+                if (made % 4 == 0) {
+                    Health h;
+                    h.max = 100.0f;
+                    h.current = 100.0f;
+                    reg.emplace<Health>(e, h);
+                }
+                // Every eighth prop gets a child, so whole SUBTREES ride their shard.
+                if (made % 8 == 0) {
+                    const entt::entity c =
+                        authoring.CreateEntity("Prop_" + std::to_string(made) + "_top");
+                    Transform ct;
+                    ct.position = {0.0f, 1.2f, 0.0f};
+                    reg.emplace<Transform>(c, ct);
+                    reg.emplace<AABB>(c, AABB{glm::vec3(-0.3f), glm::vec3(0.3f)});
+                    reg.emplace<MeshInstance>(c, MeshInstance{});
+                    reg.emplace<MeshRef>(c, MeshRef{"prim:sphere"});
+                    reg.emplace<Parent>(c, Parent{e});
+                    tags::Assign(reg, c, tag);
+                }
+            }
+        }
+        // A directional light + a camera-less untagged marker, so the resident slice is
+        // not empty and the scene lights up.
+        {
+            const entt::entity l = authoring.CreateEntity("Sun");
+            Transform t;
+            t.rotation = glm::quat(glm::vec3(glm::radians(-55.0f), glm::radians(35.0f), 0.0f));
+            reg.emplace<Transform>(l, t);
+            reg.emplace<DirectionalLightComponent>(l, DirectionalLightComponent{});
+        }
+
+        const tagshard::BakeReport rep = tagshard::BakeScene(authoring, tagStreamTestTags_);
+        HBE_INFO("--tagstreamtest: {} object(s) in {} island(s) over {:.0f} m baked into {} "
+                 "shard(s) across {} tag(s) ({} error(s), {} warning(s)).",
+                 made, islands, tagStreamSpan_, rep.shards.size(), kStreamTestTagCount,
+                 rep.errors, rep.warnings);
+        for (const tagshard::TagStat& s : rep.stats)
+            HBE_INFO("  tag '{}': {} shard(s), {} object(s), largest diagonal {:.0f} m, "
+                     "coherence {:.2f}{}",
+                     s.tag, s.shards, s.members, s.largestDiagonal, s.coherence,
+                     s.alwaysLoaded ? " (alwaysLoaded - never streamed)" : "");
+        if (!scene::SaveScene(authoring, level, {}, SceneKind::Full, &rep.shards)) {
+            HBE_ERROR("--tagstreamtest: cannot write the synthetic level to '{}'.",
+                      level.string());
+            return false;
+        }
+    }
+
+    // Bind it. assetsDir is the temp dir: the synthetic world uses only procedural
+    // primitives, so nothing has to resolve off the real project's Assets/.
+    if (!tagStream_.BindLevel(*scene_, *renderer_, level, tagStreamTestDir_,
+                              tagStreamTestTags_)) {
+        HBE_ERROR("--tagstreamtest: BindLevel failed.");
+        return false;
+    }
+    if (!tagStream_.Trusted()) {
+        HBE_ERROR("--tagstreamtest: the shard table this run just baked came back "
+                  "UNTRUSTED ({}). That is a bake/parse disagreement, not a streaming bug.",
+                  tagStream_.UntrustedReason());
+        return false;
+    }
+    tagStream_.ResetStats();
+    tagStreamTestActive_ = true;
+    tagStreamPhase_ = 0;
+    tagStreamFrame_ = 0;
+    tagStreamSweepT_ = -kStreamTestIslandSpacing;
+    // Off the end of the world: nothing is in range there.
+    tagStreamHome_ = glm::vec3(-kStreamTestIslandSpacing, 1.0f, 0.0f);
+    tagStreamFocus_ = tagStreamHome_;
+    streamFocusOverride_ = &tagStreamFocus_;
+    tagStreamBaseline_ = 0;
+    tagStreamIdleMs_.clear();
+    tagStreamSteadyMs_.clear();
+    tagStreamSweepMs_.clear();
+    tagStreamSpeed_ = glm::max(tagStreamSpan_ / kStreamTestSweepSeconds, 1.0f);
+    HBE_INFO("--tagstreamtest: bound {} streamed shard(s), {} always-resident row(s); "
+             "sweeping a focus {:.0f} m and back at {:.0f} m/s (load radius {:.0f} m).",
+             tagStream_.ShardCount(), tagStream_.ResidentRowCount(), tagStreamSpan_,
+             tagStreamSpeed_, kStreamTestLoadRadius);
+    HBE_WARN("--tagstreamtest measures a SYNTHETIC world built for this test. It is not "
+             "a measurement of any real project.");
+    return true;
+}
+
+bool Engine::StepTagStreamTest(f32 trueFrameMs) {
+    if (!tagStreamTestActive_ || !scene_ || !renderer_) return false;
+    ++tagStreamFrame_;
+    const auto liveCount = [this] {
+        const entt::registry& reg = scene_->Registry();
+        const auto* st = reg.storage<entt::entity>();
+        usize n = 0;
+        if (st)
+            for (const entt::entity e : *st)
+                if (reg.valid(e)) ++n;
+        return n;
+    };
+
+    // The camera follows the focus so streamed geometry is actually DRAWN - an
+    // unrendered spawn is not a measurement of a spawn.
+    renderer_->GetCamera().LookAt(tagStreamFocus_ + glm::vec3(-28.0f, 16.0f, 34.0f),
+                                  tagStreamFocus_);
+
+    // THREE measurement windows, because two would be dishonest. Parked-empty and
+    // moving differ in SCENE CONTENT as well as in streaming activity, so the pair
+    // cannot be read as "the cost of streaming". Parked-INSIDE-an-island has the same
+    // content as the sweep and no streaming activity, which makes it the only fair
+    // comparison; parked-empty is there to show what the bound-but-idle streamer costs.
+    switch (tagStreamPhase_) {
+    case 0: {
+        // Warm up off the end of the world (PSO compiles, first-touch page faults),
+        // sampling nothing.
+        if (tagStreamFrame_ >= kStreamTestWarmupFrames) {
+            tagStreamBaseline_ = liveCount();
+            if (tagStream_.ResidentShardCount() != 0) {
+                tagStreamTestFailed_ = true;
+                HBE_ERROR("--tagstreamtest: FAILED - {} shard(s) resident with the focus "
+                          "off the end of the world.",
+                          tagStream_.ResidentShardCount());
+            }
+            HBE_INFO("--tagstreamtest: baseline {} live entities, 0/{} shards resident "
+                     "(warmup done).",
+                     tagStreamBaseline_, tagStream_.ShardCount());
+            tagStreamPhase_ = 1;
+            tagStreamFrame_ = 0;
+        }
+        break;
+    }
+    case 1: {
+        // WINDOW A: parked off the end. Nothing resident, nothing streaming - the cost
+        // of a bound streamer that has no work.
+        tagStreamIdleMs_.push_back(trueFrameMs);
+        if (tagStreamFrame_ >= kStreamTestSampleFrames) {
+            // Jump into the middle island and let it settle before window B.
+            tagStreamFocus_ =
+                glm::vec3(static_cast<f32>(tagStreamIslands_ / 2) * kStreamTestIslandSpacing,
+                          1.0f, 0.0f);
+            tagStreamPhase_ = 2;
+            tagStreamFrame_ = 0;
+        }
+        break;
+    }
+    case 2: {
+        // Settle: let the island's shards finish loading (one finalize per frame).
+        if (tagStream_.IsSettled(StreamFoci(*scene_, *renderer_)) || tagStreamFrame_ > 600) {
+            HBE_INFO("--tagstreamtest: parked inside one island - {}/{} shard(s) resident, "
+                     "{} live entities.",
+                     tagStream_.ResidentShardCount(), tagStream_.ShardCount(), liveCount());
+            tagStreamPhase_ = 3;
+            tagStreamFrame_ = 0;
+        }
+        break;
+    }
+    case 3: {
+        // WINDOW B: parked INSIDE an island. Shards resident, nothing streaming. Same
+        // kind of content the sweep draws, so B vs C isolates streaming activity.
+        tagStreamSteadyMs_.push_back(trueFrameMs);
+        if (tagStreamFrame_ >= kStreamTestSampleFrames) {
+            tagStreamPhase_ = 4;
+            tagStreamFrame_ = 0;
+            tagStreamSweepT_ = tagStreamHome_.x;
+            tagStreamFocus_ = tagStreamHome_;
+        }
+        break;
+    }
+    case 4:
+    case 5: {
+        // WINDOW C: sweep out, then back. dt_ is the smoothed frame time - fine here,
+        // the focus path only has to be repeatable, and the MEASUREMENT is trueFrameMs.
+        const f32 dir = tagStreamPhase_ == 4 ? 1.0f : -1.0f;
+        tagStreamSweepT_ += dir * tagStreamSpeed_ * glm::min(dt_, 0.05f);
+        tagStreamFocus_ = glm::vec3(tagStreamSweepT_, 1.0f, 0.0f);
+        tagStreamSweepMs_.push_back(trueFrameMs);
+        if (tagStreamPhase_ == 4 && tagStreamSweepT_ >= tagStreamSpan_) {
+            tagStreamPhase_ = 5;
+            HBE_INFO("--tagstreamtest: reached the far end - {}/{} shard(s) resident, {} "
+                     "spawn / {} despawn so far.",
+                     tagStream_.ResidentShardCount(), tagStream_.ShardCount(),
+                     tagStream_.Stats().spawns, tagStream_.Stats().despawns);
+        } else if (tagStreamPhase_ == 5 && tagStreamSweepT_ <= tagStreamHome_.x) {
+            // Home again, and off the end: everything must have unloaded. Give the
+            // one-per-frame budget a few frames to finish draining.
+            tagStreamPhase_ = 6;
+            tagStreamFrame_ = 0;
+        }
+        break;
+    }
+    default: {
+        // Drain, then report.
+        if (tagStream_.ResidentShardCount() == 0 || tagStreamFrame_ > 240) {
+            const usize back = liveCount();
+            if (tagStream_.ResidentShardCount() != 0) {
+                tagStreamTestFailed_ = true;
+                HBE_ERROR("--tagstreamtest: FAILED - {} shard(s) still resident after the "
+                          "focus returned off the end of the world.",
+                          tagStream_.ResidentShardCount());
+            }
+            const stream::StreamStats& ss = tagStream_.Stats();
+            if (ss.spawns == 0 || ss.despawns == 0) {
+                tagStreamTestFailed_ = true;
+                HBE_ERROR("--tagstreamtest: FAILED - the sweep produced {} spawn(s) and {} "
+                          "despawn(s); it must produce both or it measured nothing.",
+                          ss.spawns, ss.despawns);
+            }
+            // AND IT MUST NOT THRASH. "spawns > 0 && despawns > 0" alone passes green with
+            // hysteresis broken: delete the salvage::EnforceHysteresis call, or widen
+            // StreamPolicy's unload test to the LOAD radius, and a focus crossing the
+            // boundary spawns and despawns the same shard tens of thousands of times -
+            // every assertion above still satisfied, exit code still 0. One out-and-back
+            // sweep visits each streamed shard at most twice; 4x that is a generous band
+            // that still catches an order-of-magnitude regression.
+            const u32 bound = 4u * static_cast<u32>(tagStream_.ShardCount());
+            if (ss.spawns > bound || ss.despawns > bound) {
+                tagStreamTestFailed_ = true;
+                HBE_ERROR("--tagstreamtest: FAILED - {} spawn / {} despawn over ONE "
+                          "out-and-back sweep of {} shard(s) (bound {}); the band is "
+                          "thrashing - check the load/unload hysteresis.",
+                          ss.spawns, ss.despawns, tagStream_.ShardCount(), bound);
+            } else
+                HBE_INFO("--tagstreamtest: no thrash - {} spawn / {} despawn over {} "
+                         "shard(s) is within the 4x out-and-back bound of {}.",
+                         ss.spawns, ss.despawns, tagStream_.ShardCount(), bound);
+            if (back != tagStreamBaseline_) {
+                tagStreamTestFailed_ = true;
+                HBE_ERROR("--tagstreamtest: FAILED - {} live entities after the sweep, "
+                          "baseline was {} ({:+d}). Something leaked or was destroyed.",
+                          back, tagStreamBaseline_,
+                          static_cast<int>(back) - static_cast<int>(tagStreamBaseline_));
+            } else
+                HBE_INFO("--tagstreamtest: entity count returned EXACTLY to the {} "
+                         "baseline.",
+                         tagStreamBaseline_);
+            ReportTagStreamTest();
+            tagStreamTestActive_ = false;
+            streamFocusOverride_ = nullptr;
+            std::error_code ec;
+            std::filesystem::remove_all(tagStreamTestDir_, ec);
+            return false;
+        }
+        break;
+    }
+    }
+    return true;
+}
+
+void Engine::ReportTagStreamTest() {
+    const auto pct = [](std::vector<f32> v, f32 q) {
+        if (v.empty()) return 0.0f;
+        std::sort(v.begin(), v.end());
+        const usize i = glm::min(static_cast<usize>(q * static_cast<f32>(v.size())), v.size() - 1);
+        return v[i];
+    };
+    const auto mean = [](const std::vector<f32>& v) {
+        if (v.empty()) return 0.0f;
+        f64 s = 0.0;
+        for (const f32 x : v) s += x;
+        return static_cast<f32>(s / static_cast<f64>(v.size()));
+    };
+    const stream::StreamStats& ss = tagStream_.Stats();
+    HBE_INFO("=== --tagstreamtest RESULTS (SYNTHETIC world, not a real project) ===");
+    HBE_INFO("  shards: {} streamed, peak {} resident at once, {} always-resident row(s)",
+             tagStream_.ShardCount(), ss.residentPeak, tagStream_.ResidentRowCount());
+    HBE_INFO("  spawned {} time(s), despawned {} time(s) over {} frame(s)", ss.spawns,
+             ss.despawns, ss.framesUpdated);
+    HBE_INFO("  staging: {} async (job system), {} synchronous; {} deferred finalize(s), "
+             "{} failure(s)",
+             ss.asyncStages, ss.syncStages, ss.deferredFinalizes, ss.failures);
+    HBE_INFO("  policy evaluations: {} over {} frame(s) = 1 per {:.1f} frames; "
+             "{:.4f} ms avg, {:.4f} ms worst",
+             ss.evaluations, ss.framesUpdated,
+             ss.evaluations ? static_cast<f64>(ss.framesUpdated) / ss.evaluations : 0.0,
+             ss.evaluations ? ss.totalEvalMs / ss.evaluations : 0.0, ss.maxEvalMs);
+    HBE_INFO("  structural work (finalize/despawn): {:.3f} ms total, {:.3f} ms worst single, "
+             "{:.4f} ms amortised per frame",
+             ss.totalStructuralMs, ss.maxStructuralMs,
+             ss.framesUpdated ? ss.totalStructuralMs / ss.framesUpdated : 0.0);
+    const auto window = [&](const char* label, const std::vector<f32>& v) {
+        HBE_INFO("  {}: {:.2f} ms mean, {:.2f} p50, {:.2f} p99, {:.2f} max over {} frames",
+                 label, mean(v), pct(v, 0.5f), pct(v, 0.99f), pct(v, 1.0f), v.size());
+    };
+    HBE_INFO("  frame time (all windows post-warmup, RAW per-frame deltas):");
+    window("A  parked, nothing resident   ", tagStreamIdleMs_);
+    window("B  parked inside one island   ", tagStreamSteadyMs_);
+    window("C  sweeping (streaming live)  ", tagStreamSweepMs_);
+    HBE_INFO("  Read B vs C for the cost of STREAMING (same kind of content, activity is the "
+             "only difference). A vs B is scene content, not streaming - do not read it as "
+             "overhead.");
+    HBE_WARN("  Reminder: this is a world built to be streamed. It says the FEATURE works. "
+             "It says nothing about any real project's frame time.");
+}
+
+void Engine::LoadGameplayScene(const std::filesystem::path& scenePath) {
+    if (!scene_ || !renderer_ || scenePath.empty()) return;
+    // Switching mid-play (the dev-menu "skip to zone") must not strand a running
+    // conversation or a cutscene owning the camera: the load below destroys their
+    // entities, so tear down the narrative runtime first. Found the hard way -
+    // mirrors LoadGameplayWorld / LoadGame / FlowMainMenu.
     ResetDialogueRuntime();
     ClearCutscene();
-    game::ClearTransientQueues(); // don't let a queued death/noise/spot fire into the new level
-    // Switching: capture what the player changed in the area being left, unload it
-    // (UI / other scenes stay resident), then load the new one and replay whatever
-    // was captured there on a previous visit. Without this the level file always
-    // reloads in its AUTHORED state - looted crates refill, dead NPCs come back.
-    if (currentLevel_->Loaded()) {
-        world::CaptureArea(*scene_, world::AreaIdFromPath(currentLevel_->Base()));
-        currentLevel_->Unload(*scene_);
+    game::ClearTransientQueues(); // don't let a queued death/noise/spot fire into the new scene
+    // BindLevel is the level transition: it captures the outgoing level (resident set
+    // AND every resident shard) before scene::BindWorld destroys it, then binds and
+    // enters the destination, replaying whatever was captured there on a previous
+    // visit. Without that a scene always reloads in its AUTHORED state - looted crates
+    // refill, dead NPCs return. A failed parse leaves the current world untouched.
+    static const std::vector<TagDef> kNoTags; // a real object: a ternary would copy
+    const std::filesystem::path assets =
+        Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    const std::vector<TagDef>& tags =
+        Project::HasActive() ? Project::Active().Settings().tags : kNoTags;
+    if (!tagStream_.BindLevel(*scene_, *renderer_, scenePath, assets, tags)) {
+        HBE_WARN("LoadGameplayScene: '{}' failed to load.", scenePath.string());
+        return;
     }
-    currentLevel_->SetBase(base);
-    currentLevel_->Load(*scene_, *renderer_, assets);
-    world::RestoreArea(*scene_, world::AreaIdFromPath(base));
-
+    currentScenePath_ = scenePath;
     // No nav step: GridNav auto-rebuilds from the new static geometry each frame.
-}
-
-void Engine::UnloadLevel() {
-    if (currentLevel_ && scene_ && currentLevel_->Loaded()) currentLevel_->Unload(*scene_);
 }
 
 // --- Checkpoint save/load ----------------------------------------------------
@@ -1803,11 +3711,32 @@ std::filesystem::path SaveFilePath(const std::string& slot) {
 
 bool Engine::SaveGame(const std::string& slot) {
     if (!scene_ || !Project::HasActive()) return false;
+    // CAPTURE BEFORE SNAPSHOTTING. Every resident shard's runtime deltas (and the
+    // always-resident set's) go into world::State, which game::SerializeState writes
+    // below - so the shards the snapshot deliberately omits can be rebuilt from the
+    // level file plus these blobs. Nothing is destroyed.
+    tagStream_.CaptureAllLoaded(*scene_);
     nlohmann::json j;
-    j["version"] = 1;
-    j["scene"] = scene::SaveSceneToString(*scene_); // full registry snapshot
-    j["game"] = game::SerializeState();             // objectives + checkpoints
-    j["level"] = currentLevel_ ? currentLevel_->Base().string() : std::string();
+    // FORMAT VERSION 2: the snapshot no longer contains streamed-shard entities, and
+    // "shards" records which shards were standing. A v1 save (no "version", or 1) still
+    // loads - see LoadGame - as a complete whole-world snapshot.
+    j["version"] = 2;
+    // EXCLUDE streamed-shard members from the snapshot. They come back by respawning
+    // their shard from the level file and replaying the blobs above, which is what keeps
+    // a save bounded: otherwise every NPC a continuous spawner ever emitted is baked in
+    // as an authored entity - and then the restored Spawner bursts again on top of them,
+    // because Spawner::maxAlive defaults to 0 (uncapped).
+    //
+    // This is only correct because StreamShard is TRANSITIVE: the streamer stamps it on
+    // everything a shard spawn created, and spawn::DoBurst copies it onto each spawned
+    // root. A non-transitive membership tag here would leave the spawned population in
+    // the snapshot and the authored NPCs out of it - the worst of both.
+    const entt::registry& sreg = scene_->Registry();
+    const auto notStreamed = [&sreg](entt::entity e) { return !sreg.all_of<StreamShard>(e); };
+    j["scene"] = scene::SaveSceneToString(*scene_, notStreamed);
+    j["game"] = game::SerializeState();             // objectives + checkpoints + world state
+    j["level"] = currentScenePath_.string(); // the .hbscene the world came from (and re-binds to)
+    j["shards"] = tagStream_.ResidentKeys(); // "<tag>#<index>", sorted
     const std::filesystem::path path = SaveFilePath(slot);
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -1850,10 +3779,58 @@ bool Engine::LoadGame(const std::string& slot) {
         HBE_ERROR("LoadGame: snapshot in '{}' is invalid.", path.string());
         return false;
     }
+    const u32 version = j.value("version", 1u);
+    // The OUTGOING level's binding is gone: the Replace below destroys its world. Drop
+    // it without capturing - a load is not a level exit, and capturing here would write
+    // the world the player is abandoning over the state they are restoring.
+    tagStream_.Reset(scene_);
+    // GAMEPLAY STATE FIRST, snapshot second. game::DeserializeState is what restores
+    // world::State, and the shard respawns below replay their deltas out of it - so it
+    // has to be populated before anything spawns. (It was second before because nothing
+    // respawned.) The snapshot itself needs none of it: its runtime fields are baked in.
+    game::DeserializeState(j.value("game", std::string()));
     scene::StagedAssets staged;
     scene::StageAssets(data, Project::Active().AssetsDir(), staged);
     scene::Instantiate(*scene_, *renderer_, data, staged, scene::LoadMode::Replace);
-    game::DeserializeState(j.value("game", std::string()));
+    // Make the area CURRENT again (so the World schematic nodes resolve "" to here)
+    // WITHOUT replaying its deltas or bumping the visit count: the snapshot already
+    // carries every runtime field of what it contains, and the player did not re-enter
+    // the level, they reloaded inside it. BindMode::AdoptWorld is exactly that contract -
+    // bind the shard table and the area over a world that is already standing, destroy
+    // nothing, instantiate nothing.
+    if (const std::string lvl = j.value("level", std::string()); !lvl.empty()) {
+        currentScenePath_ = lvl;
+        const std::filesystem::path assets = Project::Active().AssetsDir();
+        if (tagStream_.BindLevel(*scene_, *renderer_, currentScenePath_, assets,
+                                 Project::Active().Settings().tags,
+                                 stream::BindMode::AdoptWorld)) {
+            // Which shards were standing. A v2 save says so; a v1 save does not have the
+            // key, and does not need it - its snapshot carried the shard members
+            // themselves, so AdoptResidency finds and adopts them instead of spawning
+            // anything. Either way nothing is spawned twice.
+            std::vector<std::string> keys;
+            if (const auto it = j.find("shards"); it != j.end() && it->is_array())
+                for (const nlohmann::json& k : *it)
+                    if (k.is_string()) keys.push_back(k.get<std::string>());
+            tagStream_.AdoptResidency(*scene_, *renderer_, keys);
+        } else {
+            // The level file is gone or unparseable. The snapshot world is intact and
+            // playable; it just cannot stream for the rest of this session.
+            HBE_WARN("LoadGame: cannot re-bind level '{}'; the restored world will not "
+                     "stream this session.",
+                     currentScenePath_.string());
+            world::SetCurrentArea(world::AreaIdFromPath(currentScenePath_));
+        }
+    } else {
+        // A save with no "level" (an early checkpoint - the key was write-only until
+        // now). Nothing to bind; the snapshot is the whole world, exactly as before.
+        HBE_WARN("LoadGame: save has no 'level'; restored as a complete snapshot with no "
+                 "streaming (a fresh save will record it).");
+    }
+    if (version < 2)
+        HBE_INFO("LoadGame: save format v{} - a complete whole-world snapshot. Its shard "
+                 "members were ADOPTED, so streaming works from here on.",
+                 version);
     // Reset the dialogue runner (Engine members survive the scene Replace): loading
     // a save mid-conversation must not resume a stale graph over the restored world
     // or hang on a Choice whose buttons the Replace destroyed.
@@ -1915,16 +3892,18 @@ void SetProgressFill(Scene& scene, f32 f, const std::vector<entt::entity>* only 
     });
 }
 
-// All entities inside the named UIPanel subtree (root included). Scopes the loading
+// All entities inside a UIPanel subtree (root included). Scopes the loading
 // bar/wheel drivers to the "Loading" panel so gameplay HUD ProgressBars are untouched.
-void CollectPanelSubtree(Scene& scene, const std::string& panel,
+//
+// Takes the ROOT ENTITY rather than a name on purpose: the caller resolves it
+// through UIManager, which is scoped to the resident SCREEN SET. The old
+// by-name scan took the first matching UIPanel in the WHOLE registry, which with
+// one document per screen (plus a boot splash that may also define a "Loading"
+// panel) is a coin flip over which subtree drives the progress bar.
+void CollectPanelSubtree(Scene& scene, entt::entity root,
                          std::vector<entt::entity>& out) {
     auto& reg = scene.Registry();
-    entt::entity root = entt::null;
-    for (const entt::entity e : reg.view<UIPanel>()) {
-        if (reg.get<UIPanel>(e).name == panel) { root = e; break; }
-    }
-    if (root == entt::null) return;
+    if (root == entt::null || !reg.valid(root)) return;
     for (const entt::entity e : reg.storage<entt::entity>()) {
         entt::entity cur = e;
         for (int depth = 0; cur != entt::null && depth < 64; ++depth) {
@@ -1952,18 +3931,61 @@ static constexpr f32 kGameFadeInDur = 0.5f;  // gameplay eases in from black onc
 // already ran behind the splash); just long enough to read the final status.
 static constexpr f32 kBootDuration = 1.0f;
 
+void Engine::AuditScreenActions(Scene& scene) {
+    if (uiDocs_.empty()) return;
+    auto& reg = scene.Registry();
+    // Only the actions the ENGINE resolves globally. A `rebind:*` or a schematic
+    // selector may legitimately repeat across screens (two screens can both have
+    // a "back" of their own... except "back" IS a flow verb, so it is listed and
+    // duplicating it really is a bug), whereas a settings binding or the caption
+    // sink is a single named channel by construction.
+    // ONE definition, in ui::IsGlobalAction. This list used to exist three times
+    // (here, --test-uiscreens, the migrator's collision report); they agreed, but
+    // adding a verb to one would have silently weakened the other two.
+    std::unordered_map<std::string, u32> seen;
+    for (const entt::entity e : reg.view<UIElement>()) {
+        const UIDocMember* m = reg.try_get<UIDocMember>(e);
+        if (!m) continue;
+        if (std::find(uiDocs_.begin(), uiDocs_.end(), m->doc) == uiDocs_.end()) continue;
+        const std::string& a = reg.get<UIElement>(e).action;
+        if (a.empty()) continue;
+        if (ui::IsGlobalAction(a)) ++seen[a];
+    }
+    for (const auto& [action, n] : seen) {
+        if (n <= 1) continue;
+        HBE_WARN("UI: action '{}' appears {} times across the resident screen "
+                 "documents. Every consumer of UIElement::action addresses it BY "
+                 "STRING over the whole registry, so all {} will fire/seed/write.",
+                 action, n, n);
+    }
+}
+
 void Engine::FlowMainMenu() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
     if (!uiManagerMode_) return; // no menu concept without a UI scene
-    // Unload the gameplay world (destroy non-Persistent entities) but keep the
-    // resident UI, then show the initial (menu) panel. No scene swap.
+    // LEAVE THE LEVEL THROUGH THE STREAMER FIRST (plan blocker B7). The sweep below
+    // destroys entities; doing that to a resident shard without capturing it would
+    // silently discard every delta the player made in it - the door they opened, the
+    // guard they killed - so quit-to-menu-and-Play-again would reset the world. UnloadAll
+    // captures the resident set AND every resident shard, drains any staging job (so no
+    // worker is left writing into a level that is going away), and then despawns.
+    // Reset() forgets the binding; the next FlowPlay binds afresh.
+    tagStream_.UnloadAll(*scene_);
+    tagStream_.Reset(scene_);
+    // Unload the gameplay world but keep the resident UI, then show the initial
+    // (menu) panel. No scene swap. The spare predicate is IDENTICAL to
+    // scene::Instantiate's Replace sweep - Persistent (the runtime decoration and
+    // the legacy UI layer) plus UIDocMember::screenOwned (an open `.hbui`). The
+    // flag lives in the component so both sites can evaluate the same test.
     auto& reg = scene_->Registry();
     std::vector<entt::entity> kill;
-    for (const entt::entity e : reg.storage<entt::entity>())
-        if (!reg.all_of<Persistent>(e)) kill.push_back(e);
+    for (const entt::entity e : reg.storage<entt::entity>()) {
+        const UIDocMember* m = reg.try_get<UIDocMember>(e);
+        if (!reg.all_of<Persistent>(e) && !(m && m->screenOwned)) kill.push_back(e);
+    }
     for (const entt::entity e : kill)
         if (reg.valid(e)) reg.destroy(e);
-    if (currentLevel_ && currentLevel_->Loaded()) currentLevel_->Unload(*scene_);
+    currentScenePath_.clear(); // no gameplay world resident any more
     loadingPanelEntities_.clear();
     // Leaving gameplay: stop any in-progress dialogue and clear its captions so
     // they don't linger/resume over the menu.
@@ -1981,6 +4003,10 @@ void Engine::FlowMainMenu() {
     // unloads the world without a scene swap), so restore the menu's own look.
     ApplyMenuPost();
     loadTimer_ = 0.0f;
+    // Trace the state the shipped runtime actually reached, and whether the boot
+    // splash is really gone (see FlowAfterBoot). Cheap: once per menu entry.
+    HBE_INFO("Flow: MainMenu reached - panel '{}' active, boot document {}.",
+             uiManager_.Top(), bootDoc_ == 0 ? "closed" : "STILL OPEN (BUG)");
 }
 
 void Engine::FlowPlay() {
@@ -2008,34 +4034,68 @@ void Engine::FlowPlay() {
 
 void Engine::LoadGameplayWorld() {
     if (!scene_ || !renderer_ || !Project::HasActive()) return;
+    // DROP THE OUTGOING BINDING WITHOUT CAPTURING IT, BEFORE clearing game state. A
+    // restart (death respawn, F2, dev-menu "Restart level") reaches here with the
+    // streamer still bound to the run being abandoned, and BindLevel's own
+    // "binding while bound is a level transition" rule would then run UnloadAll -
+    // capturing that run's world deltas INTO the store game::Reset() just cleared, and
+    // replaying them into the fresh run. The restarted level would keep every guard the
+    // player killed dead, every door they opened fired, every pickup looted, and
+    // `visits` at 1 - and a door whose Interactable::fired is restored true while the
+    // flag it set was cleared is a hard soft-lock. A restart is not a level exit.
+    // (The main-menu path already does UnloadAll + Reset itself; LoadGame does the same
+    // for the same reason.)
+    tagStream_.Reset(scene_);
     game::Reset(); // a fresh run: clear objectives + reached checkpoints
     // Stop any dialogue/captions left over from a prior run (the runner state
     // is an Engine member, so it survives the scene Replace below).
     ResetDialogueRuntime();
     // Stop any in-progress cutscene and hand the camera back (else it stays
     // disabled into the new run).
-    if (cutsceneCamOwned_) SetGameCameraEnabled(cutsceneRestoreCam_);
-    cutsceneCamOwned_ = false;
-    cutsceneTime_ = -1.0f;
+    ClearCutscene();
+    // Drop anything the previous run queued but never drained: a death/noise/spot
+    // event or a UI/music command surviving the swap fires into the FRESH world,
+    // against entity ids that now mean something else. This is the level-TRANSITION
+    // teardown - the comment on the old level loader recorded that it was found the
+    // hard way, and it belongs here now that a transition is a plain scene load.
+    game::ClearTransientQueues();
     const std::filesystem::path assets = Project::Active().AssetsDir();
     const ProjectSettings& s = Project::Active().Settings();
 
-    // Gameplay scene/level REPLACES the current world (clears the registry). This
-    // runs BEFORE the loading screen goes down so terrain chunks and streamed cells
-    // build/settle behind the loading overlay instead of popping in afterwards.
+    // BIND THE LEVEL. This is a tag-streaming bind, not a plain Replace-load, and the
+    // difference matters even for a level with no tags:
+    //   * it clears the previous world and applies the level's environment through
+    //     scene::BindWorld - the same code Replace runs, factored out, because a
+    //     streamed shard is a SLICE and a slice may never Replace (plan blocker B2);
+    //   * it spawns the ALWAYS-RESIDENT slice (untagged entities + alwaysLoaded tags)
+    //     and leaves streamed shards to the distance policy;
+    //   * it ENTERS THE AREA and replays the resident set's persisted state, which is
+    //     what world::RestoreArea used to do here.
+    // A level with zero streaming tags has every row in the resident slice, so this is
+    // byte-for-byte the world the old full Replace produced. An UNTRUSTED shard header
+    // (stale bake, hand edit) also puts every row in the resident slice: a bad bake
+    // costs streaming, never content.
+    //
+    // This runs BEFORE the loading screen goes down so terrain chunks build/settle
+    // behind the loading overlay instead of popping in afterwards.
     bool loaded = false;
     if (!s.startupScene.empty()) {
         const std::filesystem::path gp = assets / s.startupScene;
-        if (vfs::Exists(gp)) {
-            if (scene::IsLevelMember(gp)) {
-                // First layer replaces, others stack; GridNav picks it up next frame.
-                loaded = scene::LoadLevel(*scene_, *renderer_, scene::ResolveLevel(gp));
-            } else {
-                loaded = scene::LoadScene(*scene_, *renderer_, gp); // Replace
-            }
+        // A level is ONE .hbscene; GridNav picks up its static geometry next frame.
+        if (vfs::Exists(gp) && tagStream_.BindLevel(*scene_, *renderer_, gp, assets, s.tags)) {
+            loaded = true;
+            currentScenePath_ = gp;
         }
     }
-    if (!loaded) HBE_WARN("Game flow: startup scene '{}' failed to load.", s.startupScene);
+    if (!loaded) {
+        HBE_WARN("Game flow: startup scene '{}' failed to load.", s.startupScene);
+        tagStream_.Reset(scene_); // nothing bound; do not leave a half-binding behind
+    }
+    // (The area entry that used to be a separate world::RestoreArea call is now inside
+    // BindLevel - it has to be, because a shard spawn must not bump the visit count and
+    // only the bind knows which is which. game::Reset() above cleared the world state
+    // for this fresh run, so the replay is a no-op on a new game and only does work
+    // when a save was loaded into it first.)
 
     // The HUD is a resident UIPanel in the persistent UI scene (shown on reveal in
     // EnterPlaying) - no per-scene HUD load.
@@ -2063,8 +4123,35 @@ void Engine::FlowReload() {
 }
 
 void Engine::FlowAfterBoot() {
-    // Studio splash finished: show the initial (menu) panel when a UI scene is
-    // loaded, else boot straight into gameplay (the empty-uiScene fallback).
+    // CLOSE THE BOOT DOCUMENT, EXPLICITLY, BEFORE DISPATCHING. This is the single
+    // easiest thing in the whole feature to get wrong.
+    //
+    // The splash used to be disposed IMPLICITLY, by FlowMainMenu's non-Persistent
+    // sweep. Documents are spared by that sweep (that is what makes the UI layer
+    // resident), so nothing destroys a boot DOCUMENT any more - it would render
+    // permanently on top of the menu.
+    //
+    // It has to be here, above all three branches, not inside FlowMainMenu:
+    //   * FlowMainMenu early-returns when uiManagerMode_ is false, so the
+    //     playOnBoot_ and no-UI branches would never reach it;
+    //   * both of those go through FlowPlay -> Loading -> LoadGameplayWorld,
+    //     whose Replace sweep now spares screenOwned documents too.
+    // (A LEGACY `.hbscene` splash has no document handle and is still swept, so
+    // this is a no-op for a half-migrated project - which is correct.)
+    //
+    // The reaped-entity count is LOGGED because this is the one step whose failure
+    // is invisible to every automated check inside a shipped build: the splash
+    // would simply keep drawing over the menu. `--test-uiflow` asserts it in the
+    // editor exe; this line is how you confirm it in the runtime's own log.
+    if (bootDoc_ != 0 && scene_) {
+        const ui::DocumentInstance* inst = docs_.Get(bootDoc_);
+        const u32 reaped = inst ? static_cast<u32>(inst->entities.size()) : 0;
+        docs_.Close(*scene_, bootDoc_);
+        bootDoc_ = 0;
+        HBE_INFO("Boot: boot document CLOSED ({} splash entities reaped).", reaped);
+    }
+    // Studio splash finished: show the initial (menu) panel when a UI document is
+    // loaded, else boot straight into gameplay (the empty-uiDocument fallback).
     // --play (playOnBoot_) forces gameplay directly, skipping the menu.
     if (playOnBoot_) {
         FlowPlay();
@@ -2153,21 +4240,20 @@ void Engine::PresentBootSplash(f32 progress) {
     renderer_->RenderScene(*scene_, 0.0f); // draws the splash UI + presents
 }
 
-void Engine::DevMenuScanLevels() {
-    devLevels_.clear();
+void Engine::DevMenuScanScenes() {
+    // Every .hbscene in Assets/ is a candidate "zone": a level is ONE file, so
+    // there is nothing to dedup into a base name any more.
+    devScenes_.clear();
     if (!Project::HasActive()) return;
     const std::filesystem::path root = Project::Active().AssetsDir();
     std::error_code ec;
-    std::vector<std::filesystem::path> bases;
     for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
          it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) break;
         if (!it->is_regular_file() || it->path().extension() != ".hbscene") continue;
-        bases.push_back(scene::ResolveLevel(it->path()).base); // dedup members -> one base
+        devScenes_.push_back(it->path());
     }
-    std::sort(bases.begin(), bases.end());
-    bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
-    devLevels_ = std::move(bases);
+    std::sort(devScenes_.begin(), devScenes_.end());
 }
 
 void Engine::RebuildDevMenu() {
@@ -2198,11 +4284,26 @@ void Engine::RebuildDevMenu() {
     action("Save checkpoint", [this] { SaveGame("checkpoint"); });
     action("Load checkpoint", [this] { LoadGame("checkpoint"); });
 
-    if (!devLevels_.empty()) {
-        header("LEVELS (skip to zone)");
-        for (const std::filesystem::path& base : devLevels_) {
-            const std::filesystem::path b = base;
-            action(base.filename().string(), [this, b] { devMenuOpen_ = false; LoadLevel(b); });
+    // STREAMING. A shipped-build A/B for "is this bug streaming?": turning it off pins
+    // every shard loaded (never unloads anything), so if the symptom survives, streaming
+    // is not the cause. Only offered when the bound level actually has shards - a row
+    // that does nothing is worse than no row.
+    if (tagStream_.IsBound() && tagStream_.ShardCount() > 0) {
+        header("STREAMING");
+        char v[64];
+        std::snprintf(v, sizeof(v), "%s (%u/%u resident)", tagStream_.Enabled() ? "on" : "OFF",
+                      tagStream_.ResidentShardCount(),
+                      static_cast<u32>(tagStream_.ShardCount()));
+        value("Tag streaming", v,
+              [this](int) { tagStream_.SetEnabled(!tagStream_.Enabled()); });
+    }
+
+    if (!devScenes_.empty()) {
+        header("SCENES (skip to zone)");
+        for (const std::filesystem::path& sp : devScenes_) {
+            const std::filesystem::path s2 = sp;
+            action(sp.stem().string(),
+                   [this, s2] { devMenuOpen_ = false; LoadGameplayScene(s2); });
         }
     }
 
@@ -2275,22 +4376,41 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
         case GameState::Playing:  st = "Playing"; break;
         default: break;
     }
-    const std::string level =
-        (currentLevel_ && currentLevel_->Loaded()) ? currentLevel_->Name() : std::string("(none)");
+    const std::string level = currentScenePath_.empty()
+                                  ? std::string("(none)")
+                                  : currentScenePath_.stem().string();
     glm::vec3 ppos(0.0f);
     auto pv = scene_->Registry().view<Transform, CharacterController>();
     if (pv.begin() != pv.end()) ppos = glm::vec3(scene_->WorldMatrix(*pv.begin())[3]);
     std::string obj = game::CurrentObjectiveText();
     if (obj.empty()) obj = "(none)";
     const Renderer::FrameStats& rs = renderer_->Stats();
-    char buf[512];
+    // WHAT IS CURRENTLY RESIDENT, in the shipped build. Streaming's whole visible
+    // effect is which shards exist right now, and in a shipped runtime this overlay is
+    // the only place to see it. "off" is spelled out because a pinned-loaded world looks
+    // identical to a working one until the player walks somewhere.
+    std::string streamLine = "Streaming: (no level bound)";
+    if (tagStream_.IsBound()) {
+        if (tagStream_.ShardCount() == 0)
+            streamLine = std::format("Streaming: none - all {} row(s) resident{}",
+                                     tagStream_.ResidentRowCount(),
+                                     tagStream_.Trusted() ? "" : " (shard table UNTRUSTED)");
+        else
+            streamLine = std::format("Streaming: {}/{} shard(s) resident  |  {} spawn / {} "
+                                     "despawn  |  {}",
+                                     tagStream_.ResidentShardCount(), tagStream_.ShardCount(),
+                                     tagStream_.Stats().spawns, tagStream_.Stats().despawns,
+                                     tagStream_.Enabled() ? "on" : "OFF (all pinned loaded)");
+    }
+    char buf[768];
     std::snprintf(buf, sizeof(buf),
                   "== DEV MENU ==  (Ctrl+` close  -  arrows move  -  Enter/<> use)\n"
                   "FPS %.0f  |  %.2f ms  |  Draws %u/%u (%u culled)\n"
                   "State: %s   Level: %s   Player %.1f,%.1f,%.1f\n"
+                  "%s\n"
                   "Objective: %s",
                   fps, dt_ * 1000.0f, rs.drawn, rs.total, rs.culled, st, level.c_str(), ppos.x,
-                  ppos.y, ppos.z, obj.c_str());
+                  ppos.y, ppos.z, streamLine.c_str(), obj.c_str());
     const std::string stats = buf;
 
     // --- Emit helpers (NDC) ---
@@ -2765,10 +4885,14 @@ void Engine::SaveUserSettings() {
 }
 
 void Engine::ShowInteractPrompt(const std::string& text, const std::string& iconPath,
-                                glm::vec2 anchor) {
+                                glm::vec2 anchor, bool pressed) {
     if (!scene_) return;
     entt::registry& reg = scene_->Registry();
     const bool hasIcon = !iconPath.empty();
+    // The same 0.72 press multiply a UI Button uses, so a 3D object and a 3D button
+    // depress by the same amount - one interaction language, not two.
+    constexpr f32 kPressDim = 0.72f;
+    const f32 s = pressed ? kPressDim : 1.0f;
 
     // Text label (the verb, or the "[E] verb" glyph fallback).
     if (interactPrompt_ == entt::null || !reg.valid(interactPrompt_)) {
@@ -2786,6 +4910,7 @@ void Engine::ShowInteractPrompt(const std::string& text, const std::string& icon
     lbl.anchorMin = lbl.anchorMax = anchor; // point-anchor at the object centre
     lbl.runtimeText = text;
     lbl.visible = true;
+    lbl.color = glm::vec4(1.0f * s, 0.96f * s, 0.75f * s, 1.0f);
     // With an icon, the verb sits just BELOW the (centred) icon; without one, the
     // "[E] verb" text is centred on the object.
     lbl.pivot = hasIcon ? glm::vec2(0.5f, 0.0f) : glm::vec2(0.5f, 0.5f);
@@ -2810,6 +4935,10 @@ void Engine::ShowInteractPrompt(const std::string& text, const std::string& icon
         }
         icon.anchorMin = icon.anchorMax = anchor;
         icon.visible = true;
+        // Dim AND shrink: the icon is usually a bright glyph plate where a 28%
+        // multiply alone is easy to miss at prompt size.
+        icon.color = glm::vec4(s, s, s, 1.0f);
+        icon.size = pressed ? glm::vec2(46.0f, 46.0f) : glm::vec2(52.0f, 52.0f);
     } else if (interactIcon_ != entt::null && reg.valid(interactIcon_)) {
         reg.get<UIElement>(interactIcon_).visible = false;
     }
@@ -2824,9 +4953,7 @@ void Engine::HideInteractPrompt() {
         reg.get<UIElement>(interactIcon_).visible = false;
 }
 
-void Engine::UpdateInteractions(Scene& scene, f32 dt) {
-    (void)dt;
-    entt::registry& reg = scene.Registry();
+bool Engine::InteractionsSuppressed() const {
     // Don't offer interactions while a conversation/cutscene is playing OR queued
     // this frame (the deferred queues are single-slot latest-wins, so firing now
     // would clobber a schematic's just-queued convo), or while a menu overlay is
@@ -2834,9 +4961,24 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
     // E/gamepad key must not fire behind it.
     const bool menuOpen =
         uiManagerMode_ && !uiManager_.Empty() && uiManager_.Top() != "HUD";
-    if (menuOpen || devMenuOpen_ || actionMap_.Rebinding() || rebindJustCommitted_ ||
-        dialogueNode_ != 0 || cutsceneTime_ >= 0.0f || game::DialoguePending() ||
-        game::CutscenePending()) {
+    return menuOpen || devMenuOpen_ || actionMap_.Rebinding() || rebindJustCommitted_ ||
+           dialogueNode_ != 0 || cutsceneTime_ >= 0.0f || game::DialoguePending() ||
+           game::CutscenePending();
+}
+
+bool Engine::InteractableAvailable(Scene& scene, entt::entity e) const {
+    const entt::registry& reg = scene.Registry();
+    const Interactable* ia = reg.valid(e) ? reg.try_get<Interactable>(e) : nullptr;
+    if (!ia) return false;
+    if (ia->once && ia->fired) return false;
+    if (!ia->requiredFlag.empty() && game::GetFlag(ia->requiredFlag) == 0.0f) return false;
+    return true;
+}
+
+void Engine::UpdateInteractions(Scene& scene, f32 dt) {
+    (void)dt;
+    entt::registry& reg = scene.Registry();
+    if (InteractionsSuppressed()) {
         HideInteractPrompt();
         return;
     }
@@ -2921,25 +5063,23 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
         return glm::vec3(m[3]);
     };
 
+    // THE CANDIDATE COMES FROM THE SHARED PICK PASS - this function no longer does
+    // its own selection. Previously it was a pure RADIUS test with no ray, no
+    // occlusion and no facing, so an NPC through a wall two metres away prompted
+    // and fired, and turning your back on one kept the prompt up. interact::Pick
+    // ran at the top of the frame with the same ray the world-UI pages used:
+    //   * aim-first - what the reticle is on wins, so a 3D button works;
+    //   * proximity fallback - "walk up to an NPC and press E" still works when you
+    //     are not aiming at anything, but is now occlusion-filtered too;
+    //   * and if a world UI page was NEARER, `pick_` is a Page and no object is
+    //     offered at all. Exactly one affordance, never two.
     entt::entity best = entt::null;
-    f32 bestD2 = 0.0f;
-    std::string bestPrompt;
-    glm::vec3 bestCenter(0.0f);
-    for (const entt::entity e : reg.view<Interactable>()) {
-        const Interactable& ia = reg.get<Interactable>(e);
-        if (ia.once && ia.fired) continue;
-        if (!ia.requiredFlag.empty() && game::GetFlag(ia.requiredFlag) == 0.0f) continue;
-        const glm::vec3 center = worldCenter(e);
-        const glm::vec3 rel = center - player;
-        const f32 d2 = glm::dot(rel, rel);
-        if (d2 <= ia.range * ia.range && (best == entt::null || d2 < bestD2)) {
-            best = e;
-            bestD2 = d2;
-            bestPrompt = ia.prompt;
-            bestCenter = center;
-        }
-    }
+    if (pick_.kind == interact::Hit::Kind::Object && reg.valid(pick_.entity) &&
+        reg.all_of<Interactable>(pick_.entity))
+        best = pick_.entity;
     if (best == entt::null) { HideInteractPrompt(); return; }
+    const std::string bestPrompt = reg.get<Interactable>(best).prompt;
+    const glm::vec3 bestCenter = worldCenter(best);
 
     // Project the object CENTRE to a screen anchor so the prompt sits over it.
     // Behind the camera -> hide; off to a side -> clamp on-screen.
@@ -3013,7 +5153,11 @@ void Engine::UpdateInteractions(Scene& scene, f32 dt) {
     if (glyph.empty()) glyph = "?";
     const std::string label =
         icon.empty() ? (std::string("[") + glyph + "] " + bestPrompt) : bestPrompt;
-    ShowInteractPrompt(label, icon, anchor);
+    // HOVER / PRESS / RELEASE on a whole object. `held` is read BEFORE the fire
+    // below so the frame of the press already draws pressed; release is this going
+    // false on a later frame, which restores the idle prompt.
+    const bool held = input_ && actionMap_.Down(*input_, "Interact");
+    ShowInteractPrompt(label, icon, anchor, held);
 
     const bool press = input_ && actionMap_.Pressed(*input_, "Interact");
     if (press) {
@@ -3097,7 +5241,9 @@ void Engine::UpdateGameFlow(f32 dt) {
                 // HUD bars are never clobbered (the panel entities are persistent -
                 // Show("HUD") on reveal hides them, nothing is destroyed).
                 loadingPanelEntities_.clear();
-                CollectPanelSubtree(*scene_, "Loading", loadingPanelEntities_);
+                CollectPanelSubtree(*scene_,
+                                    uiManager_.PanelEntity(*scene_, "Loading"),
+                                    loadingPanelEntities_);
                 SetProgressFill(*scene_, 0.0f, &loadingPanelEntities_);
                 SetWheelAlpha(*scene_, 0.0f, &loadingPanelEntities_); // hidden until it eases in
                 shown = true;
@@ -3118,14 +5264,21 @@ void Engine::UpdateGameFlow(f32 dt) {
             wheelAlpha_ = glm::min(wheelAlpha_ + dt / kWheelFadeDur, 1.0f);
             SetWheelAlpha(*scene_, wheelAlpha_, &loadingPanelEntities_);
 
-            // Hold until the world has materialized: terrain chunks built AND streamed
-            // cells resident around the spawn (cam::Update parks the camera there while
-            // the sim is frozen). Then nothing pops in when we reveal.
-            const glm::vec3 focus =
-                renderer_ ? renderer_->GetCamera().Position() : glm::vec3(0.0f);
+            // Hold until the world has materialized: terrain chunks built AND every
+            // in-range streaming shard actually instantiated. Then nothing pops in when
+            // we reveal.
+            //
+            // The streaming half carries all four salvaged IsSettled clauses, and the
+            // one that matters most here is "Ready is NOT settled": a shard whose assets
+            // finished staging but which the main thread has not instantiated yet would
+            // otherwise let the screen drop exactly one frame before its geometry exists
+            // - the pop the screen is there to hide. That clause is also what makes the
+            // one-finalize-per-frame budget safe: deferred finalizes still hold the
+            // screen up. Failed shards are deliberately ignored (waiting on a broken
+            // shard would hang the screen forever).
             const bool terrainReady = terrain::IsSettled(*scene_);
-            const bool streamReady = !(streamingWorld_ && streamingWorld_->Active()) ||
-                                     streamingWorld_->IsSettled(focus);
+            const bool streamReady =
+                tagStream_.IsSettled(StreamFoci(*scene_, *renderer_));
             const bool ready = terrainReady && streamReady;
 
             const f32 p = (ready && loadTimer_ >= kLoadDuration)
@@ -3137,9 +5290,10 @@ void Engine::UpdateGameFlow(f32 dt) {
             const bool timedOut = loadTimer_ >= kMaxLoadDuration;
             if ((ready && loadTimer_ >= kLoadDuration) || timedOut) {
                 if (timedOut && !ready)
-                    HBE_WARN("Loading: revealing after {:.0f}s cap (terrain={}, stream={}) - "
-                             "something never settled.",
-                             kMaxLoadDuration, terrainReady, streamReady);
+                    HBE_WARN("Loading: revealing after {:.0f}s cap (terrain={}, streaming={}, "
+                             "{}/{} shard(s) resident) - something never settled.",
+                             kMaxLoadDuration, terrainReady, streamReady,
+                             tagStream_.ResidentShardCount(), tagStream_.ShardCount());
                 loadPhase_ = LoadPhase::FadeOut;
             }
             break;
@@ -3253,8 +5407,19 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.stressShared = true; // one shared mesh (sort/instancing rig)
         } else if (arg == "--stress-particles" && i + 1 < argc) {
             config.stressParticles = static_cast<u32>(std::stoul(argv[++i]));
+        } else if (arg == "--gpu-particles") {
+            config.gpuParticles = true; // stress rig uses GPU vertex expansion
+        } else if (arg == "--gpu-sim") {
+            config.gpuSimParticles = true; // stress rig simulates in a compute shader
+        } else if (arg == "--fixed-dt" && i + 1 < argc) {
+            config.fixedDt = std::stof(argv[++i]); // deterministic sim clock for A/B runs
         } else if (arg == "--shadowcascades" && i + 1 < argc) {
             config.forceShadowCascades = std::stoi(argv[++i]); // TEMP perf A/B
+        } else if (arg == "--trace") {
+            // Per-frame diagnostics (shard spawn/despawn, world-state capture/restore,
+            // per-slice instantiate). OFF by default because every log line is flushed
+            // unbuffered AND recorded into the boot screen's {log} ring - see Core/Log.h.
+            SetTraceEnabled(true);
         } else if (arg == "--gpuprofile") {
             config.gpuProfile = true; // per-pass GPU timestamp breakdown (both backends)
         } else if (arg == "--benchmark" && i + 1 < argc) {
@@ -3266,10 +5431,6 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.benchmarkWarmup = static_cast<u32>(std::stoul(argv[++i]));
         } else if (arg == "--benchmark-csv" && i + 1 < argc) {
             config.benchmarkCsv = argv[++i];
-        } else if (arg == "--world" && i + 1 < argc) {
-            config.worldPath = argv[++i];
-        } else if (arg == "--worldtest") {
-            config.worldTest = true;
         } else if (arg == "--dof") {
             config.forceDof = true;
         } else if (arg == "--motionblur") {
@@ -3285,14 +5446,24 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
                 config.forcePainterlyRadius = std::stof(argv[++i]);
         } else if (arg == "--navtest") {
             config.navTest = true;
+        } else if (arg == "--navbench") {
+            config.navBench = true;
         } else if (arg == "--fracturetest") {
             config.fractureTest = true;
         } else if (arg == "--destructiontest") {
             config.destructionTest = true;
+        } else if (arg == "--test-terraincollide") {
+            config.terrainCollideTest = true;
         } else if (arg == "--play") {
             config.playOnBoot = true;
         } else if (arg == "--uiworldtest") {
             config.uiWorldTest = true; // world-space UI smoke test (lit page)
+        } else if (arg == "--tagstreamtest") {
+            // Optional object count; defaults to 600 (enough that each of the four tags
+            // is genuinely scattered and bakes to several shards).
+            config.tagStreamTest = 600;
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                config.tagStreamTest = static_cast<u32>(std::stoul(argv[++i]));
         } else if (arg == "--time" && i + 1 < argc) {
             config.forceTimeOfDay = std::stof(argv[++i]); // scrub the day/night sky
         } else if (arg == "--daynight" && i + 1 < argc) {

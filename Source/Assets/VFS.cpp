@@ -31,6 +31,19 @@ Mount& TheMount() {
     return m;
 }
 
+// RESOLVE-ONLY half of the filename fallback below: does that bare filename name
+// anything, in the packs or under the search root? Shares ReadByFilename's cache,
+// so a probe warms the read and vice versa.
+//
+// This exists because Exists() and ReadFile() MUST agree. They did not: ReadFile
+// had the fallback and Exists did not, so a `.hbproj` naming `"Scene.hbscene"`
+// while the file lives at `Assets/Scenes/Scene.hbscene` passed the cook (the pack
+// closure applies the same filename rule) and was then skipped at boot by the
+// Exists() gate in Engine::Run - startup scene, boot document and every UI screen
+// are all gated that way, so the symptom is a game that boots to no world and no
+// menu with one warning.
+bool ResolveByFilename(const fs::path& path);
+
 // Filename fallback: refs written before assets were organized into folders
 // (or by older importers) carry just a name; find that name anywhere in the
 // mounted packs or under the search root. Cached per filename.
@@ -91,6 +104,32 @@ std::optional<std::vector<u8>> ReadByFilename(const fs::path& path) {
     }
     m.resolveCache[filename] = fs::path(); // cache the miss
     return std::nullopt;
+}
+
+bool ResolveByFilename(const fs::path& path) {
+    Mount& m = TheMount();
+    const std::string filename = path.filename().string();
+    if (filename.empty()) return false;
+    {
+        const std::lock_guard<std::mutex> lock(m.cacheMutex);
+        if (const auto it = m.resolveCache.find(filename); it != m.resolveCache.end())
+            return !it->second.empty();
+        // Packs first, and WITHOUT populating the cache from here: a hit is
+        // recorded by ReadByFilename together with its warning, so a probe never
+        // silently swallows the "resolved by filename" diagnostic.
+        if (m.active) {
+            for (const uap::Entry& e : m.packs.Entries())
+                if (fs::path(e.path).filename().string() == filename) return true;
+        }
+    }
+    if (m.searchRoot.empty()) return false;
+    std::error_code ec;
+    for (auto it = fs::recursive_directory_iterator(m.searchRoot, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (it->is_regular_file() && it->path().filename().string() == filename) return true;
+    }
+    return false;
 }
 
 // Pack key for `path` when it lies under the mounted root (else nullopt).
@@ -169,7 +208,10 @@ bool Exists(const fs::path& path) {
         if (TheMount().packs.Contains(*key)) return true;
     }
     std::error_code ec;
-    return fs::exists(path, ec);
+    if (fs::exists(path, ec)) return true;
+    // Same three steps, in the same order, as ReadFile. Anything else and this
+    // function answers "no" about a file ReadFile would happily return.
+    return ResolveByFilename(path);
 }
 
 } // namespace hbe::vfs

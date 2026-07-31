@@ -147,12 +147,29 @@ void Apply(const UIClip& clip, f32 t, UIElement& el, const glm::vec2& baseOffset
 void UpdateAnimations(Scene& scene, f32 dt, const std::filesystem::path& assetsDir) {
     auto& reg = scene.Registry();
 
+    // AUTHORING SKIP. Everything below writes AUTHORED, SERIALIZED fields in place:
+    // Apply writes offset / scale / rotation / colour, and the auto-scroll loop
+    // writes scrollPos. ui::CaptureDocument copies the LIVE component, so with a
+    // clip running in the editor the `.hbui` on disk got whatever frame the clip
+    // happened to be on - and a drag in the UI editor was overwritten by the next
+    // frame's Apply, making the element unauthorable.
+    //
+    // Gated on UIAuthoringView (not EditorView) for exactly the reason
+    // Scene::SetUIAuthoringView documents: EditorView is true for the whole editor
+    // process, PLAY INCLUDED, and Play must behave like the shipped build. The
+    // runtime never turns UIAuthoringView on, so this is inert there.
+    const bool authoring = scene.EditorView() && scene.UIAuthoringView();
+    const auto skip = [&](entt::entity e) {
+        return authoring && reg.all_of<UIDocMember>(e);
+    };
+
     // Auto-scrolling ScrollViews (credits rolls) drift here - the one UI tick
     // with a dt. Looping content wraps around: it re-enters from below/right
     // (scrollPos -view, i.e. content parked just past the view's far edge)
     // once it has fully scrolled past (scrollPos > contentExtent).
     if (dt > 0.0f) {
         for (const entt::entity e : reg.view<UIElement>()) {
+            if (skip(e)) continue;
             UIElement& el = reg.get<UIElement>(e);
             if (el.type != UIElement::Type::ScrollView || el.autoScroll == 0.0f ||
                 !el.visible)
@@ -173,6 +190,7 @@ void UpdateAnimations(Scene& scene, f32 dt, const std::filesystem::path& assetsD
     }
 
     for (const entt::entity e : reg.view<UIAnimator, UIElement>()) {
+        if (skip(e)) continue;
         UIAnimator& an = reg.get<UIAnimator>(e);
         UIElement& el = reg.get<UIElement>(e);
         if (an.clip.empty()) continue;

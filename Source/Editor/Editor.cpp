@@ -4,6 +4,7 @@
 #include "Assets/AssetFormats.h"
 #include "Assets/AssetLoader.h"
 #include "Assets/MeshGenerator.h"
+#include "Assets/SlotIds.h" // pack slots are stamped into newly created assets
 #include "Assets/UAF.h"
 #include "Assets/UAP.h"
 #include "Audio/AudioSystem.h"
@@ -22,16 +23,21 @@
 #include "Engine/Engine.h"
 #include "Physics/PhysicsWorld.h"
 #include "Scene/AnimationSystem.h"
+#include "Scene/Hierarchy.h" // sibling order + the one parent->children walk
 #include "Scene/PaintSystem.h"
+#include "Scene/ParticleGpuSim.h"
 #include "Scene/ParticleSystem.h"
 #include "Scene/SceneSerializer.h"
-#include "Scene/StreamingWorld.h"
+#include "Scene/StreamingSalvage.h" // SALVAGE 2: the hysteresis clamp the sim must share
+#include "Scene/StrokeZone.h" // 3D paint strokes group + stream with their zone
+#include "Scene/TagTable.h" // streaming tags: the Inspector combo + the Tags panel
 #include "Scene/TerrainSystem.h"
 #include "Schematic/Schematic.h"
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
 #include "UI/UISystem.h"
 #include "UI/UIAnimation.h"
+#include "UI/UIWorld.h"
 #include "Project/Project.h"
 #include "Renderer/Camera.h"
 #include "Renderer/IBL.h"
@@ -348,21 +354,6 @@ void Editor::BuildUI(Engine& engine) {
     const Input& input = engine.GetInput();
     const f32 dt = engine.DeltaTime();
 
-    // The engine loads the project's startup scene before the first frame; adopt
-    // it once so the editor knows whether a level (3-file) or a single scene is
-    // open (drives the level-aware Save + hierarchy grouping).
-    if (!startupSynced_ && Project::HasActive()) {
-        startupSynced_ = true;
-        const std::string& su = Project::Active().Settings().startupScene;
-        if (!su.empty()) {
-            const std::filesystem::path sp = Project::Active().AssetsDir() / su;
-            if (scene::IsLevelMember(sp)) {
-                currentLevel_ = scene::ResolveLevel(sp);
-                levelOpen_ = true;
-            }
-        }
-    }
-
     if (!panelsInit_) {
         for (bool& b : panelOpen_) b = true;
         panelOpen_[Panel_ProjectSettings] = false; // opened from Project/Window menu
@@ -372,6 +363,9 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_Objectives] = false;        // task-goal browser, opened on demand
         panelOpen_[Panel_CharacterEditor] = false;   // modular-rig authoring, opened on demand
         panelOpen_[Panel_MovieRender] = false;        // trailer render, opened on demand
+        panelOpen_[Panel_UIDocument] = false;         // .hbui authoring, opened on demand
+        panelOpen_[Panel_Tags] = false;               // streaming-tag list, opened on demand
+        panelOpen_[Panel_UIEditor] = false;           // dedicated .hbui canvas, opened on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -388,8 +382,53 @@ void Editor::BuildUI(Engine& engine) {
         panelsInit_ = true;
     }
 
+    // ADOPT THE STARTUP SCENE. The Engine loads Project::Settings().startupScene into
+    // the world during boot (Engine.cpp, "Build the scene"), but that path never
+    // reached the editor: `currentScenePath_` is only ever assigned by Save As, by
+    // LoadSceneInEditor and by the two rename fixups. So on a project that HAS a
+    // startup scene, the author opened the editor, edited the level already on
+    // screen, pressed Ctrl+S - and got the Save-As modal pre-filled with "MainScene"
+    // plus "Scene has never been saved - choose a name", which is false. Accepting
+    // that default wrote a SECOND file and left the real level untouched. That reads
+    // exactly like "the game scene with all the objects doesn't save".
+    //
+    // Once, on the first frame that has a project, a startup scene and a non-empty
+    // world - and AdoptWorld with it, so the world-identity refusal recognises this
+    // registry as that file rather than refusing the first save.
+    if (!bootSceneAdopted_) {
+        bootSceneAdopted_ = true;
+        if (currentScenePath_.empty() && Project::HasActive() &&
+            !Project::Active().Settings().startupScene.empty()) {
+            const std::filesystem::path startup =
+                Project::Active().AssetsDir() / Project::Active().Settings().startupScene;
+            std::error_code ec;
+            bool worldHasContent = false;
+            for (const entt::entity e : scene.Registry().view<entt::entity>()) {
+                if (scene.Registry().valid(e) &&
+                    !scene.Registry().all_of<UIDocMember>(e)) {
+                    worldHasContent = true;
+                    break;
+                }
+            }
+            if (worldHasContent && std::filesystem::exists(startup, ec)) {
+                currentScenePath_ = startup;
+                AdoptWorld(scene);
+                HBE_INFO("Editor: adopted the project's startup scene '{}' as the open "
+                         "level, so Ctrl+S saves it rather than asking for a new name.",
+                         startup.string());
+            }
+        }
+    }
+
     ImGuizmo::BeginFrame();
     previewSubmitted_ = false; // reset the shared editor-preview claim each frame
+    gameViewPointerFed_ = false; // re-established by DrawGameView below
+    // The UI editor's "author this screen" override (EditorUIShow) is an AUTHORING
+    // view, so it is off while playing: otherwise the screen picked for authoring
+    // stayed force-visible through Play, stacked over whatever the game flow put
+    // up, and Play stopped matching the shipped build. Driven every frame rather
+    // than at the Play/Stop edges so a state restore cannot leave it stale.
+    engine.GetScene().SetUIAuthoringView(!playMode_);
 
     // Main menu bar.
     if (ImGui::BeginMainMenuBar()) {
@@ -449,15 +488,43 @@ void Editor::BuildUI(Engine& engine) {
             const bool hasProject = Project::HasActive();
             if (ImGui::MenuItem("New")) {
                 PushUndo(scene);
-                scene.Registry().clear();
+                ClearWorldSparingDocuments(scene);
+                AdoptWorld(scene); // the editor made this world; Save As may write it
                 selected_ = entt::null;
                 currentScenePath_.clear();
             }
             if (ImGui::MenuItem("Save", nullptr, false, hasProject)) {
-                SaveCurrent(scene);
+                // The return value is NOT discarded: SaveSceneToDisk can refuse
+                // before writing anything, and a refusal with no visible feedback is
+                // the same failure as a wrong-target save.
+                SaveSceneWithStatus(scene);
             }
             if (ImGui::MenuItem("Save As...", nullptr, false, hasProject)) {
                 wantSaveSceneAs_ = true;
+            }
+            ImGui::Separator();
+            // PREVIEW WHAT SHIPS. The viewport otherwise renders the AUTHORED post
+            // stack, while the shipped game degrades it to the player's quality preset
+            // (Medium by default: no SSGI, motion blur, SSR, volumetric fog, DoF or
+            // SSAO, and 3 shadow cascades instead of 4). That is a deliberate
+            // difference - the author must be able to see what they authored - but it
+            // means "the editor shows exactly what ships" is only true with this on.
+            // It declares the preset (SceneEnvironment::postQualityPreset); nothing is
+            // written into the authored post, so a save while previewing cannot bake
+            // the degrade into the `.hbscene`.
+            {
+                SceneEnvironment& senv = scene.Environment();
+                const char* kQuality[] = {"authored (High)", "shipped Medium", "shipped Low"};
+                const int cur = glm::clamp(senv.postQualityPreset, 0, 2);
+                if (ImGui::BeginMenu("Preview shipped quality")) {
+                    for (int q = 0; q < 3; ++q)
+                        if (ImGui::MenuItem(kQuality[q], nullptr, cur == q))
+                            senv.postQualityPreset = q;
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Medium is the shipped default. Not saved -");
+                    ImGui::TextDisabled("it is a viewport preview, not authored data.");
+                    ImGui::EndMenu();
+                }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Set as startup scene", nullptr, false,
@@ -465,6 +532,37 @@ void Editor::BuildUI(Engine& engine) {
                 Project::Active().Settings().startupScene =
                     Project::Active().RelativeAssetPath(currentScenePath_);
                 Project::Active().Save();
+            }
+            ImGui::Separator();
+            // RE-HOME PAINT STROKES. A stroke's zone is resolved from the surface it
+            // was painted on and baked in at paint time (Scene/StrokeZone.h); it does
+            // NOT follow that surface's tag if the tag changes later. This is the
+            // remedy, and the migration path for strokes authored before zones
+            // existed - artist-triggered and undoable, never automatic, and it
+            // rewrites nothing on disk until the next explicit Save.
+            {
+                // No group node means no strokes. HasAnyGroup takes the O(1) pool test
+                // first and only falls back to a name scan on a scene with no marked
+                // group at all - which is the LEGACY scene this menu item is the
+                // migration path for. Gating on the pool alone greyed the item out on
+                // exactly those scenes, since nothing stamps a marker until somebody
+                // paints. (This runs every frame the Scene menu is open, so it still
+                // must not build a children map, and it does not.)
+                const entt::registry& creg = scene.Registry();
+                const bool anyStrokes = strokezone::HasAnyGroup(creg);
+                if (ImGui::MenuItem("Re-home paint strokes", nullptr, false, anyStrokes)) {
+                    PushUndo(scene);
+                    const usize moved = strokezone::Rehome(scene);
+                    SetSaveStatus(moved > 0 ? "Re-homed " + std::to_string(moved) +
+                                                  " paint stroke(s)."
+                                            : "Paint strokes are already in the right zones.",
+                                  false);
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                    ImGui::SetTooltip(
+                        "Move every 3D paint stroke into the streaming zone it "
+                        "physically sits in.\nUse after re-tagging level geometry.");
+                }
             }
             ImGui::EndMenu();
         }
@@ -484,6 +582,13 @@ void Editor::BuildUI(Engine& engine) {
         ImGui::EndMainMenuBar();
     }
 
+    // SAVE SHORTCUTS. Routed, not polled, and NOT inside the `!io.WantTextInput`
+    // block below: Ctrl+S is honoured while typing (it commits the field first - see
+    // ProcessSaveRequest). Registered here only so the two save chords stay next to
+    // the rest of the shortcuts; the decision and the write happen at the END of the
+    // frame, after every panel has had its chance to claim.
+    RegisterSaveShortcuts(engine);
+
     // Keyboard shortcuts (suppressed while a text field has focus).
     {
         const ImGuiIO& io = ImGui::GetIO();
@@ -495,12 +600,12 @@ void Editor::BuildUI(Engine& engine) {
             // 3D stroke would pop a stale surface stroke from a different mode.
             const bool paintHistory = paintActive_ && !paintStrokeMode_ &&
                                       (!paintStrokeOrder_.empty() || !paintStrokeRedo_.empty());
-            if (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-                SaveAll(engine); // Ctrl+Shift+S: save project + scene
-            } else if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-                // Ctrl+S: save the level (both files) / active scene / Save As.
-                SaveCurrent(engine.GetScene());
-            } else if (paintHistory && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            // NOTE the shape: the Ctrl+S / Ctrl+Shift+S branches that used to head
+            // this if/else-if chain moved to RegisterSaveShortcuts above. The paint-
+            // vs-scene undo arbitration is the chain's remaining correctness-
+            // sensitive part and must keep its order: paint history FIRST, plain
+            // scene undo as its else.
+            if (paintHistory && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
                 io.KeyShift ? PaintRedo(engine) : PaintUndo(engine);
             } else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
                 io.KeyShift ? Redo(engine) : Undo(engine);
@@ -607,10 +712,14 @@ void Editor::BuildUI(Engine& engine) {
         ImGui::DockBuilderDockWindow("Timeline", bottomRight);
         ImGui::DockBuilderDockWindow("Audio Mixer", bottomRight);
         ImGui::DockBuilderDockWindow("Music", bottomRight);
-        ImGui::DockBuilderDockWindow("Streaming", bottomRight);
         ImGui::DockBuilderDockWindow("Viewport", center);
         ImGui::DockBuilderDockWindow("Game", center);
         ImGui::DockBuilderDockWindow("Schematic Editor", center);
+        // The dedicated `.hbui` canvas is a main editing surface, so it tabs with
+        // the viewport rather than living in a side dock. NOTE: this default only
+        // runs on a machine with no saved layout (g_hadSavedLayout above), which is
+        // why the panel is also reachable from Window > UI Editor.
+        ImGui::DockBuilderDockWindow("UI Editor", center);
         ImGui::DockBuilderFinish(dockspace);
         } // end full-editor layout
         } // end default-layout (skipped when a saved .ini was restored)
@@ -630,13 +739,12 @@ void Editor::BuildUI(Engine& engine) {
     // loop, before this hook); running the freecam here would overwrite it with
     // the stale editor pose every frame, so the game camera would never show.
     if (!engine.IsGameCameraEnabled()) UpdateFreecam(renderer, input, dt);
-    DrawHierarchy(scene, renderer);
+    DrawHierarchy(engine);
     DrawInspector(scene, renderer);
     DrawStats(engine);
     DrawPostProcess(engine);
     DrawProjectSettings(engine);
     DrawNavigation(engine);
-    DrawStreaming(engine);
     DrawTimeline(engine);
     DrawAssetBrowser(engine);
     DrawAssetViewer(engine);
@@ -652,6 +760,15 @@ void Editor::BuildUI(Engine& engine) {
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
     DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
     DrawMovieRender(engine);      // trailer render (ticks the job; pins the viewport last)
+    DrawUIDocumentPanel(engine);  // .hbui open/new/save/close + the active edit target
+    // The dedicated `.hbui` authoring canvas. AFTER DrawGameView on purpose: both
+    // claim the in-game UI pointer via Engine::SetUIPointer, and when the UI editor
+    // is open its claim must win deterministically (see UIEditor.cpp).
+    DrawUIEditorPanel(engine);
+    DrawTagsPanel(engine);        // streaming tags: per-tag radii + usage (Window > Tags)
+    // Baked shard boxes + radii + the simulated focus. Before the selection outline so
+    // the selection stays the brightest thing on screen.
+    DrawShardOverlay(scene, renderer);
     DrawSelectionOutline(scene, renderer);
     DrawNavOverlay(scene, renderer);
     UpdateTerrainTool(engine); // terrain sculpt brush (consumes the click below)
@@ -694,21 +811,41 @@ void Editor::BuildUI(Engine& engine) {
             else if (act == 3) { PushUndo(scene); scene.Registry().remove<PrefabInstance>(e); }
         }
     }
+
+    // Ctrl+S, resolved and executed LAST: every panel has drawn by now, so whichever
+    // one won the route has registered its claim. Then the toast, so a save that
+    // happened this frame is already on screen.
+    ProcessSaveRequest(engine);
+    DrawSaveToast();
 }
 
 void Editor::DrawWindowMenu() {
     if (!ImGui::BeginMenu("Window")) return;
 
     // One toggle per dockable panel (titles match the ImGui window names).
-    static const char* const kNames[Panel_Count] = {
+    // NO EXPLICIT BOUND. With `[Panel_Count]` the static_assert below was a
+    // tautology - std::size() of an array declared that size IS that size, and a
+    // missing initializer just value-initialized the tail to nullptr, which reaches
+    // MenuItem() as a null title. Unbounded, std::size() measures the initializers,
+    // so a missing string is a build error and an extra one already was.
+    static const char* const kNames[] = {
         "Viewport",     "Game",       "Hierarchy",   "Inspector",
         "Asset Viewer", "Project Settings", "Post Process", "Navigation",
-        "Streaming",    "Stats",      "Timeline",    "Scenes",
+        "Stats",        "Timeline",   "Scenes",
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
-        "Objectives", "Character Editor", "Movie Render"};
+        "Objectives", "Character Editor", "Movie Render", "UI Document",
+        "Tags", "UI Editor"};
+    // The enum only WARNS about the lockstep in a comment; this makes forgetting a
+    // string a build error instead of a null-titled menu item at MenuItem() below.
+    static_assert(std::size(kNames) == Panel_Count,
+                  "kNames must have one entry per Panel enumerator (and in the same "
+                  "order - the string must byte-match the ImGui::Begin() title)");
     if (artMode_) {
         // Artist build: only the painting-relevant panels are listed/reachable.
+        // Panel_UIEditor is deliberately NOT here: the art build is the surface-
+        // painting tool, not a UI authoring tool. (This array holds enum VALUES, so
+        // appending to the enum needs no edit here - only a decision.)
         static const Panel kArtPanels[] = {Panel_Viewport, Panel_ArtEditor,
                                            Panel_Hierarchy, Panel_Inspector,
                                            Panel_Scenes, Panel_Assets};
@@ -742,20 +879,553 @@ void Editor::DrawWindowMenu() {
     ImGui::EndMenu();
 }
 
+// === Ctrl+S DISPATCH =========================================================
+// See the long note on Editor::ClaimSave in Editor.h for WHY this is imgui input
+// routing rather than a central "which panel is focused?" dispatcher.
+
+bool Editor::ClaimSave(editor::SaveSurface surface) {
+    // RouteFocused (the deep-most focused window wins) + RouteFromRootWindow (so a
+    // claim made by, or a focus sitting in, a child canvas resolves to the PANEL -
+    // the routing equivalent of the ImGuiFocusedFlags_RootAndChildWindows idiom the
+    // two old hand-rolled handlers used).
+    //
+    // A docked-but-inactive tab, a merely-hovered panel and a detached panel that
+    // lost focus all score 0 here, so they do not claim and the scene fallback runs.
+    // Ctrl+S is deliberately NOT suppressed while a text field is active: imgui does
+    // not filter Ctrl-modified chords as potential character input, so the claim
+    // lands and ProcessSaveRequest defers it by one frame to let the field commit.
+    if (!ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S,
+                         ImGuiInputFlags_RouteFocused | ImGuiInputFlags_RouteFromRootWindow))
+        return false;
+    saveClaim_ = surface;
+    saveRequested_ = true;
+    return true;
+}
+
+void Editor::RegisterSaveShortcuts(Engine& engine) {
+    // Ctrl+Shift+S: ONE global route, unclaimable by any panel. "Save everything"
+    // does not depend on focus, and Shortcut() matches modifiers EXACTLY, so this
+    // never fires the Ctrl+S routes and the Ctrl+S routes never fire on this. (The
+    // old panel handlers had no KeyShift test at all, so Ctrl+Shift+S saved the
+    // focused graph on top of SaveAll's own pass.)
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S,
+                        ImGuiInputFlags_RouteGlobal)) {
+        SaveAll(engine);
+    }
+    // Ctrl+S: the GLOBAL fallback, score 1, so any focused panel's claim (score
+    // ~199) beats it. Fires when nothing is focused, when the dockspace void is
+    // focused, or when the focused panel owns no savable surface.
+    //
+    // Deliberately not ImGuiInputFlags_RouteUnlessBgFocused: that would make Ctrl+S
+    // do NOTHING when the void is focused - a silent no-op on the editor's most-
+    // pressed key. Falling back to the scene is today's behaviour and the safe
+    // direction to be wrong in.
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+        saveClaim_ = editor::SaveSurface::None;
+        saveRequested_ = true;
+    }
+}
+
+editor::SaveSurface Editor::AssetViewerSurface() const {
+    // The Asset Viewer is three inline editors in one window; which one is live is a
+    // function of the asset it is pointed at plus whether that asset actually parsed.
+    if (viewedAsset_.empty()) return editor::SaveSurface::AssetViewer;
+    const std::string ext = viewedAsset_.extension().string();
+    if (ext == ".hbmat" && editedMatValid_) return editor::SaveSurface::Material;
+    if (ext == ".hbevent" && editedEventValid_) return editor::SaveSurface::AudioEvent;
+    // `previewPath_ == viewedAsset_` is the LOAD-BEARING half of this test, not a
+    // redundancy. EnsureMeshPreview only runs for a `.uaf` whose type is Mesh, so
+    // selecting a TEXTURE `.uaf` right after a mesh leaves previewModel_ holding the
+    // previous mesh while viewedAsset_ points at the texture - and uaf::WriteMesh
+    // would then write that mesh OVER the texture file. previewPath_ is the model's
+    // real owner and is the only thing that says the two agree.
+    if (ext == ".uaf" && previewPath_ == viewedAsset_ && !previewModel_.empty())
+        return editor::SaveSurface::MeshSlots;
+    // A texture, a scene, a cutscene/dialogue launcher, a read-only preview: nothing
+    // this panel can write. NOT `None` - that would fall through to the scene.
+    return editor::SaveSurface::AssetViewer;
+}
+
+bool Editor::SurfaceHasContent(Engine& engine, editor::SaveSurface s) const {
+    switch (s) {
+        case editor::SaveSurface::None:
+        case editor::SaveSurface::Scene:
+            return true; // the world always exists; a never-named scene gets Save As
+        case editor::SaveSurface::UIDocument:
+            return engine.Documents().Get(activeDoc_) != nullptr;
+        case editor::SaveSurface::Schematic:  return !editedSchematic_.empty();
+        case editor::SaveSurface::Dialogue:   return !editedDialoguePath_.empty();
+        case editor::SaveSurface::Cutscene:
+            return editedCutsceneValid_ && !editedCutscenePath_.empty();
+        // The Music panel syncs its working graph from the project once per session,
+        // and `musicLoaded_` goes true on its FIRST DRAW whether or not a graph
+        // exists - so it alone is not "there is something to save". The path matters
+        // too: with `settings.musicGraph` empty, Ctrl+S in a freshly-opened Music
+        // panel used to CREATE Assets/Music/score.hbmusic and rewrite the .hbproj to
+        // point at it, overwriting any unreferenced file already at that path. SaveAll
+        // has refused to invent a music file since it was written (it requires the
+        // target to exist); the chord now obeys the same rule.
+        case editor::SaveSurface::Music:      return musicLoaded_ && !musicEditPath_.empty();
+        case editor::SaveSurface::Character:  return !charEditRel_.empty();
+        // The extension is re-checked here (not only in AssetViewerSurface) so this
+        // predicate is safe to call on its own: the working copy is only ever valid
+        // FOR the asset the viewer is currently pointed at.
+        case editor::SaveSurface::Material:
+            return editedMatValid_ && viewedAsset_.extension() == ".hbmat";
+        case editor::SaveSurface::AudioEvent:
+            return editedEventValid_ && viewedAsset_.extension() == ".hbevent";
+        // previewPath_ is the model's owner - see AssetViewerSurface().
+        case editor::SaveSurface::MeshSlots:
+            return previewPath_ == viewedAsset_ && !previewModel_.empty();
+        case editor::SaveSurface::AssetViewer:
+        case editor::SaveSurface::Count:
+            return false;
+    }
+    return false;
+}
+
+bool Editor::SaveSceneWithStatus(Scene& scene) {
+    // THE ONE PLACE a scene save turns into an author-facing message. Ctrl+S, the
+    // Scene menu, the Scenes panel and the Art Editor's "Save Scene" all come
+    // through here, so a REFUSAL can no longer be swallowed at three of the five
+    // call sites the way it used to be.
+    if (currentScenePath_.empty()) {
+        // SaveCurrent opens the Save-As modal and writes nothing. Note that this can
+        // no longer ambush a graph editor: with a graph focused the scene is not the
+        // target at all.
+        SaveCurrent(scene);
+        SetSaveStatus("Scene has never been saved - choose a name.", false);
+        return false;
+    }
+    const std::filesystem::path path = currentScenePath_;
+    const u32 seqBefore = saveStatusSeq_;
+    if (!SaveCurrent(scene)) {
+        // FOUR of SaveSceneToDisk's five refusals already said exactly what was wrong
+        // - which shards are not resident, that a cutscene preview is posing the
+        // scene, that the world is empty over a populated file, that Play is running.
+        // Only the loose-UI refusal deliberately sets no status (it opens the UI
+        // Document panel instead). Stamping this generic line unconditionally
+        // replaced every precise cause with a pointer at an empty panel.
+        if (saveStatusSeq_ == seqBefore) {
+            SetSaveStatus("SCENE SAVE REFUSED - '" + path.filename().string() +
+                              "' was NOT written. See the UI Document panel.",
+                          true);
+        }
+        return false;
+    }
+    // Magnitude, so a wrong-target save is obvious at a glance. Counted with the same
+    // predicate SaveSceneToDisk writes by (no SceneSource, no UIDocMember).
+    const auto& reg = scene.Registry();
+    u32 objects = 0;
+    for (const entt::entity e : reg.view<entt::entity>())
+        if (reg.valid(e) && !reg.all_of<SceneSource>(e) && !reg.all_of<UIDocMember>(e))
+            ++objects;
+    SetSaveStatus("Saved scene '" + path.filename().string() + "' (" +
+                      std::to_string(objects) + " objects, " +
+                      std::to_string(shardDescs_.size()) + " shards).",
+                  false);
+    return true;
+}
+
+void Editor::SetSaveStatus(std::string msg, bool error) {
+    saveStatusError_ = error;
+    saveStatus_ = std::move(msg);
+    ++saveStatusSeq_; // see saveStatusSeq_: proof that a specific message was set
+    // Headless-safe: the self-tests drive SaveSceneToDisk with no ImGui context, and a
+    // refusal must be able to report itself there too (that is exactly what
+    // --test-scenesave asserts on).
+    saveStatusTime_ = ImGui::GetCurrentContext() ? ImGui::GetTime() : 0.0;
+    // Pin the toast to the viewport the author is actually working in - the OS window
+    // holding the focused panel, which with multi-viewport is often not the main one.
+    saveStatusViewport_ = 0;
+    if (ImGuiContext* ctx = ImGui::GetCurrentContext()) {
+        const ImGuiWindow* w = ctx->NavWindow;
+        if (w && w->Viewport) saveStatusViewport_ = w->Viewport->ID;
+    }
+    if (error) HBE_ERROR("{}", saveStatus_);
+    else HBE_INFO("{}", saveStatus_);
+}
+
+void Editor::ProcessSaveRequest(Engine& engine) {
+    // A deferred request (the previous frame's chord landed while a text field was
+    // active) outranks a fresh one: the field has now committed and the author is
+    // owed the save they already asked for.
+    editor::SaveContext ctx;
+    if (pendingSave_) {
+        ctx.focused = pendingSaveSurface_;
+        ctx.afterCommitFrame = true;
+        pendingSave_ = false;
+    } else if (saveRequested_) {
+        ctx.focused = saveClaim_;
+    } else {
+        return;
+    }
+    saveRequested_ = false;
+    saveClaim_ = editor::SaveSurface::None;
+
+    // The Asset Viewer resolves to whichever sub-editor is live, HERE rather than at
+    // claim time, so the panel only ever has to answer "I am focused".
+    if (ctx.focused == editor::SaveSurface::AssetViewer)
+        ctx.focused = AssetViewerSurface();
+
+    ctx.projectOpen = Project::HasActive();
+    ctx.surfaceHasContent = SurfaceHasContent(engine, ctx.focused);
+    ctx.playMode = playMode_;
+    ctx.textFieldActive = ImGui::GetIO().WantTextInput;
+
+    const editor::SaveAction action = editor::DecideSave(ctx);
+    const char* const surfaceName = editor::SaveSurfaceName(ctx.focused);
+
+    switch (action) {
+        case editor::SaveAction::NoProject:
+            SetSaveStatus("No project open - nothing to save.", true);
+            return;
+
+        case editor::SaveAction::Defer:
+            // COMMIT THE FIELD, SAVE NEXT FRAME. Clearing the active id makes the
+            // widget see itself deactivated on the next frame, which is when its own
+            // IsItemDeactivatedAfterEdit commit path runs (the idiom the settings
+            // panels already use). Saving on THIS frame would write the previous
+            // value of every buffered-commit widget in the tree.
+            pendingSaveSurface_ = ctx.focused;
+            pendingSave_ = true;
+            ImGui::ClearActiveID();
+            return;
+
+        case editor::SaveAction::NothingOpen:
+            SetSaveStatus(std::string(surfaceName) + ": nothing open to save.", false);
+            return;
+
+        case editor::SaveAction::RefusedPlayMode:
+            if (ctx.focused == editor::SaveSurface::UIDocument) {
+                SetSaveStatus("Playing - UI document saves are disabled (Play writes "
+                              "widget state). Stop to save.",
+                              true);
+            } else {
+                SetSaveStatus("Playing - scene saves are disabled (the Play world is a "
+                              "copy). Stop to save.",
+                              true);
+            }
+            return;
+
+        case editor::SaveAction::Scene:
+            SaveSceneWithStatus(engine.GetScene());
+            return;
+
+        case editor::SaveAction::UIDocument: {
+            const ui::DocumentInstance* inst = engine.Documents().Get(activeDoc_);
+            const std::string name =
+                (!inst || inst->path.empty()) ? std::string("(unsaved)")
+                                              : inst->path.filename().string();
+            if (!SaveUIDocument(engine, activeDoc_)) {
+                SetSaveStatus("UI DOCUMENT SAVE REFUSED - '" + name +
+                                  "' was NOT written. See the UI Document panel.",
+                              true);
+                return;
+            }
+            u32 elements = 0;
+            for (const entt::entity e : engine.GetScene().Registry().view<const UIDocMember>())
+                if (engine.GetScene().Registry().get<const UIDocMember>(e).doc == activeDoc_)
+                    ++elements;
+            const ui::DocumentInstance* saved = engine.Documents().Get(activeDoc_);
+            SetSaveStatus("Saved UI document '" +
+                              (saved && !saved->path.empty() ? saved->path.filename().string()
+                                                             : name) +
+                              "' (" + std::to_string(elements) + " elements).",
+                          false);
+            return;
+        }
+
+        // The file-backed asset editors. Each reports the file it wrote, and each
+        // reports a failed write as a failure - a save that says nothing is how a
+        // wrong-target save goes unnoticed.
+        case editor::SaveAction::Schematic:
+            if (SaveSchematic())
+                SetSaveStatus("Saved schematic '" + editedSchematic_.filename().string() +
+                                  "' (" + std::to_string(schematicGraph_.nodes.size()) +
+                                  " nodes).",
+                              false);
+            else
+                SetSaveStatus("SCHEMATIC SAVE FAILED - '" +
+                                  editedSchematic_.filename().string() + "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Dialogue:
+            if (SaveDialogue())
+                SetSaveStatus("Saved dialogue graph '" +
+                                  editedDialoguePath_.filename().string() + "' (" +
+                                  std::to_string(dlgGraph_.nodes.size()) + " nodes).",
+                              false);
+            else
+                SetSaveStatus("DIALOGUE SAVE FAILED - '" +
+                                  editedDialoguePath_.filename().string() +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Cutscene:
+            if (SaveCutsceneAsset())
+                SetSaveStatus("Saved cutscene '" + editedCutscenePath_.filename().string() +
+                                  "'.",
+                              false);
+            else
+                SetSaveStatus("CUTSCENE SAVE FAILED - '" +
+                                  editedCutscenePath_.filename().string() +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Music:
+            if (SaveMusicAsset())
+                SetSaveStatus("Saved music graph '" + musicEditPath_ + "'.", false);
+            else
+                SetSaveStatus("MUSIC SAVE FAILED - '" + musicEditPath_ +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Character:
+            if (SaveCharacterAsset())
+                SetSaveStatus("Saved character '" + charEditRel_ + "'.", false);
+            else
+                SetSaveStatus("CHARACTER SAVE FAILED - '" + charEditRel_ +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Material:
+            if (SaveViewedMaterial(engine))
+                SetSaveStatus("Saved material '" + viewedAsset_.filename().string() + "'.",
+                              false);
+            else
+                SetSaveStatus("MATERIAL SAVE FAILED - '" + viewedAsset_.filename().string() +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::AudioEvent:
+            if (SaveViewedAudioEvent())
+                SetSaveStatus("Saved audio event '" + viewedAsset_.filename().string() + "'.",
+                              false);
+            else
+                SetSaveStatus("AUDIO EVENT SAVE FAILED - '" +
+                                  viewedAsset_.filename().string() + "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::MeshSlots:
+            if (SaveViewedMesh())
+                SetSaveStatus("Saved mesh material slots into '" +
+                                  viewedAsset_.filename().string() + "'.",
+                              false);
+            else
+                SetSaveStatus("MESH SAVE FAILED - '" + viewedAsset_.filename().string() +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Count:
+            return;
+    }
+}
+
+void Editor::DrawSaveToast() {
+    // A silent Ctrl+S that saved the wrong thing IS the bug. The only save feedback
+    // before this was buildResult_, which renders in the Stats panel and Build
+    // Settings - neither of which an author dragging UI is looking at.
+    if (saveStatus_.empty() || saveStatusTime_ < 0.0) return;
+    constexpr f64 kHold = 4.0, kFade = 0.6;
+    const f64 age = ImGui::GetTime() - saveStatusTime_;
+    // Errors and refusals do NOT fade: they stay until the next save replaces them.
+    f32 alpha = 1.0f;
+    if (!saveStatusError_) {
+        if (age > kHold + kFade) {
+            // The TOAST is done; the message itself stays (the Stats panel keeps
+            // showing it, so "what did my last Ctrl+S actually write?" is always
+            // answerable after the toast has gone).
+            saveStatusTime_ = -1.0;
+            return;
+        }
+        if (age > kHold)
+            alpha = 1.0f - static_cast<f32>((age - kHold) / kFade);
+    }
+
+    // THE TOAST FOLLOWS THE AUTHOR, not the main window. Panels detach into real OS
+    // windows (multi-viewport is on for both backends), so a UI Editor dragged to a
+    // second monitor used to get its "Saved UI document..." - and, worse, its REFUSAL
+    // - drawn on monitor 1, where nobody was looking. The viewport is captured when
+    // the status is set (SetSaveStatus), because by the time it renders the focus may
+    // have moved. Falls back to the main viewport if that window is gone.
+    const ImGuiViewport* vp = nullptr;
+    if (saveStatusViewport_ != 0) vp = ImGui::FindViewportByID(saveStatusViewport_);
+    if (!vp) vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowViewport(vp->ID);
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 16.0f,
+                                   vp->WorkPos.y + vp->WorkSize.y - 16.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(0.0f, 0.0f), ImVec2(520.0f, FLT_MAX));
+    ImGui::SetNextWindowBgAlpha(alpha * 0.88f);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    if (ImGui::Begin("##savetoast", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                         ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs |
+                         ImGuiWindowFlags_NoDocking)) {
+        if (saveStatusError_) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.42f, 0.36f, 1.0f));
+        ImGui::PushTextWrapPos(500.0f);
+        ImGui::TextUnformatted(saveStatus_.c_str());
+        ImGui::PopTextWrapPos();
+        if (saveStatusError_) ImGui::PopStyleColor();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
 void Editor::SaveAll(Engine& engine) {
     if (!Project::HasActive()) {
         buildResult_ = "No project open.";
+        SetSaveStatus("No project open - nothing to save.", true);
         return;
     }
-    // Save the open level (both layer files) / active scene / Save As modal.
-    SaveCurrent(engine.GetScene());
+    // PLAY MODE. The Play world is a snapshot-restored COPY that gameplay is allowed
+    // to destroy entities in and strip components from, and ui::UpdateInteraction
+    // writes `.hbui` widget state (value/toggled/selected/scrollPos) that is authored,
+    // serialized data. Neither may be written back over the authored file - but the
+    // file-backed asset editors below are untouched by Play, so they still save, and
+    // the result string names what was skipped.
+    const bool playing = playMode_;
+    // Same rule as SaveSceneWithStatus: if SaveSceneToDisk already named the cause,
+    // that sentence is the one the author needs, and the summary below must carry it
+    // rather than replace it with a guess about the UI Document panel.
+    const u32 seqBeforeScene = saveStatusSeq_;
+    const bool sceneSaved = playing ? false : SaveCurrent(engine.GetScene());
+    const std::string sceneRefusal =
+        (!playing && !sceneSaved && saveStatusSeq_ != seqBeforeScene) ? saveStatus_
+                                                                     : std::string();
     // Project settings (environment / build / audio / startup scene).
     Project::Active().Save();
-    buildResult_ = levelOpen_      ? "Saved project + level '" + currentLevel_.Name() + "'."
-                   : currentScenePath_.empty()
-                       ? "Saved project; choose a name for the scene."
-                       : "Saved project + scene '" + currentScenePath_.stem().string() + "'.";
-    HBE_INFO("{}", buildResult_);
+
+    // EVERY OPEN `.hbui` DOCUMENT. This used to be missing, and it was a silent
+    // data-loss path: a document is asset content, deliberately absent from the
+    // scene string, so Ctrl+Shift+S saved the scene, reported "Saved project +
+    // scene", and dropped the entire UI layout the author had just dragged out.
+    // The UI Document panel's own Save button was the only way to persist one.
+    //
+    // NOT gated on `dirty`: nothing outside that panel maintains the flag (the
+    // Inspector's UI fields and both drag surfaces mutate components directly), so
+    // trusting it here would reintroduce the same loss for every edit that forgot
+    // to set it. Re-writing an unchanged document is byte-stable and cheap, and the
+    // safe direction to be wrong in.
+    //
+    // Handles are snapshotted first: SaveUIDocument writes through the instance
+    // (path / rel / dirty) and re-scans the asset lists, so iterating the live
+    // vector while calling it is asking for trouble.
+    u32 docsSaved = 0, docsFailed = 0, docsUnnamed = 0;
+    if (!playing) {
+        std::vector<ui::DocHandle> handles;
+        for (const ui::DocumentInstance& inst : engine.Documents().All()) {
+            if (inst.path.empty()) {
+                ++docsUnnamed; // never-saved "New" document: needs Save As, not a guess
+                continue;
+            }
+            handles.push_back(inst.handle);
+        }
+        for (const ui::DocHandle h : handles) {
+            if (SaveUIDocument(engine, h)) ++docsSaved;
+            else ++docsFailed; // SaveUIDocument already set uiDocError_ + logged why
+        }
+    }
+
+    // EVERY FILE-BACKED ASSET EDITOR. Until now Ctrl+Shift+S wrote the scene, the
+    // project and the documents and NOTHING else, while an author who had just
+    // retimed a cutscene or renamed a character slot believed "Save All" covered it.
+    // A safety net that skips half the editors is not a safety net.
+    //
+    // Two different gates, on purpose:
+    //   * editors that TRACK DIRTY (schematic, dialogue, cutscene, material, audio
+    //     event, mesh slots) save when dirty - that is exactly "there is unsaved
+    //     work here".
+    //   * editors that do NOT (music, character) save only when their target file
+    //     ALREADY EXISTS, so Save All can re-write an asset the author is editing but
+    //     can never invent a file they merely started typing a name for.
+    u32 assetsSaved = 0, assetsFailed = 0;
+    // Takes the saver as a CALLABLE, not as an already-evaluated bool: an eager
+    // argument would run every saver regardless of its gate, which for the music and
+    // character editors means writing files the author never asked to create.
+    const auto asset = [&](bool want, auto&& save) {
+        if (!want) return;
+        if (save()) ++assetsSaved;
+        else ++assetsFailed;
+    };
+    asset(schematicDirty_ && !editedSchematic_.empty(), [&] { return SaveSchematic(); });
+    asset(dlgDirty_ && !editedDialoguePath_.empty(), [&] { return SaveDialogue(); });
+    asset(editedCutsceneDirty_ && editedCutsceneValid_ && !editedCutscenePath_.empty(),
+          [&] { return SaveCutsceneAsset(); });
+    {
+        std::error_code ec;
+        const std::filesystem::path assetsDir = Project::Active().AssetsDir();
+        asset(musicLoaded_ && !musicEditPath_.empty() &&
+                  std::filesystem::exists(assetsDir / musicEditPath_, ec),
+              [&] { return SaveMusicAsset(); });
+        asset(!charEditRel_.empty() &&
+                  std::filesystem::exists(assetsDir / charEditRel_, ec),
+              [&] { return SaveCharacterAsset(); });
+    }
+    asset(editedMatDirty_ && editedMatValid_, [&] { return SaveViewedMaterial(engine); });
+    asset(editedEventDirty_ && editedEventValid_, [&] { return SaveViewedAudioEvent(); });
+    asset(previewMeshDirty_ && previewPath_ == viewedAsset_ && !previewModel_.empty(),
+          [&] { return SaveViewedMesh(); });
+    // Appended to whatever the scene/project half reports below. A REFUSED or failed
+    // document save must be as loud as a refused scene save, for the same reason.
+    std::string docNote;
+    if (docsSaved > 0) docNote += " + " + std::to_string(docsSaved) + " UI document(s)";
+    if (docsUnnamed > 0) {
+        docNote += ". " + std::to_string(docsUnnamed) +
+                   " never-saved UI document(s) SKIPPED - use Save As in the UI "
+                   "Document panel";
+    }
+    if (docsFailed > 0) {
+        docNote += ". " + std::to_string(docsFailed) +
+                   " UI DOCUMENT SAVE(S) REFUSED - see the UI Document panel";
+        panelOpen_[Panel_UIDocument] = true;
+    }
+    if (assetsSaved > 0) docNote += " + " + std::to_string(assetsSaved) + " asset(s)";
+    if (assetsFailed > 0) {
+        docNote += ". " + std::to_string(assetsFailed) +
+                   " ASSET SAVE(S) FAILED - see the log";
+    }
+
+    // A skip has to be as visible as a failure: an author who pressed Save All while
+    // playing must not walk away believing the level was written.
+    const bool refused = playing || (!currentScenePath_.empty() && !sceneSaved) ||
+                         docsFailed > 0 || assetsFailed > 0;
+    if (playing) {
+        buildResult_ = "Saved project" + docNote +
+                       ". PLAYING - the scene and every UI document were SKIPPED "
+                       "(Play mutates both). Stop to save them.";
+        HBE_ERROR("{}", buildResult_);
+    } else if (currentScenePath_.empty()) {
+        buildResult_ = "Saved project" + docNote + "; choose a name for the scene.";
+        HBE_INFO("{}", buildResult_);
+    } else if (sceneSaved) {
+        buildResult_ = "Saved project + scene '" + currentScenePath_.stem().string() +
+                       "'" + docNote + ".";
+        HBE_INFO("{}", buildResult_);
+    } else {
+        // The scene was REFUSED. Saying "saved" here is how a Ctrl+Shift+S silently
+        // loses an edit - and saying the WRONG reason is how the author fixes the
+        // wrong thing, so the refusal's own sentence wins when there is one.
+        buildResult_ = "Saved project" + docNote + ". " +
+                       (sceneRefusal.empty()
+                            ? std::string("SCENE SAVE REFUSED - see the UI Document panel.")
+                            : sceneRefusal);
+        HBE_ERROR("{}", buildResult_);
+    }
+    if (docsFailed > 0) HBE_ERROR("{}", buildResult_);
+    // Same message on the toast: Save All used to report only into the Stats panel
+    // and Build Settings, which nobody is looking at when they press Ctrl+Shift+S.
+    SetSaveStatus(buildResult_, refused);
 }
 
 void Editor::UpdateTerrainTool(Engine& engine) {
@@ -858,64 +1528,926 @@ void Editor::UpdateTerrainTool(Engine& engine) {
 
 // --- Art Editor (surface painting) ------------------------------------------
 
-// Layer kind from a "<name>.static/.dynamic.hbscene" path (defined below).
-static SceneKind KindFromScenePath(const std::string& p);
-
-void Editor::SaveCurrent(Scene& scene) {
-    if (levelOpen_) {
-        if (SaveSceneToDisk(scene, {})) scenesScanned_ = false; // level: two files
-        // Loose UI authored while a level is open isn't part of the level and has
-        // no file yet: prompt for a standalone UI scene name (otherwise it'd be
-        // dropped on reload). Only fires when there genuinely is untagged UI.
-        if (currentScenePath_.empty()) {
-            auto& reg = scene.Registry();
-            for (const entt::entity e : reg.view<entt::entity>()) {
-                if (reg.valid(e) && !reg.all_of<SceneSource>(e)) {
-                    wantSaveSceneAs_ = true;
-                    break;
-                }
-            }
-        }
-    } else if (currentScenePath_.empty()) {
+bool Editor::SaveCurrent(Scene& scene) {
+    // Returns whether a file was actually WRITTEN. SaveSceneToDisk can refuse (the
+    // loose-UI audit), and SaveAll used to announce "Saved project + scene 'X'" in
+    // the status bar and the log regardless - so a refused save read as a success
+    // while nothing had been written.
+    if (currentScenePath_.empty()) {
         wantSaveSceneAs_ = true; // never saved -> name it
-    } else if (SaveSceneToDisk(scene, currentScenePath_)) {
-        scenesScanned_ = false;
+        return false;
     }
+    if (!SaveSceneToDisk(scene, currentScenePath_)) return false;
+    scenesScanned_ = false;
+    return true;
 }
+
+// --- The file-backed asset editors' savers -----------------------------------
+// Extracted VERBATIM from their panels' Save buttons (which now call these) so the
+// button, Ctrl+S and Ctrl+Shift+S can never drift apart, and so SaveAll can cover
+// them without duplicating a track sort or a cache clear.
+
+bool Editor::SaveCutsceneAsset() {
+    if (!editedCutsceneValid_ || editedCutscenePath_.empty()) return false;
+    CutsceneAsset& cs = editedCutscene_;
+    // Keys are authored by dragging, so a track can be out of order in memory; the
+    // file is time-sorted. This sort is part of the save, not part of the button.
+    auto byTime = [](const auto& a, const auto& b) { return a.time < b.time; };
+    std::stable_sort(cs.camera.begin(), cs.camera.end(), byTime);
+    for (CutsceneAnimTrack& t : cs.animTracks) {
+        std::stable_sort(t.keys.begin(), t.keys.end(), byTime);
+        std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
+    }
+    std::stable_sort(cs.dialogue.begin(), cs.dialogue.end(), byTime);
+    std::stable_sort(cs.shakes.begin(), cs.shakes.end(), byTime);
+    std::stable_sort(cs.subtitles.begin(), cs.subtitles.end(), byTime);
+    if (!assets::SaveCutscene(editedCutscenePath_, cs)) return false;
+    StampNewAsset(editedCutscenePath_); // the save rebuilt the JSON; restore its id
+    editedCutsceneDirty_ = false;
+    assetsDirty_ = true;
+    return true;
+}
+
+bool Editor::SaveMusicAsset() {
+    if (!Project::HasActive() || !musicLoaded_) return false;
+    const std::filesystem::path assets = Project::Active().AssetsDir();
+    // NEVER INVENT A FILE. This used to default the path to "Music/score.hbmusic",
+    // create the directory, write a default graph and REWRITE THE .hbproj to point at
+    // it - so one habitual Ctrl+S in a project with no music graph produced an asset
+    // the author never named, and clobbered any unreferenced file already sitting at
+    // that path. The name is the author's to choose (the panel's own text field), and
+    // "no name yet" is a refusal, not a guess.
+    if (musicEditPath_.empty()) {
+        HBE_ERROR("Music: no asset path - type one (e.g. Music/score.hbmusic) in the "
+                  "Music panel before saving. Nothing was written.");
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories((assets / musicEditPath_).parent_path(), ec);
+    if (!assets::SaveMusicGraph(assets / musicEditPath_, musicEdit_)) return false;
+    StampNewAsset(assets / musicEditPath_); // no-op once it has an id
+    // The graph's identity and entry state live in the .hbproj, so writing the asset
+    // without them would leave the project pointing at the old file/state.
+    ProjectSettings& settings = Project::Active().Settings();
+    settings.musicGraph = musicEditPath_;
+    settings.musicStartState = musicEdit_.initialState;
+    Project::Active().Save();
+    return true;
+}
+
+bool Editor::SaveCharacterAsset() {
+    if (!Project::HasActive() || charEditRel_.empty()) return false;
+    if (!assets::SaveCharacter(Project::Active().AssetsDir() / charEditRel_, charEdit_))
+        return false;
+    StampNewAsset(Project::Active().AssetsDir() / charEditRel_); // no-op once it has an id
+    hbe::character::ClearCache(); // re-weld on the next instantiate
+    assetsDirty_ = true;
+    return true;
+}
+
+bool Editor::SaveViewedMaterial(Engine& engine) {
+    if (!Project::HasActive() || !editedMatValid_ || viewedAsset_.empty()) return false;
+    if (viewedAsset_.extension() != ".hbmat") return false;
+    if (!assets::SaveMaterial(viewedAsset_, editedMat_)) return false;
+    StampNewAsset(viewedAsset_); // the save rebuilt the JSON; restore its id
+    editedMatDirty_ = false;
+    // Refresh every entity wearing this material so the viewport matches the file.
+    Scene& scene = engine.GetScene();
+    Renderer& renderer = engine.GetRenderer();
+    const std::string rel = Project::Active().RelativeAssetPath(viewedAsset_);
+    auto& reg = scene.Registry();
+    for (const entt::entity e : reg.view<MaterialRef, MeshInstance>()) {
+        if (reg.get<MaterialRef>(e).asset == rel) {
+            assets::ApplyMaterial(renderer, Project::Active().AssetsDir(), editedMat_,
+                                  reg.get<MeshInstance>(e), textureCache_);
+        }
+    }
+    return true;
+}
+
+bool Editor::SaveViewedAudioEvent() {
+    if (!editedEventValid_ || viewedAsset_.empty()) return false;
+    if (viewedAsset_.extension() != ".hbevent") return false;
+    if (!assets::SaveAudioEvent(viewedAsset_, editedEvent_)) return false;
+    StampNewAsset(viewedAsset_); // the save rebuilt the JSON; restore its id
+    editedEventDirty_ = false;
+    return true;
+}
+
+bool Editor::SaveViewedMesh() {
+    if (previewModel_.empty() || viewedAsset_.empty()) return false;
+    if (viewedAsset_.extension() != ".uaf") return false;
+    // REFUSE rather than write a stale model over whatever is now being viewed.
+    // previewModel_ belongs to previewPath_; the viewer can move on to another `.uaf`
+    // (a TEXTURE, say) without EnsureMeshPreview running, and writing then would
+    // destroy that file. See AssetViewerSurface().
+    if (previewPath_ != viewedAsset_) {
+        HBE_ERROR("Mesh save refused: the loaded model belongs to '{}', not to the "
+                  "viewed asset '{}'.",
+                  previewPath_.string(), viewedAsset_.string());
+        return false;
+    }
+    if (!uaf::WriteMesh(viewedAsset_, previewModel_)) return false;
+    StampNewAsset(viewedAsset_); // WriteHeader cleared the slot flag; restore its id
+    previewMeshDirty_ = false;
+    scene::ClearInstantiateCaches(); // resident copies of this mesh are now stale
+    return true;
+}
+
+bool Editor::IsDocumentEntity(const Scene& scene, entt::entity e) {
+    const auto& reg = scene.Registry();
+    return reg.valid(e) && reg.all_of<UIDocMember>(e);
+}
+
+void Editor::ClearWorldSparingDocuments(Scene& scene) {
+    // "New scene" means a new WORLD, not "throw away the assets I have open". An
+    // open `.hbui` is an asset - every other teardown path in the tree spares one
+    // (scene::Instantiate's Replace sweep, Engine::FlowMainMenu, RestoreSnapshot's
+    // explicit CloseAll-then-reopen), and `Registry().clear()` was the one hole:
+    // it destroyed the document's entities while the DocumentSet went on
+    // advertising the instance with its real `path` and a non-zero handle. The
+    // next click of that row's Save then ran CaptureDocument over ZERO live
+    // members and wrote a 0-entity `.hbui` over the user's menu - silently, and
+    // with the log line reading "UI document saved: ... (0 entities)".
+    //
+    // Documents survive; everything else goes. (Deliberately NOT the Replace
+    // sweep's predicate: `Persistent` world content should still be cleared by an
+    // explicit "New", and in an editor session the only Persistent entities are
+    // legacy-adopted document members, which the doc test below already spares.)
+    auto& reg = scene.Registry();
+    std::vector<entt::entity> kill;
+    for (const entt::entity e : reg.storage<entt::entity>())
+        if (!reg.all_of<UIDocMember>(e)) kill.push_back(e);
+    for (const entt::entity e : kill)
+        if (reg.valid(e)) reg.destroy(e);
+    scene.BumpUIVersion();
+}
+
+bool Editor::AuditSceneForLooseUI(const Scene& scene, std::string& why) {
+    // THE SEPARATION GUARANTEE, save-time half. Creation-time is the primary
+    // enforcement (the UI create menu and the UI Add-Component entries are
+    // disabled unless a document is the edit target); this is the backstop for
+    // content that predates it or was hand-edited into a file.
+    //
+    // It REFUSES rather than silently dropping. Silently dropping is what the
+    // cancelled U5 would have done, and it means a Ctrl+S quietly deletes the
+    // author's UI.
+    //
+    // The policed set is the SIX document components. `WorldText` is deliberately
+    // NOT one of them: it is world-space 3D text placed by a Transform and drawn
+    // through the particle pass - level signage. Including it would make a level
+    // with a 3D sign unsaveable.
+    const auto& reg = scene.Registry();
+    const auto loose = [&reg](entt::entity e) {
+        if (reg.all_of<UIDocMember>(e)) return false; // document content: fine
+        if (reg.all_of<UISurface>(e)) return false;   // generated world-UI page quad
+        // Runtime-spawned, transient UI: dialogue choice buttons and the interact
+        // prompt. They get no UIDocMember by design (they die with the world) and
+        // are already excluded from every snapshot.
+        if (reg.all_of<DialogueChoiceButton>(e)) return false;
+        if (reg.all_of<InteractPromptTag>(e)) return false;
+        return true;
+    };
+    const auto nameOf = [&reg](entt::entity e) {
+        const Name* n = reg.try_get<Name>(e);
+        return n && !n->value.empty() ? n->value : std::string("(unnamed)");
+    };
+    std::vector<std::string> offenders;
+    const auto sweep = [&](auto tag, const char* what) {
+        using C = decltype(tag);
+        for (const entt::entity e : reg.view<const C>()) {
+            if (!reg.valid(e) || !loose(e)) continue;
+            if (offenders.size() < 8)
+                offenders.push_back(nameOf(e) + "  (" + what + ")");
+            else if (offenders.size() == 8)
+                offenders.push_back("...");
+        }
+    };
+    sweep(UIElement{}, "ui");
+    sweep(UICanvas{}, "uiCanvas");
+    sweep(UIAnimator{}, "uiAnimator");
+    sweep(UIPanel{}, "uiPanel");
+    sweep(UILayoutGroup{}, "uiLayoutGroup");
+    sweep(UICanvasGroup{}, "uiCanvasGroup");
+    if (offenders.empty()) return true;
+
+    why = "This scene cannot be saved: UI lives in a .hbui DOCUMENT, not in a "
+          "scene.\n\nThese entities carry a UI component but belong to no open "
+          "document:\n";
+    for (const std::string& o : offenders) why += "  - " + o + "\n";
+    why += "\nOpen or create a .hbui in the UI Document panel, move them into it "
+           "(or delete them), then save.\nNothing was written and nothing was "
+           "dropped.";
+    return false;
+}
+
+bool Editor::AuditDocumentForWorldContent(const Scene& scene, ui::DocHandle doc,
+                                          std::string& why) {
+    // THE SEPARATION GUARANTEE, document side - the mirror of the sweep above, and
+    // the half that was missing. Only the six UI Add-Component entries are gated on
+    // "is this entity in a document"; every WORLD entry stays enabled on a document
+    // member. ui::CaptureDocument writes exactly Name/Parent/Transform + the six UI
+    // components, and BuildSceneJson skips the entity outright, so a MeshInstance, a
+    // collider, a 3D sign or a Health added to a menu button exists in NO FILE AT
+    // ALL and disappears on the next save+reopen.
+    //
+    // U5's principle is "refuse, never silently drop", and it has to hold in both
+    // directions, so this refuses the document save and names the components.
+    if (doc == 0) return true;
+    const auto& reg = scene.Registry();
+    std::vector<std::string> offenders;
+    const auto nameOf = [&reg](entt::entity e) {
+        const Name* n = reg.try_get<Name>(e);
+        return n && !n->value.empty() ? n->value : std::string("(unnamed)");
+    };
+    const auto sweep = [&](auto tag, const char* what) {
+        using C = decltype(tag);
+        for (const entt::entity e : reg.view<const C>()) {
+            if (!reg.valid(e)) continue;
+            const UIDocMember* m = reg.try_get<UIDocMember>(e);
+            if (!m || m->doc != doc) continue;
+            if (reg.all_of<UISurface>(e)) continue; // generated world-UI page quad
+            if (offenders.size() < 8) offenders.push_back(nameOf(e) + "  (" + what + ")");
+            else if (offenders.size() == 8) offenders.push_back("...");
+        }
+    };
+    // The components an author can actually reach from Add Component / the create
+    // menu / an asset drop while a document member is selected. Not exhaustive over
+    // all ~65 EntityData fields on purpose: this is the reachable set, and it is the
+    // one that has to stay in step with the Inspector.
+    sweep(MeshInstance{}, "mesh");
+    sweep(RigidBody{}, "collider");
+    sweep(WorldText{}, "worldText (3D signage)");
+    sweep(TerrainComponent{}, "terrain");
+    sweep(ParticleEmitter{}, "particles");
+    sweep(CameraComponent{}, "camera");
+    sweep(Health{}, "health");
+    sweep(Weapon{}, "weapon");
+    sweep(AIPerception{}, "aiPerception");
+    sweep(AIBehavior{}, "aiBehavior");
+    sweep(CharacterController{}, "characterController");
+    sweep(Character{}, "characterRig");
+    sweep(Spawner{}, "spawner");
+    sweep(Interactable{}, "interactable");
+    sweep(TriggerVolume{}, "triggerVolume");
+    sweep(AudioSource{}, "audioSource");
+    sweep(PaintComponent{}, "paintCanvas");
+    if (offenders.empty()) return true;
+
+    why = "This UI document cannot be saved: a .hbui holds UI ONLY (name, parent, "
+          "transform and the six UI components).\n\nThese document entities carry "
+          "world content, which a .hbui has nowhere to put:\n";
+    for (const std::string& o : offenders) why += "  - " + o + "\n";
+    why += "\nRemove those components (or move the object into the scene), then "
+           "save.\nNothing was written and nothing was dropped.";
+    return false;
+}
+
+// Defined with the copy/paste block further down (it is the prefab writers' guard);
+// declared here because the self-test below pins it.
+static bool FragmentCarriesUI(const std::string& fragment, std::string& whichKey);
+
+// --- --test-uiseparation ------------------------------------------------------
+
+bool Editor::SeparationSelfTest() {
+    namespace fs = std::filesystem;
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("uiseparation: FAILED - {}", what);
+        }
+    };
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "hbe_uiseparation";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path out = dir / "Level.hbscene";
+
+    const auto readAll = [](const fs::path& p) {
+        std::ifstream f(p, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(f),
+                           std::istreambuf_iterator<char>());
+    };
+    // Heap, not stack: Editor is a large aggregate of panel state.
+    const auto edp = std::make_unique<Editor>();
+    Editor& ed = *edp;
+
+    // (a) BASELINE. An ordinary world object saves, and that file is the thing a
+    // refused save must leave untouched.
+    Scene base;
+    {
+        const entt::entity w = base.CreateEntity("Crate");
+        base.Registry().emplace<Transform>(w);
+        base.Registry().emplace<MeshInstance>(w);
+    }
+    expect(ed.SaveSceneToDisk(base, out), "(a) a UI-free scene must save");
+    expect(fs::exists(out), "(a) the baseline save produced no file");
+    const std::string baseline = readAll(out);
+    expect(!baseline.empty(), "(a) the baseline file is empty");
+    if (baseline.empty()) return false; // nothing downstream can be trusted
+
+    // (b) EACH of the six document components, on a LOOSE entity, must refuse -
+    // through the audit AND end to end through the writer, leaving the file
+    // byte-identical. A silent drop would return true and rewrite the file
+    // without the widget.
+    const auto refuses = [&](const char* what, void (*add)(entt::registry&, entt::entity)) {
+        Scene t;
+        const entt::entity w = t.CreateEntity("Crate");
+        t.Registry().emplace<Transform>(w);
+        t.Registry().emplace<MeshInstance>(w);
+        const entt::entity bad = t.CreateEntity("StrayWidget");
+        t.Registry().emplace<Transform>(bad);
+        add(t.Registry(), bad);
+        std::string why;
+        expect(!AuditSceneForLooseUI(t, why), what);
+        expect(why.find("StrayWidget") != std::string::npos,
+               "(b) the refusal message must name the offending entity");
+        ed.uiDocError_.clear();
+        expect(!ed.SaveSceneToDisk(t, out), "(b) SaveSceneToDisk must return false");
+        expect(!ed.uiDocError_.empty(), "(b) the refusal surfaced no message to the UI");
+        expect(readAll(out) == baseline, "(b) a refused save MODIFIED the file on disk");
+    };
+    refuses("(b) a loose UIElement must refuse",
+            [](entt::registry& r, entt::entity e) { r.emplace<UIElement>(e); });
+    refuses("(b) a loose UICanvas must refuse",
+            [](entt::registry& r, entt::entity e) { r.emplace<UICanvas>(e); });
+    refuses("(b) a loose UIAnimator must refuse",
+            [](entt::registry& r, entt::entity e) { r.emplace<UIAnimator>(e); });
+    refuses("(b) a loose UIPanel must refuse",
+            [](entt::registry& r, entt::entity e) { r.emplace<UIPanel>(e); });
+    refuses("(b) a loose UILayoutGroup must refuse",
+            [](entt::registry& r, entt::entity e) { r.emplace<UILayoutGroup>(e); });
+    refuses("(b) a loose UICanvasGroup must refuse",
+            [](entt::registry& r, entt::entity e) { r.emplace<UICanvasGroup>(e); });
+
+    // (c) The SAME entity, once it belongs to a document, saves - and the written
+    // scene contains no UI at all, because BuildSceneJson skips document members.
+    {
+        Scene t;
+        const entt::entity w = t.CreateEntity("Crate");
+        t.Registry().emplace<Transform>(w);
+        t.Registry().emplace<MeshInstance>(w);
+        const entt::entity widget = t.CreateEntity("Button");
+        t.Registry().emplace<Transform>(widget);
+        t.Registry().emplace<UIElement>(widget);
+        t.Registry().emplace<UIPanel>(widget);
+        t.Registry().emplace<UIDocMember>(widget, UIDocMember{1u, true});
+        std::string why;
+        expect(AuditSceneForLooseUI(t, why), "(c) document content must not refuse");
+        expect(ed.SaveSceneToDisk(t, out), "(c) a scene + an open document must save");
+        const std::string wrote = readAll(out);
+        expect(wrote.find("\"ui\"") == std::string::npos,
+               "(c) a document's UI leaked into the .hbscene");
+        expect(wrote.find("\"uiPanel\"") == std::string::npos,
+               "(c) a document's uiPanel leaked into the .hbscene");
+        expect(wrote.find("\"Button\"") == std::string::npos,
+               "(c) a document entity was written into the .hbscene");
+        expect(wrote.find("\"Crate\"") != std::string::npos,
+               "(c) the world object was lost");
+    }
+
+    // (d) The deliberate EXEMPTIONS. Each of these carries a UI component with no
+    // UIDocMember and must still save: transient runtime UI dies with the world,
+    // and the generated world-UI page quad is never serialized in the first place.
+    const auto allows = [&](const char* what, void (*add)(entt::registry&, entt::entity)) {
+        Scene t;
+        const entt::entity w = t.CreateEntity("Crate");
+        t.Registry().emplace<Transform>(w);
+        t.Registry().emplace<MeshInstance>(w);
+        const entt::entity e = t.CreateEntity("Transient");
+        t.Registry().emplace<Transform>(e);
+        t.Registry().emplace<UIElement>(e);
+        add(t.Registry(), e);
+        std::string why;
+        expect(AuditSceneForLooseUI(t, why), what);
+        expect(ed.SaveSceneToDisk(t, out), "(d) an exempt scene must save");
+    };
+    allows("(d) a dialogue choice button must not refuse",
+           [](entt::registry& r, entt::entity e) { r.emplace<DialogueChoiceButton>(e); });
+    allows("(d) the interact prompt must not refuse",
+           [](entt::registry& r, entt::entity e) { r.emplace<InteractPromptTag>(e); });
+    allows("(d) a generated world-UI page quad must not refuse",
+           [](entt::registry& r, entt::entity e) { r.emplace<UISurface>(e); });
+
+    // (e) WorldText is LEVEL SIGNAGE, not screen UI. It is deliberately outside
+    // the policed six; policing it would make a level with a 3D sign unsaveable.
+    {
+        Scene t;
+        const entt::entity sign = t.CreateEntity("Sign");
+        t.Registry().emplace<Transform>(sign);
+        t.Registry().emplace<WorldText>(sign);
+        std::string why;
+        expect(AuditSceneForLooseUI(t, why), "(e) WorldText must not refuse");
+        expect(ed.SaveSceneToDisk(t, out), "(e) a level with a 3D sign must save");
+        expect(readAll(out).find("\"worldText\"") != std::string::npos,
+               "(e) the 3D sign was dropped from the level");
+    }
+
+    // (f) INTRA-DOCUMENT COPY WORKS; CROSS-BOUNDARY COPY DOES NOT. The B11 skip in
+    // BuildSubtreeJson used to apply to the requested ROOT as well, so a subtree
+    // rooted inside a document serialized to `{"version":1,"entities":[]}` - a
+    // non-empty STRING, so every caller's `frag.empty()` guard sailed past it and
+    // Ctrl+C / Ctrl+D / Cut / "Save as Prefab" on a menu button silently did
+    // nothing (Cut deleted it and copied nothing).
+    {
+        Scene t;
+        const entt::entity crate = t.CreateEntity("Crate");
+        t.Registry().emplace<Transform>(crate);
+        t.Registry().emplace<MeshInstance>(crate);
+        const entt::entity panel = t.CreateEntity("MainMenu");
+        t.Registry().emplace<UIPanel>(panel);
+        t.Registry().emplace<UIDocMember>(panel, UIDocMember{7u, true});
+        const entt::entity button = t.CreateEntity("Play");
+        t.Registry().emplace<UIElement>(button);
+        t.Registry().emplace<Parent>(button, Parent{panel});
+        t.Registry().emplace<UIDocMember>(button, UIDocMember{7u, true});
+
+        const std::string docFrag = scene::SaveSubtreeToString(t, panel);
+        scene::SceneData fragData;
+        expect(scene::ParseSceneString(docFrag, fragData) && fragData.entities.size() == 2,
+               "(f) an intra-document subtree copy carries both entities");
+        expect(docFrag.find("uiDoc") == std::string::npos,
+               "(f) a subtree copy must not carry the membership tag");
+        std::string key;
+        expect(FragmentCarriesUI(docFrag, key),
+               "(f) the prefab guard sees UI in a document fragment");
+
+        // A WORLD root parented over a document element drags nothing along.
+        t.Registry().emplace_or_replace<Parent>(panel, Parent{crate});
+        const std::string worldFrag = scene::SaveSubtreeToString(t, crate);
+        scene::SceneData worldData;
+        expect(scene::ParseSceneString(worldFrag, worldData) && worldData.entities.size() == 1,
+               "(f) a world subtree copy stops at the document boundary");
+        key.clear();
+        expect(!FragmentCarriesUI(worldFrag, key),
+               "(f) a world-only fragment is accepted by the prefab guard");
+        t.Registry().remove<Parent>(panel);
+
+        // ...and LOOSE legacy UI (no membership tag at all, i.e. a pre-migration
+        // `.hbscene` opened with "Load (replace)") is caught by the same guard, which
+        // is what keeps it out of a .hbprefab and therefore out of a .hbsave.
+        const entt::entity loose = t.CreateEntity("LegacyButton");
+        t.Registry().emplace<UIElement>(loose);
+        key.clear();
+        expect(FragmentCarriesUI(scene::SaveSubtreeToString(t, loose), key) && key == "ui",
+               "(f) loose legacy UI is refused by the prefab guard too");
+        t.Registry().destroy(loose);
+    }
+
+    // (g) THE DOCUMENT SIDE of the guarantee. World content on a document entity
+    // fits in no file - CaptureDocument's whitelist drops it and BuildSceneJson
+    // skips the entity - so the DOCUMENT save must refuse it, the same way the
+    // scene save refuses loose UI. "Refuse, never silently drop", both directions.
+    {
+        Scene t;
+        const entt::entity widget = t.CreateEntity("Play");
+        t.Registry().emplace<UIElement>(widget);
+        t.Registry().emplace<UIDocMember>(widget, UIDocMember{3u, true});
+        std::string why;
+        expect(AuditDocumentForWorldContent(t, 3u, why), "(g) a clean document must not refuse");
+        t.Registry().emplace<MeshInstance>(widget);
+        expect(!AuditDocumentForWorldContent(t, 3u, why),
+               "(g) a mesh on a document entity must refuse the document save");
+        expect(why.find("Play") != std::string::npos, "(g) the refusal names the entity");
+        // Another document's content is not this document's problem.
+        expect(AuditDocumentForWorldContent(t, 4u, why),
+               "(g) the audit is scoped to ONE document handle");
+    }
+
+    // (h) A CROSS-BOUNDARY REPARENT IS REFUSED. The hierarchy's per-row drop target
+    // accepts any entity onto any row, and Reparent rebases the child's transform,
+    // so this used to silently teleport a world object into canvas space and orphan
+    // it (its Parent points at an entity BuildSceneJson skips, so `parent` is omitted
+    // and the object reloads as a root at its canvas-local transform).
+    {
+        Scene t;
+        const entt::entity crate = t.CreateEntity("Crate");
+        t.Registry().emplace<Transform>(crate);
+        const entt::entity canvas = t.CreateEntity("Canvas");
+        t.Registry().emplace<Transform>(canvas);
+        t.Registry().emplace<UICanvas>(canvas);
+        t.Registry().emplace<UIDocMember>(canvas, UIDocMember{9u, true});
+        const entt::entity label = t.CreateEntity("Label");
+        t.Registry().emplace<UIElement>(label);
+        t.Registry().emplace<Parent>(label, Parent{canvas});
+        t.Registry().emplace<UIDocMember>(label, UIDocMember{9u, true});
+
+        ed.uiDocError_.clear();
+        ed.Reparent(t, crate, canvas);
+        expect(!t.Registry().all_of<Parent>(crate),
+               "(h) a world object must NOT parent into a document");
+        expect(!ed.uiDocError_.empty(), "(h) the refusal surfaced no message");
+        ed.uiDocError_.clear();
+        ed.Reparent(t, label, crate);
+        expect(t.Registry().get<Parent>(label).entity == canvas,
+               "(h) a document element must NOT parent into the scene");
+        expect(!ed.uiDocError_.empty(), "(h) the reverse refusal surfaced no message");
+        // The two LEGAL moves still work: unparent inside a document, and reparent
+        // within one document.
+        ed.uiDocError_.clear();
+        ed.Reparent(t, label, entt::null);
+        expect(!t.Registry().all_of<Parent>(label),
+               "(h) unparenting inside a document must still work");
+        ed.Reparent(t, label, canvas);
+        expect(t.Registry().all_of<Parent>(label) &&
+                   t.Registry().get<Parent>(label).entity == canvas,
+               "(h) reparenting within one document must still work");
+        expect(ed.uiDocError_.empty(), "(h) a legal move must not report an error");
+        // ...and a document member never picks up a SceneSource.
+        ed.MoveToScene(t, canvas, "Levels/Foo.hbscene");
+        expect(!t.Registry().all_of<SceneSource>(canvas),
+               "(h) a document entity must never be tagged with a SceneSource");
+    }
+
+    // (i) "NEW SCENE" MUST NOT DESTROY AN OPEN DOCUMENT. `Registry().clear()`
+    // reaped document entities while the DocumentSet went on advertising the
+    // instance, so the next Save captured ZERO members and wrote an empty `.hbui`
+    // over the user's menu.
+    {
+        Scene t;
+        const entt::entity crate = t.CreateEntity("Crate");
+        t.Registry().emplace<Transform>(crate);
+        const entt::entity widget = t.CreateEntity("Play");
+        t.Registry().emplace<UIElement>(widget);
+        t.Registry().emplace<UIDocMember>(widget, UIDocMember{2u, true});
+        ClearWorldSparingDocuments(t);
+        expect(!t.Registry().valid(crate), "(i) New Scene must clear the world");
+        expect(t.Registry().valid(widget) && t.Registry().all_of<UIElement>(widget),
+               "(i) New Scene must SPARE an open document's entities");
+    }
+
+    fs::remove_all(dir, ec);
+    if (ok)
+        HBE_INFO("uiseparation: SaveScene refuses all 6 loose document components "
+                 "without touching the file; document content, transient UI and "
+                 "WorldText all still save; intra-document copy works and no copy, "
+                 "reparent, prefab or New Scene crosses the boundary.");
+    return ok;
+}
+
+void Editor::AdoptWorld(const Scene& scene) { sceneWorldToken_ = scene.WorldToken(); }
 
 bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
     auto& reg = scene.Registry();
-    if (levelOpen_) {
-        // A level (or several, composed additively): every NON-UI entity is tagged
-        // with its layer FILE. UI is never folded into a level (EnsureLevelMembership
-        // skips it), so it stays untagged and saves as the active scene below.
-        EnsureLevelMembership(scene);
-        if (Project::HasActive()) {
-            scene::SavePaintCanvases(scene, Project::Active().AssetsDir(),
-                                     currentLevel_.Name());
+    // === REFUSALS ============================================================
+    // ALL of them run BEFORE anything is written - including SavePaintCanvases
+    // below, which writes `.hbpaint` files of its own. A refusal that has already
+    // written half a save is worse than no refusal at all.
+    if (std::string why; !AuditSceneForLooseUI(scene, why)) {
+        uiDocError_ = why;
+        panelOpen_[Panel_UIDocument] = true; // the refusal has to be SEEN
+        HBE_ERROR("SaveScene refused: a non-document entity carries a UI component.");
+        return false;
+    }
+    // PLAY MODE. The Play world is a snapshot-restored COPY that gameplay is
+    // allowed to DESTROY ENTITIES in (a picked-up Interactable is destroyed
+    // outright) and to STRIP COMPONENTS from (breaking a Destructible removes its
+    // MeshInstance and RigidBody), and the writer emits those keys only when the
+    // component exists - so a Play-mode save writes a level with objects missing
+    // and props that are invisible and non-solid, while `destructible.activated`
+    // is runtimeTags-suppressed so the file LOOKS pristine. Nothing in the
+    // authored file is recoverable from that world.
+    //
+    // The Ctrl+S dispatcher already refuses this (editor::DecideSave), and SaveAll
+    // skips the scene while playing. This is the backstop at the write itself, so
+    // a future call site cannot reintroduce it by not knowing.
+    if (playMode_) {
+        SetSaveStatus("PLAYING - scene saves are disabled. Press Stop (Esc) to save. '" +
+                          path.filename().string() + "' was NOT written.",
+                      true);
+        return false;
+    }
+    // WORLD IDENTITY + STREAMING COMPLETENESS. See scene::SaveRefusal: the registry
+    // may no longer be the level this path names, or it may be a streamed world that
+    // is missing whatever is currently despawned. The second case is the dangerous
+    // one - the save-time shard bake re-derives itself from whatever is live, so the
+    // file it produces is internally consistent and NOTHING downstream ever reports a
+    // problem. It is silent, total and permanent, which is why this fails closed.
+    if (const std::string why = scene::SaveRefusal(
+            scene, path == currentScenePath_ ? sceneWorldToken_ : 0u);
+        !why.empty()) {
+        SetSaveStatus("SCENE SAVE REFUSED - " + why + " '" + path.filename().string() +
+                          "' was NOT written.",
+                      true);
+        return false;
+    }
+    // THE SCENE IS POSED BY A PREVIEW. Cutscene preview and the movie renderer are
+    // DESTRUCTIVE in exactly the way Play is: cutscene::Evaluate writes
+    // position/rotation/scale straight onto named entities and FireMarkers writes
+    // clip/time/playing onto their Animators, which is why both take a
+    // SaveSceneToString snapshot up front and RestoreSnapshot when they end. Neither
+    // sets playMode_, so the guard above did not cover them - and the failure is the
+    // quietest one in this file: Ctrl+S at t=3s writes the t=3s poses, ending the
+    // preview restores the in-memory scene, and the editor looks exactly right while
+    // the file on disk holds a frame of a cutscene.
+    if (csPreview_ || movieActive_) {
+        SetSaveStatus(std::string("PREVIEW ACTIVE - the scene is currently posed by the ") +
+                          (movieActive_ ? "movie render" : "cutscene preview") +
+                          ". Stop it to save. '" + path.filename().string() +
+                          "' was NOT written.",
+                      true);
+        return false;
+    }
+    // AN EMPTY WORLD OVER A POPULATED FILE. Probed HERE, with the other refusals,
+    // because the two writers below (SavePaintCanvases, SaveStreamedScenes) are
+    // writes: leaving this check where the empty-scene branch needs it meant a
+    // refusal that said "Nothing was written" after having rewritten every additively
+    // streamed scene file. See the empty-scene branch further down for the rest.
+    const auto activeOnly = [&reg](entt::entity e) { return !reg.all_of<SceneSource>(e); };
+    bool hasActive = false;
+    for (const entt::entity e : reg.view<entt::entity>()) {
+        if (reg.valid(e) && !reg.all_of<SceneSource>(e) && !reg.all_of<UIDocMember>(e)) {
+            hasActive = true;
+            break;
         }
-    } else if (Project::HasActive()) {
+    }
+    const std::filesystem::path activePath = !path.empty() ? path : currentScenePath_;
+    if (!hasActive && !activePath.empty()) {
+        scene::SceneData onDisk;
+        if (scene::ParseSceneFile(activePath, onDisk) && !onDisk.entities.empty()) {
+            SetSaveStatus("SCENE SAVE REFUSED - the world is EMPTY but '" +
+                              activePath.filename().string() + "' holds " +
+                              std::to_string(onDisk.entities.size()) +
+                              " object(s). Nothing was written. Delete the file if that "
+                              "is really what you want.",
+                          true);
+            return false;
+        }
+    }
+    if (Project::HasActive()) {
         // Writes every loaded canvas; each scene's JSON then references its own.
         const std::string stem = path.empty() ? std::string("Scene") : path.stem().string();
         scene::SavePaintCanvases(scene, Project::Active().AssetsDir(), stem);
     }
+    // A save can MINT and can UN-STAMP assets in the same breath: SavePaintCanvases
+    // above writes `.hbpaint` files that may be brand new, scene::SaveScene rebuilds
+    // the document from scratch and so drops the top-level "packSlot" it had, and
+    // SaveStreamedScenes does the same to every additively streamed file. So the
+    // whole operation is bracketed and swept once at the end (see
+    // Editor::StampSavedAssets) rather than stamped file by file - a per-file call
+    // would still miss the by-products nobody at this level can enumerate.
+    const std::filesystem::file_time_type saveMark = slots::MarkNow();
 
-    // Tagged groups (level layers + additively-loaded scenes) each write back to
-    // their own SceneSource file.
+    // One save can write several files, each baked on its own entity set;
+    // ReportShardBake appends, so the accumulator is cleared once, here.
+    shardDiagnostics_.clear();
+    shardStats_.clear();
+    shardDescs_.clear();
+
+    // Additively-streamed scenes each write back to their own SceneSource file.
     bool ok = SaveStreamedScenes(scene);
 
-    // The active scene owns only UNTAGGED entities: loose UI while a level is open,
-    // or the whole single scene otherwise. It saves to its own file and NEVER into
-    // a level layer, so UI can't bleed into the level.
-    const auto activeOnly = [&reg](entt::entity e) { return !reg.all_of<SceneSource>(e); };
-    bool hasActive = false;
-    for (const entt::entity e : reg.view<entt::entity>()) {
-        if (reg.valid(e) && !reg.all_of<SceneSource>(e)) { hasActive = true; break; }
+    // `hasActive` / `activePath` / `activeOnly` are computed with the refusals above.
+    // The active scene owns only UNTAGGED entities - i.e. everything that was not
+    // streamed in from another file. A `.hbui` DOCUMENT's entities are neither:
+    // they are asset content that BuildSceneJson skips outright, so they must not
+    // make `hasActive` true either. Without that, opening a document with no scene
+    // loaded and hitting Ctrl+S would write a ZERO-ENTITY .hbscene over the
+    // current path - the emptiness probe would say "there is something to save"
+    // while the writer produced nothing.
+    //
+    // A SAVE THAT WRITES NOTHING MAY NOT REPORT SUCCESS. This branch used to be
+    // skipped silently: `ok` kept whatever SaveStreamedScenes returned (true when
+    // there are no streamed scenes), SaveCurrent returned true and the status line
+    // said "Saved scene 'X'" - so select-all + Delete + Ctrl+S wrote nothing, claimed
+    // it had saved, and the deleted objects came back on the next load. It also made
+    // a legitimately emptied scene impossible to save at all.
+    //
+    // The shape is copied from SaveUIDocument's empty-capture guard, which is the
+    // established precedent for exactly this hazard: refuse an empty write over a
+    // non-empty file (done above, with the refusals), allow it when the file has
+    // nothing to lose (here).
+    if (!hasActive && !activePath.empty()) {
+        // Nothing on disk to lose: write the empty scene, and say so rather than
+        // pretending an ordinary save happened.
+        const bool wrote = scene::SaveScene(scene, activePath, activeOnly, SceneKind::Full);
+        if (wrote) HBE_INFO("SaveScene: wrote an EMPTY scene to '{}'.", activePath.string());
+        StampSavedAssets(saveMark);
+        if (ok && wrote) AdoptWorld(scene);
+        return ok && wrote;
     }
-    const std::filesystem::path activePath = !path.empty() ? path : currentScenePath_;
-    if (hasActive && !activePath.empty())
-        ok &= scene::SaveScene(scene, activePath, activeOnly);
+    if (hasActive && !activePath.empty()) {
+        // AUTO-SHARD BY SPACE, at save time, invisible to authoring: the author sets
+        // a tag, the bake splits it into spatially-coherent shards and stamps each
+        // entity's shard index so SaveScene can write both halves (per-entity
+        // "shard" + the header's "tagShards"). Same relationship as
+        // SavePaintCanvases above - run it BEFORE the write.
+        const std::vector<scene::ShardDesc>* shards = nullptr;
+        tagshard::BakeReport bake;
+        if (Project::HasActive()) {
+            bake = tagshard::BakeScene(scene, Project::Active().Settings().tags, activeOnly);
+            ReportShardBake(bake, activePath);
+            shards = &bake.shards;
+        }
+        ok &= scene::SaveScene(scene, activePath, activeOnly, SceneKind::Full, shards);
+    }
+    StampSavedAssets(saveMark);
+    // The file on disk now describes THIS world, so this is the world identity the
+    // next save is allowed to write to that path (see Scene::WorldToken).
+    if (ok) AdoptWorld(scene);
     return ok;
+}
+
+// Surfaces the shard bake's findings. Deliberately NON-BLOCKING (tagshard::Severity
+// documents why: the bake resolves the cross-shard parent it reports, so refusing
+// the save would discard authored work over a condition the written file does not
+// contain). The author sees the lines in the log and the summary in the Tags panel.
+void Editor::ReportShardBake(const tagshard::BakeReport& rep,
+                             const std::filesystem::path& path) {
+    // APPENDS: one Ctrl+S can write several files (the active scene plus every
+    // streamed-in one), each baked separately. SaveSceneToDisk clears first, so the
+    // panel shows the whole save rather than only its last file.
+    for (const tagshard::Diagnostic& d : rep.diagnostics) {
+        shardDiagnostics_.push_back(
+            (d.severity == tagshard::Severity::Error ? "ERROR: " : "warning: ") + d.message);
+        if (d.severity == tagshard::Severity::Error)
+            HBE_ERROR("Shard bake [{}]: {}", path.filename().string(), d.message);
+        else
+            HBE_WARN("Shard bake [{}]: {}", path.filename().string(), d.message);
+    }
+    shardStats_.insert(shardStats_.end(), rep.stats.begin(), rep.stats.end());
+    // Keep the shard BOXES too - the viewport overlay and the streaming simulation both
+    // read them, and they are the only place the author can see what their tags became
+    // geometrically. Appended for the same reason the stats are: one save can write
+    // several files, each baked separately.
+    shardDescs_.insert(shardDescs_.end(), rep.shards.begin(), rep.shards.end());
+    if (!rep.shards.empty() || rep.errors > 0 || rep.warnings > 0) {
+        HBE_INFO("Shard bake [{}]: {} shard(s) over {} tag(s), {} entities, {} error(s), "
+                 "{} warning(s).",
+                 path.filename().string(), rep.shards.size(), rep.stats.size(), rep.tagged,
+                 rep.errors, rep.warnings);
+    }
+}
+
+// Re-derives the shard boxes from the LIVE scene without writing anything, so the
+// overlay and the simulation work before the first save of a session (and immediately
+// after moving an object, which is when an author most wants to see the effect).
+//
+// It calls the same tagshard::BakeScene the save path calls, on the same entity set, so
+// what it shows is what a save would write - there is no second clustering to disagree
+// with. It does stamp Tag::shard, exactly as the save path does; that is the bake's
+// output and the next save re-derives it from scratch anyway.
+void Editor::RebakeShardPreview(Scene& scene) {
+    shardDiagnostics_.clear();
+    shardStats_.clear();
+    shardDescs_.clear();
+    if (!Project::HasActive()) return;
+    auto& reg = scene.Registry();
+    const auto activeOnly = [&reg](entt::entity e) { return !reg.all_of<SceneSource>(e); };
+    const tagshard::BakeReport bake =
+        tagshard::BakeScene(scene, Project::Active().Settings().tags, activeOnly);
+    ReportShardBake(bake, currentScenePath_.empty() ? std::filesystem::path("(unsaved)")
+                                                    : currentScenePath_);
+    // Streamed-in scenes are baked per file, same as on save, so their boxes appear too.
+    std::set<std::string> paths;
+    for (const entt::entity e : reg.view<SceneSource>()) {
+        const std::string& p = reg.get<SceneSource>(e).scene;
+        if (!p.empty()) paths.insert(p);
+    }
+    for (const std::string& p : paths) {
+        const auto fromThisScene = [&reg, &p](entt::entity e) {
+            const SceneSource* ss = reg.try_get<SceneSource>(e);
+            return ss && ss->scene == p;
+        };
+        ReportShardBake(tagshard::BakeScene(scene, Project::Active().Settings().tags,
+                                            fromThisScene),
+                        std::filesystem::path(p));
+    }
+    UpdateStreamSim();
+}
+
+void Editor::UpdateStreamSim() {
+    streamSimResident_.assign(shardDescs_.size(), 0u);
+    streamSimDist_.assign(shardDescs_.size(), 0.0f);
+    streamSimShards_.clear();
+    if (shardDescs_.empty() || !Project::HasActive()) return;
+    const std::vector<TagDef>& defs = Project::Active().Settings().tags;
+    streamSimShards_.resize(shardDescs_.size());
+    for (usize i = 0; i < shardDescs_.size(); ++i) {
+        const scene::ShardDesc& d = shardDescs_[i];
+        // Resolve the tag's band exactly as Streamer::BindLevel does - including the
+        // hysteresis correction - so the simulation cannot be kinder than the runtime.
+        TagDef def;
+        def.name = d.tag;
+        for (const TagDef& t : defs)
+            if (t.name == d.tag) { def = t; break; }
+        stream::PolicyShard& p = streamSimShards_[i];
+        p.min = d.min;
+        p.max = d.max;
+        p.loadRadius = glm::max(def.loadRadius, 0.0f);
+        p.unloadRadius = def.unloadRadius;
+        salvage::EnforceHysteresis(p.loadRadius, p.unloadRadius);
+        p.priority = def.priority;
+        // An alwaysLoaded tag is resident and pinned, which is exactly what the runtime
+        // does with it (its rows join the resident slice and never stream).
+        p.resident = def.alwaysLoaded;
+        p.pinned = def.alwaysLoaded;
+        streamSimDist_[i] = stream::DistanceToBox(d.min, d.max, streamSimFocus_);
+    }
+    // Iterate the policy to a FIXED POINT: one Evaluate reports only what it would order
+    // THIS frame (the throttle caps it at 4), and the author wants the steady state -
+    // "standing here, what is loaded" - not "what would start loading in the next
+    // 16 ms". The runtime reaches the same set a few frames later.
+    stream::PolicyIn in;
+    in.foci = &streamSimFocus_;
+    in.fociCount = 1;
+    in.maxConcurrent = static_cast<u32>(streamSimShards_.size()) + 1;
+    in.maxUnloads = static_cast<u32>(streamSimShards_.size()) + 1;
+    in.enabled = streamSimEnabled_;
+    for (u32 pass = 0; pass < 4; ++pass) {
+        in.shards = streamSimShards_.data();
+        in.count = static_cast<u32>(streamSimShards_.size());
+        stream::Evaluate(in, streamSimOut_);
+        if (streamSimOut_.load.empty() && streamSimOut_.unload.empty()) break;
+        for (const u32 i : streamSimOut_.load) streamSimShards_[i].resident = true;
+        for (const u32 i : streamSimOut_.unload) streamSimShards_[i].resident = false;
+    }
+    for (usize i = 0; i < streamSimShards_.size(); ++i)
+        streamSimResident_[i] = streamSimShards_[i].resident ? 1u : 0u;
+}
+
+// The baked shard boxes + their load/unload radii, in the viewport. Drawn regardless of
+// selection (unlike DrawSelectionOutline): the point is to see the whole streaming
+// layout at once, because a shard's geometry is a consequence of where objects are and
+// is not attached to any one of them.
+void Editor::DrawShardOverlay(Scene& scene, Renderer& renderer) {
+    (void)scene;
+    if (!vpVisible_ || !streamSimEnabled_ || shardDescs_.empty()) return;
+    if (!streamSimDrawBoxes_ && !streamSimDrawRadii_) return;
+
+    const glm::mat4 vp = renderer.GetCamera().ViewProjection();
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    draw->PushClipRect(ImVec2(vpX_, vpY_), ImVec2(vpX_ + vpW_, vpY_ + vpH_), true);
+    const auto project = [&](const glm::vec3& world, ImVec2& out) -> bool {
+        const glm::vec4 clip = vp * glm::vec4(world, 1.0f);
+        if (clip.w <= 0.001f) return false;
+        const glm::vec2 ndc = glm::vec2(clip) / clip.w;
+        out = ImVec2(vpX_ + (ndc.x * 0.5f + 0.5f) * vpW_, vpY_ + (0.5f - ndc.y * 0.5f) * vpH_);
+        return true;
+    };
+    static constexpr int kEdges[12][2] = {
+        {0, 1}, {1, 3}, {3, 2}, {2, 0}, {4, 5}, {5, 7}, {7, 6}, {6, 4},
+        {0, 4}, {1, 5}, {2, 6}, {3, 7},
+    };
+    const auto box = [&](const glm::vec3& bmin, const glm::vec3& bmax, ImU32 col, f32 th) {
+        ImVec2 pts[8];
+        for (int c = 0; c < 8; ++c) {
+            const glm::vec3 corner((c & 1) ? bmax.x : bmin.x, (c & 2) ? bmax.y : bmin.y,
+                                   (c & 4) ? bmax.z : bmin.z);
+            if (!project(corner, pts[c])) return;
+        }
+        for (const auto& e : kEdges) draw->AddLine(pts[e[0]], pts[e[1]], col, th);
+    };
+    // A radius drawn as a horizontal ring at the shard's centre height. A ring rather
+    // than a sphere because the measurement is distance to the BOX, so a sphere would be
+    // a lie about the shape; the ring reads as "this far out from here".
+    const auto ring = [&](const glm::vec3& centre, f32 r, ImU32 col, f32 th) {
+        constexpr int kSeg = 48;
+        ImVec2 prev;
+        bool havePrev = false;
+        for (int i = 0; i <= kSeg; ++i) {
+            const f32 a = static_cast<f32>(i) / kSeg * glm::two_pi<f32>();
+            ImVec2 p;
+            const bool okp =
+                project(centre + glm::vec3(std::cos(a) * r, 0.0f, std::sin(a) * r), p);
+            if (okp && havePrev) draw->AddLine(prev, p, col, th);
+            prev = p;
+            havePrev = okp;
+        }
+    };
+
+    for (usize i = 0; i < shardDescs_.size(); ++i) {
+        const scene::ShardDesc& d = shardDescs_[i];
+        const bool res = i < streamSimResident_.size() && streamSimResident_[i] != 0;
+        // Green = would be resident here, grey-blue = streamed out. The same two states
+        // the runtime has, in the same order, so the colours mean one thing.
+        const ImU32 col = res ? IM_COL32(90, 225, 130, 210) : IM_COL32(110, 130, 165, 130);
+        if (streamSimDrawBoxes_) box(d.min, d.max, col, res ? 2.0f : 1.0f);
+        const glm::vec3 centre = (d.min + d.max) * 0.5f;
+        if (streamSimDrawRadii_ && i < streamSimShards_.size()) {
+            ring(centre, streamSimShards_[i].loadRadius, IM_COL32(90, 225, 130, 90), 1.0f);
+            ring(centre, streamSimShards_[i].unloadRadius, IM_COL32(230, 170, 70, 80), 1.0f);
+        }
+        ImVec2 lbl;
+        if (project(centre, lbl)) {
+            char t[96];
+            std::snprintf(t, sizeof(t), "%s#%u  %u obj  %.0f m", d.tag.c_str(), d.index, d.count,
+                          i < streamSimDist_.size() ? streamSimDist_[i] : 0.0f);
+            draw->AddText(ImVec2(lbl.x + 4.0f, lbl.y - 6.0f), col, t);
+        }
+    }
+    // The focus itself, so the author can see what the radii are measured from.
+    {
+        ImVec2 f;
+        if (project(streamSimFocus_, f)) {
+            draw->AddCircleFilled(f, 6.0f, IM_COL32(255, 210, 80, 240));
+            draw->AddCircle(f, 10.0f, IM_COL32(30, 30, 30, 200), 0, 2.0f);
+            draw->AddText(ImVec2(f.x + 12.0f, f.y - 7.0f), IM_COL32(255, 210, 80, 240),
+                          "streaming focus (simulated)");
+        }
+    }
+    draw->PopClipRect();
 }
 
 bool Editor::SaveStreamedScenes(Scene& scene) {
@@ -931,10 +2463,37 @@ bool Editor::SaveStreamedScenes(Scene& scene) {
             const SceneSource* ss = reg.try_get<SceneSource>(e);
             return ss && ss->scene == p;
         };
-        // A level layer file (<name>.static/.dynamic) writes its kind into the
-        // header; the filename is authoritative. Plain scenes stay Full.
-        const SceneKind kind = KindFromScenePath(p);
-        if (!scene::SaveScene(scene, std::filesystem::path(p), fromThisScene, kind)) ok = false;
+        // Each streamed-in file is baked on its OWN entity set: shard member counts
+        // are per file, so one bake over the whole registry would describe shards
+        // whose members live in a different file.
+        const std::vector<scene::ShardDesc>* shards = nullptr;
+        tagshard::BakeReport bake;
+        if (Project::HasActive()) {
+            bake = tagshard::BakeScene(scene, Project::Active().Settings().tags, fromThisScene);
+            ReportShardBake(bake, std::filesystem::path(p));
+            shards = &bake.shards;
+        }
+        // ITS OWN HEADER, NOT THE ACTIVE DOCUMENT'S.
+        //
+        // A streamed-in file was loaded ADDITIVELY, and an additive load applies no
+        // environment at all (scene::ApplyEnvironment runs only for Replace), so the
+        // live environment describes the file the editor OPENED - not this one.
+        // Writing it here overwrote every streamed file's ambientIntensity, exposure,
+        // shadowDistance, post AND giSource with the active scene's, on a plain
+        // Ctrl+S. giSource is the one that hurts: both files resolve against the same
+        // Assets/ root, so the stolen path LOADS, and the streamed level renders under
+        // an irradiance volume baked for a different level's geometry - worse than no
+        // GI and completely silent (the status banner only fires on missing/corrupt).
+        //
+        // So the destination's existing header is re-parsed and handed straight back.
+        // A file that cannot be read (first save of a scene that never existed on
+        // disk) falls back to the live environment, which is the old behaviour and the
+        // only sensible answer when there is nothing to preserve.
+        scene::SceneData existing;
+        const bool haveHeader = scene::ParseSceneFile(std::filesystem::path(p), existing);
+        if (!scene::SaveScene(scene, std::filesystem::path(p), fromThisScene,
+                              SceneKind::Full, shards, haveHeader ? &existing : nullptr))
+            ok = false;
     }
     return ok;
 }
@@ -957,6 +2516,13 @@ void Editor::MakePaintable(Scene& scene, Renderer& renderer, entt::entity e) {
     // unwraps). Box projection stays an opt-in per-object choice for cases that
     // need world-scaled, no-stretch mapping on a non-uniformly scaled object.
     pc.projection = 0;
+    // THE AUTHOR IS DELIBERATELY PAINTING THIS OBJECT. If the component was carrying
+    // a reference to a `.hbpaint` that failed to load, Instantiate kept the reference
+    // and marked the pixels UNKNOWN so a save could not blank the file (see
+    // PaintComponent::canvasMissing). Starting to paint here creates real content and
+    // means the author wants it written - and the referenced file is missing anyway,
+    // so there is nothing left to overwrite.
+    pc.canvasMissing = false;
     paint::EnsureCanvas(pc, static_cast<u32>(paintRes_));
     paint::Sync(renderer, pc);
 }
@@ -986,6 +2552,36 @@ const MeshData* Editor::GetCpuMesh(Scene& scene, entt::entity e) {
     }
     auto [ins, ok] = cpuMeshCache_.emplace(src, std::move(md));
     return ins->second.vertices.empty() ? nullptr : &ins->second;
+}
+
+entt::entity Editor::TerrainPaintOwner(Scene& scene, entt::entity e) {
+    auto& reg = scene.Registry();
+    if (e == entt::null || !reg.valid(e)) return entt::null;
+    if (reg.all_of<TerrainComponent>(e)) return e;
+    if (!reg.all_of<TerrainChunk>(e)) return entt::null;
+    // The canvas lives on the terrain ENTITY (chunks are regenerated from it and
+    // would take the strokes with them), and so does the heightmap.
+    const Parent* par = reg.try_get<Parent>(e);
+    if (par && reg.valid(par->entity) && reg.all_of<TerrainComponent>(par->entity))
+        return par->entity;
+    return entt::null;
+}
+
+bool Editor::RaycastTerrainSurface(Scene& scene, entt::entity terrainEntity,
+                                   const glm::vec3& worldOrigin, const glm::vec3& worldDir,
+                                   paint::PaintHit& out) {
+    auto& reg = scene.Registry();
+    const TerrainComponent* t = reg.valid(terrainEntity)
+                                    ? reg.try_get<TerrainComponent>(terrainEntity)
+                                    : nullptr;
+    if (!t) return false;
+
+    // World -> TERRAIN-local. The heightfield, the heightmap and the canvas UV all
+    // live in the terrain entity's space (a chunk sits at identity under it).
+    const glm::mat4 invWorld = glm::inverse(scene.WorldMatrix(terrainEntity));
+    const glm::vec3 lo = glm::vec3(invWorld * glm::vec4(worldOrigin, 1.0f));
+    const glm::vec3 ld = glm::vec3(invWorld * glm::vec4(worldDir, 0.0f));
+    return paint::RaycastTerrain(*t, lo, ld, out);
 }
 
 // Commits a finished stroke/fill/clear to entity `e`'s stroke database + the
@@ -1029,6 +2625,7 @@ void Editor::PaintRedo(Engine& engine) {
 
 std::string Editor::EnsureStrokeMaterial() {
     if (!Project::HasActive()) return {};
+    SeedStrokeCounters(); // never overwrite an asset a saved scene still references
     const std::filesystem::path assets = Project::Active().AssetsDir();
     // Reuse a stroke material identical in tip + tint + metal/rough.
     char sig[192];
@@ -1069,12 +2666,14 @@ std::string Editor::EnsureStrokeMaterial() {
     // onto it looks wrong, so they don't cast by default.
     m.flags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow;
     if (!assets::SaveMaterial(assets / matRel, m)) return {};
+    StampNewAsset(assets / matRel); // generated material: give it its pack slot
     strokeMatCache_[sig] = matRel;
     return matRel;
 }
 
 std::string Editor::EnsureRibbonMaterial() {
     if (!Project::HasActive()) return {};
+    SeedStrokeCounters(); // never overwrite an asset a saved scene still references
     const std::filesystem::path assets = Project::Active().AssetsDir();
     char sig[224];
     std::snprintf(sig, sizeof(sig), "rib|%d|%.2f|%.2f|%.2f|%.3f|%.3f|%.3f|%.3f|%.2f|%.2f",
@@ -1164,6 +2763,7 @@ std::string Editor::EnsureRibbonMaterial() {
     m.flags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow |
               rhi::MaterialFlag_DepthWrite;
     if (!assets::SaveMaterial(assets / matRel, m)) return {};
+    StampNewAsset(assets / matRel); // generated material: give it its pack slot
     strokeMatCache_[sig] = matRel;
     return matRel;
 }
@@ -1219,7 +2819,46 @@ void Editor::SpawnStroke(Engine& engine, const glm::vec3& hitWorld, const glm::v
     glm::vec3 mn, mx;
     ComputeBounds(mesh::GeneratePlane(1.0f, 1), mn, mx);
     reg.emplace<AABB>(e, AABB{mn, mx});
+    AttachStrokeToZone(engine, e);
     selected_ = e;
+}
+
+// Seeds the stroke asset counters past whatever is already on disk. Scans names of
+// the exact shapes the two writers produce; anything else in Strokes/ is ignored.
+void Editor::SeedStrokeCounters() {
+    if (strokeCountersSeeded_ || !Project::HasActive()) return;
+    strokeCountersSeeded_ = true;
+    const std::filesystem::path dir = Project::Active().AssetsDir() / "Strokes";
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return;
+    const auto bump = [](const std::string& stem, const char* prefix, int& counter) {
+        const usize n = std::strlen(prefix);
+        if (stem.size() <= n || stem.compare(0, n, prefix) != 0) return;
+        const std::string digits = stem.substr(n);
+        if (digits.empty() ||
+            digits.find_first_not_of("0123456789") != std::string::npos)
+            return;
+        counter = std::max(counter, std::atoi(digits.c_str()) + 1);
+    };
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec || !de.is_regular_file()) continue;
+        const std::string stem = de.path().stem().string();
+        bump(stem, "ribbon_", strokeMeshCounter_);      // ribbon geometry (.uaf)
+        bump(stem, "ribbonmat_", strokeMatCounter_);    // ribbon material (.hbmat)
+        bump(stem, "ribbontip_", strokeMatCounter_);    // ribbon tip texture (.uaf)
+        bump(stem, "stroke_", strokeMatCounter_);       // tap material (.hbmat)
+        bump(stem, "stroketip_", strokeMatCounter_);    // tap tip texture (.uaf)
+    }
+}
+
+// THE ONE GROUPING SITE for both creation paths. See Scene/StrokeZone.h.
+void Editor::AttachStrokeToZone(Engine& engine, entt::entity stroke) {
+    Scene& scene = engine.GetScene();
+    // The zone of the surface the stroke STARTED on. A hit that has since been
+    // deleted, or no hit at all (drawing over empty space), falls back to the
+    // untagged group - always resident, which is the safe answer.
+    const TagId zone = strokezone::ZoneOfSurface(scene.Registry(), strokeHitEntity_);
+    strokezone::Attach(scene, stroke, zone);
 }
 
 void Editor::BuildSplineStroke(Engine& engine) {
@@ -1227,6 +2866,9 @@ void Editor::BuildSplineStroke(Engine& engine) {
         strokePath_.clear(); strokePathN_.clear();
         return;
     }
+    // Before strokeMeshCounter_ is read: it names the ribbon `.uaf` AND seeds this
+    // stroke's deterministic jitter.
+    SeedStrokeCounters();
     // A tap (single point) just drops a quad stroke.
     if (strokePath_.size() < 2) {
         SpawnStroke(engine, strokePath_[0],
@@ -1319,23 +2961,27 @@ void Editor::BuildSplineStroke(Engine& engine) {
     mi.baseColor = brushColor_;
     if (mat) assets::ApplyMaterial(renderer, assets, *mat, mi, textureCache_);
     reg.emplace<MeshInstance>(e, mi);
-    reg.emplace<MeshRef>(e, MeshRef{"uaf:" + meshRel + "#0"});
+    const std::string meshKey = "uaf:" + meshRel + "#0";
+    reg.emplace<MeshRef>(e, MeshRef{meshKey});
     if (mat) reg.emplace<MaterialRef>(e, MaterialRef{matRel});
     glm::vec3 mn, mx;
     ComputeBounds(ribbon, mn, mx);
     reg.emplace<AABB>(e, AABB{mn, mx});
-    // Group strokes under one "Paint Strokes" node so they don't clutter the root
-    // hierarchy. Find-or-create by name (reused across strokes + scene reloads); it's
-    // an empty node at the origin, so a child keeps its world position. The whole
-    // group moves/duplicates/hides together and collapses to a single tree row.
-    entt::entity group = entt::null;
-    for (const entt::entity ge : reg.view<Name>())
-        if (reg.get<Name>(ge).value == "Paint Strokes") { group = ge; break; }
-    if (group == entt::null) {
-        group = scene.CreateEntity("Paint Strokes");
-        reg.emplace<Transform>(group, Transform{});
-    }
-    reg.emplace<Parent>(e, Parent{group});
+    // Publish the ribbon we just uploaded under the key Instantiate resolves it by.
+    // Without this the first scene reload after painting misses the cache, re-reads
+    // the `.uaf` we wrote a moment ago and uploads a SECOND GPU copy of it - and the
+    // RHI has no mesh destroy, so the first copy is leaked for the process lifetime,
+    // once per stroke painted this session.
+    scene::CacheUploadedMesh(meshKey, handle, AABB{mn, mx});
+    // Group the stroke under the node for the STREAMING ZONE it was painted in, so
+    // it loads and unloads with that zone instead of being permanently resident in
+    // one global node at the origin. Scene/StrokeZone.h owns the whole rule; the
+    // group node still collapses to a single tree row exactly as before.
+    //
+    // Deliberately AFTER the PushUndo above (and after the group would be created),
+    // so the snapshot covers the stroke, the grouping and a newly minted group node
+    // together - one Ctrl+Z removes all three.
+    AttachStrokeToZone(engine, e);
     selected_ = e;
     strokePath_.clear(); strokePathN_.clear();
 }
@@ -1631,7 +3277,13 @@ void Editor::DrawBrushEditor() {
 
 void Editor::DrawArtEditor(Engine& engine) {
     if (!panelOpen_[Panel_ArtEditor]) return;
-    if (!ImGui::Begin("Art Editor", &panelOpen_[Panel_ArtEditor])) {
+    const bool artVisible = ImGui::Begin("Art Editor", &panelOpen_[Panel_ArtEditor]);
+    // The Art Editor's content is the SCENE: paint canvases persist through
+    // SaveSceneToDisk -> SavePaintCanvases, so Ctrl+S here means the same thing it
+    // means in the viewport. It claims anyway so the status line can say so.
+    // Above the `Begin() == false` return - see the note in DrawUIEditor.
+    ClaimSave(editor::SaveSurface::Scene);
+    if (!artVisible) {
         ImGui::End();
         return;
     }
@@ -1658,7 +3310,7 @@ void Editor::DrawArtEditor(Engine& engine) {
 
     // Save: writes the scene AND every paint canvas (.hbpaint) to disk.
     if (ImGui::Button("Save Scene")) {
-        SaveCurrent(scene);
+        SaveSceneWithStatus(scene); // reports a REFUSAL rather than swallowing it
     }
     ImGui::SameLine();
     if (currentScenePath_.empty())
@@ -2030,14 +3682,29 @@ void Editor::UpdateArtTool(Engine& engine) {
             // -> fall back to a camera-facing plane at a default depth.
             glm::vec3 planeP = ro + rd * 5.0f;
             glm::vec3 planeN = glm::normalize(cam.Forward());
+            strokeHitEntity_ = entt::null; // reset: no hit = the untagged zone
             const entt::entity tgt = EntityUnderPixel(scene, renderer, mx, my);
             if (tgt != entt::null && reg.valid(tgt)) {
-                if (const MeshData* hm = GetCpuMesh(scene, tgt)) {
-                    const glm::mat4 w = scene.WorldMatrix(tgt);
+                // Terrain has no CPU mesh (procedural chunks); the heightfield answers
+                // the same question, so a stroke can start on the ground.
+                const entt::entity tOwner = TerrainPaintOwner(scene, tgt);
+                const entt::entity surf = tOwner != entt::null ? tOwner : tgt;
+                // KEEP the resolved surface: it is the stroke's ZONE (see
+                // strokeHitEntity_ in Editor.h). Stored even when the raycast below
+                // misses - the object under the cursor is still the surface the
+                // author aimed at, and the fallback plane is only about depth.
+                strokeHitEntity_ = surf;
+                const MeshData* hm = tOwner != entt::null ? nullptr : GetCpuMesh(scene, tgt);
+                if (hm || tOwner != entt::null) {
+                    const glm::mat4 w = scene.WorldMatrix(surf);
                     const glm::mat4 iw = glm::inverse(w);
                     paint::PaintHit hit;
-                    if (paint::RaycastMesh(*hm, glm::vec3(iw * glm::vec4(ro, 1.0f)),
-                                           glm::vec3(iw * glm::vec4(rd, 0.0f)), hit)) {
+                    const bool ok =
+                        tOwner != entt::null
+                            ? RaycastTerrainSurface(scene, tOwner, ro, rd, hit)
+                            : paint::RaycastMesh(*hm, glm::vec3(iw * glm::vec4(ro, 1.0f)),
+                                                 glm::vec3(iw * glm::vec4(rd, 0.0f)), hit);
+                    if (ok) {
                         planeP = glm::vec3(w * glm::vec4(hit.localPos, 1.0f));
                         const glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(w)));
                         planeN = glm::normalize(nm * hit.localNormal); // surface normal
@@ -2094,32 +3761,38 @@ void Editor::UpdateArtTool(Engine& engine) {
     // otherwise the mesh under the cursor. Every mesh is paintable - a canvas is
     // created on the first dab (auto-create), so the target need NOT already have
     // a PaintComponent.
+    // A terrain ENTITY carries no MeshInstance of its own (its chunks do), so the
+    // MeshInstance gate has to admit it or "selected only" could never paint terrain.
+    const auto paintable = [&](entt::entity e) {
+        return e != entt::null && reg.valid(e) &&
+               (reg.all_of<MeshInstance>(e) || reg.all_of<TerrainComponent>(e));
+    };
     entt::entity target = entt::null;
     if (paintSelectedOnly_) {
-        if (selected_ != entt::null && reg.valid(selected_) && reg.all_of<MeshInstance>(selected_))
-            target = selected_;
+        if (paintable(selected_)) target = selected_;
     } else {
         target = EntityUnderPixel(scene, renderer, mx, my);
     }
-    if (target == entt::null || !reg.valid(target) || !reg.all_of<MeshInstance>(target)) {
+    if (!paintable(target)) {
         if (!lmbDown) paintStroking_ = false;
         paintHasLast_ = false;
         return;
     }
-    const MeshData* mesh = GetCpuMesh(scene, target);
-    if (!mesh) {
+    // TERRAIN FIRST. A chunk under the cursor has no MeshRef, so GetCpuMesh returns
+    // null for it and the old order bailed out here - which is why painting terrain
+    // did nothing. Terrain is raycast analytically against its heightfield instead,
+    // and the canvas owner is the terrain entity (chunks are regenerated from it and
+    // would take the strokes with them).
+    const entt::entity terrainOwner = TerrainPaintOwner(scene, target);
+    const entt::entity paintEntity = terrainOwner != entt::null ? terrainOwner : target;
+    // Terrain-local space belongs to the terrain entity. (A chunk's Transform is
+    // identity under that parent, so the two matrices agree - but say which we mean.)
+    const entt::entity xformEntity = paintEntity;
+    const MeshData* mesh = terrainOwner != entt::null ? nullptr : GetCpuMesh(scene, target);
+    if (!mesh && terrainOwner == entt::null) {
         if (!lmbDown) paintStroking_ = false;
         paintHasLast_ = false;
         return;
-    }
-    // Terrain: the paint canvas lives on the terrain ENTITY (its chunks render it),
-    // not on the runtime-regenerated chunk under the cursor. The chunk still supplies
-    // the mesh + terrain-wide UV for the raycast; the canvas owner is its parent.
-    entt::entity paintEntity = target;
-    if (reg.all_of<TerrainChunk>(target)) {
-        if (const Parent* par = reg.try_get<Parent>(target);
-            par && reg.valid(par->entity) && reg.all_of<TerrainComponent>(par->entity))
-            paintEntity = par->entity;
     }
     PaintComponent* pc = reg.try_get<PaintComponent>(paintEntity);
     if (pc) {
@@ -2146,13 +3819,16 @@ void Editor::UpdateArtTool(Engine& engine) {
     pn /= pn.w;
     pf /= pf.w;
     const glm::vec3 ro(pn), rd = glm::normalize(glm::vec3(pf) - glm::vec3(pn));
-    const glm::mat4 world = scene.WorldMatrix(target);
+    const glm::mat4 world = scene.WorldMatrix(xformEntity);
     const glm::mat4 invWorld = glm::inverse(world);
     const glm::vec3 lo = glm::vec3(invWorld * glm::vec4(ro, 1.0f));
     const glm::vec3 ld = glm::vec3(invWorld * glm::vec4(rd, 0.0f));
 
     paint::PaintHit hit;
-    if (!paint::RaycastMesh(*mesh, lo, ld, hit)) {
+    const bool gotHit = terrainOwner != entt::null
+                            ? RaycastTerrainSurface(scene, terrainOwner, ro, rd, hit)
+                            : paint::RaycastMesh(*mesh, lo, ld, hit);
+    if (!gotHit) {
         if (!lmbDown) paintStroking_ = false;
         paintHasLast_ = false; // off-surface gap: don't streak across it
         return;
@@ -2234,7 +3910,14 @@ void Editor::UpdateArtTool(Engine& engine) {
         // and radius come from the same params the shader uses.
         glm::vec2 puv = hit.uv;
         f32 uvRadius = brushRadius_ * hit.uvPerWorld;
-        if (pc->projection == 1) {
+        // Terrain has NO CPU mesh, and both non-default projections need one: box
+        // projection reads the mesh AABB (a chunk's, which is a fraction of the
+        // terrain), and 3D projection stamps against MeshData triangles - it would
+        // dereference the null mesh outright. Terrain's terrain-wide UV already IS the
+        // seamless, uniform-density mapping those modes exist to provide, so a terrain
+        // canvas always uses it regardless of what the component asks for.
+        const int projection = terrainOwner != entt::null ? 0 : pc->projection;
+        if (projection == 1) {
             glm::vec3 wmin(0.0f), wmax(0.0f);
             if (const AABB* box = reg.try_get<AABB>(target)) { wmin = box->min; wmax = box->max; }
             const glm::vec3 ws(glm::length(glm::vec3(world[0])),
@@ -2260,7 +3943,7 @@ void Editor::UpdateArtTool(Engine& engine) {
         dab.colorVar = paintErase_ ? 0.0f : brushColorVar_; // painterly colour pooling
         const int activeLayer = pc->activeLayer;
 
-        if (pc->projection == 2) {
+        if (projection == 2) {
             // 3D PROJECTION paint: stamp by surface proximity (crosses UV-island
             // seams, never stretches). Interpolate dab centres in mesh-local space.
             const glm::vec3 ws(glm::length(glm::vec3(world[0])),
@@ -2400,6 +4083,45 @@ void Editor::DrawProjectSettings(Engine& engine) {
         }
         ImGui::EndDisabled();
         ImGui::TextDisabled("0 day length = time held; scrub it above. No re-bake needed.");
+
+        // --- PER-SCENE OVERRIDE ------------------------------------------------
+        // The project's cycle FREE-RUNS: the clock advances from whenever the
+        // process booted, so the editor and the shipped game are at different hours
+        // the moment they have been open for different lengths of time (at this
+        // project's 60-second day length, 30 seconds apart = 12 in-game hours apart,
+        // which is ~8x on ambient and ~1.7x on exposure). No level file could fix
+        // that, and a sealed interior could not opt out of a cycle it does not want.
+        // An override is stored in the `.hbscene` header and applied by the ONE
+        // writer (scene::ApplyEnvironment), so the editor and the runtime read the
+        // same hour out of the same file.
+        ImGui::Separator();
+        bool own = se.dayNightAuthored != 0;
+        if (ImGui::Checkbox("This SCENE overrides the cycle", &own)) {
+            PushUndo(engine.GetScene());
+            se.dayNightAuthored = own ? 1u : 0u;
+            if (!own) { // back to inheriting the project's cycle, immediately
+                se.timeOfDay = env.timeOfDay;
+                se.dayLengthSeconds = env.dayLengthSeconds;
+                se.dynamicSky = env.dynamicSky;
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Saved in the .hbscene, so the editor and the shipped game\n"
+                              "start at the same hour. Set Dynamic sky OFF here to author\n"
+                              "an interior against the exact ambient/exposure in the file.");
+        if (se.dayNightAuthored != 0) {
+            bool sdyn = se.dynamicSky != 0;
+            if (ImGui::Checkbox("Scene: dynamic sky", &sdyn)) {
+                PushUndo(engine.GetScene());
+                se.dynamicSky = sdyn ? 1u : 0u;
+            }
+            ImGui::SliderFloat("Scene: time of day", &se.timeOfDay, 0.0f, 24.0f, "%.1f h");
+            ImGui::DragFloat("Scene: day length (sec)", &se.dayLengthSeconds, 1.0f, 0.0f,
+                             3600.0f, "%.0f");
+            ImGui::TextDisabled("Save the SCENE (Ctrl+S) to keep this.");
+        } else {
+            ImGui::TextDisabled("Inheriting the project cycle (the clock free-runs).");
+        }
     }
 
     if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -2458,6 +4180,10 @@ void Editor::DrawProjectSettings(Engine& engine) {
                          2.0f, 10.0f, 2000.0f, "%.0f");
         if (ImGui::Button("Apply to Scene")) {
             // Push lighting/exposure into the live scene environment now.
+            // Undoable: this DESTROYS the loaded scene's authored ambient/exposure/sun,
+            // and it is the only sanctioned way for project defaults to reach a scene
+            // after boot (see scene::ApplyProjectLookDefaults).
+            PushUndo(engine.GetScene());
             SceneEnvironment& se = engine.GetScene().Environment();
             se.ambientIntensity = env.ambientIntensity;
             se.exposure = env.exposure;
@@ -2495,9 +4221,16 @@ void Editor::DrawProjectSettings(Engine& engine) {
 
     // Regenerate the sky + image-based lighting from the edited parameters
     // (button-driven; reads the project's environment we just edited).
+    //
+    // SetupSky, NOT SetupEnvironment. The old call also stamped the PROJECT's
+    // ambientIntensity / exposure / post over the LOADED SCENE's, so pressing a
+    // button labelled "Rebuild Sky" silently threw away the level's authored look
+    // until the next scene load - an editor-only path that makes the viewport
+    // brighter than the file it opened. Look defaults now move only through the
+    // explicit "Apply to Scene" button below.
     if (rebuild) {
-        scene::SetupEnvironment(engine.GetScene(), engine.GetRenderer());
-        buildResult_ = "Rebuilt sky + IBL from project settings.";
+        scene::SetupSky(engine.GetScene(), engine.GetRenderer());
+        buildResult_ = "Rebuilt sky + IBL from project settings (scene look untouched).";
     }
 
     ImGui::End();
@@ -2567,6 +4300,10 @@ void Editor::RefreshAssets() {
             item.isUIAnim = true;
             item.label = entry.path().stem().string();
             item.typeName = "UI Animation";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbui") {
+            item.isUIDoc = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "UI Document";
         } else if (entry.is_regular_file() && entry.path().extension() == ".uaf") {
             const uaf::AssetType type = uaf::PeekType(entry.path()); // header only
             item.isMesh = (type == uaf::AssetType::Mesh);
@@ -2702,8 +4439,17 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
             const std::filesystem::path src(static_cast<const char*>(p->Data));
             std::error_code ec;
             if (src != item.path) {
-                std::filesystem::rename(src, item.path / src.filename(), ec);
-                if (!ec) assetsDirty_ = true;
+                const std::filesystem::path dst = item.path / src.filename();
+                std::filesystem::rename(src, dst, ec);
+                if (!ec) {
+                    // The manifest is keyed by pack path, so a move it does not hear
+                    // about is a delete + a create - and for the binary bakes, which
+                    // can carry no embedded id, that is the ONLY thing holding their
+                    // number. Dragging Paint/ into a subfolder would otherwise
+                    // renumber every canvas in it.
+                    RekeyMovedAsset(src, dst);
+                    assetsDirty_ = true;
+                }
             }
         }
         ImGui::EndDragDropTarget();
@@ -3129,6 +4875,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
                 default: break;
             }
             if (!created.empty()) {
+                StampNewAsset(created); // its pack slot, for life
                 assetsDirty_ = true;
                 if (pendingCreateKind_ == 4) OpenSchematic(created); // jump to canvas
                 else if (pendingCreateKind_ == 7) OpenCutscene(engine, created); // jump to timeline
@@ -3174,6 +4921,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
             if (to != renameAsset_ && !std::filesystem::exists(to, ec)) {
                 std::filesystem::rename(renameAsset_, to, ec);
                 if (!ec) {
+                    RekeyMovedAsset(renameAsset_, to); // the id follows the file
                     if (currentScenePath_ == renameAsset_) currentScenePath_ = to;
                     scene::ClearInstantiateCaches();
                     scenesScanned_ = false;
@@ -3215,205 +4963,21 @@ void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path
     navPath_.clear();
     if (scene::LoadScene(engine.GetScene(), engine.GetRenderer(), path)) {
         currentScenePath_ = path;
-        levelOpen_ = false; // a standalone scene, not a level
-        currentLevel_ = {};
+        AdoptWorld(engine.GetScene()); // this registry IS that file, from now on
     }
-}
-
-void Editor::OpenLevel(Engine& engine, const scene::LevelPaths& level, bool additive) {
-    CutscenePreviewAbandon(); // loading a level replaces/augments the previewed scene
-    Scene& scene = engine.GetScene();
-    auto& reg = scene.Registry();
-    PushUndo(scene);
-    // Additive: don't reload a level that's already in the world - just make it
-    // the active one (new objects join it).
-    if (additive) {
-        const std::string s = level.Member(SceneKind::Static).string();
-        const std::string d = level.Member(SceneKind::Dynamic).string();
-        for (const entt::entity e : reg.view<SceneSource>()) {
-            const std::string& src = reg.get<SceneSource>(e).scene;
-            if (src == s || src == d) {
-                currentLevel_ = level;
-                levelOpen_ = true;
-                return;
-            }
-        }
-    } else {
-        selected_ = entt::null;
-        engine.GetPhysics().SetEditedEntity(entt::null);
-    }
-    navBuilt_ = false; // pathfinding debug overlay; GridNav rebuilds from the new level
-    navCells_.clear();
-    navPath_.clear();
-    if (scene::LoadLevel(scene, engine.GetRenderer(), level, nullptr, additive)) {
-        if (additive) {
-            currentLevel_ = level; // composed/streamed: keep the legacy level grouping
-            levelOpen_ = true;
-        } else {
-            // MERGED MODEL: a level is now just ONE scene. LoadLevel already set each
-            // entity's Static/Dynamic SceneLayer from the file it came from; strip the
-            // per-FILE SceneSource tags so there's no two-file grouping, and treat the
-            // world as a single scene saved to <base>.hbscene. The old .static/.dynamic
-            // files are left untouched as backups; the next Save writes the merged file.
-            std::vector<entt::entity> tagged;
-            for (const entt::entity e : reg.view<SceneSource>()) tagged.push_back(e);
-            for (const entt::entity e : tagged) reg.remove<SceneSource>(e);
-            std::filesystem::path merged = level.base;
-            merged += ".hbscene";
-            currentScenePath_ = merged;
-            currentLevel_ = {};
-            levelOpen_ = false;
-        }
-    }
-}
-
-void Editor::CreateLevel(Engine& engine, const std::filesystem::path& base) {
-    const scene::LevelPaths lp = scene::ResolveLevel(base);
-    // A level is static + dynamic only (UI lives in standalone scenes). Write the
-    // two empty layer files so the level exists on disk, then open it.
-    Scene empty;
-    for (const SceneKind k : {SceneKind::Static, SceneKind::Dynamic}) {
-        scene::SaveScene(empty, lp.Member(k), {}, k);
-    }
-    scenesScanned_ = false;
-    OpenLevel(engine, lp);
-}
-
-entt::entity Editor::RootOf(Scene& scene, entt::entity e) const {
-    auto& reg = scene.Registry();
-    entt::entity cur = e;
-    for (int guard = 0; guard < 256 && reg.valid(cur); ++guard) {
-        const Parent* p = reg.try_get<Parent>(cur);
-        if (p && reg.valid(p->entity)) cur = p->entity;
-        else break;
-    }
-    return cur;
-}
-
-SceneKind Editor::EffectiveLayer(Scene& scene, entt::entity e) const {
-    auto& reg = scene.Registry();
-    const entt::entity root = RootOf(scene, e);
-    if (const SceneLayer* sl = reg.try_get<SceneLayer>(root)) return sl->kind;
-    return ClassifyLayer(scene, root);
-}
-
-std::filesystem::path Editor::LevelBaseOf(Scene& scene, entt::entity e) const {
-    auto& reg = scene.Registry();
-    const entt::entity root = RootOf(scene, e);
-    if (const SceneSource* ss = reg.try_get<SceneSource>(root); ss && !ss->scene.empty()) {
-        const std::filesystem::path p(ss->scene);
-        if (scene::IsLevelMember(p)) return scene::ResolveLevel(p).base;
-    }
-    return currentLevel_.base; // the active level
-}
-
-void Editor::AssignToLevel(Scene& scene, entt::entity e, const std::filesystem::path& base,
-                           SceneKind kind) {
-    if (kind == SceneKind::Full || base.empty()) return;
-    auto& reg = scene.Registry();
-    scene::LevelPaths lp;
-    lp.base = base;
-    const std::string src = lp.Member(kind).string();
-    // Tag the whole hierarchy so it moves as a unit: SceneSource = the layer FILE
-    // it saves to, SceneLayer = the kind the navmesh reads.
-    std::vector<entt::entity> stack{RootOf(scene, e)};
-    while (!stack.empty()) {
-        const entt::entity cur = stack.back();
-        stack.pop_back();
-        if (!reg.valid(cur)) continue;
-        reg.emplace_or_replace<SceneSource>(cur, SceneSource{src});
-        reg.emplace_or_replace<SceneLayer>(cur, SceneLayer{kind});
-        for (const entt::entity c : reg.view<Parent>())
-            if (reg.get<Parent>(c).entity == cur) stack.push_back(c);
-    }
-}
-
-void Editor::AssignToLayer(Scene& scene, entt::entity e, SceneKind kind) {
-    AssignToLevel(scene, e, LevelBaseOf(scene, e), kind); // keep level, change layer
-}
-
-SceneKind Editor::ClassifyLayer(Scene& scene, entt::entity root) const {
-    auto& reg = scene.Registry();
-    bool anyUI = false, anyDynamic = false;
-    std::vector<entt::entity> stack{root};
-    while (!stack.empty()) {
-        const entt::entity e = stack.back();
-        stack.pop_back();
-        if (!reg.valid(e)) continue;
-        if (reg.any_of<UICanvas, UIElement>(e)) anyUI = true;
-        if (reg.any_of<Animator, CharacterController, NavigationAgent, Rotator,
-                       SchematicComponent>(e)) {
-            anyDynamic = true;
-        }
-        if (const RigidBody* rb = reg.try_get<RigidBody>(e);
-            rb && rb->motion == RigidBody::Motion::Dynamic) {
-            anyDynamic = true;
-        }
-        for (const entt::entity c : reg.view<Parent>())
-            if (reg.get<Parent>(c).entity == e) stack.push_back(c);
-    }
-    // A level has no UI layer (HUD/menus are separate standalone scenes), so UI
-    // created while a level is open falls into the dynamic layer rather than
-    // being lost. Author proper UI in its own scene.
-    if (anyUI || anyDynamic) return SceneKind::Dynamic; // actors, physics, scripted, UI
-    return SceneKind::Static;                           // world geometry (navmesh source)
-}
-
-void Editor::EnsureLevelMembership(Scene& scene) {
-    // Only while authoring a level. NOT during play: entities spawned by the
-    // simulation are transient and must not be folded into the level files, and
-    // the play snapshot already preserves each entity's membership.
-    if (!levelOpen_ || playMode_ || currentLevel_.base.empty()) return;
-    auto& reg = scene.Registry();
-    // UI is NEVER part of a level: menus and HUDs live in their own standalone
-    // scenes. Folding UI into a level's layer files is the "UI bleeds into the
-    // level" bug. UI hierarchies often have a plain (non-UI) ROOT grouping UI
-    // children, so detect UI by the whole tree: a ROOT is a "UI root" when its
-    // subtree contains any UICanvas/UIElement, and every entity under such a root
-    // is skipped (stays untagged -> saves as the active scene instead).
-    // EXCEPTION: a WORLD-SPACE canvas is diegetic scene content (a page on a
-    // notebook), not screen UI - it (and its elements) must stay level-membered,
-    // or parenting one under a level object would silently pull that whole
-    // subtree out of the level files.
-    const auto underWorldCanvas = [&](entt::entity e) {
-        int depth = 0;
-        for (entt::entity cur = e; cur != entt::null && depth < 64; ++depth) {
-            if (const UICanvas* c = reg.try_get<UICanvas>(cur); c && c->worldSpace)
-                return true;
-            const Parent* p = reg.try_get<Parent>(cur);
-            cur = (p && reg.valid(p->entity)) ? p->entity : entt::null;
-        }
-        return false;
-    };
-    std::unordered_set<u32> uiRoots;
-    for (const entt::entity e : reg.view<UICanvas>())
-        if (!reg.get<UICanvas>(e).worldSpace)
-            uiRoots.insert(static_cast<u32>(RootOf(scene, e)));
-    for (const entt::entity e : reg.view<UIElement>())
-        if (!underWorldCanvas(e))
-            uiRoots.insert(static_cast<u32>(RootOf(scene, e)));
-    const auto isUI = [&](entt::entity e) {
-        return uiRoots.count(static_cast<u32>(RootOf(scene, e))) != 0;
-    };
-    // Every NON-UI entity must belong to a level layer FILE (SceneSource) so Save
-    // writes it back - nothing is ever lost. Fill only the untagged ones: assign
-    // each to its hierarchy's level (its root's, else the active level) and layer
-    // (its root's SceneLayer, else auto-classified). New objects auto-sort; loaded
-    // and manually-set memberships are left alone.
-    std::vector<entt::entity> missing;
-    for (const entt::entity e : reg.view<entt::entity>()) {
-        if (!reg.valid(e) || reg.all_of<TerrainChunk>(e)) continue; // generated
-        if (!reg.all_of<SceneSource>(e) && !isUI(e)) missing.push_back(e);
-    }
-    for (const entt::entity e : missing) {
-        const entt::entity root = RootOf(scene, e);
-        const SceneLayer* sl = reg.try_get<SceneLayer>(root);
-        const SceneKind kind = sl ? sl->kind : ClassifyLayer(scene, root);
-        scene::LevelPaths lp;
-        lp.base = LevelBaseOf(scene, e);
-        if (lp.base.empty()) continue;
-        reg.emplace_or_replace<SceneSource>(e, SceneSource{lp.Member(kind).string()});
-        reg.emplace_or_replace<SceneLayer>(e, SceneLayer{kind});
+    // A PRE-MIGRATION UI SCENE says so AT LOAD, not three edits later when the save
+    // refuses. `Assets/Scenes/UIScene.hbscene` is still on disk and still listed
+    // here (the migrator never deletes a source), and loading it produces UI
+    // entities that belong to no document - which is legal to look at, illegal to
+    // save, and the only remaining way to get loose UI into an editor session.
+    if (std::string why; !AuditSceneForLooseUI(engine.GetScene(), why)) {
+        uiDocError_ = "This scene contains UI that predates .hbui documents, so it "
+                      "cannot be SAVED as-is.\n\n" +
+                      why;
+        panelOpen_[Panel_UIDocument] = true;
+        HBE_WARN("Loaded '{}': it carries UI outside any document. Saving it will be "
+                 "refused - it has a .hbui equivalent (run --migrate-ui).",
+                 path.filename().string());
     }
 }
 
@@ -3589,6 +5153,37 @@ void Editor::DrawViewport(Engine& engine) {
         vpClicked_ = false;
     }
 
+    // BAKED-GI STATUS BANNER. Without this the difference between "this level has
+    // no GI volume" and "this level's GI volume failed to load" is invisible: both
+    // fall through to MeshPBR.hlsl's sky-irradiance branch, which lights a sealed
+    // interior as though the roof were not there. That flat bright ambient is the
+    // single most confusing thing about authoring interior lighting here, so the
+    // viewport says which of the two it is looking at.
+    if (vpVisible_) {
+        const SceneEnvironment& genv = engine.GetScene().Environment();
+        std::string msg;
+        ImU32 col = IM_COL32(255, 210, 90, 230);
+        if (genv.giStatus == GiStatus::Missing || genv.giStatus == GiStatus::Corrupt ||
+            genv.giStatus == GiStatus::UploadFailed) {
+            msg = std::string("Baked GI '") + genv.giSource + "' is " +
+                  ToString(genv.giStatus) +
+                  (genv.giStatus == GiStatus::UploadFailed
+                       ? " - the FILE is fine, the GPU refused the atlas; interiors are "
+                         "leaking sky light. Re-open the scene."
+                       : " - interiors are leaking sky light. Re-bake (Create > Bake GI "
+                         "Volume).");
+            col = IM_COL32(255, 110, 90, 240);
+        } else if (genv.giSource.empty()) {
+            msg = "No baked GI volume: interiors are lit by the open sky. "
+                  "Create > Bake GI Volume, then SAVE the scene.";
+            col = IM_COL32(190, 190, 190, 170);
+        }
+        if (!msg.empty()) {
+            ImGui::GetWindowDrawList()->AddText(ImVec2(vpX_ + 8.0f, vpY_ + 8.0f), col,
+                                                msg.c_str());
+        }
+    }
+
     // Drop assets straight into the world: meshes spawn at the point under
     // the cursor; scenes stream in additively; everything else (materials,
     // textures, scripts, audio, fonts) applies to the object under the cursor.
@@ -3637,9 +5232,7 @@ void Editor::DrawViewport(Engine& engine) {
                         }
                     };
                     accumulate(e);
-                    for (const entt::entity c : reg.view<Parent>()) {
-                        if (reg.get<Parent>(c).entity == e) accumulate(c);
-                    }
+                    for (const entt::entity c : scene::ChildrenOf(reg, e)) accumulate(c);
                     if (Transform* t = reg.try_get<Transform>(e)) {
                         const glm::vec3 center =
                             any ? (wmin + wmax) * 0.5f : glm::vec3(0.0f);
@@ -3675,9 +5268,23 @@ void Editor::EnterPlayMode(Engine& engine) {
     // Restore the authored scene if a cutscene preview mutated it, so play mode
     // snapshots the real scene (not a previewed pose).
     CutscenePreviewEnd(engine);
+    // Same reason, for the UI editor's Interact preview: it mutates the authored
+    // widget state in place (value / toggled / selected / scroll) and restores it
+    // when switched off. Play must snapshot the AUTHORED values - otherwise the
+    // preview's clicks are captured here, Stop restores them, and a test click
+    // silently becomes the document's new initial state.
+    if (uiEdInteract_) {
+        UIEditorEndInteract(engine);
+        uiEdInteract_ = false;
+    }
     if (!playMode_) {
-        // Snapshot the authored scene + story state; Stop restores both exactly.
-        playSnapshot_ = scene::SaveSceneToString(engine.GetScene());
+        // Snapshot the authored scene + every open UI document + story state;
+        // Stop restores all three exactly. (A document is asset content and is
+        // absent from the scene string, so it has to be captured explicitly -
+        // otherwise a script or a schematic mutating a panel during Play would
+        // survive Stop.)
+        playSnapshot_ = CaptureSnapshot(engine);
+        playSnapshotValid_ = true;
         gameStateSnapshot_ = game::SerializeState();
         // Fresh story flags/objectives/checkpoints each Play so the developer tests
         // the first-time/locked state (mirrors the runtime's LoadGameplayWorld).
@@ -3687,6 +5294,11 @@ void Editor::EnterPlayMode(Engine& engine) {
         focusGameView_ = true;
     }
     playPaused_ = false;
+    // Drop the UI authoring override on the Play EDGE, not just at the next BuildUI:
+    // ui::UpdateInteraction hit-tests the PREVIOUS frame's layout, so a frame built
+    // with the authored screen forced visible would otherwise still be clickable
+    // once Play started.
+    engine.GetScene().SetUIAuthoringView(false);
     engine.ClearCutscene();               // never resume a cutscene left over from a prior Stop
     engine.GetPhysics().SetRunning(true); // scripts follow physics' play state
     engine.SetGameCameraEnabled(true);    // the primary CameraComponent renders
@@ -3703,14 +5315,16 @@ void Editor::StopPlayMode(Engine& engine) {
     SyncFreecam(engine.GetRenderer());
     playMode_ = false;
     playPaused_ = false;
-    if (!playSnapshot_.empty()) {
+    if (playSnapshotValid_) {
         RestoreSnapshot(engine, playSnapshot_);
-        playSnapshot_.clear();
+        playSnapshot_ = Snapshot{};
+        playSnapshotValid_ = false;
     }
     // Restore the pre-play story state (flags/objectives/checkpoints live in game::
     // globals, outside the scene snapshot, so the Replace above doesn't touch them).
     game::DeserializeState(gameStateSnapshot_);
     gameStateSnapshot_.clear();
+    engine.GetScene().SetUIAuthoringView(true); // authoring again (see the Play edge)
     focusViewport_ = true;
 }
 
@@ -3790,6 +5404,7 @@ void Editor::DrawGameView(Engine& engine) {
         if (ImGui::IsItemHovered()) {
             const ImVec2 mouse = ImGui::GetMousePos();
             engine.SetUIPointer((mouse.x - imgPos.x) / w, (mouse.y - imgPos.y) / h);
+            gameViewPointerFed_ = true; // the UI editor must not override this
         } else {
             engine.SetUIPointer(-1.0f, -1.0f);
         }
@@ -3817,6 +5432,20 @@ ui::CanvasConfig CanvasConfigFromProject() {
     }
     return config;
 }
+
+// The canvas basis to lay a document out against: its OWN header block, which is
+// what makes a `.hbui` self-describing (the reference project's menu has zero
+// UICanvas entities - every panel is a canvas-less root, so without the header
+// the document would silently inherit whatever project it was opened in).
+//
+// Falls back to the project config when no document is the edit target, because
+// that is also the basis for RUNTIME-SPAWNED UI - dialogue choices and the
+// interact prompt are parentless, canvas-less entities that lay out against the
+// legacy path and must not start following a document's canvas.
+ui::CanvasConfig CanvasConfigFor(ui::DocumentSet& docs, ui::DocHandle doc) {
+    if (const ui::DocData* d = docs.Header(doc)) return d->canvas;
+    return CanvasConfigFromProject();
+}
 } // namespace
 
 bool Editor::DrawUIEditOverlay(Engine& engine, const glm::vec2& imgPos,
@@ -3828,7 +5457,7 @@ bool Editor::DrawUIEditOverlay(Engine& engine, const glm::vec2& imgPos,
     // Lay out every UI tree exactly like the renderer does; each item carries
     // its own canvas size (canvases can differ), so screen mapping is per-item.
     static std::vector<ui::LayoutItem> layout;
-    ui::LayoutUI(scene, imgSize, CanvasConfigFromProject(), layout);
+    ui::LayoutUI(scene, imgSize, CanvasConfigFor(engine.Documents(), activeDoc_), layout);
 
     const auto toScreen = [&](glm::vec2 c, glm::vec2 canvas) {
         return ImVec2(imgPos.x + c.x / canvas.x * imgSize.x,
@@ -3977,6 +5606,7 @@ bool Editor::DrawUIEditOverlay(Engine& engine, const glm::vec2& imgPos,
         const ui::Rect desired{center.x - size.x * 0.5f, center.y - size.y * 0.5f,
                                center.x + size.x * 0.5f, center.y + size.y * 0.5f};
         ui::SolveElementFromRect(el, parent, desired);
+        MarkDocumentDirty(engine, selected_); // a layout drag IS an edit to the .hbui
     }
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) uiDragMode_ = 0;
     return consumedClick || uiDragMode_ != 0;
@@ -4093,6 +5723,39 @@ void Editor::Reparent(Scene& scene, entt::entity child, entt::entity newParent) 
     auto& reg = scene.Registry();
     if (child == newParent || !reg.valid(child)) return;
 
+    // THE SEPARATION GUARANTEE, hierarchy half. The hierarchy panel's per-row drop
+    // target accepts any entity onto any row, document rows included (only the
+    // GROUP HEADER was guarded), and this function propagates SceneSource over the
+    // subtree but knew nothing about UIDocMember. So dragging a crate onto a
+    // world-space UICanvas inside an open `.hbui` rebased the crate's Transform
+    // into canvas space and left it scene content whose Parent points at an entity
+    // BuildSceneJson skips - EntityToJson then omits `parent` and the crate
+    // reloads as a root at its canvas-local transform, i.e. a silent teleport.
+    // The reverse drag lost the link at CaptureDocument instead. A cross-boundary
+    // reparent has no correct meaning, so it is refused rather than "fixed" by
+    // re-stamping membership (that would move world content INTO an asset).
+    // (An UNPARENT is exempt: making an element a document ROOT keeps it in the
+    // same document - the reference project's menu is four canvas-less roots - and
+    // making a world object a scene root keeps it in the scene.)
+    if (newParent != entt::null) {
+        const UIDocMember* cm = reg.try_get<UIDocMember>(child);
+        const UIDocMember* pm = reg.try_get<UIDocMember>(newParent);
+        const u32 cd = cm ? cm->doc : 0u;
+        const u32 pd = pm ? pm->doc : 0u;
+        if (cd != pd) {
+            uiDocError_ =
+                "A .hbui document and the scene are separate FILES, so an entity "
+                "cannot be parented across the boundary.\n\nCopy the element into "
+                "the document instead (with that document as the edit target), or "
+                "unparent it first.";
+            panelOpen_[Panel_UIDocument] = true; // the refusal has to be SEEN
+            HBE_WARN("Reparent refused: '{}' and its new parent are not in the same "
+                     "document ({} -> {}).",
+                     reg.all_of<Name>(child) ? reg.get<Name>(child).value : "(unnamed)", cd, pd);
+            return;
+        }
+    }
+
     // Refuse cycles: newParent must not be a descendant of child.
     for (entt::entity a = newParent; a != entt::null;) {
         if (a == child) return;
@@ -4118,51 +5781,76 @@ void Editor::Reparent(Scene& scene, entt::entity child, entt::entity newParent) 
         const SceneSource* ps = reg.try_get<SceneSource>(newParent);
         MoveToScene(scene, child, ps ? ps->scene : std::string());
     }
-}
 
-// The level layer a scene file represents, from its "<name>.static|dynamic|ui"
-// filename. Full when the path isn't a level member (a standalone scene).
-static SceneKind KindFromScenePath(const std::string& p) {
-    if (p.empty()) return SceneKind::Full;
-    const std::filesystem::path fp(p);
-    if (!scene::IsLevelMember(fp)) return SceneKind::Full;
-    const std::string stem = fp.stem().string(); // "<name>.<kind>"
-    return SceneKindFromString(stem.substr(stem.find_last_of('.') + 1));
+    // A REPARENT IS A NEW SIBLING GROUP, SO IT NEEDS A NEW SIBLING INDEX.
+    // HierarchyOrder is only ever compared WITHIN one group (Scene/Components.h), and
+    // reparenting is the one operation that makes two groups' values meet. Without
+    // this re-mint, two instances of the same `.hbprefab` (PasteSubtree re-mints only
+    // the ROOT, so their children keep the file's identical values) collide the moment
+    // one instance's child is dragged under the other: the tie falls through to
+    // entt::to_entity, which is the entity INDEX, and that is assigned from the file
+    // ROW at load - so the two tied siblings can swap places across a save/reopen.
+    // That is the "hierarchy reshuffles itself" failure this whole mechanism exists to
+    // remove; it was reachable one drag past a paste.
+    //
+    // Landing LAST also matches every other creation path (Scene::CreateEntity,
+    // PasteSubtree): a dropped entity appears at the bottom of its new parent, where
+    // the author is looking. The insert-band drop (DrawEntityNode) calls Reparent and
+    // then scene::ReorderSibling, which renumbers the whole group densely afterwards,
+    // so precise placement is unaffected. A PASTE deliberately does NOT route through
+    // here either - see Editor::AttachPastedRoot, which is this function's Parent +
+    // MoveToScene + order half without the undo step or the transform rebase - and
+    // RevertPrefabInstance restores its captured order after that call, so a revert
+    // still visibly changes nothing.
+    reg.emplace_or_replace<HierarchyOrder>(child, HierarchyOrder{scene.NextHierarchyOrder()});
 }
 
 void Editor::MoveToScene(Scene& scene, entt::entity root, const std::string& scenePath) {
     auto& reg = scene.Registry();
     if (!reg.valid(root)) return;
-    const SceneKind kind = KindFromScenePath(scenePath);
+    // A document member belongs to its `.hbui`, not to any scene file, so it never
+    // carries a SceneSource. (Reachable by dropping a document element onto a
+    // streamed-scene GROUP HEADER, which is a SceneSource retag - the header drop
+    // is guarded against document GROUPS but not against document PAYLOADS.)
+    if (reg.all_of<UIDocMember>(root)) {
+        HBE_WARN("MoveToScene ignored: '{}' is .hbui document content, not scene content.",
+                 reg.all_of<Name>(root) ? reg.get<Name>(root).value : "(unnamed)");
+        return;
+    }
     // Re-tag the entity and everything parented under it (a subtree moves whole).
-    std::vector<entt::entity> stack{root};
-    while (!stack.empty()) {
-        const entt::entity e = stack.back();
-        stack.pop_back();
-        if (scenePath.empty()) {
-            reg.remove<SceneSource>(e); // active scene = untagged
-            reg.remove<SceneLayer>(e);
-        } else {
-            reg.emplace_or_replace<SceneSource>(e, SceneSource{scenePath});
-            if (kind != SceneKind::Full) reg.emplace_or_replace<SceneLayer>(e, SceneLayer{kind});
-            else reg.remove<SceneLayer>(e);
-        }
-        for (const entt::entity c : reg.view<Parent>())
-            if (reg.get<Parent>(c).entity == e) stack.push_back(c);
+    // The per-object Static/Dynamic tag is NOT touched: it is a property of the
+    // object, not of the file it happens to live in.
+    //
+    // The subtree is gathered UP FRONT (one Parent-pool pass, Scene/Hierarchy.h):
+    // `remove<SceneSource>` below is a swap_and_pop that mutates a pool, and the
+    // old inline scan re-walked view<Parent> per node while that was happening.
+    for (const entt::entity e : scene::SubtreeInOrder(reg, root)) {
+        if (scenePath.empty()) reg.remove<SceneSource>(e); // active scene = untagged
+        else reg.emplace_or_replace<SceneSource>(e, SceneSource{scenePath});
     }
 }
 
 void Editor::DestroyRecursive(Scene& scene, entt::entity e) {
     auto& reg = scene.Registry();
     if (!reg.valid(e)) return;
-    // Children list is copied: destroying mutates the Parent storage we scan.
-    std::vector<entt::entity> children;
-    for (const entt::entity c : reg.view<Parent>()) {
-        if (reg.get<Parent>(c).entity == e) children.push_back(c);
+    // ONE pool pass for the WHOLE subtree, then destroy leaf-first.
+    //
+    // The recursive shape this replaced called scene::ChildrenOf per node, and
+    // ChildrenOf scans the world-wide Parent pool AND sorts - so "one pool pass, not
+    // one per node" was true of ChildrenOf in isolation and false of this function,
+    // which is still O(N x world-Parent-pool) plus an added sort at every node. The
+    // stroke work funnels every ribbon in a zone into ONE group node, so deleting a
+    // 5,000-stroke group walked the pool 5,001 times.
+    //
+    // SubtreeInOrder is pre-order (parents before children), so destroying in REVERSE
+    // is leaf-first, which keeps the "a parent is never destroyed while a live child
+    // still points at it" property the recursion had. The list is built up front
+    // because reg.destroy mutates every pool it touches.
+    const std::vector<entt::entity> all = scene::SubtreeInOrder(reg, e);
+    for (auto it = all.rbegin(); it != all.rend(); ++it) {
+        if (selected_ == *it) selected_ = entt::null;
+        if (reg.valid(*it)) reg.destroy(*it);
     }
-    for (const entt::entity c : children) DestroyRecursive(scene, c);
-    if (selected_ == e) selected_ = entt::null;
-    reg.destroy(e);
 }
 
 void Editor::DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e) {
@@ -4186,6 +5874,10 @@ void Editor::DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e) {
         reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<u32>(e))), flags,
         "%s", label);
     if (selfHidden) ImGui::PopStyleColor();
+    // The ROW rect, captured while the tree node is still the "last item" (the eye
+    // button below would replace it). The drop handler splits it into three bands.
+    const ImVec2 rowMin = ImGui::GetItemRectMin();
+    const ImVec2 rowMax = ImGui::GetItemRectMax();
 
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
         selected_ = e;
@@ -4201,10 +5893,80 @@ void Editor::DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e) {
         ImGui::EndDragDropSource();
     }
     if (ImGui::BeginDragDropTarget()) {
+        // WHERE in the row the drop lands decides what it MEANS. Without this,
+        // "order" would be data with no way to author it: the only entity-ordering
+        // affordance in the whole editor was the `.hbui` one (Editor::UISwapOrder).
+        //
+        //   top 30%    -> insert BEFORE this row  (reorder)
+        //   bottom 30% -> insert AFTER this row   (reorder)
+        //   middle 40% -> parent under this row   (the pre-existing behaviour, and
+        //                 still the bigger target, because it is the common action)
+        const f32 rowH = rowMax.y - rowMin.y;
+        const f32 band = rowH * 0.30f;
+        const f32 mouseY = ImGui::GetMousePos().y;
+        const bool insertBefore = rowH > 0.0f && mouseY < rowMin.y + band;
+        const bool insertAfter = rowH > 0.0f && !insertBefore && mouseY > rowMax.y - band;
+        // Insertion line, so the three bands are visible rather than folklore.
+        if ((insertBefore || insertAfter) && ImGui::GetDragDropPayload() &&
+            ImGui::GetDragDropPayload()->IsDataType("HBE_ENTITY")) {
+            const f32 y = insertBefore ? rowMin.y : rowMax.y;
+            ImGui::GetWindowDrawList()->AddLine(ImVec2(rowMin.x, y), ImVec2(rowMax.x, y),
+                                                ImGui::GetColorU32(ImGuiCol_DragDropTarget),
+                                                2.0f);
+        }
         if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("HBE_ENTITY")) {
             entt::entity dropped;
             std::memcpy(&dropped, p->Data, sizeof(dropped));
-            Reparent(scene, dropped, e);
+            const auto parentOf = [&reg](entt::entity x) -> entt::entity {
+                const Parent* pp = reg.try_get<Parent>(x);
+                return (pp && reg.valid(pp->entity)) ? pp->entity : entt::null;
+            };
+            const auto docOf = [&reg](entt::entity x) -> u32 {
+                const UIDocMember* m = reg.try_get<UIDocMember>(x);
+                return m ? m->doc : 0u;
+            };
+            if (dropped == e || !reg.valid(dropped)) {
+                // Dropping a row on itself is not an edit of any kind.
+            } else if ((insertBefore || insertAfter) &&
+                       (docOf(dropped) != 0u || docOf(e) != 0u)) {
+                // A `.hbui` DOCUMENT ROW'S ORDER IS A DIFFERENT MECHANISM.
+                // Element order inside a document is z-order and hit order, and it is
+                // carried by the UIElement/Parent POOL POSITIONS plus the
+                // DocumentInstance's own list - which is what CaptureDocument writes
+                // (UI/UIDocument.cpp). It never reads HierarchyOrder. So letting
+                // scene::ReorderSibling through here would move the row in this panel,
+                // change nothing in the Game view, and then silently revert on the next
+                // save/reopen because InstantiateDocument re-mints HierarchyOrder in
+                // file order. Reparent already refuses cross-document links, but two
+                // members of the SAME document pass every test it makes.
+                //
+                // Refused rather than emulated: the UI Editor owns document order and
+                // has the affordance for it (Editor::UIReorder / UISwapOrder), which
+                // permutes the pools AND the saved list together.
+                uiDocError_ =
+                    "Element order inside a `.hbui` document is its Z-ORDER, and it is "
+                    "stored in the document file - not in the scene hierarchy's sibling "
+                    "order.\n\nReorder it in the UI Editor (the Raise/Lower affordance "
+                    "on the selected element), which moves it in the document too.";
+                panelOpen_[Panel_UIDocument] = true; // the refusal has to be SEEN
+                HBE_WARN("Hierarchy reorder refused: '{}' is `.hbui` document content; "
+                         "use the UI Editor's raise/lower (document z-order).",
+                         reg.all_of<Name>(dropped) ? reg.get<Name>(dropped).value
+                                                   : "(unnamed)");
+            } else if (insertBefore || insertAfter) {
+                if (parentOf(dropped) == parentOf(e)) {
+                    PushUndo(scene); // BEFORE the mutation, or undo restores the result
+                    scene::ReorderSibling(reg, dropped, e, insertBefore);
+                } else {
+                    // Not siblings yet: adopt the target's parent (Reparent pushes
+                    // its own undo and refuses cycles / cross-document links), then
+                    // place within the new sibling group.
+                    Reparent(scene, dropped, parentOf(e));
+                    scene::ReorderSibling(reg, dropped, e, insertBefore);
+                }
+            } else {
+                Reparent(scene, dropped, e);
+            }
         }
         // Assets dropped onto a row apply to that entity (material paint,
         // script attach, audio source, mesh spawns as a child, ...).
@@ -4267,8 +6029,12 @@ void Editor::DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e) {
     }
 }
 
-void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
+void Editor::DrawHierarchy(Engine& engine) {
     if (!panelOpen_[Panel_Hierarchy]) return;
+    // Takes the Engine (not Scene+Renderer) because the create menu's UI branch
+    // needs the open-document set: new UI entities join the active document.
+    Scene& scene = engine.GetScene();
+    Renderer& renderer = engine.GetRenderer();
     ImGui::Begin("Hierarchy", &panelOpen_[Panel_Hierarchy]);
     auto& reg = scene.Registry();
 
@@ -4364,14 +6130,33 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
         if (ImGui::MenuItem("Bake GI Volume (whole level)")) {
             const std::filesystem::path assets = Project::Active().AssetsDir();
             SceneEnvironment& env = scene.Environment();
+            // PushUndo, because assigning giSource IS an edit to the scene. Without
+            // it the bake wrote a perfectly good `.hbgi` to disk and left the only
+            // pointer to it in memory: close or reload without Ctrl+S and the file
+            // was orphaned, the scene fell back to sky-only ambient, and a sealed
+            // interior leaked daylight with nothing on screen to say why. (This
+            // project shipped in exactly that state - volume.hbgi on disk, no
+            // giSource in the .hbscene.)
+            PushUndo(scene);
             if (env.giSource.empty()) env.giSource = "GI/volume.hbgi";
-            const GiVolume vol = BakeGIVolume(renderer, scene, assets, {}, assets / env.giSource);
+            // The PROJECT's sky, not `{}`. Passing the default sky params baked a GI
+            // whose sky contribution did not match the sky being rendered.
+            const GiVolume vol = BakeGIVolume(renderer, scene, assets, scene::ProjectSkyParams(),
+                                              assets / env.giSource);
+            env.giStatus = vol.status;
             if (vol.valid) {
                 env.giSh = vol.sh;
                 env.giDepth = vol.depth;
                 env.giOrigin = vol.origin;
                 env.giSpacing = vol.spacing;
                 env.giDims = vol.dims;
+                buildResult_ = "Baked GI volume -> " + env.giSource +
+                               ". SAVE THE SCENE (Ctrl+S) or the reference is lost.";
+                HBE_WARN("GI: baked '{}'. The scene now references it - SAVE THE SCENE, "
+                         "or the volume is orphaned and the level reloads without GI.",
+                         env.giSource);
+            } else {
+                buildResult_ = "GI bake produced nothing (no geometry?).";
             }
         }
         if (ImGui::MenuItem("Auto-Place + Bake Probes")) {
@@ -4521,102 +6306,45 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
             reg.emplace<CameraComponent>(cam, c);
             selected_ = e;
         }
-        if (ImGui::BeginMenu("UI")) {
-            // Unity behavior: new UI elements land under a canvas - the
-            // selected entity's canvas tree when there is one, else the first
-            // canvas in the scene, else a freshly created one.
-            const auto canvasFor = [&]() -> entt::entity {
-                if (selected_ != entt::null && reg.valid(selected_)) {
-                    int depth = 0;
-                    for (entt::entity cur = selected_; cur != entt::null && depth < 64;
-                         ++depth) {
-                        if (reg.all_of<UICanvas>(cur) || reg.all_of<UIElement>(cur)) {
-                            return cur; // nest under the selection's UI tree
-                        }
-                        const Parent* p = reg.try_get<Parent>(cur);
-                        cur = (p && reg.valid(p->entity)) ? p->entity : entt::null;
-                    }
-                }
-                for (const entt::entity e : reg.view<UICanvas>()) return e;
-                const entt::entity e = scene.CreateEntity("Canvas");
-                reg.emplace<UICanvas>(e);
-                return e;
-            };
-            if (ImGui::MenuItem("Canvas")) {
-                PushUndo(scene);
-                const entt::entity e = scene.CreateEntity("Canvas");
-                reg.emplace<UICanvas>(e);
-                selected_ = e;
+        // CREATION-TIME SEPARATION GUARD. A UI element can only be authored INTO
+        // a `.hbui` document, so the whole menu is disabled unless one is the
+        // active edit target. This is the primary enforcement: it means loose UI
+        // in a scene is not something the editor can produce, rather than
+        // something a save-time check has to clean up after.
+        const bool uiAllowed = activeDoc_ != 0;
+        if (!uiAllowed) ImGui::BeginDisabled();
+        const bool uiMenuOpen = ImGui::BeginMenu("UI");
+        if (!uiAllowed) ImGui::EndDisabled();
+        if (!uiAllowed && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("UI lives in a .hbui document.\n"
+                              "Open or create one in the UI Document panel first.");
+        }
+        if (uiMenuOpen) {
+            // ONE CREATION PATH. This menu and the dedicated UI editor's palette
+            // both walk the SAME recipe catalog and both call the SAME
+            // Editor::CreateUIElementInDocument (Source/Editor/UIEditor.cpp), which
+            // is where the guard, the DocumentSet::Track ordering contract and the
+            // per-recipe defaults live. Before I3 this menu carried its own copy of
+            // all three, so a palette that grew its own would have been a second
+            // place for UI to leak into a scene - the one hole the whole `.hbui`
+            // subsystem exists to close.
+            int catCount = 0;
+            const UICreateDesc* cat = UICreateCatalog(catCount);
+            for (int i = 0; i < catCount; ++i) {
+                if (i > 0 && cat[i].container != cat[i - 1].container) ImGui::Separator();
+                if (ImGui::MenuItem(cat[i].label))
+                    CreateUIElementInDocument(engine, cat[i].what, selected_);
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", cat[i].tip);
             }
             ImGui::Separator();
-            const auto makeUI = [&](const char* name, UIElement::Type type) {
-                PushUndo(scene);
-                const entt::entity parent = canvasFor();
-                const entt::entity e = scene.CreateEntity(name);
-                reg.emplace<Parent>(e, Parent{parent});
-                UIElement el;
-                el.type = type;
-                el.text = type == UIElement::Type::Label    ? "New Label"
-                          : type == UIElement::Type::Button ? "Button"
-                                                            : "";
-                if (type == UIElement::Type::Panel) {
-                    el.size = {500.0f, 300.0f};
-                    el.color = {0.10f, 0.10f, 0.14f, 0.85f};
-                } else if (type == UIElement::Type::Button) {
-                    el.size = {320.0f, 90.0f};
-                    el.color = {0.86f, 0.27f, 0.33f, 1.0f};
-                } else if (type == UIElement::Type::Image) {
-                    el.size = {256.0f, 256.0f};
-                } else if (type == UIElement::Type::ProgressBar) {
-                    el.size = {420.0f, 36.0f};
-                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
-                } else if (type == UIElement::Type::Slider) {
-                    el.size = {420.0f, 40.0f};
-                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
-                } else if (type == UIElement::Type::Toggle) {
-                    el.size = {160.0f, 56.0f};
-                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
-                } else if (type == UIElement::Type::Selector) {
-                    el.size = {420.0f, 56.0f};
-                    el.color = {0.12f, 0.12f, 0.16f, 0.9f};
-                    el.options = {"High", "Med", "Low"};
-                }
-                reg.emplace<UIElement>(e, el);
-                selected_ = e;
-            };
-            if (ImGui::MenuItem("Label")) makeUI("UI Label", UIElement::Type::Label);
-            if (ImGui::MenuItem("Button")) makeUI("UI Button", UIElement::Type::Button);
-            if (ImGui::MenuItem("Panel")) makeUI("UI Panel", UIElement::Type::Panel);
-            if (ImGui::MenuItem("Image")) makeUI("UI Image", UIElement::Type::Image);
-            if (ImGui::MenuItem("Progress Bar")) {
-                makeUI("UI Progress Bar", UIElement::Type::ProgressBar);
+            if (ImGui::MenuItem("Open the UI Editor")) {
+                panelOpen_[Panel_UIEditor] = true;
+                ImGui::SetWindowFocus("UI Editor");
             }
-            if (ImGui::MenuItem("Progress Wheel")) {
-                makeUI("UI Progress Wheel", UIElement::Type::ProgressBar);
-                if (UIElement* el = reg.try_get<UIElement>(selected_)) {
-                    el->radial = true;
-                    el->size = {220.0f, 220.0f};
-                }
-            }
-            if (ImGui::MenuItem("Slider")) makeUI("UI Slider", UIElement::Type::Slider);
-            if (ImGui::MenuItem("Toggle")) makeUI("UI Toggle", UIElement::Type::Toggle);
-            if (ImGui::MenuItem("Selector")) makeUI("UI Selector", UIElement::Type::Selector);
-            if (ImGui::MenuItem("Scroll View")) {
-                makeUI("UI Scroll View", UIElement::Type::ScrollView);
-                if (UIElement* el = reg.try_get<UIElement>(selected_)) {
-                    el->size = {600.0f, 400.0f};
-                    el->color = {0.08f, 0.08f, 0.10f, 0.85f};
-                }
-            }
-            if (ImGui::MenuItem("Text Input")) {
-                makeUI("UI Text Input", UIElement::Type::TextInput);
-                if (UIElement* el = reg.try_get<UIElement>(selected_)) {
-                    el->text.clear();
-                    el->placeholder = "Enter text...";
-                    el->size = {420.0f, 56.0f};
-                    el->color = {0.12f, 0.12f, 0.16f, 0.9f};
-                }
-            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The dedicated 2D authoring surface: this same "
+                                  "palette, the document tree, and the page drawn by "
+                                  "the shipped UI pass.");
             ImGui::EndMenu();
         }
         ImGui::EndPopup();
@@ -4628,26 +6356,26 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
     ImGui::EndDisabled();
     ImGui::Separator();
 
-    // Stable display order: sort by entity id (≈ creation order). entt's raw
-    // storage iteration reshuffles as components/entities change, which made the
-    // tree jump around mid-reparent; a fixed order keeps drag-reroute reliable.
-    const auto byId = [](entt::entity a, entt::entity b) {
-        return static_cast<u32>(a) < static_cast<u32>(b);
+    // DISPLAY ORDER IS AUTHORED ORDER (Scene/Hierarchy.h), not the entity handle.
+    //
+    // This used to sort by `static_cast<u32>(entity)` with a comment claiming that
+    // was "≈ creation order". It is not: an entt handle is `index | (version << 20)`,
+    // so the FIRST delete in a session makes every recycled handle sort above every
+    // never-recycled one. A Ctrl+D after any delete draws its whole subtree from the
+    // free list, and the panel showed the clone's children scrambled even though the
+    // clipboard fragment was perfectly ordered - the user-visible half of this bug.
+    // (`.hbui` diagnosed the identical failure first; UI/UIDocument.cpp:585.)
+    const auto byOrder = [&reg](entt::entity a, entt::entity b) {
+        return scene::OrderLess(reg, a, b);
     };
 
-    // While a level is open, make sure every entity belongs to a layer file so
-    // the groups below (and Save) are correct without any per-object bookkeeping.
-    EnsureLevelMembership(scene);
-
     // Parent -> children map for this frame's tree walk. Terrain chunks are
-    // system-generated noise; keep them out of the hierarchy.
-    childrenByParent_.clear();
-    for (const entt::entity c : reg.view<Parent>()) {
-        if (reg.try_get<TerrainChunk>(c)) continue;
-        const entt::entity p = reg.get<Parent>(c).entity;
-        if (reg.valid(p)) childrenByParent_[static_cast<u32>(p)].push_back(c);
-    }
-    for (auto& [p, kids] : childrenByParent_) std::sort(kids.begin(), kids.end(), byId);
+    // system-generated noise; keep them out of the hierarchy (filtered inside the
+    // build, so a big terrain's chunk bucket is never even sorted).
+    scene::BuildChildrenMap(reg, childrenByParent_,
+                            [](const entt::registry& r, entt::entity c) {
+                                return r.try_get<const TerrainChunk>(c) == nullptr;
+                            });
 
     // Roots: every live entity without a (valid) parent. Gather then draw in the
     // fixed order (Transform-less entities - UI / lights / cameras - included).
@@ -4658,43 +6386,42 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
         if (p && reg.valid(p->entity)) continue;
         roots.push_back(e);
     }
-    std::sort(roots.begin(), roots.end(), byId);
+    std::sort(roots.begin(), roots.end(), byOrder);
 
-    // Group roots so the hierarchy is a single FLAT tree PER LEVEL: a level's Static
-    // and Dynamic layers are MERGED into one group (no manual sorting between two
-    // scenes). The per-object Static/Dynamic choice lives in the Inspector, new
-    // objects auto-classify, and Save still splits the .static/.dynamic files
-    // invisibly. Non-level scenes group by their own file as before.
+    // Group roots by the FILE they came from. A level is ONE scene, so the common
+    // case is a single group (drawn flat, no header); extra groups only appear when
+    // other scenes have been streamed in additively. The per-object Static/Dynamic
+    // choice lives in the Inspector and is independent of grouping.
     const std::string activeName =
         currentScenePath_.empty() ? std::string("Scene") : currentScenePath_.stem().string();
     struct Grp {
         std::string key, label, sortKey;
-        bool isLevel = false;
-        std::filesystem::path levelBase;
         std::vector<entt::entity> ents;
     };
     std::vector<Grp> groups;
     const auto groupFor = [&](entt::entity e) -> std::vector<entt::entity>& {
         std::string key = activeName, label = activeName, sk = "0";
-        bool isLevel = false;
-        std::filesystem::path base;
-        if (const SceneSource* ss = reg.try_get<SceneSource>(e); ss && !ss->scene.empty()) {
-            const std::filesystem::path p(ss->scene);
-            if (scene::IsLevelMember(p)) {
-                base = scene::ResolveLevel(p).base; // merge .static + .dynamic
-                key = base.string();
-                label = scene::ResolveLevel(p).Name();
-                sk = "1" + label;
-                isLevel = true;
-            } else {
-                key = ss->scene;
-                label = p.stem().string();
-                sk = "2" + label;
-            }
+        // A `.hbui` DOCUMENT gets its own group, above the streamed-scene groups:
+        // it is not part of any scene file, and showing its roots mixed into the
+        // level's would suggest they save with it (they never do). Reuses the
+        // SceneSource grouping machinery verbatim - only the key differs.
+        if (const UIDocMember* m = reg.try_get<UIDocMember>(e); m && m->doc != 0) {
+            const ui::DocumentInstance* inst = engine.Documents().Get(m->doc);
+            const std::string stem =
+                inst && !inst->path.empty() ? inst->path.stem().string()
+                                            : std::string("Untitled");
+            key = "\1doc" + std::to_string(m->doc); // \1 cannot collide with a path
+            label = stem + "  [UI Document]";
+            sk = "1" + label;
+        } else if (const SceneSource* ss = reg.try_get<SceneSource>(e);
+                   ss && !ss->scene.empty()) {
+            key = ss->scene;
+            label = std::filesystem::path(ss->scene).stem().string();
+            sk = "2" + label;
         }
         for (auto& g : groups)
             if (g.key == key) return g.ents;
-        groups.push_back({key, label, sk, isLevel, base, {}});
+        groups.push_back({key, label, sk, {}});
         return groups.back().ents;
     };
     for (const entt::entity e : roots) groupFor(e).push_back(e);
@@ -4711,18 +6438,19 @@ void Editor::DrawHierarchy(Scene& scene, Renderer& renderer) {
             std::snprintf(hdr, sizeof(hdr), "%s  (%zu)###grp_%s", g.label.c_str(),
                           g.ents.size(), g.key.c_str());
             const bool open = ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen);
-            // Drop onto a header to move an entity here. A LEVEL header keeps the
-            // entity's current Static/Dynamic layer (change it in the Inspector); a
-            // scene header re-tags the source scene (active group = untag).
-            if (ImGui::BeginDragDropTarget()) {
+            // Drop onto a header to move an entity into that scene file (dropping
+            // on the active group untags it). The object's Static/Dynamic layer is
+            // its own property and is left alone.
+            const bool isDocGroup = !g.key.empty() && g.key[0] == '\1';
+            if (!isDocGroup && ImGui::BeginDragDropTarget()) {
+                // Document groups are NOT drop targets: moving an entity into a
+                // `.hbui` is not a SceneSource retag, and letting the drop through
+                // would write the synthetic "\1docN" key into a SceneSource.
                 if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("HBE_ENTITY")) {
                     entt::entity dropped;
                     std::memcpy(&dropped, p->Data, sizeof(dropped));
                     Reparent(scene, dropped, entt::null); // becomes a root
-                    if (g.isLevel)
-                        AssignToLevel(scene, dropped, g.levelBase, EffectiveLayer(scene, dropped));
-                    else
-                        MoveToScene(scene, dropped, g.key == activeName ? std::string() : g.key);
+                    MoveToScene(scene, dropped, g.key == activeName ? std::string() : g.key);
                 }
                 ImGui::EndDragDropTarget();
             }
@@ -4841,9 +6569,70 @@ void DrawCameraBehaviour(entt::registry& reg, CameraComponent& cam, Snap&& snap)
         if (m != Mode::Spline && cam.target.empty())
             ImGui::TextDisabled("No target -> behaves as Static.");
     }
+    // Player look, shared by First and Third Person - the two modes accumulate it
+    // through the same code and the same fields (cam::PlayerLook), so exposing it
+    // twice with two different sets of controls is how they stop matching.
+    const auto playerLookControls = [&](bool firstPerson) {
+        bool pl = cam.playerLook;
+        if (ImGui::Checkbox("Player look (mouse / right stick)", &pl)) {
+            snap();
+            cam.playerLook = pl;
+        }
+        if (!cam.playerLook) {
+            ImGui::TextDisabled(firstPerson ? "Off: the eye faces the target's own forward."
+                                            : "Off: the boom trails the target's facing.");
+            return;
+        }
+        ImGui::DragFloat("Look Sensitivity", &cam.lookSensitivity, 0.005f, 0.01f, 2.0f,
+                         "%.3f deg/px");
+        undoOnActivate();
+        ImGui::DragFloat("Stick Speed", &cam.lookStickSpeed, 1.0f, 0.0f, 720.0f, "%.0f deg/s");
+        undoOnActivate();
+        bool inv = cam.invertLookY;
+        if (ImGui::Checkbox("Invert Y", &inv)) { snap(); cam.invertLookY = inv; }
+        ImGui::DragFloat("Pitch Min", &cam.lookPitchMin, 0.5f, -89.0f, 89.0f, "%.0f deg");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Pitch is a DOWNWARD angle, so the minimum is how far\n"
+                              "the player can look UP (-80 by default).");
+        undoOnActivate();
+        ImGui::DragFloat("Pitch Max", &cam.lookPitchMax, 0.5f, -89.0f, 89.0f, "%.0f deg");
+        undoOnActivate();
+        if (cam.lookPitchMin > cam.lookPitchMax)
+            ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f),
+                               "Pitch Min is above Pitch Max - the aim will be pinned.");
+        if (firstPerson) {
+            ImGui::TextDisabled("Look turns the BODY (yaw); pitch is camera-only.");
+            ImGui::TextDisabled("The character then moves where it is looking.");
+            if (cam.rotation != CameraComponent::RotationMode::Free)
+                ImGui::TextDisabled("Aim is ignored here - the player owns the aim.");
+        } else {
+            ImGui::TextDisabled("Orbit the camera; the character moves relative to it.");
+        }
+    };
+
     if (m == Mode::FirstPerson) {
         ImGui::DragFloat3("Eye Offset", glm::value_ptr(cam.offset), 0.02f);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Eye position relative to the target, in the body's frame.\n"
+                              "Y is head height; Z is forward off the body's centre.");
         undoOnActivate();
+        // THE SEED, exposed. First-person look is seeded from cam.pitch/cam.yaw
+        // (CameraSystem::PlayerLook), which are otherwise the THIRD-person boom's
+        // angles - and those default to 15 degrees down, with the Create > Player rig
+        // setting 12. Switching that rig to first person therefore opened the eye
+        // aimed at the floor with no control anywhere in this branch to level it.
+        // The fields already serialize; they just had no first-person label.
+        ImGui::DragFloat("Start Pitch", &cam.pitch, 0.5f, -89.0f, 89.0f, "%.0f deg");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Where the eye looks on the first frame (downward degrees).\n"
+                              "0 = level with the horizon. Player look takes over after that.");
+        undoOnActivate();
+        ImGui::DragFloat("Start Yaw Offset", &cam.yaw, 0.5f, -180.0f, 180.0f, "%.0f deg");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Added to the target's own facing when the look is seeded.\n"
+                              "0 = start looking exactly where the body faces.");
+        undoOnActivate();
+        playerLookControls(/*firstPerson=*/true);
     } else if (m == Mode::ThirdPerson || m == Mode::Orbit || m == Mode::Distance) {
         ImGui::DragFloat3("Pivot Offset", glm::value_ptr(cam.offset), 0.02f);
         undoOnActivate();
@@ -4959,20 +6748,7 @@ void DrawCameraBehaviour(entt::registry& reg, CameraComponent& cam, Snap&& snap)
             }
             ImGui::TreePop();
         }
-        if (m == Mode::ThirdPerson) {
-            bool pl = cam.playerLook;
-            if (ImGui::Checkbox("Player look (mouse / right stick)", &pl)) {
-                snap();
-                cam.playerLook = pl;
-            }
-            if (cam.playerLook) {
-                ImGui::DragFloat("Look Sensitivity", &cam.lookSensitivity, 0.005f, 0.01f, 2.0f);
-                undoOnActivate();
-                bool inv = cam.invertLookY;
-                if (ImGui::Checkbox("Invert Y", &inv)) { snap(); cam.invertLookY = inv; }
-                ImGui::TextDisabled("Orbit the camera; the character moves relative to it.");
-            }
-        }
+        if (m == Mode::ThirdPerson) playerLookControls(/*firstPerson=*/false);
     } else if (m == Mode::Spline) {
         std::string pick;
         if (EntityNameCombo("Spline", reg, cam.spline, 2, pick)) { snap(); cam.spline = pick; }
@@ -4992,6 +6768,12 @@ void DrawCameraBehaviour(entt::registry& reg, CameraComponent& cam, Snap&& snap)
         cam.rotation = static_cast<CameraComponent::RotationMode>(rot);
     }
     using Rot = CameraComponent::RotationMode;
+    // First-person player look OWNS the aim (cam::Update forces Free for it), so
+    // say so here rather than letting an author set Look At and wonder why the
+    // mouse does nothing.
+    if (m == Mode::FirstPerson && cam.playerLook && cam.rotation != Rot::Free)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.35f, 1.0f),
+                           "Ignored: first-person player look aims the camera.");
     if (cam.rotation == Rot::SlowFollow) {
         ImGui::DragFloat("Aim Damping", &cam.rotationDamping, 0.1f, 0.0f, 60.0f);
         undoOnActivate();
@@ -5075,15 +6857,9 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (ImGui::Combo("Layer", &idx, "Static\0Dynamic\0")) {
             PushUndo(scene);
             const SceneKind kind = idx == 1 ? SceneKind::Dynamic : SceneKind::Static;
-            // Tag this entity + all descendants (depth-first over the Parent links).
-            std::vector<entt::entity> stack{sel};
-            while (!stack.empty()) {
-                const entt::entity cur = stack.back();
-                stack.pop_back();
+            // Tag this entity + all descendants (one Parent-pool pass; Hierarchy.h).
+            for (const entt::entity cur : scene::SubtreeInOrder(reg, sel))
                 reg.emplace_or_replace<SceneLayer>(cur, SceneLayer{kind});
-                for (const entt::entity c : reg.view<Parent>())
-                    if (reg.get<Parent>(c).entity == cur) stack.push_back(c);
-            }
         }
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Static = world geometry (navmesh source).\n"
@@ -5092,7 +6868,107 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
+    // --- Streaming tag (per object, whole subtree) --------------------------
+    // ORTHOGONAL to the Layer combo above: Layer picks the navmesh/painterly
+    // filter, Tag picks the STREAMING GROUP. Per-tag radii live in Window > Tags.
+    //
+    // Writing the whole subtree is the enforcement mechanism for "a shard owns
+    // whole subtrees", not a convenience - a scene file stores `parent` as an
+    // index into its own entity array, so a shard that contains a child but not
+    // its parent writes the child as a ROOT, i.e. at its LOCAL transform in world
+    // space (a silent teleport). tags::AssignSubtree is the shared implementation
+    // --test-tagtable exercises.
+    {
+        const bool inDoc = reg.all_of<UIDocMember>(sel);
+        const Tag* tg = reg.try_get<Tag>(sel);
+        const TagId cur = tg ? tg->id : kTagUntagged;
+        if (inDoc) ImGui::BeginDisabled();
+        ImGui::SetNextItemWidth(-110.0f);
+        if (ImGui::BeginCombo("Tag", tags::Name(cur).c_str())) {
+            const std::vector<std::string>& all = tags::All();
+            for (usize i = 0; i < all.size(); ++i) {
+                const bool isCur = static_cast<TagId>(i) == cur;
+                if (ImGui::Selectable(all[i].c_str(), isCur)) {
+                    PushUndo(scene);
+                    tags::AssignSubtree(reg, sel, static_cast<TagId>(i));
+                }
+                if (isCur) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable("New Tag...")) {
+                tagNewPopupOpen_ = true;
+                tagNewName_[0] = '\0';
+            }
+            ImGui::EndCombo();
+        }
+        if (inDoc) ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            if (inDoc) {
+                ImGui::SetTooltip("UI documents are never tagged.\n"
+                                  "A `.hbui` is asset content: it is excluded from every\n"
+                                  "scene write and survives every world swap, so it cannot\n"
+                                  "belong to a streaming group.");
+            } else {
+                ImGui::SetTooltip("Streaming group. Coming into range SPAWNS the group,\n"
+                                  "leaving DESPAWNS it; Untagged is always resident.\n"
+                                  "Sets this object's WHOLE SUBTREE - children cannot\n"
+                                  "differ from their root. Radii: Window > Tags.");
+            }
+        }
+        if (tg && tg->shard >= 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("shard %d", tg->shard);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Baked spatial shard index (re-derived on save).");
+        }
+        // Naming modal for "New Tag...". Deferred out of the combo (which has
+        // closed by now) because a popup cannot be opened from inside one.
+        if (tagNewPopupOpen_) {
+            ImGui::OpenPopup("New Streaming Tag");
+            tagNewPopupOpen_ = false;
+        }
+        if (ImGui::BeginPopupModal("New Streaming Tag", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("Tag name:");
+            ImGui::SetNextItemWidth(240.0f);
+            const bool entered = ImGui::InputText("##tagname", tagNewName_, sizeof(tagNewName_),
+                                                  ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::TextDisabled("Added to the project (saved immediately) and");
+            ImGui::TextDisabled("assigned to this object's whole subtree.");
+            const bool named = tagNewName_[0] != '\0';
+            if (!named) ImGui::BeginDisabled();
+            const bool create = ImGui::Button("Create") || entered;
+            if (!named) ImGui::EndDisabled();
+            if (create && named) {
+                const TagId id = CreateProjectTag(tagNewName_);
+                if (id != kTagUntagged) {
+                    PushUndo(scene);
+                    tags::AssignSubtree(reg, sel, id);
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+
     if (ImGui::BeginPopup("AddComponent")) {
+        // The OTHER direction of the separation guarantee, stated where the mistake
+        // is made. Only the six UI entries below are gated on document membership;
+        // the world entries stay enabled because gating ~40 of them would be a
+        // maintenance trap. What backs this warning up is a REFUSAL, not a drop:
+        // SaveUIDocument runs AuditDocumentForWorldContent and refuses to write a
+        // document whose entities carry world components, because a `.hbui` has
+        // nowhere to put them and CaptureDocument would silently discard them.
+        if (reg.all_of<UIDocMember>(sel)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.74f, 0.35f, 1.0f));
+            ImGui::TextUnformatted("This entity is .hbui DOCUMENT content.");
+            ImGui::PopStyleColor();
+            ImGui::TextDisabled("A document stores name/parent/transform + UI only.");
+            ImGui::TextDisabled("Adding world components below blocks the document save.");
+            ImGui::Separator();
+        }
         if (!reg.all_of<Transform>(sel) && ImGui::MenuItem("Transform")) {
             PushUndo(scene);
             reg.emplace<Transform>(sel);
@@ -5285,29 +7161,44 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             reg.emplace<IKConstraint>(sel);
             if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // IK poses an Animator
         }
-        if (!reg.all_of<UIElement>(sel) && ImGui::MenuItem("UI Element")) {
-            PushUndo(scene);
-            reg.emplace<UIElement>(sel);
-        }
-        if (!reg.all_of<UICanvas>(sel) && ImGui::MenuItem("UI Canvas")) {
-            PushUndo(scene);
-            reg.emplace<UICanvas>(sel);
-        }
-        if (!reg.all_of<UIAnimator>(sel) && ImGui::MenuItem("UI Animator")) {
-            PushUndo(scene);
-            reg.emplace<UIAnimator>(sel);
-        }
-        if (!reg.all_of<UIPanel>(sel) && ImGui::MenuItem("UI Panel")) {
-            PushUndo(scene);
-            reg.emplace<UIPanel>(sel);
-        }
-        if (!reg.all_of<UILayoutGroup>(sel) && ImGui::MenuItem("UI Layout Group")) {
-            PushUndo(scene);
-            reg.emplace<UILayoutGroup>(sel);
-        }
-        if (!reg.all_of<UICanvasGroup>(sel) && ImGui::MenuItem("UI Canvas Group")) {
-            PushUndo(scene);
-            reg.emplace<UICanvasGroup>(sel);
+        // CREATION-TIME SEPARATION GUARD, component half. A UI component may only
+        // be added to an entity that is already inside a `.hbui` document - the
+        // same rule as the create menu, applied where the other half of the hole
+        // was. (World Text below is NOT gated: it is level signage, not screen UI.)
+        {
+            const bool inDoc = reg.all_of<UIDocMember>(sel);
+            if (!inDoc) ImGui::BeginDisabled();
+            if (!reg.all_of<UIElement>(sel) && ImGui::MenuItem("UI Element")) {
+                PushUndo(scene);
+                reg.emplace<UIElement>(sel);
+            }
+            if (!reg.all_of<UICanvas>(sel) && ImGui::MenuItem("UI Canvas")) {
+                PushUndo(scene);
+                reg.emplace<UICanvas>(sel);
+            }
+            if (!reg.all_of<UIAnimator>(sel) && ImGui::MenuItem("UI Animator")) {
+                PushUndo(scene);
+                reg.emplace<UIAnimator>(sel);
+            }
+            if (!reg.all_of<UIPanel>(sel) && ImGui::MenuItem("UI Panel")) {
+                PushUndo(scene);
+                reg.emplace<UIPanel>(sel);
+            }
+            if (!reg.all_of<UILayoutGroup>(sel) && ImGui::MenuItem("UI Layout Group")) {
+                PushUndo(scene);
+                reg.emplace<UILayoutGroup>(sel);
+            }
+            if (!reg.all_of<UICanvasGroup>(sel) && ImGui::MenuItem("UI Canvas Group")) {
+                PushUndo(scene);
+                reg.emplace<UICanvasGroup>(sel);
+            }
+            if (!inDoc) {
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("UI components belong to a .hbui document.\n"
+                                      "Create the element from Hierarchy > + Create > UI\n"
+                                      "with a document open.");
+            }
         }
         if (!reg.all_of<WorldText>(sel) && ImGui::MenuItem("World Text (3D)")) {
             PushUndo(scene);
@@ -5541,6 +7432,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                         mat.subsurfaceRadius = mi->subsurfaceRadius;
                         mat.flags = mi->materialFlags;
                         assets::SaveMaterial(created, mat);
+                        StampNewAsset(created); // CreateMaterialAsset wrote it; re-stamp is a no-op
                         reg.emplace_or_replace<MaterialRef>(
                             sel, MaterialRef{Project::Active().RelativeAssetPath(created)});
                         RefreshAssets();
@@ -5925,6 +7817,45 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 ImGui::SliderFloat("Size variance", &pe->sizeVariance, 0.0f, 1.0f);
                 undoOnActivate();
             }
+            bool gpuExp = pe->gpuExpand;
+            if (ImGui::Checkbox("GPU vertex expansion", &gpuExp)) {
+                PushUndo(scene);
+                pe->gpuExpand = gpuExp;
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Builds the billboard quads in the vertex shader instead of "
+                                  "on the CPU. Same simulation, same look; the CPU uploads 64 "
+                                  "bytes per particle instead of six world-space vertices, and "
+                                  "the batch stops truncating at ~26k particles. Worth it on "
+                                  "dense emitters; irrelevant on small ones.");
+            bool gpuSimulate = pe->gpuSim;
+            // Mutually exclusive with Volumetric by construction, not by taste: a GPU
+            // emitter holds ZERO CPU pool (ParticleGpuSim.cpp Reserve(0,0)) and the
+            // volumetric blob build reads that pool, so the combination silently
+            // produces no plume at all. Refuse it rather than let it look broken.
+            ImGui::BeginDisabled(pe->volumetric);
+            if (ImGui::Checkbox("GPU simulation (compute)", &gpuSimulate)) {
+                PushUndo(scene);
+                pe->gpuSim = gpuSimulate;
+            }
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Runs the SIMULATION in a compute shader (VfxSim.hlsl), not "
+                                  "just the billboarding - zero per-particle CPU work.\n\n"
+                                  "THIS CHANGES THE EFFECT. A GPU emitter compiles to the v1 "
+                                  "module stack, not the legacy compatibility one, because the "
+                                  "legacy modules cannot exist in a shader. Emit Shape is "
+                                  "ignored (spawn is a sphere of Emit radius with Spread), "
+                                  "Turbulence becomes divergence-free curl noise, Drag becomes "
+                                  "exponential, and Buoyancy/Vortex have no v1 equivalent and "
+                                  "are dropped. Preview it before shipping it.\n\n"
+                                  "Unavailable on a Volumetric emitter: the raymarched plume is "
+                                  "built from the CPU particle pool, which a GPU emitter does "
+                                  "not have.");
+            if (pe->gpuSim) {
+                ImGui::TextDisabled("  ring %u slots (rate x lifetime + burst + 25%%)",
+                                    particle::GpuRingCapacity(*pe));
+            }
 
             ImGui::SeparatorText("Look (over life)");
             ImGui::ColorEdit4("Start color", glm::value_ptr(pe->startColor),
@@ -5973,7 +7904,14 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
 
             ImGui::SeparatorText("Volumetric VFX (raymarched 3D)");
             bool vol = pe->volumetric;
+            // The other half of the exclusion above.
+            ImGui::BeginDisabled(pe->gpuSim);
             if (ImGui::Checkbox("Volumetric", &vol)) { PushUndo(scene); pe->volumetric = vol; }
+            ImGui::EndDisabled();
+            if (pe->gpuSim && ImGui::IsItemHovered())
+                ImGui::SetTooltip("Unavailable while \"GPU simulation (compute)\" is on: the "
+                                  "raymarched volume is built from the CPU particle pool, "
+                                  "which a GPU-simulated emitter does not have.");
             if (pe->volumetric) {
                 ImGui::TextWrapped(
                     "This emitter's particles feed a raymarched 3D density/temperature "
@@ -7436,6 +9374,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     const std::filesystem::path rel =
                         std::filesystem::path("UI") / (std::string(name) + ".hbuianim");
                     if (ui::SaveClip(Project::Active().AssetsDir() / rel, clip)) {
+                        StampNewAsset(Project::Active().AssetsDir() / rel);
                         PushUndo(scene);
                         an->clip = rel.generic_string();
                         ui::ClearClipCache();
@@ -7587,6 +9526,22 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     canvas->rtWidth = rt[0] <= 0 ? 0u : static_cast<u32>(glm::clamp(rt[0], 64, 4096));
                     canvas->rtHeight = rt[1] <= 0 ? 0u : static_cast<u32>(glm::clamp(rt[1], 64, 4096));
                 }
+                ImGui::SeparatorText("Interaction");
+                bool occl = canvas->occlude;
+                if (ImGui::Checkbox("Occluded by world", &occl)) {
+                    PushUndo(scene);
+                    canvas->occlude = occl;
+                }
+                ImGui::TextDisabled(
+                    "On (default): a solid collider between the camera and this\n"
+                    "page makes it un-clickable - a button behind a wall cannot be\n"
+                    "pressed. Only entities with a RigidBody (and terrain) block;\n"
+                    "a mesh with no collider blocks nothing. Mount the page at\n"
+                    "least 2 cm proud of its backing surface. Clear it for a\n"
+                    "hologram or a screen attached to the player.");
+                ImGui::DragFloat("Interact Range (m, 0 = any)", &canvas->interactRange,
+                                 0.05f, 0.0f, 500.0f, "%.2f");
+                undoOnActivate();
                 ImGui::TextDisabled(
                     "The canvas renders onto a LIT page in the scene (paper-like:\n"
                     "shaded and occluded by the world, exempt from the painterly\n"
@@ -7964,6 +9919,18 @@ void Editor::DrawStats(Engine& engine) {
     if (!buildResult_.empty()) {
         ImGui::Separator();
         ImGui::TextWrapped("Build: %s", buildResult_.c_str());
+    }
+    // The last Ctrl+S, in full. The toast fades; this does not, so an author can
+    // always check WHICH surface the last save actually wrote.
+    if (!saveStatus_.empty()) {
+        ImGui::Separator();
+        if (saveStatusError_) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.42f, 0.36f, 1.0f));
+            ImGui::TextWrapped("Save: %s", saveStatus_.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextWrapped("Save: %s", saveStatus_.c_str());
+        }
     }
     if (streamer_.Busy()) {
         ImGui::TextDisabled("Streaming scene: %s",
@@ -8438,13 +10405,17 @@ void Editor::OpenSchematic(const std::filesystem::path& path) {
     panelOpen_[Panel_SchematicEditor] = true;
 }
 
-void Editor::SaveSchematic() {
-    if (editedSchematic_.empty()) return;
-    if (schematic::SaveGraph(editedSchematic_, schematicGraph_)) {
-        schematicDirty_ = false;
-        schematic::ClearCache(); // running entities reload the edited graph next play
-        assetsDirty_ = true;     // surface the file in the asset browser
+bool Editor::SaveSchematic() {
+    if (editedSchematic_.empty()) return false;
+    if (!schematic::SaveGraph(editedSchematic_, schematicGraph_)) {
+        HBE_ERROR("Failed to write schematic '{}'.", editedSchematic_.string());
+        return false;
     }
+    StampNewAsset(editedSchematic_); // the save rebuilt the JSON; restore its id
+    schematicDirty_ = false;
+    schematic::ClearCache(); // running entities reload the edited graph next play
+    assetsDirty_ = true;     // surface the file in the asset browser
+    return true;
 }
 
 std::filesystem::path Editor::CreateSchematicAsset(const std::filesystem::path& dirIn,
@@ -8460,6 +10431,7 @@ std::filesystem::path Editor::CreateSchematicAsset(const std::filesystem::path& 
     schematic::Graph g;
     g.AddNode(schematic::NodeType::EventUpdate, {48.0f, 48.0f});
     if (!schematic::SaveGraph(p, g)) return {};
+    StampNewAsset(p); // a new asset gets its pack slot at birth
     assetsDirty_ = true;
     return p;
 }
@@ -8471,7 +10443,14 @@ void Editor::DrawSchematicEditor(Engine& engine) {
         ImGui::SetNextWindowFocus();
         schematicFocus_ = false;
     }
-    if (!ImGui::Begin("Schematic Editor", &panelOpen_[Panel_SchematicEditor])) {
+    const bool schemVisible =
+        ImGui::Begin("Schematic Editor", &panelOpen_[Panel_SchematicEditor]);
+    // CLAIM Ctrl+S. Above the `editedSchematic_.empty()` early return AND above the
+    // collapsed-window return on purpose - see the note on Editor::ClaimSave and the
+    // longer one in DrawUIEditor. Replaces the old focus-gated handler that used to
+    // sit after DrawSchematicCanvas() and double-fired with the global one.
+    ClaimSave(editor::SaveSurface::Schematic);
+    if (!schemVisible) {
         ImGui::End();
         return;
     }
@@ -8485,7 +10464,15 @@ void Editor::DrawSchematicEditor(Engine& engine) {
     if (ImGui::Button("Open")) { assetPickerSearch_[0] = '\0'; ImGui::OpenPopup("##schemopen"); }
     ImGui::SameLine();
     ImGui::BeginDisabled(editedSchematic_.empty());
-    if (ImGui::Button(schematicDirty_ ? "Save*" : "Save")) SaveSchematic();
+    if (ImGui::Button(schematicDirty_ ? "Save*" : "Save")) {
+        if (SaveSchematic())
+            SetSaveStatus("Saved schematic '" + editedSchematic_.filename().string() + "'.",
+                          false);
+        else
+            SetSaveStatus("SCHEMATIC SAVE FAILED - '" +
+                              editedSchematic_.filename().string() + "' was NOT written.",
+                          true);
+    }
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (editedSchematic_.empty()) {
@@ -8530,11 +10517,7 @@ void Editor::DrawSchematicEditor(Engine& engine) {
 
     ImGui::Separator();
     DrawSchematicCanvas();
-
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-        SaveSchematic();
-    }
+    // (Ctrl+S is claimed at the top of this function - see ClaimSave there.)
     ImGui::End();
 }
 
@@ -8886,19 +10869,78 @@ void Editor::DrawSchematicCanvas() {
 
 // --- Undo / redo ------------------------------------------------------------------
 
-void Editor::PushUndo(Scene& scene) {
-    undoStack_.push_back(scene::SaveSceneToString(scene));
+std::string Editor::CaptureDocumentSnapshotJson(Scene& scene,
+                                                const ui::DocumentInstance& inst) {
+    ui::DocData captured;
+    // THE ORDER LIST IS NOT OPTIONAL. Draw order inside a document is POOL order,
+    // and Editor::UISwapOrder changes it by permuting pool positions and mirroring
+    // the swap into inst.entities. A pool permutation does not move entity INDICES,
+    // so with no order argument CaptureDocument falls back to sorting by index and
+    // every z-order edit is silently dropped by the next undo capture - and by
+    // Play -> Stop. --test-uieditor (c) drives this exact function for that reason.
+    ui::CaptureDocument(scene, inst.handle, inst.header, captured, &inst.entities);
+    return ui::SaveDocumentToString(captured);
+}
+
+Editor::Snapshot Editor::CaptureSnapshot(Engine& engine) const {
+    Snapshot snap;
+    // A never-yet-saved paint canvas has no `source`, and BuildSceneJson skips those -
+    // so it would be absent from this snapshot and destroyed by the Replace that
+    // Stop-Play / Undo perform. Give it a file first. (const_cast for the same reason
+    // Documents() below needs one: capturing is logically const, mechanically not.)
+    if (Project::HasActive()) {
+        const std::string stem =
+            currentScenePath_.empty() ? std::string("Scene") : currentScenePath_.stem().string();
+        scene::EnsurePaintSources(const_cast<Engine&>(engine).GetScene(),
+                                  Project::Active().AssetsDir(), stem);
+    }
+    snap.scene = scene::SaveSceneToString(engine.GetScene());
+    // B12. Document entities are skipped by BuildSceneJson on purpose (they are
+    // asset content with their own file), so the scene string above contains
+    // ZERO of them - the documents have to ride alongside or a UI edit is
+    // captured by nothing.
+    ui::DocumentSet& docs = const_cast<Engine&>(engine).Documents();
+    for (const ui::DocumentInstance& inst : docs.All()) {
+        DocSnapshot ds;
+        ds.path = inst.path;
+        ds.screenOwned = inst.screenOwned;
+        ds.active = inst.handle == activeDoc_;
+        ds.dirty = inst.dirty; // else undo/redo and Play->Stop silently clear the `*`
+        ds.json = CaptureDocumentSnapshotJson(engine.GetScene(), inst);
+        snap.docs.push_back(std::move(ds));
+    }
+    return snap;
+}
+
+void Editor::PushUndo(Engine& engine) {
+    undoStack_.push_back(CaptureSnapshot(engine));
     if (undoStack_.size() > kMaxUndoSteps) {
         undoStack_.erase(undoStack_.begin());
     }
     redoStack_.clear(); // a new edit invalidates the redo branch
 }
 
+void Editor::PushUndo(Scene& scene) {
+    // Shim for the ~60 call sites that only have a Scene. BuildUI parks the
+    // Engine each frame so those sites still capture the open documents; the
+    // fallback (no Engine yet) can only happen outside a frame, where no
+    // document can be open either.
+    if (engine_) {
+        PushUndo(*engine_);
+        return;
+    }
+    Snapshot snap;
+    snap.scene = scene::SaveSceneToString(scene);
+    undoStack_.push_back(std::move(snap));
+    if (undoStack_.size() > kMaxUndoSteps) undoStack_.erase(undoStack_.begin());
+    redoStack_.clear();
+}
+
 void Editor::Undo(Engine& engine) {
     if (undoStack_.empty()) return;
     CutscenePreviewEnd(engine); // revert previewed poses so the stacks capture authored state
-    redoStack_.push_back(scene::SaveSceneToString(engine.GetScene()));
-    const std::string snapshot = std::move(undoStack_.back());
+    redoStack_.push_back(CaptureSnapshot(engine));
+    const Snapshot snapshot = std::move(undoStack_.back());
     undoStack_.pop_back();
     RestoreSnapshot(engine, snapshot);
 }
@@ -8906,23 +10948,78 @@ void Editor::Undo(Engine& engine) {
 void Editor::Redo(Engine& engine) {
     if (redoStack_.empty()) return;
     CutscenePreviewEnd(engine); // revert previewed poses so the stacks capture authored state
-    undoStack_.push_back(scene::SaveSceneToString(engine.GetScene()));
-    const std::string snapshot = std::move(redoStack_.back());
+    undoStack_.push_back(CaptureSnapshot(engine));
+    const Snapshot snapshot = std::move(redoStack_.back());
     redoStack_.pop_back();
     RestoreSnapshot(engine, snapshot);
 }
 
-void Editor::RestoreSnapshot(Engine& engine, const std::string& snapshot) {
+void Editor::RestoreSnapshot(Engine& engine, const std::string& sceneJson) {
+    // SCENE-ONLY restore, for callers whose snapshot never involved a document:
+    // the cutscene-preview revert and the movie-render job. Open documents are
+    // simply left alone - the Replace sweep spares them, which is exactly right,
+    // because neither of those operations can edit one.
     scene::SceneData data;
-    if (!scene::ParseSceneString(snapshot, data)) return;
+    if (!scene::ParseSceneString(sceneJson, data)) return;
     scene::StagedAssets staged;
     const std::filesystem::path assetsDir =
         Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
     scene::StageAssets(data, assetsDir, staged);
     selected_ = entt::null; // entities are recreated; old ids are invalid
     engine.GetPhysics().SetEditedEntity(entt::null);
+    UIEditorInvalidate(); // the UI canvas caches per-entity state; see the comment there
     scene::Instantiate(engine.GetScene(), engine.GetRenderer(), data, staged,
                        scene::LoadMode::Replace);
+    // A Replace bumps Scene::WorldToken, but this is the SAME level coming back (a
+    // cutscene-preview revert / a movie-render restore), so the editor re-adopts it.
+    AdoptWorld(engine.GetScene());
+}
+
+void Editor::RestoreSnapshot(Engine& engine, const Snapshot& snapshot) {
+    scene::SceneData data;
+    if (!scene::ParseSceneString(snapshot.scene, data)) return;
+    scene::StagedAssets staged;
+    const std::filesystem::path assetsDir =
+        Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    scene::StageAssets(data, assetsDir, staged);
+    selected_ = entt::null; // entities are recreated; old ids are invalid
+    engine.GetPhysics().SetEditedEntity(entt::null);
+    // The UI editor's canvas caches a LayoutItem list keyed by entity plus, during
+    // a drag, the entity being dragged. Both are invalid the moment the registry is
+    // replaced below, and an in-flight drag would otherwise resume writing to
+    // whatever entity id got recycled.
+    UIEditorInvalidate();
+
+    // CLOSE the open documents BEFORE the Replace. They are spared by the sweep
+    // (that is the point of screenOwned), so leaving them open would keep the
+    // pre-undo entities alive and the reopen below would double the UI layer.
+    ui::DocumentSet& docs = engine.Documents();
+    docs.CloseAll(engine.GetScene());
+    activeDoc_ = 0;
+
+    scene::Instantiate(engine.GetScene(), engine.GetRenderer(), data, staged,
+                       scene::LoadMode::Replace);
+
+    // REOPEN from the captured strings, in capture order.
+    for (const DocSnapshot& ds : snapshot.docs) {
+        ui::DocData doc;
+        if (!ui::LoadDocumentFromString(ds.json, doc)) continue;
+        const ui::DocHandle h = docs.OpenFromData(engine.GetScene(), &engine.GetRenderer(),
+                                                  doc, ds.path, ds.screenOwned);
+        if (h == 0) continue;
+        if (ui::DocumentInstance* inst = docs.Get(h)) inst->dirty = ds.dirty;
+        if (ds.active) activeDoc_ = h;
+    }
+    // A reopen MINTS A NEW HANDLE (next_++ never reuses), so the UI editor would see
+    // activeDoc_ != uiEdLastDoc_ and treat the same file as a different edit target -
+    // refitting the canvas and dropping the pan on EVERY undo/redo and every
+    // Play -> Stop. The handle churn is real and the panel still needs to re-select
+    // its tab from it, so the VIEW is what gets spared here, not the comparison.
+    uiEdPreserveView_ = true;
+    // Undo/redo and Play -> Stop bring the SAME level back through a Replace, which
+    // bumps Scene::WorldToken. Re-adopt, or the next Ctrl+S would refuse a world the
+    // editor itself put there.
+    AdoptWorld(engine.GetScene());
 }
 
 // --- Copy / paste / duplicate ----------------------------------------------------
@@ -8930,16 +11027,210 @@ void Editor::RestoreSnapshot(Engine& engine, const std::string& snapshot) {
 void Editor::CopySelection(Scene& scene) {
     if (selected_ == entt::null || !scene.Registry().valid(selected_)) return;
     clipboard_ = scene::SaveSubtreeToString(scene, selected_);
+    // Remembered so a paste of a document element that carries NO UI component of
+    // its own (a bare grouping node inside a menu tree) still lands in the
+    // document rather than silently becoming world content: PasteSubtree's own
+    // test can only see UI components in the fragment.
+    clipboardFromDoc_ = IsDocumentEntity(scene, selected_);
+    // THE SOURCE'S PARENT, AND WHY IT IS CAPTURED HERE AND NOT READ AT PASTE.
+    //
+    // EntityToJson writes a `parent` key only when the parent is inside the
+    // fragment (Scene/SceneSerializer.cpp - `indexOf` is built from the subtree),
+    // and the copied root's parent is BY DEFINITION outside it. So the fragment
+    // is complete and self-contained, and the one thing it can never describe is
+    // where the subtree hung. That is not a serializer bug to fix: a fragment that
+    // named an entity it does not contain would be unpasteable into any other
+    // scene. The parent is editor-session state, so the editor holds it.
+    const entt::registry& reg = scene.Registry();
+    const Parent* p = reg.try_get<Parent>(selected_);
+    clipboardParent_ = (p && reg.valid(p->entity)) ? p->entity : entt::null;
+    clipboardWorld_ = scene.WorldToken();
+    // AND AS A GUID. The handle above dies with the world; undo, redo and Play->Stop
+    // all Replace the world (scene::DestroyWorld bumps the token), so a copy that
+    // crossed any of them fell back to "paste at the scene root" - the exact reported
+    // bug, back again, for the most ordinary sequence there is. Guids survive a
+    // Replace because every snapshot path writes them (Scene/EntityGuid.h).
+    clipboardParentGuid_ = 0;
+    if (clipboardParent_ != entt::null)
+        if (const Guid* g = reg.try_get<Guid>(clipboardParent_)) clipboardParentGuid_ = g->value;
+    // The source's WORLD placement, so that dropping the parent does not silently
+    // teleport the clone (see PasteSubtree's `worldFallback`).
+    clipboardWorldMatrix_ = scene.WorldMatrix(selected_);
+    clipboardHasWorldMatrix_ = true;
 }
 
-void Editor::PasteSubtree(Engine& engine, const std::string& fragment,
-                          const glm::vec3* placeAt, bool pushUndo) {
-    if (fragment.empty()) return;
+// A serialized subtree that carries any of the six document component keys. Used
+// by the prefab writers, which must refuse it: a `.hbprefab` is scene content, it
+// is instantiated at runtime by spawn::GetPrefab with no document to join, and
+// from there BuildSceneJson would write the resulting loose UI into a `.hbsave`
+// as permanent, un-clearable UI. Checked on the JSON, not on UIDocMember, so it
+// also catches LOOSE legacy UI (a pre-migration `.hbscene` opened with "Load
+// (replace)"), which carries no membership tag at all.
+static bool FragmentCarriesUI(const std::string& fragment, std::string& whichKey) {
+    try {
+        const nlohmann::json j = nlohmann::json::parse(fragment);
+        const auto ents = j.find("entities");
+        if (ents == j.end() || !ents->is_array()) return false;
+        for (const nlohmann::json& je : *ents) {
+            if (!je.is_object()) continue;
+            for (const std::string& k : ui::DocumentComponentKeys())
+                if (je.contains(k)) {
+                    whichKey = k;
+                    return true;
+                }
+        }
+    } catch (const std::exception&) {
+        return false; // unparseable: the caller's own parse rejects it
+    }
+    return false;
+}
+
+// THE PASTE-PARENTING RULE, in one place.
+//
+// A pasted root has no `parent` key (see CopySelection), so without this it lands
+// at the scene root - "I copy and paste and it becomes its own thing". The parent
+// therefore arrives from the CALLER, and everything that can be wrong with it is
+// decided here rather than at four call sites.
+//
+// This is Reparent()'s body minus its two halves that are wrong for a paste:
+//   * PushUndo - PasteSubtree already pushed one, and a paste must cost ONE Ctrl+Z
+//     (RevertPrefabInstance passes pushUndo=false for exactly that reason).
+//   * the world-transform rebase - Reparent assumes the child's TRS is currently
+//     world-relative and divides out the new parent. A fresh clone's TRS is the
+//     SOURCE's local TRS, already expressed in this same parent's space; rebasing
+//     it would teleport the clone by the parent's transform. Keeping it verbatim
+//     is what makes a Ctrl+D land exactly on top of the original.
+// The cycle check is dropped as vacuous - the root is brand new, so nothing can be
+// its descendant - with one exception that is NOT vacuous and is checked instead:
+// a stale handle can alias an entity this very paste just created.
+entt::entity Editor::AttachPastedRoot(Scene& scene, entt::entity root, entt::entity parentTo,
+                                      const std::vector<entt::entity>& created,
+                                      const glm::mat4* worldFallback) {
+    auto& reg = scene.Registry();
+    if (!reg.valid(root)) return entt::null;
+
+    entt::entity use = parentTo;
+    const auto drop = [&](const char* why) {
+        HBE_INFO("Paste: the source's parent was not usable ({}); pasting as a root.", why);
+        use = entt::null;
+    };
+    if (use != entt::null) {
+        if (!reg.valid(use)) {
+            drop("it has been deleted since the copy");
+        } else if (use == root ||
+                   std::find(created.begin(), created.end(), use) != created.end()) {
+            // Only reachable through a recycled handle: the entity the copy pointed
+            // at died, entt handed its index back out, and the paste itself is what
+            // took it. Honouring it would parent the clone to its own subtree.
+            drop("it now aliases an entity this paste created");
+        } else {
+            // THE SEPARATION GUARANTEE, paste half. A `.hbui` and the scene are
+            // separate FILES (see Reparent), so the clone cannot hang across the
+            // boundary. Unlike a drag - which the author aimed, so it is refused
+            // out loud - this parent is an inference the editor made on their
+            // behalf, and copying a button out of one document into another is a
+            // NORMAL gesture. So it re-homes to a root of wherever it landed
+            // instead of refusing the whole paste. Note the compare happens after
+            // PasteSubtree re-Tracked the clone into the active document, so
+            // `root`'s membership is already its FINAL one.
+            const UIDocMember* cm = reg.try_get<UIDocMember>(root);
+            const UIDocMember* pm = reg.try_get<UIDocMember>(use);
+            if ((cm ? cm->doc : 0u) != (pm ? pm->doc : 0u))
+                drop("it belongs to a different .hbui document");
+        }
+    }
+
+    // A DROPPED PARENT MUST NOT TELEPORT THE CLONE.
+    //
+    // The no-rebase rule above is right when the parent is ACCEPTED: the clone's TRS
+    // is the source's local TRS, already in that same parent's space. When the parent
+    // is dropped, the very same numbers are reinterpreted as WORLD - so a lamp at
+    // local (0,0,0) under a rig at world (100,0,0) appears at the origin, 100 m from
+    // where the author is looking, and it is the new selection. That was the universal
+    // behaviour before the parent was recorded at all; narrowing it to a fallback made
+    // the placement unpredictable instead of merely wrong, which is worse.
+    //
+    // Only for a parent that was REQUESTED and rejected (parentTo != null): a prefab
+    // drop asks for no parent and is positioned by `placeAt`, and document content is
+    // laid out by the UI solver, not by a world matrix.
+    if (use == entt::null && parentTo != entt::null && worldFallback &&
+        !reg.all_of<UIDocMember>(root)) {
+        if (Transform* t = reg.try_get<Transform>(root)) DecomposeTRS(*worldFallback, *t);
+    }
+
+    if (use != entt::null) {
+        reg.emplace_or_replace<Parent>(root, Parent{use});
+        // A child belongs to its parent's scene, or it saves to the wrong FILE -
+        // the silent-teleport class of bug (Scene/StrokeZone.h). Same call Reparent
+        // makes, skipped for document content, which carries no SceneSource at all
+        // and would only earn a warning from MoveToScene.
+        if (!reg.all_of<UIDocMember>(root)) {
+            const SceneSource* ps = reg.try_get<SceneSource>(use);
+            MoveToScene(scene, root, ps ? ps->scene : std::string());
+        }
+    }
+
+    // THE PASTED ROOT GOES LAST, its descendants keep the source's order.
+    //
+    // The fragment carries every entity's authored "order" (Scene/Hierarchy.h), and
+    // for the DESCENDANTS that is exactly right: they only ever compare against each
+    // other, so copying the values reproduces the source subtree's shape at every
+    // depth. The ROOT is different - it joins a sibling group it was not authored
+    // in (its source's group now, not just "the roots"), and keeping the source's
+    // value would tie it with the original, where the tiebreak falls through to
+    // entt::to_entity and two identical siblings can swap places across a save. A
+    // fresh mint is the same rule CreateEntity and Reparent use: it appears at the
+    // end of its new group, where the author is looking.
+    //
+    // RevertPrefabInstance overrides this again (it is a restore, not a paste).
+    reg.emplace_or_replace<HierarchyOrder>(root, HierarchyOrder{scene.NextHierarchyOrder()});
+    return use;
+}
+
+entt::entity Editor::PasteSubtree(Engine& engine, const std::string& fragment,
+                                  const glm::vec3* placeAt, bool pushUndo, bool intoDocument,
+                                  entt::entity parentTo, const glm::mat4* worldFallback) {
+    if (fragment.empty()) return entt::null;
+
+    // B11 - the paste half of the separation guarantee. A fragment carrying any
+    // of the six document component keys may only land in a DOCUMENT. Checked on
+    // the raw JSON, before ParseSceneString, because the copy could have come
+    // from anywhere (another editor session's clipboard, a .hbprefab a user
+    // hand-edited) and because a rejected paste must leave no undo step behind.
+    //
+    // `worldText` is deliberately not in the reject set: it is level signage, and
+    // rejecting it would make a 3D sign uncopyable.
+    {
+        bool hasUIKey = false;
+        try {
+            const nlohmann::json j = nlohmann::json::parse(fragment);
+            const auto ents = j.find("entities");
+            if (ents != j.end() && ents->is_array()) {
+                for (const nlohmann::json& je : *ents) {
+                    if (!je.is_object()) continue;
+                    for (const std::string& k : ui::DocumentComponentKeys())
+                        if (je.contains(k)) { hasUIKey = true; break; }
+                    if (hasUIKey) break;
+                }
+            }
+        } catch (const std::exception&) {
+            // Not parseable as JSON - ParseSceneString below rejects it anyway.
+        }
+        if (hasUIKey && activeDoc_ == 0) {
+            uiDocError_ =
+                "That clipboard fragment contains UI, and UI lives in a .hbui "
+                "DOCUMENT, not in a scene.\n\nOpen a document in the UI Document "
+                "panel (it becomes the edit target) and paste again.";
+            HBE_WARN("Paste refused: UI fragment with no active UI document.");
+            return entt::null;
+        }
+    }
+
     scene::SceneData data;
-    if (!scene::ParseSceneString(fragment, data) || data.entities.empty()) return;
+    if (!scene::ParseSceneString(fragment, data) || data.entities.empty()) return entt::null;
 
     Scene& scene = engine.GetScene();
-    if (pushUndo) PushUndo(scene); // a paste is one undo step
+    if (pushUndo) PushUndo(engine); // a paste is one undo step
 
     scene::StagedAssets staged;
     const std::filesystem::path assetsDir =
@@ -8949,7 +11240,35 @@ void Editor::PasteSubtree(Engine& engine, const std::string& fragment,
     std::vector<entt::entity> created;
     scene::Instantiate(scene, engine.GetRenderer(), data, staged,
                        scene::LoadMode::Additive, &created);
-    if (created.empty()) return;
+    if (created.empty()) return entt::null;
+
+    // Pasting into a document makes the new entities document content. Without
+    // this they would be loose UI in the scene, which the save-time audit then
+    // refuses - correct but useless. (Pasting NON-UI while a document is the edit
+    // target still lands in the scene: only UI is document-bound.)
+    if (activeDoc_ != 0) {
+        auto& reg = scene.Registry();
+        bool anyUI = intoDocument; // the copy came FROM a document: it goes back into one
+        for (const entt::entity e : created)
+            if (reg.valid(e) && reg.any_of<UIElement, UICanvas, UIAnimator, UIPanel,
+                                           UILayoutGroup, UICanvasGroup>(e)) {
+                anyUI = true;
+                break;
+            }
+        if (anyUI) {
+            // The WHOLE pasted subtree joins the document, not only the entities
+            // that happen to carry a UI component: an empty grouping node inside
+            // a menu tree is document content too, and leaving it in the scene
+            // would break the parent chain across the boundary.
+            //
+            // Through DocumentSet::Track, not a bare emplace: Track also appends to
+            // the instance's order list, which is what CaptureDocument writes the
+            // file in. A tag without the list entry lands the clone wherever entt's
+            // free list put its handle instead of at the end of the document.
+            for (const entt::entity e : created)
+                if (reg.valid(e)) engine.Documents().Track(scene, activeDoc_, e);
+        }
+    }
 
     // A cloned PaintComponent inherits the original's .hbpaint path; clear it so
     // a later Save writes each clone its own file. The pixels are already copied
@@ -8961,15 +11280,46 @@ void Editor::PasteSubtree(Engine& engine, const std::string& fragment,
 
     // created[0] is the subtree root (serialized first). A prefab drop places it at
     // `placeAt`; copy/paste/duplicate keeps the original's exact position (clone sits
-    // on top - move it with the gizmo). Either way, select the new root.
+    // on top of its SIBLING - move it with the gizmo). Either way, select the new root.
     const entt::entity root = created.front();
     if (placeAt) {
         if (Transform* t = scene.Registry().try_get<Transform>(root)) t->position = *placeAt;
     }
+    // Parent it (or not) and give it a sibling index. AFTER the document Track
+    // above, so the cross-document check inside sees the clone's final membership.
+    AttachPastedRoot(scene, root, parentTo, created, worldFallback);
     selected_ = root;
+    return root;
 }
 
-void Editor::PasteClipboard(Engine& engine) { PasteSubtree(engine, clipboard_); }
+// The recorded parent is a handle into the world that was live when the copy
+// happened. If that world has been REPLACED since (undo/redo, a scene load, a
+// Play -> Stop), entt has recycled the indices and the handle can VALIDLY refer to
+// a completely different entity - reg.valid() cannot tell the difference, which is
+// why the world token is compared instead of trusting it. The fragment itself
+// stays pasteable across all of that; it is text.
+entt::entity Editor::ClipboardParentFor(const Scene& scene) const {
+    if (clipboardWorld_ == 0) return entt::null;
+    if (clipboardWorld_ == scene.WorldToken()) return clipboardParent_;
+    // A DIFFERENT WORLD - but not necessarily a different LEVEL. Undo, redo and
+    // Play -> Stop all rebuild the registry from a snapshot of the same level, and
+    // those snapshots carry guids, so the parent is still there under a new handle.
+    // Resolving it is what keeps "copy, Play, Stop, paste" from regressing to the
+    // reported bug. Same lookup shape TagStreaming/StrokeZone use.
+    if (clipboardParentGuid_ == 0) return entt::null;
+    const entt::registry& reg = scene.Registry();
+    for (const entt::entity e : reg.view<const Guid>())
+        if (reg.get<const Guid>(e).value == clipboardParentGuid_) return e;
+    return entt::null;
+}
+
+void Editor::PasteClipboard(Engine& engine) {
+    Scene& scene = engine.GetScene();
+    PasteSubtree(engine, clipboard_, nullptr, /*pushUndo*/ true,
+                 /*intoDocument*/ clipboardFromDoc_,
+                 /*parentTo*/ ClipboardParentFor(scene),
+                 clipboardHasWorldMatrix_ ? &clipboardWorldMatrix_ : nullptr);
+}
 
 std::filesystem::path Editor::PrefabSourcePath(const std::string& rel) const {
     if (rel.empty() || !Project::HasActive()) return {};
@@ -9016,6 +11366,24 @@ std::filesystem::path Editor::CreatePrefabFromSelection(Scene& scene,
         if (hadLink) reg.emplace<PrefabInstance>(selected_, oldLink);
         return {};
     }
+    // THE SEPARATION GUARANTEE, prefab half - the WRITE side of the rule
+    // PasteSubtree already enforces on the read side. A `.hbprefab` is scene
+    // content: spawn::GetPrefab instantiates it at runtime with no document to
+    // join, and BuildSceneJson then writes the resulting loose UI into every
+    // `.hbsave` as permanent, un-clearable UI (the exact failure the
+    // DialogueChoiceButton skip exists to prevent). Refuses rather than dropping,
+    // and keys on the JSON so it catches BOTH document content and loose legacy UI
+    // from a pre-migration `.hbscene` opened with "Load (replace)".
+    if (std::string key; FragmentCarriesUI(frag, key)) {
+        uiDocError_ = "UI cannot be saved as a .hbprefab (this selection carries '" + key +
+                      "').\n\nA prefab is scene content and is spawned into a world with "
+                      "no document to belong to. Save the UI in its .hbui document "
+                      "instead - a document IS the reusable UI template.";
+        panelOpen_[Panel_UIDocument] = true;
+        HBE_ERROR("Create Prefab refused: the selection carries UI ('{}').", key);
+        if (hadLink) reg.emplace<PrefabInstance>(selected_, oldLink);
+        return {};
+    }
     const fs::path dir = dirIn.empty() ? Project::Active().AssetsDir() / "Prefabs" : dirIn;
     std::error_code ec;
     fs::create_directories(dir, ec);
@@ -9040,11 +11408,24 @@ void Editor::InstantiatePrefab(Engine& engine, const std::filesystem::path& path
     std::ifstream in(path, std::ios::binary);
     if (!in) return;
     const std::string frag((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    PasteSubtree(engine, frag, at); // additive; selects + places the new root
-    // Link the new root back to the source prefab so it's a live instance.
+    // A placed prefab is a ROOT: it has no source parent to inherit (it came from a
+    // FILE, not from a copy), and `at` already positions it where the author dropped
+    // it. Parenting it under whatever was last copied would be an invention.
+    // additive; selects + places the new root
+    const entt::entity root = PasteSubtree(engine, frag, at, /*pushUndo*/ true,
+                                           /*intoDocument*/ false, /*parentTo*/ entt::null);
+    // Link THE NEW ROOT back to the source prefab so it's a live instance.
+    //
+    // The new root, not `selected_`. PasteSubtree refuses on four paths (empty,
+    // UI-with-no-document, unparseable, instantiated nothing) and leaves the
+    // selection alone, so reading `selected_` stamped the prefab link onto whatever
+    // the author had selected BEFORE the drop - a crate in the viewport silently
+    // becoming an instance of a truncated `.hbprefab`. The next "Apply" then
+    // overwrites that prefab file with the crate, and "Revert" destroys the crate.
+    // Silent, and destructive on the following click.
     Scene& scene = engine.GetScene();
-    if (selected_ != entt::null && scene.Registry().valid(selected_))
-        scene.Registry().emplace_or_replace<PrefabInstance>(selected_,
+    if (root != entt::null && scene.Registry().valid(root))
+        scene.Registry().emplace_or_replace<PrefabInstance>(root,
                                                             PrefabInstance{AssetRelPath(path)});
 }
 
@@ -9062,6 +11443,16 @@ void Editor::ApplyPrefabInstance(Engine& engine, entt::entity root) {
     const std::string frag = scene::SaveSubtreeToString(scene, root);
     reg.emplace<PrefabInstance>(root, PrefabInstance{source});
     if (frag.empty()) return;
+    // Same rule as CreatePrefabFromSelection, on the OVERWRITE path: never write UI
+    // into an existing .hbprefab either (and never blank one out by "applying" a
+    // subtree the writer refuses to serialize).
+    if (std::string key; FragmentCarriesUI(frag, key)) {
+        uiDocError_ = "Prefab Apply refused: this subtree carries UI ('" + key +
+                      "'), which belongs in a .hbui document, not in a .hbprefab.";
+        panelOpen_[Panel_UIDocument] = true;
+        HBE_ERROR("Prefab Apply refused: '{}' carries UI ('{}').", source, key);
+        return;
+    }
     std::ofstream out(dst, std::ios::binary | std::ios::trunc);
     if (!out) { HBE_WARN("Prefab Apply: cannot write '{}'.", dst.string()); return; }
     out.write(frag.data(), static_cast<std::streamsize>(frag.size()));
@@ -9088,27 +11479,81 @@ void Editor::RevertPrefabInstance(Engine& engine, entt::entity root) {
         HBE_WARN("Prefab Revert: source '{}' is empty/corrupt; instance kept.", source);
         return;
     }
+    // The OTHER thing PasteSubtree refuses, checked here for the same reason: this
+    // function destroys the instance BEFORE it pastes, so every refusal downstream
+    // must be pre-flighted or the revert deletes the object and puts nothing back
+    // (with the undo step already spent). A `.hbprefab` carrying a document
+    // component key can only be hand-authored or pre-migration - the writers refuse
+    // to create one - which is exactly why nothing else would catch it.
+    if (std::string key; FragmentCarriesUI(frag, key) && activeDoc_ == 0) {
+        uiDocError_ = "Prefab Revert refused: '" + source + "' carries UI ('" + key +
+                      "'), which can only be pasted into an open .hbui document.\n\n"
+                      "The instance was left alone.";
+        panelOpen_[Panel_UIDocument] = true;
+        HBE_ERROR("Prefab Revert refused: '{}' carries UI ('{}') and no document is open.",
+                  source, key);
+        return;
+    }
     // Preserve the instance's placement AND its parenting across the re-instantiate
     // (the stored position is local when parented; re-attaching keeps it in place).
     glm::vec3 place{0.0f};
     if (const Transform* t = reg.try_get<Transform>(root)) place = t->position;
     const bool hadParent = reg.all_of<Parent>(root);
     const entt::entity parent = hadParent ? reg.get<Parent>(root).entity : entt::null;
+    // Revert is a RESTORE of this object, not a copy of it: the instance keeps its
+    // placement, its parenting and its prefab link, so it must keep its identity
+    // too. Without this, every row of saved state keyed to the old guid (world::
+    // area state, a .hbsave, a streaming despawn set) is silently orphaned by a
+    // revert that visibly changes nothing. Only the ROOT is restored - the
+    // children genuinely are re-created from the template. See EntityGuid.h.
+    const u64 keepGuid = reg.all_of<Guid>(root) ? reg.get<Guid>(root).value : 0;
+    // Same argument for its SIBLING ORDER: a revert visibly changes nothing, so it
+    // must not make the instance jump to the bottom of its parent's child list the
+    // way an ordinary paste deliberately does. (Only the root - the children really
+    // are re-created from the template, and take the template's order.)
+    const HierarchyOrder* ho0 = reg.try_get<HierarchyOrder>(root);
+    const bool hadOrder = ho0 != nullptr;
+    const HierarchyOrder keepOrder = hadOrder ? *ho0 : HierarchyOrder{};
 
     PushUndo(scene);                              // ONE undo step for the whole revert
     DestroyRecursive(scene, root);                // clears selected_ if it was root
-    PasteSubtree(engine, frag, &place, /*pushUndo=*/false); // selects the fresh root
+    // THE INSTANCE'S OWN parent, never the clipboard's: a revert is a restore of
+    // THIS object, not a copy of one. Routed through PasteSubtree's parameter
+    // rather than re-attached raw afterwards, so a reverted instance under a
+    // streamed-scene parent also gets that parent's SceneSource (AttachPastedRoot's
+    // MoveToScene) - re-attaching the component alone left it saving to the wrong
+    // file. `parent` cannot have died between the capture and here.
+    PasteSubtree(engine, frag, &place, /*pushUndo=*/false, /*intoDocument=*/false,
+                 /*parentTo*/ hadParent ? parent : entt::null); // selects the fresh root
     if (selected_ != entt::null && reg.valid(selected_)) {
+        // The old holder is destroyed above, so this guid is free (and the Claim
+        // inside Instantiate has already run - nothing can contest it).
+        if (keepGuid != 0) reg.emplace_or_replace<Guid>(selected_, Guid{keepGuid});
+        // AFTER the paste: AttachPastedRoot mints a fresh sibling index (correct for
+        // a paste, wrong for a restore that must visibly change nothing).
+        if (hadOrder) reg.emplace_or_replace<HierarchyOrder>(selected_, keepOrder);
         reg.emplace_or_replace<PrefabInstance>(selected_, PrefabInstance{source});
-        if (hadParent && reg.valid(parent))
-            reg.emplace_or_replace<Parent>(selected_, Parent{parent}); // restore parenting
     }
 }
 
 void Editor::DuplicateSelection(Engine& engine) {
     Scene& scene = engine.GetScene();
-    if (selected_ == entt::null || !scene.Registry().valid(selected_)) return;
-    PasteSubtree(engine, scene::SaveSubtreeToString(scene, selected_));
+    auto& reg = scene.Registry();
+    if (selected_ == entt::null || !reg.valid(selected_)) return;
+    // Ctrl+D reads the SELECTION's parent here and now - it never touches
+    // clipboard_, so clipboardParent_ would be some unrelated older copy's answer.
+    // No world-token guard is needed for the same reason: this handle is one
+    // statement old.
+    const Parent* p = reg.try_get<Parent>(selected_);
+    const entt::entity parent = (p && reg.valid(p->entity)) ? p->entity : entt::null;
+    // Where the source actually IS, for the same teleport guard Ctrl+V uses: the
+    // handle cannot be stale here, but the cross-document check can still reject it.
+    const glm::mat4 world = scene.WorldMatrix(selected_);
+    // Duplicating INSIDE a document keeps the clone in that document (the most
+    // common UI edit there is - "another button like this one").
+    PasteSubtree(engine, scene::SaveSubtreeToString(scene, selected_), nullptr,
+                 /*pushUndo*/ true, /*intoDocument*/ IsDocumentEntity(scene, selected_),
+                 /*parentTo*/ parent, &world);
 }
 
 // --- Asset viewer ---------------------------------------------------------------
@@ -9246,7 +11691,13 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         return;
     }
     if (cutsceneFocus_) { ImGui::SetNextWindowFocus(); cutsceneFocus_ = false; }
-    if (!ImGui::Begin("Cutscene Timeline", &panelOpen_[Panel_CutsceneTimeline])) {
+    const bool csVisible =
+        ImGui::Begin("Cutscene Timeline", &panelOpen_[Panel_CutsceneTimeline]);
+    // Above the "no cutscene open" early return AND above the collapsed-window one:
+    // an unconditional claim is what makes an empty (or collapsed-but-focused) panel
+    // say so instead of writing the level. See the note in DrawUIEditor.
+    ClaimSave(editor::SaveSurface::Cutscene);
+    if (!csVisible) {
         // Collapsed (or clipped): the preview step below won't run, so end the
         // preview and restore the scene rather than freezing it mid-pose.
         if (csPreview_) CutscenePreviewEnd(engine);
@@ -9318,19 +11769,13 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     }
     ImGui::SameLine();
     if (ImGui::Button(editedCutsceneDirty_ ? "Save*" : "Save")) {
-        auto byTime = [](const auto& a, const auto& b) { return a.time < b.time; };
-        std::stable_sort(cs.camera.begin(), cs.camera.end(), byTime);
-        for (CutsceneAnimTrack& t : cs.animTracks) {
-            std::stable_sort(t.keys.begin(), t.keys.end(), byTime);
-            std::stable_sort(t.clips.begin(), t.clips.end(), byTime);
-        }
-        std::stable_sort(cs.dialogue.begin(), cs.dialogue.end(), byTime);
-        std::stable_sort(cs.shakes.begin(), cs.shakes.end(), byTime);
-        std::stable_sort(cs.subtitles.begin(), cs.subtitles.end(), byTime);
-        if (assets::SaveCutscene(editedCutscenePath_, cs)) {
-            editedCutsceneDirty_ = false;
-            assetsDirty_ = true;
-        }
+        if (SaveCutsceneAsset())
+            SetSaveStatus("Saved cutscene '" + editedCutscenePath_.filename().string() + "'.",
+                          false);
+        else
+            SetSaveStatus("CUTSCENE SAVE FAILED - '" +
+                              editedCutscenePath_.filename().string() + "' was NOT written.",
+                          true);
     }
     ImGui::SameLine();
     ImGui::TextDisabled("%s", editedCutscenePath_.filename().string().c_str());
@@ -9951,6 +12396,7 @@ void Editor::DrawMusicEditor(Engine& engine) {
     if (!panelOpen_[Panel_Music]) return;
     AudioSystem& audio = engine.GetAudio();
     ImGui::Begin("Music", &panelOpen_[Panel_Music]);
+    ClaimSave(editor::SaveSurface::Music);
     if (!Project::HasActive()) {
         ImGui::TextDisabled("No project open.");
         ImGui::End();
@@ -9995,15 +12441,15 @@ void Editor::DrawMusicEditor(Engine& engine) {
     editStr("Asset (.hbmusic)", musicEditPath_);
     ImGui::SameLine();
     if (ImGui::Button("Save")) {
-        if (musicEditPath_.empty()) musicEditPath_ = "Music/score.hbmusic";
-        std::error_code ec;
-        std::filesystem::create_directories((assets / musicEditPath_).parent_path(), ec);
-        if (assets::SaveMusicGraph(assets / musicEditPath_, musicEdit_)) {
-            settings.musicGraph = musicEditPath_;
-            settings.musicStartState = musicEdit_.initialState;
-            Project::Active().Save();
-            buildResult_ = "Saved music graph '" + musicEditPath_ + "'.";
-        }
+        if (musicEditPath_.empty())
+            SetSaveStatus("Music: type an asset path (e.g. Music/score.hbmusic) above "
+                          "before saving. Nothing was written.",
+                          true);
+        else if (SaveMusicAsset())
+            SetSaveStatus("Saved music graph '" + musicEditPath_ + "'.", false);
+        else
+            SetSaveStatus("MUSIC SAVE FAILED - '" + musicEditPath_ + "' was NOT written.",
+                          true);
     }
     ImGui::SliderFloat("Default fade (s)", &musicEdit_.defaultFade, 0.0f, 10.0f, "%.1f");
 
@@ -10524,6 +12970,7 @@ std::filesystem::path Editor::MaterialFromTexture(const std::filesystem::path& t
     }
 
     if (!assets::SaveMaterial(matPath, mat)) return {};
+    StampNewAsset(matPath); // its pack slot, for life
     assetsDirty_ = true; // show the new .hbmat in the browser
     HBE_INFO("Editor: auto-created material '{}' from texture.", matPath.string());
     return matPath;
@@ -10919,8 +13366,15 @@ void Editor::DrawObjectives(Engine& engine) {
 
 // --- Character Editor: author a .hbchar (slots / variants / loadouts) + weld ----
 void Editor::DrawCharacterEditor(Engine& engine) {
+    // The panel authors a `.hbchar` ASSET (slots / variants / loadouts) and never
+    // touches the live scene, so it needs nothing from the engine - but it keeps
+    // the uniform Draw*(Engine&) signature the panel dispatcher calls through.
+    (void)engine;
     if (!panelOpen_[Panel_CharacterEditor]) return;
-    if (!ImGui::Begin("Character Editor", &panelOpen_[Panel_CharacterEditor])) {
+    const bool charVisible =
+        ImGui::Begin("Character Editor", &panelOpen_[Panel_CharacterEditor]);
+    ClaimSave(editor::SaveSurface::Character); // above the return - see DrawUIEditor
+    if (!charVisible) {
         ImGui::End();
         return;
     }
@@ -10971,8 +13425,11 @@ void Editor::DrawCharacterEditor(Engine& engine) {
     if (ImGui::InputText("Path (rel Assets/)", relBuf, sizeof(relBuf))) charEditRel_ = relBuf;
     ImGui::SameLine();
     if (ImGui::Button("Save") && !charEditRel_.empty()) {
-        if (assets::SaveCharacter(assets / charEditRel_, charEdit_))
-            hbe::character::ClearCache(); // re-weld next instantiate
+        if (SaveCharacterAsset())
+            SetSaveStatus("Saved character '" + charEditRel_ + "'.", false);
+        else
+            SetSaveStatus("CHARACTER SAVE FAILED - '" + charEditRel_ + "' was NOT written.",
+                          true);
     }
     ImGui::Separator();
 
@@ -11106,6 +13563,684 @@ void Editor::DrawCharacterEditor(Engine& engine) {
         if (charBuildStats_.nonManifoldEdges > 0)
             ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "%u non-manifold edge(s) (check the mesh).",
                                charBuildStats_.nonManifoldEdges);
+    }
+    ImGui::End();
+}
+
+// --- Streaming tags (Window > Tags) -------------------------------------------
+// The project's tag list is the streaming CONFIG; the Inspector's Tag combo is
+// the per-object assignment. Both edit the same authoritative list
+// (ProjectSettings::tags), and both re-seed the process-wide table afterwards
+// because a TagId is an INDEX into that list.
+//
+// NOTHING HERE STREAMS. P4 is authoring only: a tag is data on an entity and a
+// row in the `.hbproj`. The radii below are read by nothing yet.
+
+TagId Editor::CreateProjectTag(const std::string& name) {
+    if (name.empty() || !Project::HasActive()) return kTagUntagged;
+    std::vector<TagDef>& defs = Project::Active().Settings().tags;
+    // Intern FIRST so an already-interned name (one auto-interned from a scene
+    // file, listed in the panel as "not in this project") keeps the id every live
+    // entity is already holding. Reconcile then makes the authored list agree with
+    // the table - index == id - without re-seeding, so no id moves.
+    const TagId id = tags::Intern(name);
+    tags::ReconcileWithTable(defs);
+    // The tag list is PROJECT data. Undo/redo snapshots the scene, not the
+    // `.hbproj`, so an unsaved new tag would survive on the entities and vanish
+    // from the project on the next open - saving now is what keeps the two in
+    // step. (Deleting a tag, which mutates live entities, is Tags-panel only.)
+    Project::Active().Save();
+    return id;
+}
+
+void Editor::DrawTagsPanel(Engine& engine) {
+    if (!panelOpen_[Panel_Tags]) return;
+    if (!ImGui::Begin("Tags", &panelOpen_[Panel_Tags])) {
+        ImGui::End();
+        return;
+    }
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("No project open.");
+        ImGui::End();
+        return;
+    }
+    Scene& scene = engine.GetScene();
+    auto& reg = scene.Registry();
+    std::vector<TagDef>& defs = Project::Active().Settings().tags;
+    if (defs.empty()) { // a hand-cleared list: Normalize always restores index 0
+        tags::Normalize(defs);
+        tags::SeedFromProject(defs);
+    }
+
+    ImGui::TextDisabled("A tag is a STREAMING GROUP. Radii and priority are per");
+    ImGui::TextDisabled("tag; assignment is per object (Inspector > Tag).");
+    ImGui::Separator();
+
+    // --- Last shard bake ------------------------------------------------------
+    // Sharding is invisible to authoring by design, so this is the ONE place the
+    // author can see what their tags actually became. Scattering is the failure
+    // mode: a semantic tag ("Props") spread over the level bakes to one
+    // level-sized shard and silently behaves as always-loaded.
+    if (!shardStats_.empty() || !shardDiagnostics_.empty()) {
+        if (ImGui::CollapsingHeader("Last shard bake (on save)",
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            if (ImGui::BeginTable("shardstats", 5,
+                                  ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Tag");
+                ImGui::TableSetupColumn("Shards");
+                ImGui::TableSetupColumn("Objects");
+                ImGui::TableSetupColumn("Largest");
+                ImGui::TableSetupColumn("Coherence");
+                ImGui::TableHeadersRow();
+                for (const tagshard::TagStat& s : shardStats_) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(s.tag.c_str());
+                    ImGui::TableNextColumn();
+                    if (s.alwaysLoaded) ImGui::TextDisabled("always");
+                    else ImGui::Text("%u", s.shards);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", s.members);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.0f m", s.largestDiagonal);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f", s.coherence);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::TextDisabled("(?) what these numbers mean");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Largest = the biggest shard's diagonal. When one shard "
+                                  "spans several load radii the tag is effectively always "
+                                  "loaded.\nCoherence = shard volume / tag volume; 1.00 means "
+                                  "one solid blob and nothing was gained by sharding.");
+            for (const std::string& line : shardDiagnostics_) {
+                const bool err = line.rfind("ERROR", 0) == 0;
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                                      err ? ImVec4(1.0f, 0.45f, 0.4f, 1.0f)
+                                          : ImVec4(1.0f, 0.82f, 0.35f, 1.0f));
+                ImGui::TextWrapped("%s", line.c_str());
+                ImGui::PopStyleColor();
+            }
+        }
+        ImGui::Separator();
+    }
+
+    // --- Streaming simulation + shard visualisation --------------------------
+    // Sharding is invisible to authoring by design, which is fine right up until the
+    // author asks "will this actually stream?". This is where they find out: the real
+    // baked boxes, the real radii, and the real stream::Evaluate deciding residency for a
+    // focus they can move.
+    if (ImGui::CollapsingHeader("Shard visualisation & streaming simulation",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        // Seed the preview the first time this section is drawn with nothing baked yet.
+        // Opening the panel and being told "no shards" when the scene is full of tagged
+        // objects is a worse first experience than one bake, and the bake is O(entities)
+        // so a ONE-SHOT is the right shape - never per frame.
+        if (!shardPreviewSeeded_) {
+            shardPreviewSeeded_ = true;
+            if (shardDescs_.empty()) RebakeShardPreview(scene);
+        }
+        if (ImGui::Checkbox("Show shards in the viewport", &streamSimEnabled_))
+            UpdateStreamSim();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Re-bake now")) RebakeShardPreview(scene);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Runs the same save-time bake WITHOUT saving, so the boxes\n"
+                              "match what a save would write after you have moved things.");
+        if (shardDescs_.empty()) {
+            ImGui::TextDisabled("No baked shards yet. Save the scene (or Re-bake now) after");
+            ImGui::TextDisabled("tagging some objects.");
+        } else {
+            ImGui::Checkbox("Boxes", &streamSimDrawBoxes_);
+            ImGui::SameLine();
+            ImGui::Checkbox("Radii", &streamSimDrawRadii_);
+            if (ImGui::DragFloat3("Focus", glm::value_ptr(streamSimFocus_), 0.5f))
+                UpdateStreamSim();
+            if (ImGui::SmallButton("Focus = camera")) {
+                streamSimFocus_ = engine.GetRenderer().GetCamera().Position();
+                UpdateStreamSim();
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Focus = selection") && reg.valid(selected_)) {
+                streamSimFocus_ = glm::vec3(scene.WorldMatrix(selected_)[3]);
+                UpdateStreamSim();
+            }
+            u32 residentN = 0;
+            for (const u8 r : streamSimResident_) residentN += r ? 1u : 0u;
+            ImGui::Text("Would be resident here: %u of %u shard(s)", residentN,
+                        static_cast<u32>(shardDescs_.size()));
+            // THE HONEST CAVEAT, in the UI and not only in a comment. The editor does not
+            // spawn or despawn: a streamer here would have to BindWorld, which destroys
+            // the scene being edited.
+            ImGui::TextDisabled("(?) this simulates the DECISION, not the spawn");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("The editor runs the real distance/hysteresis policy\n"
+                                  "against the real baked boxes, but never spawns or\n"
+                                  "despawns - that would mean destroying the scene you are\n"
+                                  "editing. Spawn/despawn is exercised by the runtime and\n"
+                                  "by --tagstreamtest.");
+            if (ImGui::BeginTable("shardsim", 5,
+                                  ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp |
+                                      ImGuiTableFlags_ScrollY,
+                                  ImVec2(0.0f, 160.0f))) {
+                ImGui::TableSetupColumn("Shard");
+                ImGui::TableSetupColumn("Obj");
+                ImGui::TableSetupColumn("Dist");
+                ImGui::TableSetupColumn("Load/Unload");
+                ImGui::TableSetupColumn("State");
+                ImGui::TableHeadersRow();
+                for (usize i = 0; i < shardDescs_.size(); ++i) {
+                    const scene::ShardDesc& d = shardDescs_[i];
+                    const bool res = i < streamSimResident_.size() && streamSimResident_[i] != 0;
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%s#%u", d.tag.c_str(), d.index);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", d.count);
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.0f m", i < streamSimDist_.size() ? streamSimDist_[i] : 0.0f);
+                    ImGui::TableNextColumn();
+                    if (i < streamSimShards_.size())
+                        ImGui::Text("%.0f / %.0f", streamSimShards_[i].loadRadius,
+                                    streamSimShards_[i].unloadRadius);
+                    ImGui::TableNextColumn();
+                    if (i < streamSimShards_.size() && streamSimShards_[i].pinned)
+                        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "always");
+                    else if (res)
+                        ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.5f, 1.0f), "resident");
+                    else
+                        ImGui::TextDisabled("streamed out");
+                }
+                ImGui::EndTable();
+            }
+        }
+        ImGui::Separator();
+    }
+
+    // Live usage, so the scattered-tag failure mode is visible while authoring:
+    // a tag spread over the whole map cannot be a streaming unit until the
+    // sharder splits it. One sweep per draw - editor-only, never per frame in a
+    // game build.
+    std::vector<u32> used(defs.size(), 0u);
+    u32 unknownTagged = 0;
+    for (const entt::entity e : reg.view<const Tag>()) {
+        if (!reg.valid(e)) continue;
+        const TagId id = reg.get<const Tag>(e).id;
+        if (static_cast<usize>(id) < used.size()) ++used[id];
+        else ++unknownTagged; // interned from a scene, not listed in the project
+    }
+
+    int removeAt = -1; // deferred: RemoveTag mutates `defs` mid-iteration
+    for (usize i = 0; i < defs.size(); ++i) {
+        TagDef& d = defs[i];
+        const bool untagged = (i == 0);
+        ImGui::PushID(static_cast<int>(i));
+        const bool open = ImGui::TreeNodeEx(
+            "##row", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_SpanAvailWidth,
+            "%s  (id %d, %u object%s)", d.name.c_str(), static_cast<int>(i), used[i],
+            used[i] == 1 ? "" : "s");
+        if (open) {
+            if (untagged) {
+                ImGui::TextDisabled("Always resident, never streamed, undeletable.");
+                ImGui::TextDisabled("This is what an object with no tag means.");
+            } else {
+                ImGui::DragFloat("Load Radius", &d.loadRadius, 1.0f, 0.0f, 100000.0f, "%.1f m");
+                if (ImGui::IsItemDeactivatedAfterEdit()) tags::Normalize(defs);
+                ImGui::DragFloat("Unload Radius", &d.unloadRadius, 1.0f, 0.0f, 100000.0f,
+                                 "%.1f m");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Must exceed the load radius, and is CORRECTED to\n"
+                                      "load * 1.25 + 1 if it does not. A degenerate band\n"
+                                      "means the player on the boundary spawns and\n"
+                                      "despawns this group every single frame.");
+                if (ImGui::IsItemDeactivatedAfterEdit()) tags::Normalize(defs);
+                ImGui::DragInt("Priority", &d.priority, 0.1f, -100, 100);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Higher = spawned first when the frame budget throttles.");
+                ImGui::Checkbox("Always Loaded", &d.alwaysLoaded);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Spawns with the level and never despawns\n"
+                                      "(the radii above are then ignored).");
+                ImGui::Checkbox("Auto Shard", &d.autoShard);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("OFF (default): the whole tag is ONE streaming unit.\n"
+                                      "Everything wearing it shares one combined bounding\n"
+                                      "box and spawns/despawns together, however far apart\n"
+                                      "the objects are. Nothing is decided per object.\n\n"
+                                      "ON: split the tag into spatially-coherent shards at\n"
+                                      "save, each streamed on its own. Turn this on only\n"
+                                      "once a tag is so spread out that its combined box\n"
+                                      "stops being meaningful - at that point the box covers\n"
+                                      "everywhere, so the tag would just stay resident.\n"
+                                      "The bake warns when that happens.");
+                // Shard Cell only means anything when the tag is actually being split.
+                ImGui::BeginDisabled(!d.autoShard);
+                ImGui::DragFloat("Shard Cell", &d.shardCell, 1.0f, 0.0f, 100000.0f,
+                                 "%.1f m (0 = auto)");
+                ImGui::EndDisabled();
+                if (!d.autoShard && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Only used when Auto Shard is on.");
+                if (ImGui::SmallButton("Select Objects")) {
+                    // Selecting the first member is enough to jump to the group;
+                    // multi-select is not a thing the inspector supports.
+                    for (const entt::entity e : reg.view<const Tag>())
+                        if (reg.valid(e) && reg.get<const Tag>(e).id == static_cast<TagId>(i)) {
+                            selected_ = e;
+                            break;
+                        }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Delete")) removeAt = static_cast<int>(i);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Removes the tag and UNTAGS its objects.\n"
+                                      "Objects on later tags are remapped, not repointed.");
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+
+    if (removeAt > 0) {
+        PushUndo(scene); // the remap mutates live entities
+        tags::RemoveTag(reg, defs, static_cast<usize>(removeAt));
+        Project::Active().Save();
+    }
+
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(200.0f);
+    const bool entered = ImGui::InputText("##newtag", tagNewName_, sizeof(tagNewName_),
+                                          ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    const bool named = tagNewName_[0] != '\0';
+    if (!named) ImGui::BeginDisabled();
+    if (ImGui::Button("Add Tag") || (entered && named)) {
+        CreateProjectTag(tagNewName_);
+        tagNewName_[0] = '\0';
+    }
+    if (!named) ImGui::EndDisabled();
+
+    if (unknownTagged > 0) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.96f, 0.74f, 0.35f, 1.0f),
+                           "%u object(s) reference a tag this project does not list.",
+                           unknownTagged);
+        ImGui::TextDisabled("They were interned from a scene file and kept (folding them");
+        ImGui::TextDisabled("into Untagged would move content into the resident set");
+        ImGui::TextDisabled("silently). Add the tag below to give it streaming config:");
+        const std::vector<std::string>& all = tags::All();
+        for (usize i = defs.size(); i < all.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            ImGui::BulletText("%s", all[i].c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Add to project")) CreateProjectTag(all[i]);
+            ImGui::PopID();
+        }
+    }
+
+    if (ImGui::Button("Save Project")) Project::Active().Save();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Add/Delete already save.)");
+    ImGui::End();
+}
+
+// --- UI Document (.hbui) ------------------------------------------------------
+// Open / New / Save / Save As / Close, several at once, plus the ACTIVE EDIT
+// TARGET that gates every UI-authoring entry point in the editor.
+//
+// Documents open into the LIVE scene, so the viewport, the gizmo, the inspector,
+// the UI edit overlay and the hierarchy all work on them unchanged - the only
+// difference is that their entities carry UIDocMember and are therefore invisible
+// to every scene/prefab/save write and spared by every Replace sweep.
+
+void Editor::MarkDocumentDirty(Engine& engine, entt::entity e) {
+    const auto& reg = engine.GetScene().Registry();
+    if (!reg.valid(e)) return;
+    const UIDocMember* m = reg.try_get<UIDocMember>(e);
+    if (!m || m->doc == 0) return;
+    if (ui::DocumentInstance* inst = engine.Documents().Get(m->doc)) inst->dirty = true;
+}
+
+bool Editor::SaveUIDocument(Engine& engine, ui::DocHandle doc,
+                            const std::filesystem::path& as) {
+    ui::DocumentInstance* inst = engine.Documents().Get(doc);
+    if (!inst) return false;
+    const std::filesystem::path target = as.empty() ? inst->path : as;
+    if (target.empty()) {
+        uiDocError_ = "This document has never been saved - use Save As.";
+        return false;
+    }
+    // PLAY MODE, at the write itself. ui::UpdateInteraction writes value / toggled /
+    // selected / scrollPos onto the live components while playing, and all four are
+    // AUTHORED, serialized initial state - so one test click on a toggle becomes the
+    // shipped default, silently, with `inst->dirty` cleared so no `*` is left to warn
+    // anyone. The Ctrl+S dispatcher refuses this and SaveAll skips documents while
+    // playing, but this function has FOUR other call sites (the panel's Save and Save
+    // As buttons, the Save-As modal, the UI Editor's "Save and close" prompt) and
+    // every one of them is clickable mid-playtest. Same backstop, same reasoning as
+    // SaveSceneToDisk's.
+    if (playMode_) {
+        uiDocError_ = "PLAYING - UI document saves are disabled: Play writes widget "
+                      "state (value / toggled / selected / scroll) onto the same "
+                      "components that are serialized as the authored defaults. Press "
+                      "Stop (Esc), then save. '" +
+                      target.filename().string() + "' was NOT written.";
+        panelOpen_[Panel_UIDocument] = true;
+        HBE_ERROR("UI document save refused: Play mode ('{}' was NOT written).",
+                  target.string());
+        return false;
+    }
+    // Document-side half of the separation guarantee: refuse world content rather
+    // than let CaptureDocument's whitelist drop it silently.
+    if (std::string why; !AuditDocumentForWorldContent(engine.GetScene(), doc, why)) {
+        uiDocError_ = why;
+        panelOpen_[Panel_UIDocument] = true;
+        HBE_ERROR("UI document save refused: a document entity carries world content.");
+        return false;
+    }
+    // LEAVE THE INTERACT PREVIEW BEFORE CAPTURING. ui::UpdateInteraction writes
+    // value / toggled / selected / scrollPos on the live components, and those four
+    // are AUTHORED, SERIALIZED initial state - so a save taken while the preview was
+    // on wrote whatever the author had just test-clicked as the shipped default,
+    // silently and with no `*` left to warn them. EnterPlayMode was hardened for
+    // exactly this; the save path was not. Re-armed afterwards so Interact keeps
+    // working (this is the same snapshot-restore-resnapshot shape the panel's own
+    // delete path uses).
+    const bool wasInteract = uiEdInteract_;
+    if (wasInteract) UIEditorEndInteract(engine);
+    ui::DocData captured;
+    ui::CaptureDocument(engine.GetScene(), doc, inst->header, captured, &inst->entities);
+    if (wasInteract) UIEditorBeginInteract(engine);
+    // AN EMPTY CAPTURE OVER A NON-EMPTY FILE IS A BUG, NOT AN EDIT. The only way to
+    // legitimately reach zero entities is a brand-new document (never saved, or
+    // saved empty). Something that destroyed the document's entities behind the
+    // DocumentSet's back - the `Registry().clear()` that Scene > New used to do -
+    // would otherwise write a 0-entity `.hbui` over the whole shipped menu, and the
+    // log line would read like a successful save.
+    if (captured.entities.empty()) {
+        std::error_code ec;
+        ui::DocData onDisk;
+        if (std::filesystem::exists(target, ec) && ui::LoadDocument(target, onDisk) &&
+            !onDisk.entities.empty()) {
+            uiDocError_ =
+                "Refused to save an EMPTY document over '" + target.filename().string() +
+                "', which has " + std::to_string(onDisk.entities.size()) +
+                " entities on disk.\n\nThis document has no live entities - something "
+                "destroyed them outside the UI Document panel. Close it (the file is "
+                "untouched) and re-open it.";
+            panelOpen_[Panel_UIDocument] = true;
+            HBE_ERROR("UI document save refused: 0 live entities would overwrite '{}' "
+                      "({} entities on disk).",
+                      target.string(), onDisk.entities.size());
+            return false;
+        }
+    }
+    if (!ui::SaveDocument(captured, target)) {
+        uiDocError_ = "Failed to write '" + target.string() + "'.";
+        return false;
+    }
+    StampNewAsset(target); // a first save mints the document's pack slot
+    inst->path = target;
+    inst->rel = Project::HasActive() ? Project::Active().RelativeAssetPath(target)
+                                     : target.string();
+    inst->dirty = false;
+    scenesScanned_ = false; // the .hbui list (and the pickers) need a refresh
+    assetsScanned_ = false;
+    HBE_INFO("UI document saved: {} ({} entities).", target.string(),
+             captured.entities.size());
+    return true;
+}
+
+void Editor::DrawUIDocumentPanel(Engine& engine) {
+    if (!panelOpen_[Panel_UIDocument]) return;
+    const bool uiDocVisible = ImGui::Begin("UI Document", &panelOpen_[Panel_UIDocument]);
+    // Same handle space as the UI Editor: Ctrl+S here saves the ACTIVE document.
+    // Above the `Begin() == false` return - see the note in DrawUIEditor.
+    ClaimSave(editor::SaveSurface::UIDocument);
+    if (!uiDocVisible) {
+        ImGui::End();
+        return;
+    }
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("No project open.");
+        ImGui::End();
+        return;
+    }
+    if (!scenesScanned_) RefreshScenes();
+    Scene& scene = engine.GetScene();
+    ui::DocumentSet& docs = engine.Documents();
+    Project& project = Project::Active();
+
+    ImGui::TextWrapped(
+        "A .hbui is an ASSET, like a mesh. Its entities never save into a "
+        ".hbscene, a .hbprefab or a .hbsave, and a level load never destroys "
+        "them. The UI create menu and the UI Add-Component entries only work "
+        "while a document below is the ACTIVE edit target.");
+    ImGui::Separator();
+
+    // -- Open ------------------------------------------------------------------
+    if (ImGui::BeginCombo("Open", "Choose a .hbui...")) {
+        if (uiDocList_.empty()) ImGui::TextDisabled("(no .hbui under Assets/)");
+        for (const std::filesystem::path& p : uiDocList_) {
+            const std::string rel = project.RelativeAssetPath(p);
+            if (ImGui::Selectable(rel.c_str())) {
+                const ui::DocHandle h =
+                    docs.Open(scene, &engine.GetRenderer(), p, /*screenOwned*/ true);
+                if (h != 0) activeDoc_ = h;
+                else uiDocError_ = "Failed to open '" + rel + "'.";
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh")) RefreshScenes();
+    ImGui::SameLine();
+    if (ImGui::Button("New")) {
+        wantUIDocNew_ = true;
+        uiDocNameBuf_[0] = '\0';
+        ImGui::OpenPopup("New UI Document");
+    }
+
+    // -- New / Save As naming modal -------------------------------------------
+    if (wantUIDocNew_ || uiDocSaveAs_ != 0) {
+        const char* title = wantUIDocNew_ ? "New UI Document" : "Save UI Document As";
+        if (!ImGui::IsPopupOpen(title)) ImGui::OpenPopup(title);
+        if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Assets/UI/<name>.hbui");
+            ImGui::InputText("Name", uiDocNameBuf_, sizeof(uiDocNameBuf_));
+            const bool named = uiDocNameBuf_[0] != '\0';
+            if (!named) ImGui::BeginDisabled();
+            if (ImGui::Button("OK", ImVec2(120, 0))) {
+                const std::filesystem::path target =
+                    project.AssetsDir() / "UI" / (std::string(uiDocNameBuf_) + ".hbui");
+                if (wantUIDocNew_) {
+                    // A new document seeds its canvas from the project so it lays
+                    // out the same way the runtime will (the migrator does the
+                    // same thing for exactly the same reason).
+                    ui::DocData fresh;
+                    fresh.canvas = CanvasConfigFromProject();
+                    const ui::DocHandle h = docs.OpenFromData(
+                        scene, &engine.GetRenderer(), fresh, target, /*screenOwned*/ true);
+                    if (h != 0) {
+                        activeDoc_ = h;
+                        SaveUIDocument(engine, h);
+                    }
+                } else {
+                    SaveUIDocument(engine, uiDocSaveAs_, target);
+                }
+                wantUIDocNew_ = false;
+                uiDocSaveAs_ = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            if (!named) ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                wantUIDocNew_ = false;
+                uiDocSaveAs_ = 0;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::SeparatorText("Open documents");
+    if (docs.All().empty()) {
+        ImGui::TextDisabled("None open. The UI menus stay disabled until one is.");
+    }
+
+    // Deferred so the list is not mutated mid-draw.
+    ui::DocHandle wantClose = 0;
+    for (const ui::DocumentInstance& inst : docs.All()) {
+        ImGui::PushID(static_cast<int>(inst.handle));
+        const bool isActive = inst.handle == activeDoc_;
+        std::string label = inst.path.empty() ? std::string("(unsaved)")
+                                              : inst.path.stem().string();
+        if (inst.legacy) label += "  [legacy .hbscene]";
+        // Count live members so the row reflects edits, not the open-time list.
+        u32 count = 0;
+        for (const entt::entity e : scene.Registry().view<const UIDocMember>())
+            if (scene.Registry().get<const UIDocMember>(e).doc == inst.handle) ++count;
+        if (ImGui::RadioButton("##active", isActive)) activeDoc_ = inst.handle;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Make this the edit target");
+        ImGui::SameLine();
+        ImGui::Text("%s  (%u entities)", label.c_str(), count);
+        ImGui::SameLine();
+        // The ENGINE's own documents (the resident UI layer in a runtime session)
+        // are never savable/closable from here - they are not the editor's.
+        // EVERY engine-owned document, not just the menu one: with one .hbui per
+        // screen the runtime holds several, and gating on UIDocument() alone would
+        // let three of four screens be closed out from under the live flow.
+        const bool engineOwned = engine.IsEngineDocument(inst.handle);
+        if (engineOwned) ImGui::BeginDisabled();
+        if (ImGui::SmallButton("Save")) SaveUIDocument(engine, inst.handle);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Save As")) {
+            uiDocSaveAs_ = inst.handle;
+            uiDocNameBuf_[0] = '\0';
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Close")) wantClose = inst.handle;
+        if (engineOwned) ImGui::EndDisabled();
+        if (!inst.rel.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", inst.rel.c_str());
+        }
+        ImGui::PopID();
+    }
+    if (wantClose != 0) {
+        docs.Close(scene, wantClose);
+        if (activeDoc_ == wantClose) activeDoc_ = 0;
+        selected_ = entt::null; // the selection may have been inside it
+    }
+
+    // -- Canvas block ----------------------------------------------------------
+    if (ui::DocumentInstance* act = docs.Get(activeDoc_)) {
+        ImGui::SeparatorText("Canvas (this document's layout basis)");
+        int mode = static_cast<int>(act->header.canvas.mode);
+        if (ImGui::Combo("Scale Mode", &mode, "Stretch\0Match Height\0Pixel\0")) {
+            act->header.canvas.mode = static_cast<ui::ScaleMode>(glm::clamp(mode, 0, 2));
+            act->dirty = true;
+        }
+        f32 ref[2] = {act->header.canvas.refWidth, act->header.canvas.refHeight};
+        if (ImGui::InputFloat2("Reference", ref)) {
+            act->header.canvas.refWidth = glm::max(ref[0], 64.0f);
+            act->header.canvas.refHeight = glm::max(ref[1], 64.0f);
+            act->dirty = true;
+        }
+        // THE POST BLOCK, AUTHORABLE. The document carries the look the runtime
+        // replays whenever this menu is up (Engine::ApplyMenuPost), and until now
+        // there was no way to author it: the Post Process panel edits
+        // `scene.Environment().post`, which CaptureDocument never reads, so an
+        // artist who tuned the menu look and pressed this document's Save had the
+        // tuning silently dropped - and a document made with "New" shipped engine
+        // defaults as the menu look, which is the exact failure the mandatory
+        // block exists to prevent. This is the bridge between the live
+        // environment and the document header.
+        ImGui::SeparatorText("Menu look (replayed by ApplyMenuPost)");
+        ImGui::TextDisabled("Tune it in the Post Process panel, then capture it here.");
+        const rhi::PostSettings& live = scene.Environment().post;
+        if (ImGui::Button("Capture the live look into this document")) {
+            act->header.post = live;
+            act->header.ambientIntensity = scene.Environment().ambientIntensity;
+            act->header.exposure = scene.Environment().exposure;
+            act->dirty = true;
+            HBE_INFO("UI document: captured the live post settings into '{}'.",
+                     act->rel.empty() ? std::string("(unsaved)") : act->rel);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Preview the document's look")) {
+            // Look-at, not an edit: the environment is re-stamped by the next
+            // scene load / ApplyMenuPost regardless.
+            scene.Environment().post = act->header.post;
+        }
+        ImGui::TextDisabled("Stored: bloom %s, fog %s, autoExposure %s, painterly %s",
+                            act->header.post.bloomEnabled ? "on" : "off",
+                            act->header.post.fogEnabled ? "on" : "off",
+                            act->header.post.autoExposureEnabled ? "on" : "off",
+                            act->header.post.painterlyEnabled ? "on" : "off");
+        ImGui::TextDisabled("Live:    bloom %s, fog %s, autoExposure %s, painterly %s",
+                            live.bloomEnabled ? "on" : "off", live.fogEnabled ? "on" : "off",
+                            live.autoExposureEnabled ? "on" : "off",
+                            live.painterlyEnabled ? "on" : "off");
+        ImGui::TextDisabled("ambientIntensity/exposure ride along in the file, but\n"
+                            "only `post` is replayed - see UIDocument.h decision 1.");
+    }
+
+    // -- Project slots ---------------------------------------------------------
+    ImGui::SeparatorText("Project slots");
+    {
+        const std::vector<std::string>& screens = project.Settings().uiDocuments;
+        if (screens.empty()) {
+            ImGui::TextDisabled("UI Screens:    (none)");
+        } else {
+            for (usize i = 0; i < screens.size(); ++i)
+                ImGui::TextDisabled("UI Screen %d:   %s%s", static_cast<int>(i),
+                                    screens[i].c_str(),
+                                    i == 0 ? "   [menu doc - supplies `post`]" : "");
+        }
+    }
+    ImGui::TextDisabled("Boot Document: %s", project.Settings().bootDocument.empty()
+                                                 ? "(none)"
+                                                 : project.Settings().bootDocument.c_str());
+    if (ui::DocumentInstance* act = docs.Get(activeDoc_); act && !act->rel.empty()) {
+        std::vector<std::string>& screens = project.Settings().uiDocuments;
+        const bool listed =
+            std::find(screens.begin(), screens.end(), act->rel) != screens.end();
+        // ADD, not replace: the screens are a list now, and the common action
+        // after authoring Settings.hbui is "this is another screen", not "throw
+        // the other three away".
+        if (listed) ImGui::BeginDisabled();
+        if (ImGui::Button("Add as UI Screen")) {
+            screens.push_back(act->rel);
+            project.Settings().uiDocument = screens.front();
+            project.Save();
+        }
+        if (listed) ImGui::EndDisabled();
+        if (listed && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Already a UI screen of this project.");
+        ImGui::SameLine();
+        if (ImGui::Button("Use as MENU Document")) {
+            // Menu document == entry 0: its `post` is the menu look.
+            screens.erase(std::remove(screens.begin(), screens.end(), act->rel),
+                          screens.end());
+            screens.insert(screens.begin(), act->rel);
+            project.Settings().uiDocument = screens.front();
+            project.Save();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Use as Boot Document")) {
+            project.Settings().bootDocument = act->rel;
+            project.Save();
+        }
+    }
+
+    if (!uiDocError_.empty()) {
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.40f, 1.0f));
+        ImGui::TextWrapped("%s", uiDocError_.c_str());
+        ImGui::PopStyleColor();
+        if (ImGui::Button("Dismiss")) uiDocError_.clear();
     }
     ImGui::End();
 }
@@ -11312,6 +14447,11 @@ void Editor::DrawAssetViewer(Engine& engine) {
     Renderer& renderer = engine.GetRenderer();
     Scene& scene = engine.GetScene();
     ImGui::Begin("Asset Viewer", &panelOpen_[Panel_AssetViewer]);
+    // One claim for the whole panel; AssetViewerSurface() resolves WHICH of the three
+    // inline sub-editors (material / audio event / mesh slots) is live at dispatch
+    // time. A texture or a read-only preview resolves to "nothing open to save" -
+    // never to the scene.
+    ClaimSave(editor::SaveSurface::AssetViewer);
 
     std::error_code ec;
     if (!Project::HasActive() || viewedAsset_.empty() ||
@@ -11403,6 +14543,11 @@ void Editor::DrawAssetViewer(Engine& engine) {
             }
         } else if (isMat) {
             viewedTypeName_ = "Material";
+            // CLEARED FIRST, like the audio-event branch below. Without this a
+            // material whose file fails to parse inherits the PREVIOUS material's
+            // working copy and its `valid` flag - so the editor shows material A
+            // while pointed at file B, and a save (button or Ctrl+S) writes A over B.
+            editedMatValid_ = false;
             if (const auto mat = assets::LoadMaterial(viewedAsset_)) {
                 editedMat_ = *mat;
                 editedMatValid_ = true;
@@ -11571,19 +14716,13 @@ void Editor::DrawAssetViewer(Engine& engine) {
 
         ImGui::Separator();
         if (ImGui::Button(editedMatDirty_ ? "Save*" : "Save")) {
-            if (assets::SaveMaterial(viewedAsset_, editedMat_)) {
-                editedMatDirty_ = false;
-                // Refresh every entity wearing this material.
-                const std::string rel = Project::Active().RelativeAssetPath(viewedAsset_);
-                auto& reg = scene.Registry();
-                for (const entt::entity e : reg.view<MaterialRef, MeshInstance>()) {
-                    if (reg.get<MaterialRef>(e).asset == rel) {
-                        assets::ApplyMaterial(renderer, Project::Active().AssetsDir(),
-                                              editedMat_, reg.get<MeshInstance>(e),
-                                              textureCache_);
-                    }
-                }
-            }
+            if (SaveViewedMaterial(engine))
+                SetSaveStatus("Saved material '" + viewedAsset_.filename().string() + "'.",
+                              false);
+            else
+                SetSaveStatus("MATERIAL SAVE FAILED - '" + viewedAsset_.filename().string() +
+                                  "' was NOT written.",
+                              true);
         }
         ImGui::SameLine();
         const bool hasMeshSel = selected_ != entt::null && scene.Registry().valid(selected_) &&
@@ -11690,9 +14829,13 @@ void Editor::DrawAssetViewer(Engine& engine) {
         }
         ImGui::SameLine();
         if (ImGui::Button(editedEventDirty_ ? "Save*" : "Save")) {
-            if (assets::SaveAudioEvent(viewedAsset_, editedEvent_)) {
-                editedEventDirty_ = false;
-            }
+            if (SaveViewedAudioEvent())
+                SetSaveStatus("Saved audio event '" + viewedAsset_.filename().string() + "'.",
+                              false);
+            else
+                SetSaveStatus("AUDIO EVENT SAVE FAILED - '" +
+                                  viewedAsset_.filename().string() + "' was NOT written.",
+                              true);
         }
         if (editedEventDirty_) {
             ImGui::SameLine();
@@ -11893,11 +15036,14 @@ void Editor::DrawAssetViewer(Engine& engine) {
 
             ImGui::Separator();
             if (ImGui::Button(previewMeshDirty_ ? "Save Mesh*" : "Save Mesh")) {
-                if (uaf::WriteMesh(viewedAsset_, previewModel_)) {
-                    previewMeshDirty_ = false;
-                    // Resident copies of this mesh may now be stale.
-                    scene::ClearInstantiateCaches();
-                }
+                if (SaveViewedMesh())
+                    SetSaveStatus("Saved mesh material slots into '" +
+                                      viewedAsset_.filename().string() + "'.",
+                                  false);
+                else
+                    SetSaveStatus("MESH SAVE FAILED - '" + viewedAsset_.filename().string() +
+                                      "' was NOT written.",
+                                  true);
             }
             ImGui::SameLine();
             if (ImGui::Button("Spawn in scene")) {
@@ -11968,6 +15114,7 @@ void Editor::DrawAssetViewer(Engine& engine) {
 
 void Editor::RefreshScenes() {
     sceneList_.clear();
+    uiDocList_.clear();
     scenesScanned_ = true;
     if (!Project::HasActive()) return;
     const std::filesystem::path root = Project::Active().AssetsDir();
@@ -11975,11 +15122,12 @@ void Editor::RefreshScenes() {
     for (auto it = std::filesystem::recursive_directory_iterator(root, ec);
          it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) break;
-        if (it->is_regular_file() && it->path().extension() == ".hbscene") {
-            sceneList_.push_back(it->path());
-        }
+        if (!it->is_regular_file()) continue;
+        if (it->path().extension() == ".hbscene") sceneList_.push_back(it->path());
+        else if (it->path().extension() == ".hbui") uiDocList_.push_back(it->path());
     }
     std::sort(sceneList_.begin(), sceneList_.end());
+    std::sort(uiDocList_.begin(), uiDocList_.end());
 }
 
 void Editor::DrawSceneManager(Engine& engine) {
@@ -11997,27 +15145,22 @@ void Editor::DrawSceneManager(Engine& engine) {
     // Toolbar.
     if (ImGui::Button("New Scene")) {
         PushUndo(scene);
-        scene.Registry().clear();
+        ClearWorldSparingDocuments(scene);
+        AdoptWorld(scene); // the editor made this world; Save As may write it
         selected_ = entt::null;
         currentScenePath_.clear();
-        levelOpen_ = false;
-        currentLevel_ = {};
         wantSaveSceneAs_ = true; // name it right away
     }
     ImGui::SameLine();
-    if (ImGui::Button("Save")) SaveCurrent(scene);
+    if (ImGui::Button("Save")) SaveSceneWithStatus(scene); // reports refusals
     ImGui::SameLine();
     if (ImGui::Button("Save As...")) wantSaveSceneAs_ = true;
     ImGui::SameLine();
     if (ImGui::Button("Refresh")) RefreshScenes();
 
-    if (levelOpen_) {
-        ImGui::Text("Level: %s  [static / dynamic / ui]", currentLevel_.Name().c_str());
-    } else {
-        ImGui::Text("Current: %s", currentScenePath_.empty()
-                                       ? "(unsaved scene)"
-                                       : currentScenePath_.stem().string().c_str());
-    }
+    ImGui::Text("Current: %s", currentScenePath_.empty()
+                                   ? "(unsaved scene)"
+                                   : currentScenePath_.stem().string().c_str());
     ImGui::Separator();
 
     if (sceneList_.empty()) {
@@ -12026,71 +15169,9 @@ void Editor::DrawSceneManager(Engine& engine) {
 
     const std::string startupRel = project.Settings().startupScene;
     std::filesystem::path deferredLoad;
-    scene::LevelPaths deferredLevel;
-    bool wantOpenLevel = false;
-    bool deferredAdditive = false;
-
-    // Legacy levels (a .static/.dynamic pair with no merged <base>.hbscene yet) show
-    // in the SAME list as scenes. Opening one MERGES it into a single scene - save it
-    // once and it becomes a normal <base>.hbscene (the two layer files stay as
-    // backups; the build re-derives them). No separate "Levels" section any more.
-    {
-        std::vector<std::filesystem::path> bases;
-        for (const std::filesystem::path& p : sceneList_) {
-            if (!scene::IsLevelMember(p)) continue;
-            std::filesystem::path base = scene::ResolveLevel(p).base;
-            std::filesystem::path merged = base;
-            merged += ".hbscene";
-            std::error_code ec;
-            if (std::filesystem::exists(merged, ec)) continue; // already merged -> a scene
-            if (std::find(bases.begin(), bases.end(), base) == bases.end())
-                bases.push_back(base);
-        }
-        for (usize i = 0; i < bases.size(); ++i) {
-            scene::LevelPaths lp;
-            lp.base = bases[i];
-            const std::string rel = project.RelativeAssetPath(lp.Member(SceneKind::Static));
-            const bool isStartup = !startupRel.empty() && rel == startupRel;
-            ImGui::PushID(static_cast<int>(i) + 20000);
-            if (ImGui::SmallButton(isStartup ? "[default]" : "   set   ")) {
-                project.Settings().startupScene = rel; // runtime loads it as a level
-                project.Save();
-            }
-            ImGui::SameLine();
-            char row[512];
-            std::snprintf(row, sizeof(row), "%s  (level)##lvl", lp.Name().c_str());
-            if (ImGui::Selectable(row, false, ImGuiSelectableFlags_AllowDoubleClick) &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                deferredLevel = lp; // open MERGED (non-additive)
-                deferredAdditive = false;
-                wantOpenLevel = true;
-            }
-            if (ImGui::IsItemHovered()) {
-                ImGui::SetTooltip("Double-click: open as ONE scene (merges the two layer\n"
-                                  "files). Save it once to finish; it then lists as a scene.");
-            }
-            if (ImGui::BeginPopupContextItem("##lvlctx")) {
-                if (ImGui::MenuItem("Open (merge to one scene)")) {
-                    deferredLevel = lp;
-                    deferredAdditive = false;
-                    wantOpenLevel = true;
-                }
-                if (ImGui::MenuItem("Delete")) {
-                    for (const SceneKind k : {SceneKind::Static, SceneKind::Dynamic}) {
-                        std::error_code ec;
-                        std::filesystem::remove(lp.Member(k), ec);
-                    }
-                    scenesScanned_ = false;
-                }
-                ImGui::EndPopup();
-            }
-            ImGui::PopID();
-        }
-    }
 
     for (usize i = 0; i < sceneList_.size(); ++i) {
         const std::filesystem::path& path = sceneList_[i];
-        if (scene::IsLevelMember(path)) continue; // legacy layer file (backup) - hidden
         const std::string rel = project.RelativeAssetPath(path);
         const bool isStartup = !startupRel.empty() && rel == startupRel;
         const bool isCurrent = path == currentScenePath_;
@@ -12159,11 +15240,7 @@ void Editor::DrawSceneManager(Engine& engine) {
 
     // Deferred so the list isn't mutated mid-iteration by a load that
     // triggers RefreshAssets/RefreshScenes.
-    if (wantOpenLevel) OpenLevel(engine, deferredLevel, deferredAdditive);
-    else if (!deferredLoad.empty()) LoadSceneInEditor(engine, deferredLoad);
-
-    // (Levels are no longer authored separately - every scene is one file, with
-    // per-object Static/Dynamic; the build splits the layers. No "New Level" modal.)
+    if (!deferredLoad.empty()) LoadSceneInEditor(engine, deferredLoad);
 
     // Rename popup.
     if (!renameScene_.empty() && !ImGui::IsPopupOpen("Rename Scene")) {
@@ -12184,6 +15261,7 @@ void Editor::DrawSceneManager(Engine& engine) {
                 const std::string oldRel = Project::Active().RelativeAssetPath(renameScene_);
                 std::filesystem::rename(renameScene_, to, ec);
                 if (!ec) {
+                    RekeyMovedAsset(renameScene_, to); // the id follows the file
                     if (Project::Active().Settings().startupScene == oldRel) {
                         Project::Active().Settings().startupScene =
                             Project::Active().RelativeAssetPath(to);
@@ -12212,98 +15290,103 @@ void Editor::DrawSceneManager(Engine& engine) {
 // viewport so picking has visible feedback.
 // --- Shipping ------------------------------------------------------------------
 
-std::set<std::string> Editor::CollectReferencedAssets() {
-    std::set<std::string> refs;
-    if (!Project::HasActive()) return refs;
-    namespace fs = std::filesystem;
-    const fs::path assetsDir = Project::Active().AssetsDir();
-    std::error_code ec;
-
-    const auto addTexture = [&](const std::string& rel) {
-        if (!rel.empty()) refs.insert(rel);
+// The project's NON-SCENE roots: assets owned by no scene, named only by the
+// `.hbproj`. Missing any of these is invisible until the shipped build boots
+// without a menu, without icons, or in silence.
+//
+// This function is the ONLY place that enumerates them, and it enumerates them
+// from ProjectSettings rather than from a hand-copied list, so a new settings
+// path is one line here and nothing else.
+static std::vector<std::string> ProjectRootRefs() {
+    std::vector<std::string> roots;
+    if (!Project::HasActive()) return roots;
+    const ProjectSettings& ps = Project::Active().Settings();
+    const auto add = [&roots](const std::string& s) {
+        if (!s.empty()) roots.push_back(s);
     };
-    const auto addMesh = [&](const std::string& rel) {
-        if (rel.empty() || refs.count(rel)) return;
-        refs.insert(rel);
-        // The mesh's own materials reference textures.
-        if (const auto model = uaf::ReadMesh(assetsDir / rel)) {
-            for (const MeshData& md : *model) {
-                addTexture(md.material.baseColorTex);
-                addTexture(md.material.normalTex);
-                addTexture(md.material.mrTex);
-                addTexture(md.material.aoTex);
-                addTexture(md.material.emissiveTex);
-            }
-        }
-    };
+    add(ps.startupScene);   // the level the runtime boots into
+    add(ps.bootDocument);   // studio/boot splash (.hbui, or a legacy .hbscene)
+    add(ps.uiDocument);     // legacy mirror of uiDocuments[0]
+    for (const std::string& d : ps.uiDocuments) add(d); // every screen
+    add(ps.musicGraph);     // .hbmusic - and, transitively, every stem it names
+    const InputIcons& ic = ps.inputIcons;
+    add(ic.general);
+    add(ic.logo);
+    for (const DeviceGlyphs* dg :
+         {&ic.keyboard, &ic.xbox, &ic.playstation, &ic.nintendo, &ic.generic})
+        for (const auto& e : dg->icons) add(e.second);
+    return roots;
+}
 
-    for (auto it = fs::recursive_directory_iterator(assetsDir, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) break;
-        if (!it->is_regular_file() || it->path().extension() != ".hbscene") continue;
-        refs.insert(fs::relative(it->path(), assetsDir, ec).generic_string());
+assets::ClosureResult Editor::CollectReferencedAssets() {
+    assets::ClosureResult empty;
+    if (!Project::HasActive()) return empty;
+    assets::ClosureOptions opts;
+    opts.roots = ProjectRootRefs();
+    // Every .hbscene / .hbui / .hbprefab under Assets/ is also a root. A level is
+    // selected by a name the scan cannot see (a `.hbsave`, the dev menu, a
+    // streaming tag), a world-space page is mounted by content this walk does not
+    // interpret, and a prefab is picked by a Spawner at runtime. They are small
+    // JSON; sweeping them is cheap insurance. Everything else - textures, meshes,
+    // materials, schematics, dialogue, cutscenes, music, characters, fracture
+    // data, GI and probe bakes - ships ONLY if something reaches it.
+    opts.sweepEntryPoints = true;
+    return assets::ComputeClosure(Project::Active().AssetsDir(), opts);
+}
 
-        scene::SceneData data;
-        if (!scene::ParseSceneFile(it->path(), data)) continue;
-        for (const scene::EntityData& d : data.entities) {
-            // "uaf:<rel>#<submesh>" mesh provenance.
-            if (d.hasMesh && d.meshSource.rfind("uaf:", 0) == 0) {
-                const std::string rest = d.meshSource.substr(4);
-                addMesh(rest.substr(0, rest.find_last_of('#')));
-            }
-            if (!d.materialAsset.empty() && !refs.count(d.materialAsset)) {
-                refs.insert(d.materialAsset);
-                if (const auto mat = assets::LoadMaterial(assetsDir / d.materialAsset)) {
-                    addTexture(mat->albedoTex);
-                    addTexture(mat->normalTex);
-                    addTexture(mat->mrTex);
-                    addTexture(mat->aoTex);
-                    addTexture(mat->emissiveTex);
-                }
-            }
-            if (d.hasAudio) addTexture(d.audio.asset); // same "insert rel" semantics
-            // UI element image + font (.uaf), e.g. a boot-screen logo - otherwise
-            // they pack out and show as a white square / default font in builds.
-            if (d.hasUI) {
-                addTexture(d.uiElement.texture);
-                addTexture(d.uiElement.font);
-            }
-            // Art Editor paint canvas (.hbpaint): pixels live outside the scene.
-            if (d.hasPaint && !d.paintSource.empty()) refs.insert(d.paintSource);
-            // Interactable / Trigger actions reference a .hbdialogue / .hbcutscene.
-            if (d.hasInteractable && !d.interactable.asset.empty())
-                refs.insert(d.interactable.asset);
-            if (d.hasTrigger && !d.trigger.asset.empty()) refs.insert(d.trigger.asset);
-        }
-    }
-    // Project-settings assets owned by no scene: interaction-prompt icons + the
-    // adaptive-music graph. Without this they pack out under "Pack only referenced".
-    if (Project::HasActive()) {
-        const ProjectSettings& ps = Project::Active().Settings();
-        const InputIcons& ic = ps.inputIcons;
-        if (!ic.general.empty()) refs.insert(ic.general);
-        if (!ic.logo.empty()) refs.insert(ic.logo);
-        for (const DeviceGlyphs* dg :
-             {&ic.keyboard, &ic.xbox, &ic.playstation, &ic.nintendo, &ic.generic})
-            for (const auto& e : dg->icons)
-                if (!e.second.empty()) refs.insert(e.second);
-        if (!ps.musicGraph.empty()) refs.insert(ps.musicGraph);
-    }
-    return refs;
+void Editor::StampNewAsset(const std::filesystem::path& file) {
+    if (!Project::HasActive() || file.empty()) return;
+    slots::StampAsset(Project::Active().AssetsDir(), Project::Active().SlotManifestPath(), file);
+}
+
+void Editor::StampSavedAssets(std::filesystem::file_time_type mark) {
+    if (!Project::HasActive()) return;
+    slots::StampNewAssets(Project::Active().AssetsDir(), Project::Active().SlotManifestPath(),
+                          mark);
+}
+
+void Editor::RekeyMovedAsset(const std::filesystem::path& from,
+                             const std::filesystem::path& to) {
+    if (!Project::HasActive() || from.empty() || to.empty()) return;
+    slots::RekeyAsset(Project::Active().AssetsDir(), Project::Active().SlotManifestPath(), from,
+                      to);
 }
 
 namespace {
 // Pack options from the active project's BuildSettings. `refs` keeps the
 // referenced-asset set alive for the returned options' filter pointer.
-uap::WriteOptions PackOptionsFromSettings(std::set<std::string>& refs) {
+//
+// Returns false when the cook must NOT proceed. An unresolvable reference is not
+// a packing problem - the file does not exist anywhere, so the game is already
+// broken - but cook time is the last point at which a human is present, and a
+// warning printed next to "Shipping build (545.2 MB)" plus a success exit reads
+// as success. So the diagnostic is the one thing that cannot be ignored.
+bool PackOptionsFromSettings(std::set<std::string>& refs, uap::WriteOptions& options,
+                             std::string& outError) {
+    namespace fs = std::filesystem;
     const BuildSettings& build = Project::Active().Settings().build;
-    uap::WriteOptions options;
     options.compress = build.compressAssets;
-    if (build.onlyReferenced) {
-        refs = Editor::CollectReferencedAssets();
-        options.filter = &refs;
+
+    const assets::ClosureResult closure = Editor::CollectReferencedAssets();
+    // Report ALWAYS - including when the filter is off. A silent cook is what
+    // made the old hole invisible; with the report on, "onlyReferenced off packs
+    // 375" and "onlyReferenced on packs 291, here are the 84 it dropped" are both
+    // visible facts rather than an assumption about how packing works.
+    assets::LogClosureReport(closure, build.onlyReferenced, build.allowMissingRefs);
+
+    if (!build.onlyReferenced) return true; // no filter: everything packable ships
+
+    if (!closure.ok && !build.allowMissingRefs) {
+        outError = "Pack aborted: " + std::to_string(closure.missing.size()) +
+                   " unresolvable asset reference(s) and " +
+                   std::to_string(closure.unreadable.size()) +
+                   " unreadable file(s) - see the log. Fix them, or set "
+                   "\"allowMissingRefs\": true in the .hbproj build block.";
+        return false;
     }
-    return options;
+    refs = closure.included;
+    options.filter = &refs;
+    return true;
 }
 
 std::string PackSummary(const uap::PackBuildResult& result) {
@@ -12324,9 +15407,13 @@ bool Editor::BuildAssetPack(std::string& outMessage) {
     const std::string& name = Project::Active().Settings().name;
     const std::filesystem::path root = Project::Active().Root();
     std::set<std::string> refs;
-    const uap::WriteOptions options = PackOptionsFromSettings(refs);
+    uap::WriteOptions options;
+    if (!PackOptionsFromSettings(refs, options, outMessage)) {
+        HBE_ERROR("UAP: {}", outMessage);
+        return false;
+    }
     const auto result = uap::WritePacks(root, name, Project::Active().AssetsDir(),
-                                        root / (name + ".uapmanifest"), options);
+                                        Project::Active().SlotManifestPath(), options);
     if (!result) {
         outMessage = "Pack failed: no assets found.";
         return false;
@@ -12355,15 +15442,30 @@ bool Editor::BuildShipping(std::string& outMessage) {
         outMessage = "No project open.";
         return false;
     }
-    // Persist the live project settings BEFORE packing - the build packs the
-    // `.hbproj` from disk (below), so anything edited live but not yet saved (e.g.
-    // the Dynamic Sky / day-night toggle, weather, build settings) would otherwise
-    // ship stale. This makes a build always reflect the current editor state.
-    Project::Active().Save();
     namespace fs = std::filesystem;
     std::error_code ec;
     const std::string& name = Project::Active().Settings().name;
     const fs::path dst = Project::Active().Root() / "Build";
+
+    // Compute (and REPORT) the dependency closure FIRST - before Build/ is wiped
+    // and the runtime is copied - so a build that cannot be cooked correctly
+    // leaves the previous, working build intact instead of a half-populated
+    // folder that looks shippable.
+    std::set<std::string> refs;
+    uap::WriteOptions options;
+    if (!PackOptionsFromSettings(refs, options, outMessage)) {
+        HBE_ERROR("Shipping: {}", outMessage);
+        return false; // Build/ untouched
+    }
+
+    // Persist the live project settings once the cook is committed to running - the
+    // build packs the `.hbproj` from DISK below, so anything edited live but not yet
+    // saved (the day-night toggle, weather, build settings) would otherwise ship
+    // stale. AFTER the closure gate on purpose: a build that refuses to cook must
+    // leave the project exactly as it found it, and this is the one write into the
+    // user's folder that an aborted --ship used to perform anyway.
+    Project::Active().Save();
+
     fs::create_directories(dst, ec);
 
     // Ship the RELEASE runtime: it is the fastest build (full inlining, /Ob2) and the
@@ -12477,36 +15579,15 @@ bool Editor::BuildShipping(std::string& outMessage) {
     }
     extras.push_back({"__project.hbproj", Project::Active().ProjectFile()});
 
-    // Author-time scenes are ONE merged file; emit the .static/.dynamic split the
-    // runtime's level loader expects, partitioned by each object's Static/Dynamic tag.
-    // Regenerated fresh from the merged scene each build, so the pack ships current
-    // data and the runtime's two-file LoadLevel keeps working unchanged.
-    int splitCount = 0;
-    for (auto it = fs::recursive_directory_iterator(Project::Active().AssetsDir(), ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (!it->is_regular_file()) continue;
-        const fs::path p = it->path();
-        if (p.extension() != ".hbscene" || scene::IsLevelMember(p)) continue;
-        fs::path base = p;
-        base.replace_extension(); // <dir>/<name>.hbscene -> <dir>/<name>
-        fs::path st = base, dy = base;
-        st += ".static.hbscene";
-        dy += ".dynamic.hbscene";
-        if (scene::SplitSceneFile(p, st, dy)) ++splitCount;
-    }
-    if (splitCount > 0)
-        HBE_INFO("Shipping: split {} merged scene(s) into static/dynamic layers.", splitCount);
-
-    std::set<std::string> refs;
-    uap::WriteOptions options = PackOptionsFromSettings(refs);
     options.extras = &extras;
-    // A full export packs into dense slots (the fewest packs) - a shipped build
-    // is a fresh whole-folder copy, so the dev manifest's sticky/sparse slots
-    // (left by deleting assets) would only waste pack files here.
-    options.compact = true;
+    // NOTE the line that is NOT here: `options.compact = true`. It used to
+    // discard the slot assignment and re-derive dense slots 0..N-1 in sorted-path
+    // order, which meant the shipped packs were reshuffled by any asset whose
+    // path sorted early - shipped pack stability was exactly zero, and every
+    // update was a full re-download. Slots now come from the assets themselves
+    // (Assets/SlotIds.h), so unchanged packs stay byte-identical.
     const auto packed = uap::WritePacks(dst, name, Project::Active().AssetsDir(),
-                                        Project::Active().Root() / (name + ".ship.uapmanifest"),
-                                        options);
+                                        Project::Active().SlotManifestPath(), options);
     ok &= packed.has_value();
     if (packed) {
         // Verify the cooked packs read back (exercises decompression too) and
@@ -12664,8 +15745,13 @@ void Editor::DrawBuildSettings(Engine& engine) {
         changed |= ImGui::Checkbox("Ship packed assets only (.uap, no Assets folder)",
                                    &build.packAssets);
         changed |= ImGui::Checkbox("Compress packs (LZMS)", &build.compressAssets);
-        changed |= ImGui::Checkbox("Pack only scene-referenced assets",
-                                   &build.onlyReferenced);
+        changed |= ImGui::Checkbox("Pack only referenced assets", &build.onlyReferenced);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Packs the TRANSITIVE closure of everything reachable from this project's\n"
+                "scenes, UI documents, prefabs and settings - and nothing else.\n"
+                "The cook logs exactly what it included and excluded, and FAILS if any\n"
+                "reference names a file that does not exist.");
         changed |= ImGui::Checkbox("Developer overlay in shipped build (Ctrl+`)",
                                    &build.devMenu);
         if (build.devMenu)
@@ -12679,36 +15765,109 @@ void Editor::DrawBuildSettings(Engine& engine) {
         // shows/hides; UI buttons with a "play"/"settings"/"back"/"menu"/"quit"
         // action drive the transitions. The studio scene is separate: it renders
         // during boot, before the UI scene exists.
-        ImGui::TextDisabled("Set a UI Scene to enable the menu flow.\n"
+        ImGui::TextDisabled("Set a UI Document to enable the menu flow.\n"
                             "Buttons with a play/settings/back/menu/quit Action drive it.");
-        auto scenePicker = [&](const char* label, std::string& slot) {
-            if (ImGui::BeginCombo(label, slot.empty() ? "(none)" : slot.c_str())) {
+        // `.hbui` DOCUMENT picker. Legacy `.hbscene` values are still listed (and
+        // still boot, via the extension branch in the Engine) but are marked, so
+        // a half-migrated project is visibly half-migrated rather than silently
+        // reset to "(none)" by a picker that cannot represent its current value.
+        auto docPicker = [&](const char* label, std::string& slot) {
+            const bool legacy = !slot.empty() &&
+                                std::filesystem::path(slot).extension() != ".hbui";
+            std::string preview = slot.empty() ? "(none)" : slot;
+            if (legacy) preview += "   [legacy .hbscene]";
+            if (ImGui::BeginCombo(label, preview.c_str())) {
                 if (ImGui::Selectable("(none)", slot.empty())) {
                     slot.clear();
                     changed = true;
                 }
-                for (const std::filesystem::path& s : sceneList_) {
+                for (const std::filesystem::path& s : uiDocList_) {
                     const std::string rel = project.RelativeAssetPath(s);
                     if (ImGui::Selectable(rel.c_str(), rel == slot)) {
                         slot = rel;
                         changed = true;
                     }
                 }
+                if (!sceneList_.empty()) {
+                    ImGui::Separator();
+                    ImGui::TextDisabled("Legacy UI scenes (run --migrate-ui)");
+                    for (const std::filesystem::path& s : sceneList_) {
+                        const std::string rel = project.RelativeAssetPath(s);
+                        const std::string lbl = rel + "   [legacy]";
+                        if (ImGui::Selectable(lbl.c_str(), rel == slot)) {
+                            slot = rel;
+                            changed = true;
+                        }
+                    }
+                }
                 ImGui::EndCombo();
             }
         };
-        scenePicker("UI Scene (panels)", project.Settings().uiScene);
-        ImGui::TextDisabled("UI Scene: one persistent scene of UIPanel screens\n"
-                            "(name them MainMenu / Settings / HUD / Pause / Loading).\n"
-                            "The \"Loading\" panel is the loading screen: give it a\n"
+        // UI SCREENS: an ORDERED LIST, one .hbui per screen, ALL resident at
+        // runtime. Order is meaningful - [0] is the menu document and supplies the
+        // `post` look, and bind order breaks ties on the initial panel and on a
+        // duplicate panel name - so the rows can be moved, not just added/removed.
+        {
+            std::vector<std::string>& screens = project.Settings().uiDocuments;
+            ImGui::Text("UI Screens (%d)", static_cast<int>(screens.size()));
+            int moveUp = -1, moveDown = -1, removeAt = -1;
+            for (int i = 0; i < static_cast<int>(screens.size()); ++i) {
+                ImGui::PushID(i);
+                if (i == 0)
+                    ImGui::TextDisabled("menu doc (supplies `post`)");
+                else
+                    ImGui::TextDisabled("screen %d", i);
+                ImGui::SameLine();
+                docPicker("##screen", screens[static_cast<usize>(i)]);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("^")) moveUp = i;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("v")) moveDown = i;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X")) removeAt = i;
+                ImGui::PopID();
+            }
+            if (moveUp > 0) {
+                std::swap(screens[static_cast<usize>(moveUp)],
+                          screens[static_cast<usize>(moveUp - 1)]);
+                changed = true;
+            }
+            if (moveDown >= 0 && moveDown + 1 < static_cast<int>(screens.size())) {
+                std::swap(screens[static_cast<usize>(moveDown)],
+                          screens[static_cast<usize>(moveDown + 1)]);
+                changed = true;
+            }
+            if (removeAt >= 0) {
+                screens.erase(screens.begin() + removeAt);
+                changed = true;
+            }
+            if (ImGui::Button("+ Add screen")) {
+                screens.emplace_back();
+                changed = true;
+            }
+            // Keep the legacy mirror pointing at the menu document so a downgrade
+            // (or anything still reading the old single slot) gets the right file.
+            project.Settings().uiDocument = screens.empty() ? std::string() : screens.front();
+        }
+        ImGui::TextDisabled("UI Screens: ONE .hbui per screen (MainMenu / Settings /\n"
+                            "Loading / HUD / Pause). ALL of them are opened at boot and\n"
+                            "stay resident - showing a screen is a bool write, so it can\n"
+                            "never pop in or flash unstyled. The FIRST entry is the menu\n"
+                            "document: its `post` block is the menu look, and the others'\n"
+                            "are ignored. Panel names (and the engine's global actions:\n"
+                            "setting:* / play / menu / restart / settings / back / quit /\n"
+                            "caption) must be UNIQUE across the list - both are checked at\n"
+                            "boot. The \"Loading\" panel is the loading screen: give it a\n"
                             "ProgressBar and the engine drives its fill during loads.\n"
                             "Empty = no menus: the runtime boots straight into the\n"
-                            "Startup Scene.");
-        scenePicker("Studio (Boot) Scene", project.Settings().studioLoadingScene);
+                            "Startup Scene.  Split an old all-in-one document with\n"
+                            "--migrate-screens (see --dry-run first).");
+        docPicker("Boot (Studio) Document", project.Settings().bootDocument);
         ImGui::TextDisabled(
-            "Studio scene shows at boot (before the UI scene loads). Put {log}\n"
-            "in a Label to show the live boot console. Other text tokens:\n"
-            "{progress} {version} {backend} {gpu} {audio}.");
+            "Boot document shows at startup (before the UI document opens). Put\n"
+            "{log} in a Label to show the live boot console. Other text tokens:\n"
+            "{progress} {version} {backend} {gpu} {audio}. It is CLOSED explicitly\n"
+            "when boot finishes.");
     }
 
     ImGui::SeparatorText("UI Canvas");
@@ -13004,19 +16163,71 @@ void Editor::OnProjectChanged() {
     mixerSynced_ = false; // re-push the new project's bus tree
     ui::ClearFontCache(); // font-asset atlases belong to the previous project
     sceneList_.clear();
+    uiDocList_.clear();
     scenesScanned_ = false;
     currentScenePath_.clear();
+    // OPEN DOCUMENTS BELONG TO THE PREVIOUS PROJECT. They are spared by every
+    // sweep and the undo stack is cleared two lines down, so leaving them open
+    // meant project A's menu rendered over project B's viewport with activeDoc_
+    // still pointing at it - and SaveUIDocument writes to inst->path, captured at
+    // open time, so the next Save wrote into project A's .hbui while B was active
+    // (and recomputed inst->rel against B, corrupting the display path too).
+    if (engine_) engine_->Documents().CloseAll(engine_->GetScene());
+    activeDoc_ = 0;
+    uiDocError_.clear();
+    uiDocSaveAs_ = 0;
+    wantUIDocNew_ = false;
+    clipboard_.clear(); // a fragment of the previous project's content
+    clipboardFromDoc_ = false;
+    clipboardParent_ = entt::null; // a handle into the previous project's world
+    clipboardWorld_ = 0;
+    clipboardParentGuid_ = 0; // ...and a guid into its scenes
+    clipboardHasWorldMatrix_ = false;
+    clipboardWorldMatrix_ = glm::mat4(1.0f);
     undoStack_.clear(); // snapshots reference the previous project's assets
     redoStack_.clear();
     textureCache_.clear();
     cpuMeshCache_.clear();  // CPU geometry belongs to the previous project
     paintStrokeOrder_.clear();
     paintStrokeRedo_.clear();
+    // 3D-STROKE ASSET STATE IS PER PROJECT. strokeMatCache_ maps a brush signature
+    // to a `.hbmat` path relative to the OLD project's Assets/, so keeping it across
+    // a switch hands back a material file that does not exist in the new one; the
+    // counters must be re-seeded from the new project's Strokes/ folder or the first
+    // stroke there overwrites `ribbon_0.uaf`.
+    strokeMatCache_.clear();
+    strokeMeshCounter_ = 0;
+    strokeMatCounter_ = 0;
+    strokeCountersSeeded_ = false;
+    strokeHitEntity_ = entt::null; // a handle into the previous project's scene
     musicLoaded_ = false;   // re-sync the music graph from the new project
     musicPreviewing_ = false;
     brushesLoaded_ = false; // reload the new project's brush library (brushes.json)
     scene::ClearInstantiateCaches();
+    ui::ClearWorldTargetCache(); // world-canvas render targets belong to the old project
     if (engine_) engine_->SyncActionMap(); // adopt the new project's action definitions
+    // THE NEW PROJECT'S SKY, IBL, FALLBACK SUN AND DAY/NIGHT SETTINGS.
+    //
+    // These come from the .hbproj (scene::SetupSky) and were previously applied at
+    // boot and nowhere else, so File > Open Project left the environment holding the
+    // OLD project's irradiance/prefiltered/brdf/sky handles, its fallback sun and -
+    // worst - its `dynamicSky`. A scene loaded from the new project then applied its
+    // own five header fields correctly and still rendered under the previous
+    // project's sky, with a day/night cycle that was on or off according to a file
+    // that is no longer open. It persisted until the editor was restarted, and
+    // nothing on screen said so.
+    //
+    // SetupSky, NOT SetupEnvironment: the look-preserving half. The other half
+    // (ApplyProjectLookDefaults) would stamp project ambient/exposure/post over
+    // whatever scene is loaded next, which is the editor-only brightening this whole
+    // area exists to remove. No scene is loaded here, so a scene load's own header
+    // still wins - it runs after.
+    if (engine_) {
+        // The previous project's SCENE is gone, so its per-scene day/night claim goes
+        // with it - otherwise SetupSky would honour a claim no loaded file makes.
+        engine_->GetScene().Environment().dayNightAuthored = 0;
+        scene::SetupSky(engine_->GetScene(), engine_->GetRenderer());
+    }
 
     // Seed starter content so a brand-new project isn't empty.
     const std::filesystem::path sphereUaf = Project::Active().AssetsDir() / "Sphere.uaf";
@@ -13581,16 +16792,16 @@ void Editor::DrawNavigation(Engine& engine) {
         return obs;
     };
     if (ImGui::Button("Rebuild Grid")) {
-        EnsureLevelMembership(engine.GetScene());
         nav::GridNav& g = engine.GetGridNav();
         g.SetParams(gridParams_);
         g.Rebuild(engine.GetScene(), navAssets);
         g.DebugCells(navStart_, 60.0f, navCells_);
         navBuilt_ = g.Ready();
-        navStatus_ = g.Ready() ? ("Grid: " + std::to_string(g.TriangleCount()) +
-                                  " static tris, " + std::to_string(navCells_.size()) +
+        navStatus_ = g.Ready() ? ("Grid: " + std::to_string(g.TriangleCount()) + " tris, " +
+                                  std::to_string(g.TerrainCount()) + " terrain surface(s), " +
+                                  std::to_string(navCells_.size()) +
                                   " walkable cells near start.")
-                               : "Grid: no static geometry found.";
+                               : "Grid: no static geometry and no terrain found.";
     }
     ImGui::SameLine();
     ImGui::Checkbox("Show##grid", &navShow_);
@@ -13629,22 +16840,34 @@ void Editor::DrawNavigation(Engine& engine) {
     }
     if (!navStatus_.empty()) ImGui::TextWrapped("%s", navStatus_.c_str());
 
-    // Input geometry: NavmeshInput tags restrict which static meshes the A* grid
-    // samples (otherwise every static mesh is used).
+    // Input geometry. REPORTED BY GridNav, not re-derived here: this used to count every
+    // NavmeshInput entity (including streamed ones, which deliberately do not get a vote
+    // in the predicate) and to say "baking", of which there is none - GridNav samples on
+    // demand. It also never mentioned terrain, which is a nav surface now.
     {
         entt::registry& reg = engine.GetScene().Registry();
-        int tagged = 0;
-        for (const entt::entity e : reg.view<NavmeshInput>()) {
-            if (reg.get<NavmeshInput>(e).enabled) ++tagged;
-        }
+        const nav::GridNav& g = engine.GetGridNav();
         ImGui::SeparatorText("Input geometry");
-        if (tagged > 0) {
-            ImGui::TextWrapped("Baking %d tagged mesh%s (Navmesh Input).", tagged,
-                               tagged == 1 ? "" : "es");
-        } else {
-            ImGui::TextWrapped("No tags - baking ALL meshes. Add a Navmesh Input "
-                               "component to limit the bake.");
+        switch (g.ActiveSource()) {
+            case nav::NavSource::StaticLayer:
+                ImGui::TextWrapped("Static layer: %d mesh(es) sampled (untagged counts as "
+                                   "Static). Navmesh Input can only opt a static mesh OUT.",
+                                   g.AcceptedMeshCount());
+                break;
+            case nav::NavSource::NavmeshInputTag:
+                ImGui::TextWrapped("Navmesh Input tags: %d mesh(es) sampled. Untagged meshes "
+                                   "are ignored.",
+                                   g.AcceptedMeshCount());
+                break;
+            case nav::NavSource::AllMeshes:
+                ImGui::TextWrapped("No Static layer and no tags - ALL %d mesh(es) sampled. Add "
+                                   "a Navmesh Input component to narrow it.",
+                                   g.AcceptedMeshCount());
+                break;
         }
+        ImGui::TextWrapped("+ %d terrain surface(s) (sampled analytically - a sculpt needs no "
+                           "rebuild) and %d streamed shard block(s). %u full rebuild(s) so far.",
+                           g.TerrainCount(), g.StreamedBlockCount(), g.RebuildCount());
         const bool hasSel = selected_ != entt::null && reg.valid(selected_);
         ImGui::BeginDisabled(!hasSel);
         if (ImGui::Button("Tag Selected")) {
@@ -13703,60 +16926,6 @@ void Editor::DrawNavOverlay(Scene& scene, Renderer& renderer) {
         }
     }
     draw->PopClipRect();
-}
-
-void Editor::DrawStreaming(Engine& engine) {
-    if (!panelOpen_[Panel_Streaming]) return;
-    StreamingWorld& world = engine.GetStreamingWorld();
-    ImGui::Begin("Streaming", &panelOpen_[Panel_Streaming]);
-    ImGui::TextDisabled("World partition: cells stream in/out around the camera.");
-
-    static char pathBuf[256] = "World.hbworld";
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::InputText("##worldpath", pathBuf, sizeof(pathBuf));
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        if (Project::HasActive()) {
-            const std::filesystem::path assets = Project::Active().AssetsDir();
-            const std::filesystem::path manifest = assets / pathBuf;
-            streamStatus_ = world.LoadManifest(manifest, assets)
-                                ? std::string("Loaded ") + pathBuf
-                                : std::string("Failed to load ") + pathBuf;
-        } else {
-            streamStatus_ = "No project open.";
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Unload All")) {
-        world.UnloadAll(engine.GetScene());
-        streamStatus_ = "Unloaded all cells.";
-    }
-    ImGui::TextDisabled(".hbworld path relative to the project's Assets/.");
-    ImGui::TextDisabled("A cell's scene may be a level (streams static + dynamic).");
-
-    // Whole-world editing: load every cell at once and pause distance streaming
-    // so nothing unloads while you edit. Each cell's entities stay tagged to
-    // their scene/level files, so a normal Save writes them all back.
-    ImGui::Separator();
-    if (ImGui::Button("Load All (edit world)")) {
-        world.LoadAll(engine.GetScene(), engine.GetRenderer());
-        streamStatus_ = "Loaded all cells; streaming paused for editing.";
-    }
-    ImGui::SameLine();
-    ImGui::BeginDisabled(world.Enabled());
-    if (ImGui::Button("Resume Streaming")) {
-        world.SetEnabled(true);
-        streamStatus_ = "Distance streaming resumed.";
-    }
-    ImGui::EndDisabled();
-    if (!world.Enabled()) ImGui::TextDisabled("Streaming paused (editing the whole world).");
-
-    const StreamingWorld::Stats st = world.GetStats();
-    ImGui::Separator();
-    ImGui::Text("Cells: %u total, %u loaded, %u loading", st.cells, st.loaded, st.loading);
-    ImGui::Text("Streamed entities: %u", st.entities);
-    if (!streamStatus_.empty()) ImGui::TextWrapped("%s", streamStatus_.c_str());
-    ImGui::End();
 }
 
 void Editor::ExtendSpline(Scene& scene, CameraSpline& sp, bool atStart) {

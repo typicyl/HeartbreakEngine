@@ -40,10 +40,42 @@ struct SourceFormat {
     const char* note; // human-readable, shown in editor tooling
 };
 
+// How the dependency-closure walker (Assets/AssetRefs.h) extracts a file's
+// OUTBOUND asset references. Every runtimeLoaded row must declare one.
+//
+// `Unspecified` is the zero value ON PURPOSE: a row added without thinking
+// value-initialises to the invalid state and fails --test-assetformats, instead
+// of silently contributing nothing to the closure - which, with
+// BuildSettings::onlyReferenced on, ships a build whose assets are quietly
+// absent (no cook error, no runtime error, the feature just does nothing).
+enum class RefScan : u8 {
+    Unspecified = 0, // invalid; --test-assetformats fails on this
+    JsonScan,        // parse as JSON; EVERY string value is a reference candidate
+    Hook,            // `collect` walks the format's own (binary) payload
+    Leaf,            // proven to carry no outbound references (`note` must say why)
+};
+
+// Extracts the raw, as-authored reference strings out of one file. Resolution
+// (and the packable-extension test) happens in the closure, not here - a hook
+// may over-report freely. Returns false when the file could not be read or is
+// not this format at all, which the closure records as "reachable but unknown"
+// rather than quietly treating as a leaf.
+using CollectRefsFn = bool (*)(const std::filesystem::path& file,
+                               std::vector<std::string>& out);
+
+// The RefScan::Hook collectors. Declared here (rather than living beside their
+// parsers) so the registry rows below can take their addresses without this
+// translation unit depending on the whole asset library; defined in
+// Assets/AssetRefs.cpp.
+bool CollectRefsUaf(const std::filesystem::path& file, std::vector<std::string>& out);
+bool CollectRefsFracture(const std::filesystem::path& file, std::vector<std::string>& out);
+
 struct EngineAsset {
     const char* extension;  // lower-case, leading dot
     const char* name;       // display name ("Cutscene")
     bool runtimeLoaded;     // the RUNTIME reads it -> must be packable
+    RefScan scan;           // how the closure walks it (see RefScan)
+    CollectRefsFn collect;  // non-null IFF scan == Hook
     const char* note;
 };
 
@@ -63,6 +95,18 @@ SourceKind KindOf(const std::string& ext);
 // True when the pack cooker must include this extension. Exactly the engine-asset
 // entries flagged runtimeLoaded - derived, never a second hand-written list.
 bool IsPackable(const std::string& ext);
+
+// Closure-walk classification for `ext` (Unspecified when unknown/unregistered).
+RefScan RefScanOf(const std::string& ext);
+// The collector for a RefScan::Hook extension (nullptr otherwise).
+CollectRefsFn CollectorOf(const std::string& ext);
+
+// --test-assetformats: the registry's own invariants, checked rather than
+// assumed. Fails (logging every violation) when a runtime-loaded row leaves
+// `scan` Unspecified, when a Hook row has no collector, when a non-Hook row
+// carries one, when a Leaf row has no written justification in `note`, or when
+// an extension is duplicated / malformed. Headless; no project needed.
+bool RegistrySelfTest();
 
 // Win32 OPENFILENAME filter for the editor's Import dialog, built from
 // SourceFormats() so the dialog and the importer can never disagree. Returns a

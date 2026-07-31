@@ -4,6 +4,26 @@
 #include <cstdint>
 #include <cstddef>
 
+// ONE STL EXCEPTION ABI ACROSS THE WHOLE BUILD. This header is reachable from
+// essentially every TU, which is exactly why the check lives here.
+//
+// `_HAS_EXCEPTIONS=0` does not merely "turn off exceptions" - it selects a
+// different, smaller std::exception (16 bytes instead of 24) with different
+// ownership of the message buffer. Mixing the two across a library boundary is an
+// ODR violation on std::exception itself, and the way it shows up is a bad free:
+// a `throw`/`catch` inside a TU compiled one way, unwound by machinery compiled
+// the other, hands the CRT a pointer it never allocated. It cost a long hunt once
+// already (it was blamed on nlohmann/json), so it is a hard compile error now.
+//
+// The historical source was JoltPhysics, which pushes the define PUBLIC unless
+// CPP_EXCEPTIONS_ENABLED is ON - see cmake/Dependencies.cmake, which forces it ON
+// and additionally strips the define from Jolt's interface.
+#if defined(_MSC_VER) && defined(_HAS_EXCEPTIONS) && _HAS_EXCEPTIONS == 0
+#  error "_HAS_EXCEPTIONS=0 in a Heartbreak TU: this splits std::exception's ABI \
+between the engine libraries and the executables and corrupts the heap on every \
+throw. See cmake/Dependencies.cmake (CPP_EXCEPTIONS_ENABLED)."
+#endif
+
 namespace hbe {
 
 using u8  = std::uint8_t;

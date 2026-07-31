@@ -810,25 +810,61 @@ IBLMaps BakeLocalProbe(Renderer& renderer, const Scene& scene,
 IBLMaps LoadProbeMaps(Renderer& renderer, const std::filesystem::path& path) {
     IBLMaps maps;
     if (!renderer.SupportsScene()) return maps;
-    std::ifstream f{path, std::ios::binary};
-    if (!f) return maps;
+    // Pack-aware: a shipped build serves .hbprobe from the mounted .uap packs.
+    // This was a raw ifstream, which - together with .hbprobe being absent from
+    // the asset registry entirely - meant a baked probe could NEVER ship: the
+    // cooker skipped the extension, and even a packed one would not have been
+    // read. The caller (SceneSerializer) tests `maps.valid` with no else branch,
+    // so the whole failure was one silent fallback to sky-leaked ambient.
+    const std::optional<std::vector<u8>> bytes = vfs::ReadFile(path);
+    if (!bytes) {
+        HBE_WARN("Probe: '{}' could not be read - this probe contributes NO local "
+                 "reflection or bounce (the area falls back to the sky). Re-bake it, "
+                 "or clear the probe's source.",
+                 path.string());
+        return maps;
+    }
+    usize cursor = 0;
+    bool truncated = false;
     const auto rd = [&](void* p, usize n) {
-        f.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(n));
+        if (cursor + n > bytes->size()) {
+            truncated = true;
+            return;
+        }
+        std::memcpy(p, bytes->data() + cursor, n);
+        cursor += n;
     };
     u32 magic = 0, ver = 0, iw = 0, ih = 0, pw = 0, ph = 0, pm = 0;
     f32 maxLod = 0.0f;
     rd(&magic, 4); rd(&ver, 4);
-    if (magic != 0x42525048u) return maps;
+    if (truncated || magic != 0x42525048u) {
+        HBE_WARN("Probe: '{}' is not a usable .hbprobe - re-bake it.", path.string());
+        return maps;
+    }
     rd(&iw, 4); rd(&ih, 4);
+    // Size the allocations from the file's own dimensions only AFTER bounding them
+    // against the bytes actually present, so a corrupt header cannot ask for a
+    // multi-gigabyte vector.
+    if (truncated || static_cast<u64>(iw) * ih * sizeof(glm::vec4) > bytes->size()) {
+        HBE_WARN("Probe: '{}' has a corrupt irradiance header - re-bake it.", path.string());
+        return maps;
+    }
     std::vector<glm::vec4> irr(static_cast<usize>(iw) * ih);
     rd(irr.data(), irr.size() * sizeof(glm::vec4));
     rd(&pw, 4); rd(&ph, 4); rd(&pm, 4); rd(&maxLod, 4);
     usize preTotal = 0;
-    for (u32 m = 0; m < pm; ++m)
+    for (u32 m = 0; m < pm && !truncated; ++m)
         preTotal += static_cast<usize>(glm::max(1u, pw >> m)) * glm::max(1u, ph >> m);
+    if (truncated || preTotal * sizeof(glm::vec4) > bytes->size()) {
+        HBE_WARN("Probe: '{}' has a corrupt prefiltered header - re-bake it.", path.string());
+        return maps;
+    }
     std::vector<glm::vec4> pre(preTotal);
     rd(pre.data(), pre.size() * sizeof(glm::vec4));
-    if (!f || iw == 0 || pw == 0) return maps; // truncated / bad
+    if (truncated || iw == 0 || pw == 0) {
+        HBE_WARN("Probe: '{}' is truncated - re-bake it.", path.string());
+        return maps; // truncated / bad
+    }
     rhi::TextureDesc di;
     di.width = iw; di.height = ih; di.format = rhi::Format::R32G32B32A32_FLOAT;
     di.pixels = irr.data(); di.debugName = "probe_irradiance";
@@ -976,6 +1012,7 @@ GiVolume BakeGIVolume(Renderer& renderer, const Scene& scene,
     vol.spacing = glm::vec3(spacing);
     vol.dims = dims;
     vol.valid = vol.sh.IsValid();
+    vol.status = vol.valid ? GiStatus::Loaded : GiStatus::None;
 
     // Cache to disk (.hbgi) so the volume reloads without re-baking.
     if (vol.valid && !savePath.empty()) {
@@ -1001,14 +1038,36 @@ GiVolume BakeGIVolume(Renderer& renderer, const Scene& scene,
     return vol;
 }
 
+const char* ToString(GiStatus s) {
+    switch (s) {
+        case GiStatus::None:    return "none";
+        case GiStatus::Loaded:  return "loaded";
+        case GiStatus::Missing: return "missing";
+        case GiStatus::Corrupt: return "corrupt";
+        case GiStatus::UploadFailed: return "upload-failed";
+    }
+    return "?";
+}
+
 GiVolume LoadGIVolume(Renderer& renderer, const std::filesystem::path& path) {
     GiVolume vol;
-    if (!renderer.SupportsScene()) return vol;
+    // NOTE: the file is PARSED even without a device. It used to early-out on
+    // !SupportsScene, which made "no GPU" indistinguishable from "no file" - so a
+    // headless test could never prove that a missing `.hbgi` is reported rather
+    // than silently inherited. Only the UPLOAD is skipped below.
+    //
     // Pack-aware: a shipped build serves .hbgi from the mounted packs, not disk.
     // This was a raw ifstream, so baked GI silently vanished in shipped builds
     // (the scene fell back to sky-only ambient with no warning).
     const std::optional<std::vector<u8>> bytes = vfs::ReadFile(path);
-    if (!bytes) return vol;
+    if (!bytes) {
+        vol.status = GiStatus::Missing;
+        HBE_WARN("GI: '{}' could not be read - the scene will render with NO baked "
+                 "volume (a sealed interior will leak sky light). Re-bake it, or "
+                 "clear the scene's giSource.",
+                 path.string());
+        return vol;
+    }
     usize cursor = 0;
     bool truncated = false;
     const auto rd = [&](void* p, usize n) {
@@ -1016,22 +1075,35 @@ GiVolume LoadGIVolume(Renderer& renderer, const std::filesystem::path& path) {
         std::memcpy(p, bytes->data() + cursor, n);
         cursor += n;
     };
+    const auto corrupt = [&](const char* why) {
+        vol = GiVolume{};
+        vol.status = GiStatus::Corrupt;
+        HBE_WARN("GI: '{}' is not a usable .hbgi ({}) - rendering with NO baked "
+                 "volume. Re-bake it.", path.string(), why);
+        return vol;
+    };
     u32 magic = 0, ver = 0;
     rd(&magic, 4); rd(&ver, 4);
-    if (truncated || magic != 0x56494748u) return vol;
+    if (truncated || magic != 0x56494748u) return corrupt("bad magic / truncated header");
     glm::ivec3 dims(0);
     glm::vec3 origin(0.0f);
     f32 spacing = 1.0f;
     rd(&dims.x, 4); rd(&dims.y, 4); rd(&dims.z, 4);
     rd(&origin.x, 12); rd(&spacing, 4);
-    if (truncated) return vol;
-    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) return vol;
+    if (truncated) return corrupt("truncated grid header");
+    if (dims.x <= 0 || dims.y <= 0 || dims.z <= 0) return corrupt("non-positive dimensions");
     const usize cells = static_cast<usize>(dims.x) * dims.y * dims.z;
-    if (cells == 0 || cells > 1'000'000) return vol; // sanity
+    if (cells == 0 || cells > 1'000'000) return corrupt("implausible cell count"); // sanity
     std::vector<glm::vec4> atlas(4 * cells), depthAtlas(64 * cells);
     rd(atlas.data(), atlas.size() * sizeof(glm::vec4));
     rd(depthAtlas.data(), depthAtlas.size() * sizeof(glm::vec4));
-    if (truncated) return vol;
+    if (truncated) return corrupt("truncated atlas payload");
+    // The file is good. Everything below this line is GPU-only.
+    vol.status = GiStatus::Loaded;
+    vol.origin = origin;
+    vol.spacing = glm::vec3(spacing);
+    vol.dims = dims;
+    if (!renderer.SupportsScene()) return vol; // headless: parsed, not uploaded
     {
         rhi::TextureDesc d;
         d.width = 4; d.height = static_cast<u32>(cells);
@@ -1046,10 +1118,18 @@ GiVolume LoadGIVolume(Renderer& renderer, const std::filesystem::path& path) {
         d.pixels = depthAtlas.data(); d.debugName = "gi_volume_depth";
         vol.depth = renderer.UploadTexture(d);
     }
-    vol.origin = origin;
-    vol.spacing = glm::vec3(spacing);
-    vol.dims = dims;
-    vol.valid = vol.sh.IsValid();
+    vol.valid = vol.sh.IsValid() && vol.depth.IsValid();
+    // The file was good and the GPU was not. Say so, instead of reporting Loaded
+    // with handles nothing can sample: the shader gates on the SH index, so an
+    // invalid handle falls silently back to sky irradiance and a sealed interior
+    // lights as though it had no roof - indistinguishable from never having baked.
+    if (!vol.valid) {
+        vol.status = GiStatus::UploadFailed;
+        HBE_WARN("GI: '{}' parsed but could not be uploaded (no descriptor/texture) - "
+                 "the scene will render with NO baked volume (a sealed interior will "
+                 "leak sky light). This is a GPU-resource failure, not a bad file.",
+                 path.string());
+    }
     return vol;
 }
 

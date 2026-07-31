@@ -146,6 +146,32 @@ public:
         return pads_[index < kMaxGamepads ? index : 0];
     }
 
+    // TEST SEAM. Headless self-tests have no XInput device, so there is no other
+    // way to exercise a gamepad-driven code path (--test-3dinteract's gamepad
+    // activation case). Both masks are explicit so the caller owns the EDGE:
+    // WasPressed is `buttons & ~prev`, so hold is inject(B,B) and press is
+    // inject(B,0). Call it AFTER NewFrame(), which polls and would overwrite it.
+    void InjectGamepadForTest(u32 buttons, u32 prev, u32 index = 0) {
+        GamepadState& p = pads_[index < kMaxGamepads ? index : 0];
+        p.connected = true;
+        p.prevButtons = prev;
+        p.buttons = buttons;
+        if (buttons != 0) lastGamepad_ = true;
+    }
+
+    // TEST SEAM (sticks). Same reason and same rules as the button injector
+    // above - call it AFTER NewFrame(), which polls XInput and would overwrite
+    // it. Values are post-deadzone, in the same [-1,1] the poll produces (+Y up).
+    // --test-fpslook drives camera look through this.
+    void InjectGamepadSticksForTest(f32 lx, f32 ly, f32 rx, f32 ry, u32 index = 0) {
+        GamepadState& p = pads_[index < kMaxGamepads ? index : 0];
+        p.connected = true;
+        p.leftX = lx;
+        p.leftY = ly;
+        p.rightX = rx;
+        p.rightY = ry;
+    }
+
     // -- Active device (for adaptive prompts) ---------------------------------
     // Which controller family a connected gamepad is, so button prompts can show
     // the right glyph. Read via a raw-input vendor-id scan (XInput can't tell

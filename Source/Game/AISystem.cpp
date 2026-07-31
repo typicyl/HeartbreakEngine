@@ -175,8 +175,12 @@ void Update(Scene& scene, PhysicsWorld& physics, f32 dt) {
         if (prevAware < per.detectThreshold && per.awareness >= per.detectThreshold) {
             game::SpottedRec sr;
             sr.spotter = static_cast<u32>(e);
-            sr.target =
-                per.knownTarget != entt::null ? static_cast<u32>(per.knownTarget) : 0xFFFFFFFFu;
+            // Same rule as the death queue's instigator: the spotted target can be
+            // destroyed between sensing and dispatch (routine once shards despawn), and
+            // schematics feed this pin straight into try_get. Report "no target".
+            sr.target = (per.knownTarget != entt::null && reg.valid(per.knownTarget))
+                            ? static_cast<u32>(per.knownTarget)
+                            : 0xFFFFFFFFu;
             game::QueueSpotted(sr);
         }
 

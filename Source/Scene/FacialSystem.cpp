@@ -68,6 +68,10 @@ const std::unordered_map<std::string, f32>* FindPreset(const std::string& name) 
 
 MorphState* ResolveMorphTarget(Scene& scene, entt::entity e) {
     entt::registry& reg = scene.Registry();
+    // Reached from a schematic Entity pin (raw handle bits), so a despawned target is
+    // routine; try_get on an invalid handle is an assert in Debug and an out-of-bounds
+    // sparse-set index in Release.
+    if (e == entt::null || !reg.valid(e)) return nullptr;
     if (MorphState* ms = reg.try_get<MorphState>(e)) return ms;
     if (Character* ch = reg.try_get<Character>(e)) {
         if (auto it = ch->liveParts.find("head");

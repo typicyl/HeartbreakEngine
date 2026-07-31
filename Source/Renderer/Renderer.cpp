@@ -207,6 +207,17 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
             worldUIDraws_ = nullptr; // one frame only
         }
 
+        // The editor's `.hbui` authoring canvas: same pre-shadow slot, so the ImGui
+        // pass later in THIS frame samples what was just written (no staleness).
+        // count == 0 still submits - the backend clears, so an empty document reads
+        // transparent rather than showing the previous document's page.
+        if (editorUITarget_.IsValid()) {
+            device_->DrawUIToTexture(editorUITarget_, editorUIVerts_, editorUICount_);
+            editorUITarget_ = {};
+            editorUIVerts_ = nullptr;
+            editorUICount_ = 0;
+        }
+
         rhi::SceneView view = scene.MakeView(camera_);
         view.exposure *= userExposureScale_; // player brightness (view-level only)
         view.deltaTime = dt; // for temporal post effects (auto-exposure)
@@ -392,6 +403,14 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
                               particleAddCount_);
         particleAlpha_ = particleAdd_ = nullptr; // one frame only
         particleAlphaCount_ = particleAddCount_ = 0;
+        // GPU-expanded batches (opt-in emitters) ride the same HDR pass. One
+        // forward per record buffer - the device accumulates them too.
+        for (u32 g = 0; g < particleGpuGroupCount_; ++g) {
+            const GpuParticleGroup& grp = particleGpuGroups_[g];
+            device_->SetGpuParticles(grp.buffer, grp.batches, grp.count);
+            particleGpuGroups_[g] = {};
+        }
+        particleGpuGroupCount_ = 0;
         // Shadow map first: it must record before the main pass begins. FULL list
         // (see the culling invariant above); the main pass draws the prefix only.
         device_->DrawShadowPass(view, drawItems_.data(), itemCount);

@@ -71,8 +71,7 @@ Counter* Kick(JobEntry entry, void* arg, Priority prio = Priority::Normal);
 
 // Submits a single fire-and-forget job with no completion counter (nothing to
 // wait on, nothing to free). Use for background work whose result is observed
-// another way - e.g. an atomic the job stores into. StreamingWorld loads cells
-// this way.
+// another way - e.g. an atomic the job stores into.
 void RunDetached(JobEntry entry, void* arg, Priority prio = Priority::Normal);
 
 // Waits until *counter <= target, then frees the counter when target is 0 (the

@@ -143,6 +143,79 @@ static_assert(offsetof(GpuParticle, position) == 0 && offsetof(GpuParticle, age)
               "GpuParticle field offsets drifted - the HLSL mirror in "
               "Shaders/VfxCommon.hlsli reads these exact byte offsets.");
 
+// ---------------------------------------------------------------------------
+// GpuEmitter - the 128-byte per-emitter render record
+// ---------------------------------------------------------------------------
+
+// GPU VERTEX EXPANSION needs every value that BuildVertices reads as a LOOP
+// INVARIANT (the ramps, the fade envelope, the sub-UV grid, the render mode, the
+// sprite index and the four mask bits). On the CPU those are just fields of the
+// component the loop is sitting inside; in a vertex shader they have to be
+// fetched, so they become a record.
+//
+// EXACTLY 128 bytes = 2 GpuParticle elements, and that is deliberate: the whole
+// frame lives in ONE structured buffer with ONE 64-byte stride, laid out as
+//   [emitter record][its particles][emitter record][its particles]...
+// so a batch is bound by pointing the buffer's base at its emitter record. The VS
+// then reads the emitter at byte 0 and particle i at byte 128 + i*64 - no
+// per-particle emitter index, no second binding, and the base rides in the BUFFER
+// OFFSET (D3D12 root-SRV GPU VA / Vulkan dynamic offset) rather than a
+// firstInstance, so the SV_InstanceID vs gl_InstanceIndex divergence cannot arise.
+//
+// camRight/camUp live HERE rather than in FrameConstants on purpose. The basis the
+// CPU path uses is roll-free and world-up derived (Engine.cpp builds it from
+// Camera::Forward, deliberately ignoring Camera::up_), so reconstructing it from
+// the view matrix in the shader would silently change how a rolled cinematic
+// camera renders particles. Carrying it per emitter reproduces the CPU basis
+// exactly and costs no three-site FrameCB/FrameUBO/FrameConstants lockstep change.
+//
+// Mirrored byte-for-byte by `struct GpuEmitter` in Shaders/VfxCommon.hlsli.
+struct GpuEmitter {
+    glm::vec4 startColor{1.0f};          //   0
+    glm::vec4 endColor{1.0f};            //  16
+    glm::vec4 sizeFade{0.0f};            //  32  x=startSize y=endSize z=fadeIn w=fadeOut
+    u32 texIndex = 0;                    //  48  bindless sprite (0 = procedural soft dot)
+    u32 subUV = 1u | (1u << 16);         //  52  cols | rows<<16
+    f32 subUVFps = 0.0f;                 //  56  >0 loops the sheet; 0 plays it over life
+    u32 flags = 0;                       //  60  see GpuEmitterFlag
+    glm::vec3 camRight{1.0f, 0.0f, 0.0f}; //  64
+    f32 stretch = 1.0f;                  //  76  Stretched aspect (>= 1)
+    glm::vec3 camUp{0.0f, 1.0f, 0.0f};   //  80
+    u32 renderMode = 0;                  //  92  ParticleEmitter::Render
+    glm::vec4 _pad0{0.0f};               //  96
+    glm::vec4 _pad1{0.0f};               // 112
+};
+
+// Which per-particle STREAMS actually exist for this emitter. These are not value
+// selectors - dead-stream elimination makes an unused stream's memory not exist at
+// all, so the CPU gather substitutes a default and the VS must know which case it
+// is looking at (identical to the simColor/simSize/hasRot/hasVel booleans
+// BuildVertices reads off ParticleSoA::Has).
+namespace GpuEmitterFlag {
+enum : u32 {
+    SimColor = 1u << 0, // per-particle colour attribute (else the start/end ramp)
+    SimSize = 1u << 1,  // per-particle size attribute (else the start/end ramp)
+    HasRot = 1u << 2,   // rotation stream exists (else no spin)
+    HasVel = 1u << 3,   // velocity stream exists (else Stretched degrades to Billboard)
+};
+}
+
+static_assert(sizeof(GpuEmitter) == 128,
+              "GpuEmitter must be exactly 2 GpuParticle elements - the render buffer is "
+              "one stride and the VS reads particle i at 128 + i*64. Mirror: "
+              "Shaders/VfxCommon.hlsli.");
+static_assert(alignof(GpuEmitter) == 4,
+              "GpuEmitter must have no implicit padding (glm vec types are packed under "
+              "this project's GLM config; see the GpuParticle note above).");
+static_assert(offsetof(GpuEmitter, startColor) == 0 && offsetof(GpuEmitter, endColor) == 16 &&
+                  offsetof(GpuEmitter, sizeFade) == 32 && offsetof(GpuEmitter, texIndex) == 48 &&
+                  offsetof(GpuEmitter, subUV) == 52 && offsetof(GpuEmitter, subUVFps) == 56 &&
+                  offsetof(GpuEmitter, flags) == 60 && offsetof(GpuEmitter, camRight) == 64 &&
+                  offsetof(GpuEmitter, stretch) == 76 && offsetof(GpuEmitter, camUp) == 80 &&
+                  offsetof(GpuEmitter, renderMode) == 92,
+              "GpuEmitter field offsets drifted - Shaders/VfxCommon.hlsli decodes these exact "
+              "byte offsets out of a ByteAddressBuffer.");
+
 // Flags <-> seed packing helpers (GPU aliasing; see the note on GpuParticle).
 constexpr u32 SeedOf(u32 packed) { return packed & 0x00FFFFFFu; }
 constexpr u32 FlagsOf(u32 packed) { return packed >> 24; }

@@ -2,6 +2,7 @@
 #include "Scene/ParticleSystem.h"
 
 #include "Assets/AssetLoader.h"
+#include "Scene/ParticleGpuSim.h"
 #include "Core/Log.h"
 #include "Renderer/Renderer.h"
 #include "Scene/Components.h"
@@ -10,6 +11,7 @@
 #include "Vfx/VfxStack.h"
 
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/packing.hpp> // packHalf2x16 (GPU record colour)
 
 #include <cmath>
 #include <cstring>
@@ -240,6 +242,15 @@ void Update(Scene& scene, f32 dt, bool emitting) {
     auto& reg = scene.Registry();
     for (const entt::entity e : reg.view<ParticleEmitter>()) {
         ParticleEmitter& em = reg.get<ParticleEmitter>(e);
+        // GPU-simulated emitters take the other fork entirely: no pool, no kernels,
+        // no per-particle CPU work at all. StepGpuEmitter compiles/stamps the v1
+        // stack and runs only the spawn scheduler; particle::GpuSim then queues the
+        // compute dispatches (Scene/ParticleGpuSim.cpp).
+        if (em.gpuSim) {
+            StepGpuEmitter(em, scene.WorldMatrix(e), dt, emitting,
+                           static_cast<u32>(entt::to_integral(e)));
+            continue;
+        }
         StepEmitter(em, scene.WorldMatrix(e), dt, emitting);
     }
 }
@@ -256,6 +267,12 @@ void BuildVertices(Scene& scene, Renderer& renderer, const std::filesystem::path
         ParticleEmitter& em = reg.get<ParticleEmitter>(e);
         const u32 count = em.pool.count;
         if (count == 0) continue;
+        // Opted into GPU vertex expansion: BuildGpuRecords owns this emitter. An
+        // emitter is expanded by exactly one path, never both. gpuSim is the same
+        // seam one step further out - its records are written by the compute shader,
+        // so it has no CPU pool at all (count would already be 0; named anyway so
+        // the exclusion is a statement rather than a side effect).
+        if (em.gpuExpand || em.gpuSim) continue;
 
         // Resolve the sprite once (cached). 0 = procedural soft dot in the shader.
         if (!em.textureResolved) {
@@ -359,6 +376,139 @@ void BuildVertices(Scene& scene, Renderer& renderer, const std::filesystem::path
             out.push_back(a); out.push_back(cc); out.push_back(d);
         }
     }
+}
+
+bool AnyGpuExpand(Scene& scene) {
+    auto& reg = scene.Registry();
+    for (const entt::entity e : reg.view<ParticleEmitter>()) {
+        if (reg.get<ParticleEmitter>(e).gpuExpand) return true;
+    }
+    return false;
+}
+
+u32 LiveCount(Scene& scene) {
+    auto& reg = scene.Registry();
+    u32 n = 0;
+    for (const entt::entity e : reg.view<ParticleEmitter>()) {
+        const ParticleEmitter& em = reg.get<ParticleEmitter>(e);
+        if (em.gpuSim) continue; // no CPU pool; see GpuSim::Stats
+        n += em.pool.count;
+    }
+    return n;
+}
+
+u32 BuildGpuRecords(Scene& scene, Renderer& renderer, const std::filesystem::path& assetsDir,
+                    const glm::vec3& camRight, const glm::vec3& camUp, void* dst,
+                    u32 capacityElements, std::vector<rhi::GpuParticleBatch>& batchesOut) {
+    batchesOut.clear();
+    if (!dst || capacityElements == 0) return 0;
+
+    // The buffer is ONE 64-byte stride carrying both record types; a GpuEmitter is
+    // exactly two elements, which is what lets a whole batch be selected by a single
+    // buffer offset (see rhi::GpuParticleBatch).
+    static_assert(sizeof(vfx::GpuParticle) == 64, "record stride");
+    static_assert(sizeof(vfx::GpuEmitter) ==
+                      rhi::kGpuParticleEmitterElements * sizeof(vfx::GpuParticle),
+                  "GpuEmitter must occupy exactly kGpuParticleEmitterElements elements - the "
+                  "VS reads particle i at sizeof(GpuEmitter) + i*64.");
+    constexpr u32 kHeader = rhi::kGpuParticleEmitterElements;
+
+    u8* const base = static_cast<u8*>(dst);
+    u32 cursor = 0; // in elements
+    auto& reg = scene.Registry();
+
+    for (const entt::entity e : reg.view<ParticleEmitter>()) {
+        ParticleEmitter& em = reg.get<ParticleEmitter>(e);
+        if (!em.gpuExpand || em.pool.count == 0) continue;
+        // Every emitter block starts 256-byte aligned. The batch base reaches Vulkan
+        // as a DYNAMIC STORAGE-BUFFER OFFSET, which must be a multiple of
+        // minStorageBufferOffsetAlignment - 32 on this project's dev GPU but up to
+        // 256 on other parts, and the backend SKIPS a misaligned batch while D3D12
+        // draws it. Aligning costs at most 3 slots per emitter and is the same rule
+        // the GPU simulation applies (ParticleGpuSim.cpp kBlockAlign).
+        constexpr u32 kAlign = rhi::kGpuParticleBlockAlign;
+        cursor = (cursor + kAlign - 1u) & ~(kAlign - 1u);
+        if (cursor + kHeader >= capacityElements) break; // no room for even one particle
+
+        // Same lazy, cached sprite resolve the CPU path does (it touches the asset
+        // loader and the filesystem, so it can never move into a shader).
+        if (!em.textureResolved) {
+            em.textureResolved = true;
+            em.textureCache = 0;
+            if (!em.texture.empty() && !assetsDir.empty()) {
+                em.textureCache = assets::LoadTexture(renderer, assetsDir / em.texture).index;
+            }
+        }
+
+        u32 room = capacityElements - cursor - kHeader;
+        // One batch is one bind, so it cannot exceed the buffer's declared bind
+        // window (rhi::GpuBufferDesc::maxBindElements). Both backends clamp to this
+        // at the draw as well; doing it here keeps the surplus from being uploaded.
+        constexpr u32 kMaxBatch =
+            rhi::kMaxGpuParticleBatchElements - rhi::kGpuParticleEmitterElements;
+        if (room > kMaxBatch) room = kMaxBatch;
+        const u32 count = em.pool.count < room ? em.pool.count : room;
+        if (count == 0) break;
+
+        // Which per-particle streams actually exist. Dead-stream elimination can
+        // leave any of these unbacked, so the flags travel with the record and the
+        // gather substitutes a default - exactly the four booleans BuildVertices
+        // reads off the pool.
+        const bool simColor = em.pool.Has(vfx::Attr::Color);
+        const bool simSize = em.pool.Has(vfx::Attr::Size);
+        const bool hasRot = em.pool.Has(vfx::Attr::Rotation);
+        const bool hasVel = em.pool.Has(vfx::Attr::Velocity);
+
+        vfx::GpuEmitter rec;
+        rec.startColor = em.startColor;
+        rec.endColor = em.endColor;
+        rec.sizeFade = glm::vec4(em.startSize, em.endSize, em.fadeIn, em.fadeOut);
+        rec.texIndex = em.textureCache;
+        rec.subUV = glm::max(1u, em.subUVCols) | (glm::max(1u, em.subUVRows) << 16);
+        rec.subUVFps = em.subUVFps;
+        rec.flags = (simColor ? vfx::GpuEmitterFlag::SimColor : 0u) |
+                    (simSize ? vfx::GpuEmitterFlag::SimSize : 0u) |
+                    (hasRot ? vfx::GpuEmitterFlag::HasRot : 0u) |
+                    (hasVel ? vfx::GpuEmitterFlag::HasVel : 0u);
+        rec.camRight = camRight;
+        rec.stretch = em.stretch;
+        rec.camUp = camUp;
+        rec.renderMode = static_cast<u32>(em.render);
+        std::memcpy(base + static_cast<usize>(cursor) * sizeof(vfx::GpuParticle), &rec,
+                    sizeof(rec));
+
+        // The gather. This is the whole CPU cost of the GPU path: 64 bytes written
+        // per particle, sequentially, versus 240 bytes of billboarded vertices plus
+        // a second memcpy through a staging vector.
+        u8* out = base + static_cast<usize>(cursor + kHeader) * sizeof(vfx::GpuParticle);
+        for (u32 i = 0; i < count; ++i) {
+            vfx::GpuParticle p{};
+            p.position = em.pool.position[i];
+            p.age = em.pool.age[i];
+            p.velocity = hasVel ? em.pool.velocity[i] : glm::vec3(0.0f);
+            p.lifetime = em.pool.lifetime[i];
+            if (simColor) {
+                // half4 linear HDR. The CPU path keeps float4; this is the one
+                // precision difference between the two, and the reason the GPU path
+                // is "visually equivalent" rather than bit-identical.
+                const glm::vec4& c = em.pool.color[i];
+                p.colorRG = glm::packHalf2x16(glm::vec2(c.r, c.g));
+                p.colorBA = glm::packHalf2x16(glm::vec2(c.b, c.a));
+            }
+            p.sizeX = simSize ? em.pool.sizeX[i] : 0.0f;
+            p.sizeY = p.sizeX;
+            p.rotation = hasRot ? em.pool.rotation[i] : 0.0f;
+            std::memcpy(out + static_cast<usize>(i) * sizeof(vfx::GpuParticle), &p, sizeof(p));
+        }
+
+        rhi::GpuParticleBatch b;
+        b.recordFirst = cursor;
+        b.count = count;
+        b.additive = em.additive ? 1u : 0u;
+        batchesOut.push_back(b);
+        cursor += kHeader + count;
+    }
+    return cursor;
 }
 
 bool BuildVolumetricBlobs(Scene& scene, std::vector<rhi::VolumeBlob>& blobsOut,

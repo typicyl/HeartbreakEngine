@@ -66,6 +66,23 @@ public:
     };
     void SetWorldUI(const std::vector<WorldUIDraw>& draws) { worldUIDraws_ = &draws; }
 
+    // -- Editor UI-authoring canvas (the dedicated `.hbui` editor panel) --------
+    // ONE document rendered into its own UI target this frame. Its own slot rather
+    // than an append to SetWorldUI because (a) worldUIDraws is a local of
+    // Engine::Run that the editor cannot reach, and (b) an authoring page is not
+    // world content and must not enter the world-UI list.
+    //
+    // Consumed and cleared by RenderScene (one frame only; `verts` must stay alive
+    // until then - the editor owns the vector). Submitted in the SAME pre-shadow
+    // block as the world-UI draws, which is what makes the panel same-frame rather
+    // than one frame stale: the editor's BuildUI hook runs BEFORE RenderScene, and
+    // DrawUIToTexture runs before the ImGui pass inside it.
+    void SetEditorUICanvas(rhi::TextureHandle target, const rhi::UIVertex* verts, u32 count) {
+        editorUITarget_ = target;
+        editorUIVerts_ = verts;
+        editorUICount_ = count;
+    }
+
     // Particle billboards for this frame (world-space; alpha + additive lists).
     // Drawn inside RenderScene's HDR pass; cleared after one frame.
     void SetParticles(const std::vector<rhi::ParticleVertex>& alpha,
@@ -74,6 +91,23 @@ public:
         particleAlphaCount_ = static_cast<u32>(alpha.size());
         particleAdd_ = additive.empty() ? nullptr : additive.data();
         particleAddCount_ = static_cast<u32>(additive.size());
+    }
+
+    // GPU-EXPANDED particle batches for this frame. Deferred exactly like
+    // SetParticles (forwarded inside RenderScene, cleared after one frame) so the
+    // batch vector's lifetime rule is the same one callers already follow.
+    //
+    // ACCUMULATES, up to rhi::kMaxGpuParticleGroups: the CPU-simulated emitters live
+    // in the per-frame upload ring and the GPU-simulated ones in the compute-written
+    // buffer, and a batch carries only an element offset.
+    void SetGpuParticles(rhi::GpuBufferHandle records,
+                         const std::vector<rhi::GpuParticleBatch>& batches) {
+        if (!records.IsValid() || batches.empty()) return;
+        if (particleGpuGroupCount_ >= rhi::kMaxGpuParticleGroups) return;
+        GpuParticleGroup& g = particleGpuGroups_[particleGpuGroupCount_++];
+        g.buffer = records;
+        g.batches = batches.data();
+        g.count = static_cast<u32>(batches.size());
     }
 
     // Volumetric-VFX blobs for this frame (splatted into a 3D density volume; see
@@ -86,6 +120,33 @@ public:
             device_->SetVolumeParticles(blobs.empty() ? nullptr : blobs.data(),
                                         static_cast<u32>(blobs.size()), params);
         }
+    }
+
+    // -- GPU compute + GPU-writable structured buffers -----------------------
+    // Thin forwarders (the SetVolumeParticles pattern). QueueCompute must be
+    // called BEFORE RenderScene: both backends execute the queue in their
+    // BeginFrame, because Vulkan cannot record compute inside a render pass.
+    bool SupportsGpuCompute() const { return device_ && device_->SupportsGpuCompute(); }
+    rhi::GpuBufferHandle CreateGpuBuffer(const rhi::GpuBufferDesc& desc) {
+        return device_ ? device_->CreateGpuBuffer(desc) : rhi::GpuBufferHandle{};
+    }
+    void* MapGpuBuffer(rhi::GpuBufferHandle h) {
+        return device_ ? device_->MapGpuBuffer(h) : nullptr;
+    }
+    bool ReadGpuBuffer(rhi::GpuBufferHandle h, void* dst, u32 bytes) {
+        return device_ && device_->ReadGpuBuffer(h, dst, bytes);
+    }
+    void DestroyGpuBuffer(rhi::GpuBufferHandle h) {
+        if (device_) device_->DestroyGpuBuffer(h);
+    }
+    rhi::ComputePipelineHandle CreateComputePipeline(const rhi::ComputePipelineDesc& desc) {
+        return device_ ? device_->CreateComputePipeline(desc) : rhi::ComputePipelineHandle{};
+    }
+    void QueueCompute(const rhi::ComputeDispatch& d) {
+        if (device_) device_->QueueCompute(d);
+    }
+    void SetVertexShaderBuffer(rhi::GpuBufferHandle h, u32 firstElement) {
+        if (device_) device_->SetVertexShaderBuffer(h, firstElement);
     }
 
     void Resize(u32 width, u32 height);
@@ -164,9 +225,19 @@ private:
     std::vector<rhi::DrawItem> drawItems_; // reused each frame
     const std::vector<rhi::UIVertex>* uiVertices_ = nullptr; // set per frame
     const std::vector<WorldUIDraw>* worldUIDraws_ = nullptr; // set per frame
+    rhi::TextureHandle editorUITarget_;                       // set per frame (editor canvas)
+    const rhi::UIVertex* editorUIVerts_ = nullptr;
+    u32 editorUICount_ = 0;
     const rhi::ParticleVertex* particleAlpha_ = nullptr;     // set per frame
     const rhi::ParticleVertex* particleAdd_ = nullptr;
     u32 particleAlphaCount_ = 0, particleAddCount_ = 0;
+    struct GpuParticleGroup {                                        // set per frame
+        rhi::GpuBufferHandle buffer;
+        const rhi::GpuParticleBatch* batches = nullptr;
+        u32 count = 0;
+    };
+    GpuParticleGroup particleGpuGroups_[rhi::kMaxGpuParticleGroups]{};
+    u32 particleGpuGroupCount_ = 0;
     rhi::SceneView previewView_;                  // editor asset preview
     std::vector<rhi::DrawItem> previewItems_;     // (consumed each frame)
     bool previewPending_ = false;

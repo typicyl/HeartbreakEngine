@@ -2,11 +2,10 @@
 #include "Assets/UAP.h"
 
 #include "Assets/AssetFormats.h" // the single source of truth for packable types
+#include "Assets/SlotIds.h"      // the asset's OWN pack slot (authority tier 1)
 
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
-
-#include <nlohmann/json.hpp>
 
 #include <atomic>
 
@@ -28,7 +27,6 @@
 namespace hbe::uap {
 
 namespace fs = std::filesystem;
-using json = nlohmann::json;
 
 namespace {
 
@@ -85,48 +83,6 @@ bool IsPackableExtension(const fs::path& ext) {
     return assets::IsPackable(assets::NormalizeExtension(ext));
 }
 
-// Loads `path -> slot` assignments from the manifest (empty map if missing).
-std::unordered_map<std::string, u32> LoadManifest(const fs::path& manifestPath) {
-    std::unordered_map<std::string, u32> slots;
-    std::ifstream in(manifestPath);
-    if (!in) return slots;
-    try {
-        json j;
-        in >> j;
-        // NOTE: don't call .items() on a j.value(...) temporary - the proxy
-        // would outlive it (C++20 range-for doesn't extend that lifetime).
-        if (const auto it = j.find("slots"); it != j.end() && it->is_object()) {
-            for (const auto& [path, slot] : it->items()) {
-                slots[path] = slot.get<u32>();
-            }
-        }
-    } catch (const std::exception&) {
-        HBE_WARN("UAP: manifest '{}' is corrupt; slots will be reassigned.",
-                 manifestPath.string());
-        slots.clear();
-    }
-    return slots;
-}
-
-bool SaveManifest(const fs::path& manifestPath,
-                  const std::unordered_map<std::string, u32>& slots) {
-    // Sorted by slot so diffs of the manifest stay readable.
-    std::map<u32, std::string> bySlot;
-    for (const auto& [path, slot] : slots) bySlot[slot] = path;
-    json j;
-    j["version"] = 1;
-    j["slotsPerPack"] = kSlotsPerPack;
-    auto& out = j["slots"] = json::object();
-    for (const auto& [slot, path] : bySlot) out[path] = slot;
-
-    std::error_code ec;
-    fs::create_directories(manifestPath.parent_path(), ec);
-    std::ofstream file(manifestPath);
-    if (!file) return false;
-    file << j.dump(2);
-    return true;
-}
-
 } // namespace
 
 std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::string& baseName,
@@ -141,15 +97,22 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
     // separately and read from there when packing.
     std::map<std::string, u64> files; // sorted: new-slot assignment is stable
     std::unordered_map<std::string, fs::path> sourceOf; // virtualPath -> on-disk source
+    // EVERY packable file on disk, filter or no filter. Slots are reserved from
+    // this set rather than from `files`, so an asset that this cook does not pack
+    // (because BuildSettings::onlyReferenced excluded it) still holds its number -
+    // toggling that setting can no longer renumber the assets that DO ship.
+    std::vector<std::string> assetKeys;
     u64 scanned = 0; // regular files seen under rootDir (packable or not)
     for (const auto& it : fs::recursive_directory_iterator(rootDir, ec)) {
         if (!it.is_regular_file()) continue;
         ++scanned;
         if (!IsPackableExtension(it.path().extension())) continue;
         const std::string rel = fs::relative(it.path(), rootDir, ec).generic_string();
+        assetKeys.push_back(rel);
         if (options.filter && !options.filter->count(rel)) continue;
         files[rel] = static_cast<u64>(fs::file_size(it.path(), ec));
     }
+    std::sort(assetKeys.begin(), assetKeys.end());
     // Guard: a populated Assets folder that contributes ZERO packable files means
     // the extension test is broken, not that the project is empty. That exact
     // failure once shipped a build containing only shaders + the project file -
@@ -174,35 +137,149 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
         return std::nullopt;
     }
 
-    // Slot assignment: existing assets KEEP their slot; deleted assets free
-    // theirs (no shifting); new assets fill the lowest free slot. `compact`
-    // discards the prior assignment so everything packs into dense slots 0..N-1
-    // (the fewest packs) - used for full exports where pack stability is moot.
-    std::unordered_map<std::string, u32> slots =
-        options.compact ? std::unordered_map<std::string, u32>{} : LoadManifest(manifestPath);
-    for (auto it = slots.begin(); it != slots.end();) {
-        it = files.count(it->first) ? std::next(it) : slots.erase(it);
-    }
-    std::set<u32> used;
-    for (const auto& [path, slot] : slots) used.insert(slot);
+    // --- SLOT ASSIGNMENT ----------------------------------------------------
+    // The cook DECIDES nothing it can look up. An asset's slot is a property of
+    // the asset, assigned when it was created and stored inside it
+    // (Assets/SlotIds.h), so a cook is a pure function of the files on disk and
+    // two cooks in a row produce byte-identical packs. The order below is the
+    // authority order, and the tiers are disjoint - there is exactly one
+    // authority per file:
+    //   0. the ledger's reservations for everything that is NOT an asset - the
+    //      compiled shaders and `__project.hbproj`. These come FIRST, ahead of even
+    //      an embedded id, because they are the only tier those files have: an
+    //      asset that loses a contested slot can be repaired permanently by
+    //      --migrate-slots, while a displaced shader would be displaced again on
+    //      every cook forever. It is reported either way (`displace` below).
+    //   1. the id embedded in the asset;
+    //   2. the id this manifest remembers for that exact pack key - for the binary
+    //      bakes, which can hold no field, and for an asset whose saver rebuilt its
+    //      JSON and dropped the key;
+    //   3. the lowest free id, in sorted-path order.
+    // This is what the old code got wrong twice over: the manifest was the ONLY
+    // authority (so a rename was a delete + create), and the shipping cook set
+    // `compact`, which threw the manifest away and re-derived dense slots
+    // 0..N-1 - so adding one early-sorting asset rewrote every pack file.
+    std::vector<std::string> extraKeys;
     for (const auto& [path, size] : files) {
-        if (slots.count(path)) continue;
-        u32 slot = 0;
-        while (used.count(slot)) ++slot; // lowest free slot
-        slots[path] = slot;
-        used.insert(slot);
+        if (sourceOf.count(path)) extraKeys.push_back(path); // `files` is sorted
     }
-    if (!SaveManifest(manifestPath, slots)) {
+    std::map<std::string, u32> remembered = slots::LoadRememberedSlots(manifestPath);
+    slots::SlotTable table;
+    // Every displacement is a pack that changes for every player, so each one is
+    // named. This used to be silent for everything except a tier-1 collision, which
+    // is precisely why two whole classes of renumbering went unnoticed.
+    u32 displaced = 0;
+    const auto displace = [&](const std::string& key, u32 wanted) {
+        ++displaced;
+        std::string holder = "(unknown)";
+        for (const auto& [k, s] : table.All())
+            if (s == wanted) { holder = k; break; }
+        HBE_WARN("UAP: '{}' wanted pack slot {} but '{}' holds it; '{}' is renumbered for "
+                 "this cook, so the pack it lands in changes for everyone who already has "
+                 "the old one.",
+                 key, wanted, holder, key);
+    };
+
+    // NON-ASSET RESERVATIONS FIRST, from the ledger, whether or not THIS cook packs
+    // them. The compiled shaders and `__project.hbproj` ship as ExtraFiles in the
+    // same slot space and can carry no embedded id, so they exist only here - and a
+    // cook that has no extras at all (the dev `--pack`) would otherwise treat all
+    // 100+ of their numbers as free and hand them to assets, permanently.
+    for (const auto& [key, slot] : remembered)
+        if (!slots::IsAssetSlotKey(key)) table.Claim(key, slot);
+
+    std::vector<std::string> pending; // no embedded id
+    for (const std::string& rel : assetKeys) {
+        const std::optional<u32> embedded = slots::ReadSlot(rootDir / fs::path(rel));
+        if (!embedded || *embedded == slots::kUnassigned) {
+            pending.push_back(rel);
+            continue;
+        }
+        if (table.Claim(rel, *embedded)) continue;
+        // Two files claiming one id - two assets copied between projects, most
+        // likely, or an asset whose embedded id lands on an ExtraFile reservation.
+        // The lexicographically lower path (or the reservation) keeps it and this
+        // one is re-numbered, so two machines converge on the same packing - but
+        // `displace` says so, loudly and by name, because the loser's number
+        // changes and that costs a patch.
+        displace(rel, *embedded);
+        HBE_WARN("UAP: run --migrate-slots --apply to give '{}' a permanent id and make "
+                 "that fix stick.",
+                 rel);
+        pending.push_back(rel);
+    }
+
+    std::vector<std::string> unassigned; // tier 3
+    for (const std::string& rel : pending) {
+        const auto it = remembered.find(rel);
+        if (it == remembered.end()) {
+            unassigned.push_back(rel);
+        } else if (!table.Claim(rel, it->second)) {
+            displace(rel, it->second); // it HAD a number and lost it - never silent
+            unassigned.push_back(rel);
+        }
+    }
+    for (const std::string& virt : extraKeys) {
+        if (table.SlotOf(virt) != slots::kUnassigned) continue; // reserved above
+        const auto it = remembered.find(virt);
+        if (it == remembered.end()) {
+            unassigned.push_back(virt);
+        } else if (!table.Claim(virt, it->second)) {
+            displace(virt, it->second);
+            unassigned.push_back(virt);
+        }
+    }
+    u32 freshIds = 0;
+    for (const std::string& key : unassigned) {
+        table.ClaimLowestFree(key);
+        ++freshIds;
+    }
+    // NOT gated on `pending` being non-empty. That gate meant a displaced SHADER -
+    // the exact victim of a shared ledger going wrong - produced no output at all.
+    if (freshIds != 0) {
+        HBE_INFO("UAP: {} file(s) were numbered for this cook (no id in the file, none "
+                 "remembered, or the one they wanted was taken). Run --migrate-slots to give "
+                 "them permanent ids.",
+                 freshIds);
+    }
+    if (displaced != 0) {
+        HBE_WARN("UAP: {} file(s) were DISPLACED from the slot they previously held (listed "
+                 "above). Every pack containing one of them changes, so this build is a "
+                 "larger patch than it needs to be.",
+                 displaced);
+    }
+
+    // The ledger is MERGED, not overwritten: an asset that is gone loses its entry
+    // (which is exactly what frees its id for the next thing created), a non-asset
+    // entry is kept whether or not this cook packed extras, and everything the
+    // allocator holds is recorded. Writing table.All() wholesale was safe only while
+    // the dev cook and the ship cook had separate manifests; sharing one ledger (the
+    // point of Project::SlotManifestPath) means a `--pack` with no extras would
+    // otherwise erase every shader reservation on its way past.
+    slots::MergeRememberedSlots(rootDir, table, remembered);
+    if (!slots::SaveRememberedSlots(manifestPath, remembered)) {
         HBE_ERROR("UAP: cannot write manifest '{}'.", manifestPath.string());
         return std::nullopt;
     }
 
-    const u32 maxSlot = used.empty() ? 0 : *used.rbegin();
-    const u32 packCount = maxSlot / kSlotsPerPack + 1;
-
-    // Slot -> path lookup for the writer.
+    // Slot -> path lookup for the writer, over the files this cook actually packs.
+    // The pack count follows the highest PACKED slot, not the highest reserved
+    // one - a filtered cook must not emit six empty packs because an unreferenced
+    // asset happens to sit at slot 300.
     std::unordered_map<u32, std::string> bySlot;
-    for (const auto& [path, slot] : slots) bySlot[slot] = path;
+    u32 maxSlot = 0;
+    for (const auto& [path, size] : files) {
+        const u32 slot = table.SlotOf(path);
+        if (slot == slots::kUnassigned) {
+            HBE_ERROR("UAP: '{}' ended up with no pack slot - refusing to write packs that "
+                      "would silently omit it.",
+                      path);
+            return std::nullopt;
+        }
+        bySlot[slot] = path;
+        maxSlot = std::max(maxSlot, slot);
+    }
+    const u32 packCount = maxSlot / kSlotsPerPack + 1;
 
     fs::create_directories(outDir, ec);
     const u32 algorithm = options.compress ? kCompressionAlgorithm : 0;
@@ -333,6 +410,24 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
         }
     }
 
+    // Remove pack files a PREVIOUS, larger cook left behind. PackSet::Open walks
+    // `<base>_0`, `_1`, ... until one is missing, so a stale trailing chunk would
+    // be mounted and could shadow a current entry by path - and with slots now
+    // sparse rather than compacted, the pack count genuinely shrinks when the
+    // high assets are deleted.
+    for (u32 p = packCount;; ++p) {
+        const fs::path stale = outDir / (baseName + "_" + std::to_string(p) + ".uap");
+        if (!fs::exists(stale, ec)) break;
+        // Stop on a failed delete rather than retrying the same path forever: a
+        // locked file would otherwise spin here (`exists` stays true).
+        if (!fs::remove(stale, ec) || ec) {
+            HBE_WARN("UAP: could not remove the stale pack '{}'; delete it by hand or a "
+                     "mount will still see its (outdated) entries.",
+                     stale.string());
+            break;
+        }
+    }
+
     HBE_INFO("UAP: packed {} assets into {} pack(s) of {} slots ('{}_N.uap'){}.",
              result.assetCount, result.packCount, kSlotsPerPack, baseName,
              options.compress
@@ -360,6 +455,16 @@ bool PackReader::Open(const fs::path& packFile) {
     pod(version);
     pod(count);
     if (!in || version > kVersion || count > 100000) return false;
+    // The slot count is written into every pack, but nothing used to check it -
+    // and PackSet::Entries() globalises with the COMPILE-TIME kSlotsPerPack
+    // (`e.slot += p * kSlotsPerPack`). Changing the constant would therefore have
+    // silently mis-numbered every already-shipped pack. Refuse to mount instead.
+    if (count != kSlotsPerPack) {
+        HBE_ERROR("UAP: '{}' was written with {} slots per pack but this build uses {}. "
+                  "Re-cook the packs; mounting them would mis-number every slot.",
+                  packFile.string(), count, kSlotsPerPack);
+        return false;
+    }
     algorithm_ = 0;
     if (version >= 3) pod(algorithm_);
 

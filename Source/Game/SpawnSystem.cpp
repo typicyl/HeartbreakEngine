@@ -6,6 +6,7 @@
 #include "Game/GameSystems.h"
 #include "Project/Project.h"
 #include "Scene/Components.h"
+#include "Scene/Hierarchy.h" // scene::BuildChildrenMap (one parent->children pass)
 #include "Scene/Scene.h"
 #include "Scene/SceneSerializer.h"
 
@@ -34,8 +35,29 @@ Prefab* GetPrefab(const std::string& rel) {
     Prefab pf;
     const std::filesystem::path path = Project::Active().AssetsDir() / rel;
     if (scene::ParseSceneFile(path, pf.data)) {
-        scene::StageAssets(pf.data, Project::Active().AssetsDir(), pf.staged);
-        pf.ok = true;
+        // A PREFAB CARRYING UI IS REJECTED, ONCE, LOUDLY. The editor refuses to
+        // write one (Editor::CreatePrefabFromSelection), but a hand-edited or
+        // pre-migration `.hbprefab` can still exist on disk - and spawning it would
+        // create UI entities with no UIDocMember, i.e. loose UI that carries none of
+        // BuildSceneJson's skip tags and therefore lands in the next `.hbsave` as
+        // permanent, un-clearable screen UI. Exactly the failure the
+        // DialogueChoiceButton skip was added to prevent, arriving by another door.
+        // UI lives in a `.hbui`; a document IS the reusable UI template.
+        bool hasUI = false;
+        for (const scene::EntityData& d : pf.data.entities)
+            if (d.hasUI || d.hasUICanvas || d.hasUIAnimator || d.hasUIPanel ||
+                d.hasUILayoutGroup || d.hasUICanvasGroup) {
+                hasUI = true;
+                break;
+            }
+        if (hasUI) {
+            HBE_ERROR("Spawner: prefab '{}' contains UI components and will NOT be "
+                      "spawned. UI belongs in a .hbui document, not in a .hbprefab.",
+                      rel);
+        } else {
+            scene::StageAssets(pf.data, Project::Active().AssetsDir(), pf.staged);
+            pf.ok = true;
+        }
     } else {
         HBE_WARN("Spawner: failed to load prefab '{}'.", rel);
     }
@@ -90,16 +112,17 @@ void DespawnBySpawner(Scene& scene, const std::string& spawnerId) {
     for (auto e : reg.view<Spawned>())
         if (reg.get<Spawned>(e).spawnerId == spawnerId) kill.insert(static_cast<u32>(e));
     if (kill.empty()) return;
-    bool grew = true;
-    while (grew) {
-        grew = false;
-        for (auto e : reg.view<Parent>()) {
-            if (kill.count(static_cast<u32>(e))) continue;
-            if (kill.count(static_cast<u32>(reg.get<Parent>(e).entity))) {
+    // Descend from each spawned root through ONE parent->children map. This used to
+    // be a `while (grew)` fixpoint over the whole Parent pool - worse than quadratic
+    // (one full pool scan per level of depth, every despawn), and the worst-shaped
+    // walk in the tree. See Scene/Hierarchy.h.
+    {
+        const scene::ChildrenMap kids = scene::BuildChildrenMap(reg);
+        const std::vector<u32> roots(kill.begin(), kill.end());
+        for (const u32 bits : roots)
+            for (const entt::entity e :
+                 scene::SubtreeInOrder(kids, static_cast<entt::entity>(bits)))
                 kill.insert(static_cast<u32>(e));
-                grew = true;
-            }
-        }
     }
     for (u32 bits : kill) {
         const entt::entity e = static_cast<entt::entity>(bits);
@@ -122,6 +145,13 @@ void DoBurst(Scene& scene, Renderer& renderer, entt::entity spawnerEnt, Spawner&
         const entt::entity root = created.front();
         if (Transform* t = reg.try_get<Transform>(root)) t->position = base + DiscOffset(i, want, s.radius);
         reg.emplace_or_replace<Spawned>(root, Spawned{s.encounterId, s.spawnerId});
+        // A spawned NPC INHERITS its spawner's streaming-shard membership, so despawning
+        // that shard takes it too. Without this the NPC is created long after the shard
+        // loaded and belongs to nothing: stream::CollectShardEntities' spawnerId rule
+        // would still catch it, but only for a spawner with a non-empty spawnerId, and a
+        // stranded NPC standing in an unloaded region is a leak that grows per burst.
+        if (const StreamShard* sh = reg.try_get<StreamShard>(spawnerEnt))
+            reg.emplace_or_replace<StreamShard>(root, *sh);
         ++s.spawnedTotal;
     }
 }
@@ -247,12 +277,20 @@ void UpdateEncounters(Scene& scene, f32 dt) {
         en.activateRequested = false;
 
         if (en.state == Encounter::State::Active) {
-            if (en.aliveCount > 0) en.everHadAlive = true;
-            else if (en.everHadAlive) {
+            if (en.aliveCount > 0) {
+                en.everHadAlive = true;
+                // The population is live again (the shard came back and its spawner
+                // re-burst), so absence stops being ambiguous.
+                en.membersStreamedOut = false;
+            } else if (en.everHadAlive && !en.membersStreamedOut) {
                 en.state = Encounter::State::Cleared;
                 en.clearedEdge = true;
                 FireClearedAction(en);
             }
+            // else: alive == 0 because a shard unloaded the members. NOT cleared - the
+            // player walked away from the fight. stream::DespawnShard set the flag and
+            // re-armed the spawner, so re-entering the area repopulates it (decision 4:
+            // spawner progress persists, individual survivors' health resets).
         }
     }
 }

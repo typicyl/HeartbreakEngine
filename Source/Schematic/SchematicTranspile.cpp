@@ -109,8 +109,8 @@ struct Gen {
             case NodeType::KeyDown:      return "Value::Bool(ctx.input.IsKeyDown(KeyFromName((" + IN(0) + ").s)))";
             case NodeType::GetVar:       return "([&]() -> Value { auto _it = ctx.inst.vars.find((" + IN(0) +
                                                 ").s); return _it != ctx.inst.vars.end() ? _it->second : Value::Float(0.0f); }())";
-            case NodeType::GetPosition:  return "([&]() -> Value { entt::entity _e = BakedEnt(" + IN(0) +
-                                                ", ctx.self); const Transform* _t = ctx.scene.Registry().try_get<Transform>(_e); "
+            case NodeType::GetPosition:  return "([&]() -> Value { entt::entity _e = BakedEnt(ctx.scene.Registry(), " + IN(0) +
+                                                ", ctx.self); const Transform* _t = BakedGet<Transform>(ctx.scene.Registry(), _e); "
                                                 "return Value::Vec3(_t ? _t->position : glm::vec3(0.0f)); }())";
             case NodeType::EventUIClicked: // Action payload (valid while the event fires)
                 return "(ctx.eventAction ? Value::Str(*ctx.eventAction) : Value::Str(\"\"))";
@@ -129,9 +129,9 @@ struct Gen {
                        "; }); return _o; }())";
             }
             case NodeType::IsAlive:
-                return "Value::Bool(combat::IsAlive(ctx.scene, BakedEnt(" + IN(0) + ", ctx.self)))";
+                return "Value::Bool(combat::IsAlive(ctx.scene, BakedEnt(ctx.scene.Registry(), " + IN(0) + ", ctx.self)))";
             case NodeType::GetHealth:
-                return "([&]() -> Value { const Health* _h = ctx.scene.Registry().try_get<Health>(BakedEnt(" +
+                return "([&]() -> Value { const Health* _h = BakedGet<Health>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " +
                        IN(0) + ", ctx.self)); return Value::Float(_h ? (" +
                        (outPin == 1 ? std::string("_h->max") : std::string("_h->current")) +
                        ") : 0.0f); }())";
@@ -142,11 +142,11 @@ struct Gen {
                            : "(ctx.eventDeathTag ? Value::Str(*ctx.eventDeathTag) : Value::Str(\"\"))";
             case NodeType::IsPlayerVisible:
                 return "([&]() -> Value { const AIPerception* _p = "
-                       "ctx.scene.Registry().try_get<AIPerception>(BakedEnt(" + IN(0) +
+                       "BakedGet<AIPerception>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " + IN(0) +
                        ", ctx.self)); return Value::Bool(_p && _p->canSeeTarget); }())";
             case NodeType::GetAwareness:
                 return "([&]() -> Value { const AIPerception* _p = "
-                       "ctx.scene.Registry().try_get<AIPerception>(BakedEnt(" + IN(0) +
+                       "BakedGet<AIPerception>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " + IN(0) +
                        ", ctx.self)); return Value::Float(_p ? _p->awareness : 0.0f); }())";
             case NodeType::OnSpotPlayer:
                 return outPin == 2
@@ -218,14 +218,14 @@ struct Gen {
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetPosition:
-                out += "        { entt::entity _e = BakedEnt(" + IN(1) +
-                       ", ctx.self); if (Transform* _t = ctx.scene.Registry().try_get<Transform>(_e)) "
+                out += "        { entt::entity _e = BakedEnt(ctx.scene.Registry(), " + IN(1) +
+                       ", ctx.self); if (Transform* _t = BakedGet<Transform>(ctx.scene.Registry(), _e)) "
                        "_t->position = (" + IN(2) + ").v3; }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::Translate:
-                out += "        { entt::entity _e = BakedEnt(" + IN(1) +
-                       ", ctx.self); if (Transform* _t = ctx.scene.Registry().try_get<Transform>(_e)) "
+                out += "        { entt::entity _e = BakedEnt(ctx.scene.Registry(), " + IN(1) +
+                       ", ctx.self); if (Transform* _t = BakedGet<Transform>(ctx.scene.Registry(), _e)) "
                        "_t->position += (" + IN(2) + ").v3; }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
@@ -248,40 +248,40 @@ struct Gen {
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::ApplyDamage:
-                out += "        { combat::DamageEvent _ev; _ev.target = BakedEnt(" + IN(1) +
+                out += "        { combat::DamageEvent _ev; _ev.target = BakedEnt(ctx.scene.Registry(), " + IN(1) +
                        ", ctx.self); _ev.instigator = ctx.self; _ev.amount = BakedF(" + IN(2) +
                        "); combat::ApplyDamage(ctx.scene, _ev, nullptr); }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::Kill:
-                out += "        combat::Kill(ctx.scene, BakedEnt(" + IN(1) + ", ctx.self));\n";
+                out += "        combat::Kill(ctx.scene, BakedEnt(ctx.scene.Registry(), " + IN(1) + ", ctx.self));\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::Heal:
-                out += "        combat::Heal(ctx.scene, BakedEnt(" + IN(1) + ", ctx.self), BakedF(" +
+                out += "        combat::Heal(ctx.scene, BakedEnt(ctx.scene.Registry(), " + IN(1) + ", ctx.self), BakedF(" +
                        IN(2) + "));\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetHealth:
-                out += "        { if (Health* _h = ctx.scene.Registry().try_get<Health>(BakedEnt(" +
+                out += "        { if (Health* _h = BakedGet<Health>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " +
                        IN(1) + ", ctx.self))) { _h->current = glm::clamp(BakedF(" + IN(2) +
                        "), 0.0f, _h->max); if (_h->current <= 0.0f) _h->alive = false; "
                        "else if (!_h->alive) { _h->alive = true; _h->deathDispatched = false; } } }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetInvulnerable:
-                out += "        { if (Health* _h = ctx.scene.Registry().try_get<Health>(BakedEnt(" +
+                out += "        { if (Health* _h = BakedGet<Health>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " +
                        IN(1) + ", ctx.self))) _h->invincible = BakedB(" + IN(2) + "); }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetAIState:
-                out += "        { if (AIBehavior* _b = ctx.scene.Registry().try_get<AIBehavior>(BakedEnt(" +
+                out += "        { if (AIBehavior* _b = BakedGet<AIBehavior>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " +
                        IN(1) + ", ctx.self))) _b->state = AIStateFromName((" + IN(2) + ").s); }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetAlert:
                 out += "        { if (AIPerception* _p = "
-                       "ctx.scene.Registry().try_get<AIPerception>(BakedEnt(" + IN(1) +
+                       "BakedGet<AIPerception>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " + IN(1) +
                        ", ctx.self))) _p->awareness = glm::clamp(BakedF(" + IN(2) + "), 0.0f, 1.0f); }\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
@@ -314,7 +314,7 @@ struct Gen {
                 EmitExec(out, node, 0, stack, depth);
                 break;
             case NodeType::SetMorphWeight:
-                out += "        { if (MorphState* _m = facial::ResolveMorphTarget(ctx.scene, BakedEnt(" +
+                out += "        { if (MorphState* _m = facial::ResolveMorphTarget(ctx.scene, BakedEnt(ctx.scene.Registry(), " +
                        IN(1) + ", ctx.self))) { const std::string _n = (" + IN(2) +
                        ").s; if (!_n.empty()) _m->weights[_n] = glm::clamp(BakedF(" + IN(3) +
                        "), 0.0f, 1.0f); } }\n";
@@ -322,7 +322,7 @@ struct Gen {
                 break;
             case NodeType::PlayFacialExpression:
                 out += "        { if (FacialAnimator* _f = "
-                       "ctx.scene.Registry().try_get<FacialAnimator>(BakedEnt(" + IN(1) +
+                       "BakedGet<FacialAnimator>(ctx.scene.Registry(), BakedEnt(ctx.scene.Registry(), " + IN(1) +
                        ", ctx.self))) { _f->expression = (" + IN(2) +
                        ").s; _f->expressionWeight = glm::clamp(BakedF(" + IN(3) + "), 0.0f, 1.0f); } }\n";
                 EmitExec(out, node, 0, stack, depth);

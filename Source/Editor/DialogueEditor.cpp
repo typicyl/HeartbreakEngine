@@ -7,6 +7,7 @@
 // grow further.
 #include "Editor/Editor.h"
 
+#include "Core/Log.h"
 #include "Dialogue/DialogueGraph.h"
 #include "Project/Project.h"
 
@@ -76,12 +77,16 @@ void Editor::OpenDialogue(const std::filesystem::path& path) {
     panelOpen_[Panel_DialogueEditor] = true;
 }
 
-void Editor::SaveDialogue() {
-    if (editedDialoguePath_.empty()) return;
-    if (dlg::SaveGraph(editedDialoguePath_, dlgGraph_)) {
-        dlgDirty_ = false;
-        assetsDirty_ = true;
+bool Editor::SaveDialogue() {
+    if (editedDialoguePath_.empty()) return false;
+    if (!dlg::SaveGraph(editedDialoguePath_, dlgGraph_)) {
+        HBE_ERROR("Failed to write dialogue graph '{}'.", editedDialoguePath_.string());
+        return false;
     }
+    StampNewAsset(editedDialoguePath_); // the save rebuilt the JSON; restore its id
+    dlgDirty_ = false;
+    assetsDirty_ = true;
+    return true;
 }
 
 void Editor::DrawDialogueEditor(Engine& engine) {
@@ -91,7 +96,24 @@ void Editor::DrawDialogueEditor(Engine& engine) {
         ImGui::SetNextWindowFocus();
         dlgFocus_ = false;
     }
-    if (!ImGui::Begin("Dialogue Editor", &panelOpen_[Panel_DialogueEditor])) {
+    const bool dlgVisible = ImGui::Begin("Dialogue Editor", &panelOpen_[Panel_DialogueEditor]);
+    // CLAIM Ctrl+S FOR THIS PANEL. Before the "no graph open" early return below on
+    // purpose: an unconditional claim is what makes an empty Dialogue Editor say
+    // "nothing open to save" instead of quietly writing the LEVEL. RouteFromRootWindow
+    // means the ##dlgcanvas child does not split the claim off the panel.
+    //
+    // This REPLACES the old hand-rolled IsWindowFocused()+IsKeyPressed() handler that
+    // used to sit at the bottom of this function: because ImGui::IsKeyPressed() is not
+    // consumed by reading it, that handler ran IN ADDITION to the unguarded global
+    // Ctrl+S, so one keypress here saved the graph AND the scene. It also had no
+    // KeyShift test, so Ctrl+Shift+S saved the graph a second time on top of SaveAll.
+    //
+    // ...and above the `Begin() == false` early return too: a COLLAPSED window keeps
+    // the focus (the collapse arrow focuses first, then collapses), so a claim below
+    // that return would be skipped and the global route would write the LEVEL while
+    // the focused window is titled "Dialogue Editor".
+    ClaimSave(editor::SaveSurface::Dialogue);
+    if (!dlgVisible) {
         ImGui::End();
         return;
     }
@@ -105,7 +127,16 @@ void Editor::DrawDialogueEditor(Engine& engine) {
     if (ImGui::Button("Open")) ImGui::OpenPopup("##dlgopen");
     ImGui::SameLine();
     ImGui::BeginDisabled(editedDialoguePath_.empty());
-    if (ImGui::Button(dlgDirty_ ? "Save*" : "Save")) SaveDialogue();
+    if (ImGui::Button(dlgDirty_ ? "Save*" : "Save")) {
+        if (SaveDialogue())
+            SetSaveStatus("Saved dialogue graph '" +
+                              editedDialoguePath_.filename().string() + "'.",
+                          false);
+        else
+            SetSaveStatus("DIALOGUE SAVE FAILED - '" +
+                              editedDialoguePath_.filename().string() + "' was NOT written.",
+                          true);
+    }
     ImGui::EndDisabled();
     ImGui::SameLine();
     if (editedDialoguePath_.empty()) {
@@ -230,11 +261,7 @@ void Editor::DrawDialogueEditor(Engine& engine) {
         }
     }
     ImGui::EndChild();
-
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
-        ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-        SaveDialogue();
-    }
+    // (Ctrl+S is claimed at the top of this function - see ClaimSave there.)
     ImGui::End();
 }
 

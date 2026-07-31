@@ -45,6 +45,13 @@ f32 RaySphere(const glm::vec3& origin, const glm::vec3& dir, const glm::vec3& ce
 f32 ApplyDamage(Scene& scene, const DamageEvent& ev, PhysicsWorld* physics) {
     if (ev.target == entt::null || ev.amount <= 0.0f) return 0.0f;
     entt::registry& reg = scene.Registry();
+    // A DESPAWNED target, not merely a null one. Damage events travel through
+    // schematics (an Entity pin is raw handle bits), through AI (a target sensed last
+    // frame), and through the death queue - any of which can name an entity a shard
+    // despawn destroyed since. try_get on an invalid handle is an ENTT_ASSERT in Debug
+    // and an out-of-bounds sparse-set index in Release, so the guard belongs at this
+    // chokepoint rather than at each of the callers.
+    if (!reg.valid(ev.target)) return 0.0f;
     Health* h = reg.try_get<Health>(ev.target);
     if (!h || !h->alive || h->invincible) return 0.0f;
     if (h->invulnTimer > 0.0f && !ev.ignoreInvuln) return 0.0f;
@@ -52,7 +59,7 @@ f32 ApplyDamage(Scene& scene, const DamageEvent& ev, PhysicsWorld* physics) {
     // Faction gate: an instigator that carries Health can only hurt a hostile
     // (or explicitly friendly-fire-enabled) target. Environmental damage passes
     // ignoreFaction and skips this.
-    if (!ev.ignoreFaction && ev.instigator != entt::null) {
+    if (!ev.ignoreFaction && ev.instigator != entt::null && reg.valid(ev.instigator)) {
         if (const Health* ih = reg.try_get<Health>(ev.instigator)) {
             if (!Hostile(ih->faction, h->faction) && !h->friendlyFire) return 0.0f;
         }
@@ -112,6 +119,7 @@ void ApplyRadialDamage(Scene& scene, PhysicsWorld& physics, const glm::vec3& cen
 }
 
 void Kill(Scene& scene, entt::entity e, bool respectInvuln) {
+    if (e == entt::null || !scene.Registry().valid(e)) return;
     const Health* h = scene.Registry().try_get<Health>(e);
     if (!h) return;
     DamageEvent ev;
@@ -123,14 +131,14 @@ void Kill(Scene& scene, entt::entity e, bool respectInvuln) {
 }
 
 void Heal(Scene& scene, entt::entity e, f32 amount) {
-    if (amount <= 0.0f) return;
+    if (amount <= 0.0f || e == entt::null || !scene.Registry().valid(e)) return;
     Health* h = scene.Registry().try_get<Health>(e);
     if (!h || !h->alive) return;
     h->current = std::min(h->max, h->current + amount);
 }
 
 bool IsAlive(const Scene& scene, entt::entity e) {
-    if (e == entt::null) return false;
+    if (e == entt::null || !scene.Registry().valid(e)) return false;
     const Health* h = scene.Registry().try_get<Health>(e);
     return h && h->alive;
 }
@@ -244,8 +252,12 @@ void Update(Scene& scene, f32 dt) {
         if (!h.deathTag.empty()) rec.tag = h.deathTag;
         else if (const Name* n = reg.try_get<Name>(e)) rec.tag = n->value;
         rec.entity = static_cast<u32>(e);
-        rec.instigator =
-            h.lastAttacker != entt::null ? static_cast<u32>(h.lastAttacker) : 0xFFFFFFFFu;
+        // A killer that was itself destroyed first - routine once shards despawn -
+        // must not be laundered into the queue as raw bits: schematics read the
+        // Instigator pin and hand it straight to try_get. Report "no instigator".
+        rec.instigator = (h.lastAttacker != entt::null && reg.valid(h.lastAttacker))
+                             ? static_cast<u32>(h.lastAttacker)
+                             : 0xFFFFFFFFu;
         game::QueueDeath(rec);
 
         // Corpse: stop pathing + switch to the death clip (ragdoll is a future hook).

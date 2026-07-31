@@ -309,6 +309,13 @@ struct PostSettings {
     // still cover the full shadowDistance - just coarser per slice. Preset-driven
     // (High = 4 = the authored look; Medium/Low reduce it). Clamped to [1, kMaxShadowCascades].
     u32 shadowCascades = 4;
+
+    // Memberwise, defaulted ON PURPOSE: --test-lightingparity compares the whole
+    // post stack rather than a hand-picked list of fields, so a member added below
+    // is covered by the parity test the day it is added instead of silently
+    // escaping it. Exact float equality is what is wanted - both sides come from
+    // the same parse of the same bytes, so any difference is a real one.
+    bool operator==(const PostSettings&) const = default;
 };
 
 // Per-frame view + lighting environment.
@@ -569,6 +576,51 @@ struct ParticleVertex {
     u32 texIndex = 0;          // bindless sprite (0 = soft dot)
 };
 
+// One GPU-EXPANDED particle batch: one emitter's worth of billboards, drawn
+// straight out of a record buffer with no CPU vertex expansion at all.
+//
+// The buffer this indexes into has ONE 64-byte stride and is laid out per batch as
+//   [emitter record: 2 elements = vfx::GpuEmitter][particle 0][particle 1]...
+// so `recordFirst` selects the whole batch: the backend points the buffer's base at
+// that element (D3D12 root-SRV GPU virtual address, Vulkan dynamic storage-buffer
+// offset) and the VS reads the emitter at byte 0 and particle i at 128 + i*64.
+// The base is NEVER a firstInstance - D3D12's SV_InstanceID excludes
+// StartInstanceLocation while Vulkan's gl_InstanceIndex includes firstInstance, so
+// expressing it that way would make the two backends silently disagree. The draw is
+// DrawInstanced(6*count,1,0,0) / vkCmdDraw(cmd, 6*count, 1, 0, 0), firstInstance 0.
+//
+// VULKAN ALIGNMENT: recordFirst * 64 must be a multiple of
+// minStorageBufferOffsetAlignment, which the spec permits to be as large as 256.
+// Every producer therefore 256-byte-aligns (4 elements) every emitter block; the
+// backend still logs and skips a batch that would violate it rather than diverging.
+struct GpuParticleBatch {
+    u32 recordFirst = 0; // element index of this emitter's 2-element record block
+    u32 count = 0;       // live particles following it
+    u32 additive = 0;    // 0 = alpha blend, 1 = additive
+};
+
+// Elements the per-emitter record occupies, in units of the buffer's 64-byte
+// stride. C++ twin: sizeof(vfx::GpuEmitter) == 128. HLSL twin: kVfxEmitterBytes.
+inline constexpr u32 kGpuParticleEmitterElements = 2;
+
+// Element alignment of an emitter block inside a record buffer. 4 elements = 256 B,
+// the largest minStorageBufferOffsetAlignment the Vulkan spec permits, so a layout
+// built to this is legal on every desktop part rather than on the one it was tested
+// on. Producers align to it; both backends draw the identical result.
+inline constexpr u32 kGpuParticleBlockAlign = 4;
+
+// Elements ONE emitter batch may occupy, record block included. This is the bind
+// window a record buffer declares via GpuBufferDesc::maxBindElements, so it is also
+// the hard per-emitter particle ceiling on BOTH backends - the batch is clamped to
+// it at the draw so D3D12 and Vulkan can never disagree about the tail.
+inline constexpr u32 kMaxGpuParticleBatchElements = 65536;
+
+// Distinct record BUFFERS whose batches can draw in one frame. Two are in use: the
+// per-frame CpuWrite ring the CPU-simulated gpuExpand emitters upload into, and the
+// persistent device-local buffer the GPU simulation writes with compute. A batch
+// carries only an element offset, so the buffer identity has to come from the group.
+inline constexpr u32 kMaxGpuParticleGroups = 4;
+
 // One volumetric "blob": a spherical density/temperature sample the compute
 // splat writes into the 3D volume (Embergen-style volumetric smoke/fire). Built
 // per-frame from particle emitters. GPU-ready layout (32 bytes, float4-packed).
@@ -598,6 +650,121 @@ struct VolumeParams {
                                // frames so the noise doesn't crawl/pop when the AABB resizes
 };
 inline constexpr u32 kMaxVolumeBlobs = 4096; // cap (per-frame upload buffer size)
+
+// ---------------------------------------------------------------------------
+// GPU compute + GPU-writable structured buffers
+// ---------------------------------------------------------------------------
+//
+// The volumetric splat (CreateVolumeTexture / SetVolumeParticles) is a CLOSED
+// compute path: one hard-coded root signature, one hard-coded shader, one
+// hard-coded resource set, private to each backend. Nothing outside the RHI can
+// dispatch through it. These types are the general seam - a structured buffer a
+// compute shader WRITES and a vertex shader READS, plus a way to run a kernel
+// over it - which is what GPU particle simulation + GPU vertex expansion need.
+//
+// Deliberately NOT here: indirect draw. Every draw the particle system issues has
+// a CPU-known vertex count (the spawn scheduler stays on the CPU - it owns an f64
+// accumulator and the bit-exactness contract that --test-vfxcompat pins), so
+// DrawInstanced(6*N,1,0,0) / vkCmdDraw(cmd,6*N,1,0,0) is sufficient and sidesteps
+// the D3D12 CommandSignature machinery and the multiDrawIndirect /
+// drawIndirectFirstInstance feature gates entirely.
+
+// Opaque handle to a GPU buffer created via CreateGpuBuffer. Slot-recycling: a
+// destroyed handle's id may be reissued, so never hold one past DestroyGpuBuffer.
+struct GpuBufferHandle {
+    u32 id = 0;
+    bool IsValid() const { return id != 0; }
+};
+
+// Bit flags for GpuBufferDesc::usage. ShaderWrite and CpuWrite are mutually
+// exclusive (a GPU-written buffer must be device-local; D3D12 forbids
+// ALLOW_UNORDERED_ACCESS on the UPLOAD heap) - CreateGpuBuffer rejects both.
+namespace GpuBufferUsage {
+enum : u32 {
+    // Readable by a shader as a StructuredBuffer (D3D12 SRV / Vulkan read-only
+    // storage buffer). Required for SetVertexShaderBuffer and for compute SRVs.
+    ShaderRead = 1u << 0,
+    // Writable by a compute dispatch as an RWStructuredBuffer (D3D12 UAV /
+    // Vulkan storage buffer). Implies device-local storage.
+    ShaderWrite = 1u << 1,
+    // Bindable as a vertex stream (per-vertex or per-instance attributes).
+    VertexBuffer = 1u << 2,
+    // Host-visible and persistently mapped; MapGpuBuffer returns a pointer.
+    // Allocated as a per-frame-in-flight RING so the CPU can refill the current
+    // slot without racing the GPU - MapGpuBuffer hands back the CURRENT frame's
+    // slot, and every bind uses that same slot.
+    CpuWrite = 1u << 3,
+};
+}
+
+struct GpuBufferDesc {
+    u32 elementCount = 0;
+    u32 elementStride = 0; // bytes per element (e.g. sizeof(vfx::GpuParticle) == 64)
+    u32 usage = GpuBufferUsage::ShaderRead;
+    // Elements a SINGLE bind may address starting at its bind offset. 0 means the
+    // buffer is only ever bound at offset 0, so the whole thing is visible.
+    //
+    // This exists for Vulkan, and it is not optional there: a dynamic storage-buffer
+    // descriptor written with VK_WHOLE_SIZE must be bound with a dynamic offset of 0
+    // (VUID-vkCmdBindDescriptorSets-pDescriptorSets-06715), and the bound range must
+    // still fit the allocation (VUID-...-01979). So a buffer that IS bound at a
+    // non-zero offset gets a BOUNDED range of maxBindElements, and the backend pads
+    // the allocation by that same window so every legal offset stays in bounds.
+    // D3D12 root SRVs take any offset and ignore this field - which is exactly why
+    // it has to be declared here rather than discovered per backend.
+    u32 maxBindElements = 0;
+    const char* debugName = nullptr;
+};
+
+// Opaque handle to a compute pipeline created via CreateComputePipeline.
+struct ComputePipelineHandle {
+    u32 id = 0;
+    bool IsValid() const { return id != 0; }
+};
+
+// Per-dispatch resource caps. Both backends build a root signature / descriptor
+// set layout sized exactly from ComputePipelineDesc, so these are ceilings, not
+// costs.
+inline constexpr u32 kMaxComputeUavs = 4;
+inline constexpr u32 kMaxComputeSrvs = 4;
+// Root/uniform constant block per dispatch. Copied at QueueCompute time, so the
+// caller's pointer does not have to outlive the call.
+inline constexpr u32 kMaxComputeConstantBytes = 256;
+// Dispatches that may be queued in one frame.
+inline constexpr u32 kMaxQueuedComputeDispatches = 16;
+
+// A compute pipeline built from a precompiled kernel. `shaderName` names the
+// product cmake/ShaderCompile.cmake emits: "Foo" loads shaders/Foo.cs.dxil on
+// D3D12 and shaders/Foo.cs.spv on Vulkan. A kernel that is not registered in
+// ShaderCompile.cmake produces no file and CreateComputePipeline fails loudly
+// (the fog/ssgi silent-dormancy precedent).
+//
+// BINDING CONVENTION - the shader MUST declare its resources exactly like this,
+// with an explicit [[vk::binding]] on every one (the -fvk-*-shift remapping in
+// ShaderCompile.cmake would otherwise land Vulkan's bindings somewhere else):
+//   constants  cbuffer            : register(b0)      [[vk::binding(0, 0)]]
+//   uav i      RWStructuredBuffer : register(u<i>)    [[vk::binding(1 + i, 0)]]
+//   srv i      StructuredBuffer   : register(t<i>)    [[vk::binding(1 + uavCount + i, 0)]]
+struct ComputePipelineDesc {
+    const char* shaderName = nullptr;  // "VfxSim" -> VfxSim.cs.dxil / VfxSim.cs.spv
+    const char* entryPoint = "CSMain"; // Vulkan needs it by name; DXIL ignores it
+    u32 constantBytes = 0;             // <= kMaxComputeConstantBytes
+    u32 uavCount = 0;                  // <= kMaxComputeUavs
+    u32 srvCount = 0;                  // <= kMaxComputeSrvs
+    const char* debugName = nullptr;
+};
+
+// One queued dispatch. Buffers are bound at the CURRENT frame's ring slot.
+struct ComputeDispatch {
+    ComputePipelineHandle pipeline;
+    const void* constants = nullptr; // copied immediately by QueueCompute
+    u32 constantBytes = 0;
+    GpuBufferHandle uavs[kMaxComputeUavs]{};
+    u32 uavCount = 0;
+    GpuBufferHandle srvs[kMaxComputeSrvs]{};
+    u32 srvCount = 0;
+    u32 groupsX = 1, groupsY = 1, groupsZ = 1;
+};
 
 // Default reference canvas the UI is authored against (configurable per
 // project; see ui::CanvasConfig).
@@ -659,6 +826,55 @@ public:
     virtual void SetVolumeParticles(const VolumeBlob* /*blobs*/, u32 /*count*/,
                                     const VolumeParams& /*params*/) {}
 
+    // -- GPU compute + GPU-writable structured buffers (optional capability) --
+    // True when CreateGpuBuffer / CreateComputePipeline / QueueCompute do real
+    // work. False on clear-only backends (GL), which inherit the no-ops below.
+    virtual bool SupportsGpuCompute() const { return false; }
+
+    // Allocates a structured buffer of elementCount * elementStride bytes. With
+    // GpuBufferUsage::CpuWrite it is a per-frame-in-flight RING (one allocation
+    // per slot); otherwise it is a single device-local allocation. Returns an
+    // invalid handle on failure (bad desc, out of memory, unsupported backend).
+    virtual GpuBufferHandle CreateGpuBuffer(const GpuBufferDesc&) { return {}; }
+
+    // CPU pointer to the CURRENT frame's slot of a CpuWrite buffer (nullptr for
+    // any other buffer). Valid until the next BeginFrame; write, do not read
+    // (it is write-combined upload memory).
+    virtual void* MapGpuBuffer(GpuBufferHandle) { return nullptr; }
+
+    // Blocking read-back of the current slot's first `bytes` bytes into `dst`.
+    // Flushes the GPU, so this is a debug/validation tool - never a per-frame
+    // call. Returns false when unsupported or the range is out of bounds.
+    virtual bool ReadGpuBuffer(GpuBufferHandle, void* /*dst*/, u32 /*bytes*/) { return false; }
+
+    // Releases a buffer. Waits for GPU idle first (the buffer may still be
+    // referenced by in-flight command lists), so treat it as a load-time call.
+    virtual void DestroyGpuBuffer(GpuBufferHandle) {}
+
+    // Builds a compute pipeline from a precompiled kernel. Invalid handle when
+    // the shader is missing or the backend has no compute.
+    virtual ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc&) { return {}; }
+
+    // Queues a dispatch to run at the START of the next frame, BEFORE any render
+    // pass opens. Call it before Renderer::RenderScene, exactly like
+    // SetVolumeParticles - and for the same reason: Vulkan cannot record compute
+    // inside an active render pass, and ClearBackBuffer opens one that stays open
+    // through DrawScene. Both backends execute the queue at the same point (their
+    // BeginFrame), so the two frame timelines stay comparable. The queue is
+    // consumed and cleared every frame; queueing more than
+    // kMaxQueuedComputeDispatches drops the excess with a warning.
+    virtual void QueueCompute(const ComputeDispatch&) {}
+
+    // Binds a ShaderRead buffer as the vertex shader's structured buffer
+    // (`StructuredBuffer<T> gVfxRecords : register(t2, space1)` /
+    // `[[vk::binding(0, 2)]]`) for this frame's DrawScene, starting at element
+    // `firstElement`. That element offset is the per-batch base - it is applied
+    // as a BUFFER OFFSET (D3D12 root-SRV GPU virtual address / Vulkan dynamic
+    // storage-buffer offset), never as a firstInstance, so the D3D12
+    // SV_InstanceID vs Vulkan gl_InstanceIndex divergence cannot arise.
+    // An invalid handle unbinds. One frame only, like SetParticles.
+    virtual void SetVertexShaderBuffer(GpuBufferHandle, u32 /*firstElement*/) {}
+
     // Re-uploads pixel data (all mips) into an EXISTING bindless texture in place
     // (no new slot/resource), the texture-equivalent of UpdateMesh. The desc must
     // match the texture's created width/height/mipCount/format. Used for live
@@ -677,6 +893,23 @@ public:
     // scene; `additive` verts add. Pointers must stay valid through DrawScene.
     virtual void SetParticles(const ParticleVertex* /*alpha*/, u32 /*alphaCount*/,
                               const ParticleVertex* /*additive*/, u32 /*addCount*/) {}
+
+    // Sets this frame's GPU-EXPANDED particle batches. `records` is a ShaderRead
+    // buffer of 64-byte elements holding [emitter record][particles] blocks (see
+    // GpuParticleBatch); each batch becomes one draw with no vertex buffer and no
+    // input layout - the VS builds the quad from SV_VertexID (Shaders/ParticleGpu.hlsl).
+    //
+    // Runs INSIDE the same block as SetParticles, in the same HDR pass, so both
+    // paths blend against each other correctly: CPU alpha, GPU alpha, CPU additive,
+    // GPU additive. Pointers must stay valid through DrawScene; one frame only.
+    // An invalid handle or count 0 disables the path this frame at zero cost.
+    //
+    // CALLS ACCUMULATE, up to kMaxGpuParticleGroups. A GpuParticleBatch carries an
+    // element offset and nothing else, so batches living in two different record
+    // buffers - the CpuWrite upload ring and the compute-written simulation buffer -
+    // cannot share one call. Each call adds one (buffer, batches) group; the whole
+    // set is consumed and cleared by DrawScene.
+    virtual void SetGpuParticles(GpuBufferHandle, const GpuParticleBatch*, u32 /*count*/) {}
 
     // Records draws for `count` items using the analytic PBR pipeline. Must be
     // called between BeginFrame (after the clear) and EndFrame.

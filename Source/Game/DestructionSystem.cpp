@@ -149,6 +149,64 @@ void DetachChunk(Scene& scene, entt::entity root, Destructible& d, const CachedF
     }
 }
 
+// Rebuilds a RESTORED break: the object claims to be activated (persisted break
+// progress replayed by world::ApplyEntityState) but its chunk entities do not exist,
+// because entt handles never survive a despawn or a save.
+//
+// This cannot be done in the restore itself. Activate() refuses to run on an activated
+// object, and Activate() is also what removes the root's intact MeshInstance and
+// RigidBody - so a restore that only writes `activated = true` produces a wall that
+// renders and collides as PRISTINE, has an all-null chunkEntity[], and can never break
+// again (every further DetachChunk just flips a state byte). "A half-collapsed wall is
+// still half-collapsed" (WorldState.h) is only true with this pass.
+//
+// Order matters: build the chunks from a CLEAN state, then re-detach the ones that were
+// detached, so each of those gets its convex collider and its unparented world pose
+// exactly as it did the first time. No impulse - the debris is being restored at rest,
+// not thrown again.
+void Reactivate(Scene& scene, entt::entity root, Destructible& d, const CachedFracture& cf,
+                PhysicsWorld* physics) {
+    d.reactivate = false;
+    const usize n = cf.asset.chunks.size();
+    if (n == 0) {
+        d.activated = false; // nothing to rebuild from; treat it as intact
+        return;
+    }
+    std::vector<u8> restored = d.chunkState;
+    restored.resize(n, static_cast<u8>(Destructible::ChunkState::Intact));
+    std::vector<f32> hp = d.chunkHp;
+    hp.resize(n, d.chunkHealth);
+
+    d.activated = false; // so Activate() runs
+    d.chunkState.assign(n, static_cast<u8>(Destructible::ChunkState::Intact));
+    d.chunkEntity.assign(n, entt::entity{entt::null});
+    d.supportScratch.assign(n, 0);
+    d.chunkHp = std::move(hp);
+    Activate(scene, root, d, cf);
+
+    usize detached = 0;
+    for (usize i = 0; i < n; ++i) {
+        if (restored[i] == static_cast<u8>(Destructible::ChunkState::Detached)) {
+            DetachChunk(scene, root, d, cf, i, glm::vec3(0.0f), glm::vec3(0.0f), physics);
+            ++detached;
+        } else {
+            d.chunkState[i] = restored[i]; // Intact / Loose, as captured
+        }
+    }
+    // The restored state was captured AFTER its own support solve, so it is already
+    // consistent; re-solving here would only risk cascading it further.
+    d.structureDirty = false;
+    HBE_INFO("Destruction: restored break progress ({} of {} chunk(s) detached).", detached, n);
+}
+
+// Rebuilds the chunk entities if a restore is pending. Every entry point that is about
+// to touch chunk state goes through this, so a Destructible whose shard respawned mid
+// break is never observed in the "activated but empty" state.
+void EnsureLive(Scene& scene, entt::entity root, Destructible& d, const CachedFracture& cf,
+                PhysicsWorld* physics) {
+    if (d.reactivate) Reactivate(scene, root, d, cf, physics);
+}
+
 // Structural integrity: flood fill from the anchored chunks across the adjacency
 // graph. Anything unreached has lost its load path and is released.
 //
@@ -213,6 +271,7 @@ bool ApplyDamageAt(Scene& scene, Renderer& renderer, entt::entity e,
     const CachedFracture* cf = GetFracture(renderer, d->asset);
     if (!cf || cf->asset.chunks.empty()) return false;
 
+    EnsureLive(scene, e, *d, *cf, nullptr); // a restored break rebuilds before it takes more
     EnsureChunkState(*d, cf->asset.chunks.size());
     Activate(scene, e, *d, *cf);
 
@@ -246,6 +305,7 @@ void Shatter(Scene& scene, Renderer& renderer, entt::entity e, const glm::vec3& 
     if (!d) return;
     const CachedFracture* cf = GetFracture(renderer, d->asset);
     if (!cf || cf->asset.chunks.empty()) return;
+    EnsureLive(scene, e, *d, *cf, nullptr); // a restored break rebuilds before it shatters
     EnsureChunkState(*d, cf->asset.chunks.size());
     Activate(scene, e, *d, *cf);
 
@@ -265,6 +325,24 @@ void Shatter(Scene& scene, Renderer& renderer, entt::entity e, const glm::vec3& 
 
 void Update(Scene& scene, Renderer& renderer, PhysicsWorld& physics, f32 dt) {
     entt::registry& reg = scene.Registry();
+
+    // --- 0. Rebuild restored breaks ----------------------------------------
+    // A shard respawn (or a `.hbsave` load) replays break progress onto an object whose
+    // chunk ENTITIES are gone. Rebuild them before anything else this frame observes
+    // the object, so the wall the player half-destroyed comes back half-destroyed
+    // instead of pristine-but-unbreakable. Costs one flag test per Destructible.
+    {
+        std::vector<entt::entity> pending;
+        for (const entt::entity e : reg.view<Destructible>())
+            if (reg.get<Destructible>(e).reactivate) pending.push_back(e);
+        for (const entt::entity e : pending) {
+            Destructible& d = reg.get<Destructible>(e);
+            if (const CachedFracture* cf = GetFracture(renderer, d.asset))
+                Reactivate(scene, e, d, *cf, &physics);
+            else
+                d.reactivate = false; // no asset: nothing to rebuild, do not retry forever
+        }
+    }
 
     // --- 1. Contacts -> breaks ---------------------------------------------
     // The physics contact queue is drained here (it had no consumer before). Only

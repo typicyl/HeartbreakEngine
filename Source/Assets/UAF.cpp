@@ -18,26 +18,43 @@ std::vector<hbe::u8> LoadAssetFile(const std::filesystem::path& path) {
 namespace hbe::uaf {
 namespace {
 
+// Every header written from here RESERVES the pack-slot field (kSlotFlag), even
+// though the writer does not know the number: an importer produces the bytes,
+// and the id is assigned afterwards by Assets/SlotIds.cpp. Reserving it makes
+// that a 4-byte patch at a fixed offset instead of a rewrite of a file that may
+// be hundreds of megabytes. kUnassignedSlot is what an unstamped asset holds.
+constexpr u32 kUnassignedSlot = 0xFFFFFFFFu;
+
 void WriteHeader(BinaryWriter& w, AssetType type, u64 guid) {
     w.Bytes(kMagic, 4);
-    w.Pod(kVersion);
+    w.Pod(static_cast<u32>(kVersion | kSlotFlag));
     w.Pod(static_cast<u32>(type));
     w.Pod(guid);
+    w.Pod(kUnassignedSlot);
 }
 
 // Validates the header and returns the recorded type (Unknown on mismatch).
-AssetType ReadHeader(BinaryReader& r, u32* outVersion = nullptr, u64* outGuid = nullptr) {
+// `outVersion` is the PAYLOAD version with the slot flag masked off - every
+// payload read downstream gates on it, so leaking the flag bit through would
+// make every stamped asset look like a future version and fail to load.
+AssetType ReadHeader(BinaryReader& r, u32* outVersion = nullptr, u64* outGuid = nullptr,
+                     u32* outSlot = nullptr) {
     char magic[4] = {};
     r.Bytes(magic, 4);
     if (std::memcmp(magic, kMagic, 4) != 0) return AssetType::Unknown;
-    u32 version = 0, type = 0;
+    u32 raw = 0, type = 0;
     u64 guid = 0;
-    r.Pod(version);
+    r.Pod(raw);
     r.Pod(type);
     r.Pod(guid);
+    const bool hasSlot = (raw & kSlotFlag) != 0;
+    const u32 version = raw & ~kSlotFlag;
+    u32 slot = kUnassignedSlot;
+    if (hasSlot) r.Pod(slot);
     if (outVersion) *outVersion = version;
     if (outGuid) *outGuid = guid;
-    if (!r.Ok() || version > kVersion) return AssetType::Unknown;
+    if (outSlot) *outSlot = slot;
+    if (!r.Ok() || version == 0 || version > kVersion) return AssetType::Unknown;
     return static_cast<AssetType>(type);
 }
 
@@ -91,15 +108,17 @@ const char* ToString(AssetType t) {
 }
 
 AssetType PeekType(const std::filesystem::path& path) {
-    // Read only the fixed-size header (magic+version+type+guid = 20 bytes) rather
-    // than loading the whole file - asset assets can be hundreds of MB.
-    constexpr usize kHeaderSize = 4 + 4 + 4 + 8;
+    // Read only the header (20 bytes, or 24 when it reserves a pack slot) rather
+    // than loading the whole file - assets can be hundreds of MB. A short read is
+    // fine: whether the extra 4 bytes are needed is decided by the flag bit, and
+    // BinaryReader reports a shortfall through Ok().
     std::ifstream in(path, std::ios::binary);
     if (!in) return AssetType::Unknown;
-    u8 hdr[kHeaderSize] = {};
-    in.read(reinterpret_cast<char*>(hdr), kHeaderSize);
-    if (static_cast<usize>(in.gcount()) < kHeaderSize) return AssetType::Unknown;
-    BinaryReader r(hdr, kHeaderSize);
+    u8 hdr[kHeaderSizeWithSlot] = {};
+    in.read(reinterpret_cast<char*>(hdr), kHeaderSizeWithSlot);
+    const usize got = static_cast<usize>(in.gcount());
+    if (got < kHeaderSize) return AssetType::Unknown;
+    BinaryReader r(hdr, got);
     return ReadHeader(r);
 }
 
@@ -235,6 +254,22 @@ bool ReadMeshPayload(BinaryReader& r, u32 version, Model* outModel, Rig* outRig)
         r.Vec(md.indices);
         if (!ReadMaterial(r, md.material, version)) return false;
         r.Str(md.name);
+        // v8: blendshape / morph targets. Read unconditionally (not only when
+        // outModel is wanted) - the payload is one sequential stream, so skipping
+        // the bytes would desynchronise the trailing rig for ReadRig.
+        if (version >= 8) {
+            u32 morphCount = 0;
+            r.Pod(morphCount);
+            if (!r.Ok()) return false;
+            for (u32 m = 0; m < morphCount; ++m) {
+                MorphTarget mt;
+                r.Str(mt.name);
+                r.Vec(mt.posDelta);
+                r.Vec(mt.nrmDelta);
+                if (!r.Ok()) return false;
+                md.morphTargets.push_back(std::move(mt));
+            }
+        }
         if (!r.Ok()) return false;
         if (outModel) outModel->push_back(std::move(md));
     }
@@ -258,6 +293,15 @@ bool WriteMesh(const std::filesystem::path& path, const Model& model, u64 guid,
         w.Vec(md.indices);
         WriteMaterial(w, md.material);
         w.Str(md.name);
+        // v8: blendshapes. The importer has always produced these (ModelLoader
+        // converts aiAnimMesh absolute positions to deltas); until v8 they were
+        // never written, so scene::BuildMorphAtlas had nothing to build from.
+        w.Pod(static_cast<u32>(md.morphTargets.size()));
+        for (const MorphTarget& mt : md.morphTargets) {
+            w.Str(mt.name);
+            w.Vec(mt.posDelta);
+            w.Vec(mt.nrmDelta);
+        }
     }
     const u32 hasRig = (rig && rig->Valid()) ? 1u : 0u;
     w.Pod(hasRig);

@@ -36,6 +36,13 @@ inline constexpr char kMagic[4] = {'U', 'A', 'P', '1'};
 inline constexpr u32 kVersion = 4;
 inline constexpr u32 kSlotsPerPack = 50;
 
+// Which pack file a slot lands in, and where inside it. The ONLY definition of
+// "50 per pack"; kSlotsPerPack is also written into every pack header and
+// validated on Open, because changing it would silently mis-globalise the slots
+// of packs that were already shipped.
+inline constexpr u32 PackIndexOf(u32 slot) { return slot / kSlotsPerPack; }
+inline constexpr u32 SlotWithinPack(u32 slot) { return slot % kSlotsPerPack; }
+
 struct Entry {
     std::string path; // relative to the packed root, forward slashes
     u64 offset = 0;
@@ -67,11 +74,12 @@ struct WriteOptions {
     // Extra files packed in addition to (and exempt from the filter of) the
     // rootDir content - e.g. compiled shaders, the project file.
     const std::vector<ExtraFile>* extras = nullptr;
-    // Ignore the existing manifest's slot assignments and pack into dense slots
-    // 0..N-1 (the fewest packs). Use for a fresh full export where stable,
-    // byte-identical packs across rebuilds don't matter; leave off for live dev
-    // packing so unchanged packs stay cached.
-    bool compact = false;
+    // NOTE: there is deliberately no `compact` option any more. It used to throw
+    // the slot assignment away and re-derive dense slots 0..N-1 in sorted-path
+    // order, and BuildShipping set it - so the ONLY build that ships reshuffled
+    // every asset whenever one was added, and every pack file had to be
+    // re-downloaded. Slots now come from the assets themselves; a cook is a pure
+    // function of the files on disk.
 };
 
 // Packs every .uaf / .hbscene / .hbmat under `rootDir` into `<baseName>_<n>.uap`
