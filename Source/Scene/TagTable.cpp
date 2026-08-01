@@ -122,6 +122,20 @@ void Normalize(std::vector<TagDef>& defs) {
     }
 
     for (TagDef& d : outv) {
+        // RULE 6's authored list. ONLY the unambiguously meaningless is removed: an
+        // empty name, a self-reference (a tag cannot pull itself in) and a repeat.
+        // A name this project does not list is KEPT - see the header for why
+        // dropping it here would eat authored data on a keystroke.
+        if (!d.associates.empty()) {
+            std::vector<std::string> keep;
+            keep.reserve(d.associates.size());
+            for (const std::string& a : d.associates) {
+                if (a.empty() || a == d.name) continue;
+                if (std::find(keep.begin(), keep.end(), a) != keep.end()) continue;
+                keep.push_back(a);
+            }
+            d.associates = std::move(keep);
+        }
         if (d.loadRadius < 0.0f) d.loadRadius = 0.0f;
         if (d.shardCell < 0.0f) d.shardCell = 0.0f;
         const f32 before = d.unloadRadius;
@@ -169,6 +183,33 @@ void ReconcileWithTable(std::vector<TagDef>& defs) {
     defs = std::move(outv);
 }
 
+void BuildAssocGraph(const std::vector<TagDef>& defs, stream::AssocGraph& out,
+                     std::vector<std::string>* unresolvedOut) {
+    out.edges.assign(defs.size(), {});
+    if (unresolvedOut) unresolvedOut->clear();
+    if (defs.empty()) return;
+    // One map, then a lookup per edge: O(tags + edges), not O(tags x edges). Built
+    // once per bind, never per evaluation.
+    std::unordered_map<std::string, u32> byName;
+    byName.reserve(defs.size());
+    for (usize i = 0; i < defs.size(); ++i) byName.emplace(defs[i].name, static_cast<u32>(i));
+    for (usize i = 0; i < defs.size(); ++i) {
+        for (const std::string& a : defs[i].associates) {
+            const auto it = byName.find(a);
+            if (it == byName.end()) {
+                // Not a tag this project lists. The edge cannot become an index, so
+                // it is dropped HERE and reported ONCE by the caller; the authored
+                // string itself is untouched (a hand-edited `.hbproj` and a target
+                // that is about to be added both survive a round trip).
+                if (unresolvedOut) unresolvedOut->push_back(defs[i].name + " -> " + a);
+                continue;
+            }
+            if (it->second == static_cast<u32>(i)) continue; // Normalize drops these
+            out.edges[i].push_back(it->second);
+        }
+    }
+}
+
 bool RemoveTag(entt::registry& reg, std::vector<TagDef>& defs, usize index) {
     if (index == 0) {
         HBE_WARN("tags: '{}' is undeletable (it is what an untagged entity means).",
@@ -196,7 +237,15 @@ bool RemoveTag(entt::registry& reg, std::vector<TagDef>& defs, usize index) {
     }
     for (const entt::entity e : untag) reg.remove<Tag>(e);
 
+    // The dead tag's NAME leaves every other row's association list with it. A name
+    // is not an index, so this is an erase and not a third remap - which is the
+    // whole reason RULE 6 stores names. Done before the row goes, so `gone`'s name
+    // is still readable.
+    const std::string goneName = defs[index].name;
     defs.erase(defs.begin() + static_cast<std::ptrdiff_t>(index));
+    for (TagDef& d : defs)
+        d.associates.erase(std::remove(d.associates.begin(), d.associates.end(), goneName),
+                           d.associates.end());
     Normalize(defs);
     SeedFromProject(defs);
     return true;

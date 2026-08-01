@@ -24,6 +24,7 @@
 
 #include "Project/Project.h" // TagDef (the authored per-tag streaming config)
 #include "Scene/Components.h" // TagId, kTagUntagged, Tag, UIDocMember
+#include "Scene/StreamPolicy.h" // stream::AssocGraph (RULE 6's integer adjacency)
 
 #include <entt/entt.hpp>
 
@@ -60,8 +61,25 @@ const std::vector<std::string>& All();
 //     because a duplicate would collapse two ids onto one under SeedFromProject,
 //   * loadRadius is clamped non-negative and the hysteresis band is enforced via
 //     salvage::EnforceHysteresis - corrected unconditionally, with a warning,
-//     exactly as the `.hbworld` manifest parser did.
+//     exactly as the `.hbworld` manifest parser did,
+//   * `associates` (RULE 6) loses only what is UNAMBIGUOUSLY MEANINGLESS: empty
+//     strings, self-references and duplicates.
+//
+// IT DELIBERATELY DOES NOT DROP A DANGLING ASSOCIATION. This runs from ten sites,
+// including ReconcileWithTable - which is called BEFORE auto-interned scene tags are
+// guaranteed to be in the list - and on every keystroke-commit in the Tags panel.
+// Deleting an association whose target is merely not listed YET would destroy
+// authored data the instant a target is scene-interned. Validation of associations
+// is a BAKE-TIME REPORT (tagshard::Bake), which is a report and not a mutation.
 void Normalize(std::vector<TagDef>& defs);
+
+// Resolves the authored `associates` NAME lists into the integer adjacency the
+// policy consumes, over the SAME index space as `defs` (index == TagId after
+// Normalize + SeedFromProject). A name no row carries is DROPPED from the graph -
+// it cannot be an index - and appended to `unresolvedOut` if given, so the caller
+// can warn about it once per bind instead of once per evaluation.
+void BuildAssocGraph(const std::vector<TagDef>& defs, stream::AssocGraph& out,
+                     std::vector<std::string>* unresolvedOut = nullptr);
 
 // Makes the authored list agree with the LIVE table: after this, defs[i].name ==
 // All()[i] for every interned tag. Appends a default-configured row for each tag
@@ -84,6 +102,11 @@ void ReconcileWithTable(std::vector<TagDef>& defs);
 //
 // Without the remap, deleting a row would silently repoint every entity above it
 // at its neighbour's tag, which is the one failure an index-based id invites.
+//
+// It also erases the removed NAME from every surviving row's `associates`. That is a
+// string erase, not a third index remap - which is exactly why associations are
+// stored as names - and it is the only route by which a target can vanish through
+// the UI.
 bool RemoveTag(entt::registry& reg, std::vector<TagDef>& defs, usize index);
 
 // --- Assignment (the enforced mutation site) ---------------------------------

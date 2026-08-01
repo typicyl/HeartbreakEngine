@@ -76,6 +76,11 @@ struct SceneEnvironment {
     glm::vec3  giSpacing{1.0f};
     glm::ivec3 giDims{0};
     std::string giSource;       // cached .hbgi (rel to Assets; "" = no baked volume)
+    // The scene FILE's permanent pack slot, carried through load so a live save can
+    // re-emit it (0xFFFFFFFF = none; slot 0 is valid). Packaging identity, not
+    // rendering state - it rides here because the environment is the one thing that
+    // survives from the file into the live scene. See SceneData::packSlot.
+    u32 packSlot = 0xFFFFFFFFu;
     // Why the volume above is (or is not) bound. Written ONLY by
     // scene::ApplyEnvironment, so "the scene says it has GI but it did not load"
     // is a state the editor can show and a test can assert instead of a look
@@ -178,6 +183,18 @@ struct StreamingResidency {
     u32  shardCount = 0;
     u32  nonResident = 0;    // shards that are NOT currently spawned
     std::string missing;     // "Props#2, Foliage#0, ..." (first few, for the message)
+    // An AUTHORING bind (stream::BindMode::AuthorWorld): the EDITOR bound its own
+    // streamer to the world it already has, non-destructively, so the author can watch
+    // zones spawn and despawn. Defaults FALSE, which is what makes this safe: a plain
+    // runtime Streamer never sets it, so the blanket "a streamer owns this world"
+    // refusal below is unchanged for every existing caller.
+    //
+    // It weakens EXACTLY ONE clause - "the editor may not author a streamer-owned
+    // world", which is the statement live editor zones reverse. The clause that
+    // actually protects the file (nonResident > 0 => refuse, by name) applies
+    // identically either way, because a partial write is silent, total and permanent
+    // whoever caused it.
+    bool authoring = false;
 };
 
 // Owns an entt::registry. Entities with Transform + MeshInstance are drawn.

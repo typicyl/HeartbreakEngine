@@ -218,6 +218,32 @@ struct TagDef {
     // streams in when you approach either end, not only its middle.
     bool autoShard = false;
     f32 shardCell = 0.0f;     // shard grid size; 0 = derive from loadRadius (autoShard only)
+
+    // ASSOCIATED TAGS: other tags this one PULLS IN. Tag NAMES, never TagIds - a
+    // TagId is an index into this very list and tags::RemoveTag shifts every id
+    // above a deleted row down by one, so an id here would need a third remap
+    // beside the entity remap. Scene files already serialize tag names.
+    //
+    // THE RELATION IS ONE-WAY: "this tag is resident => every tag named here is
+    // resident too". It does NOT run backwards. The motivating case is a hill from
+    // which a distant city is visible: the author writes a separate low-poly city as
+    // its own content with its own tag, and associates it with the hill tag, so
+    // standing on the hill brings the low-poly city in. Standing IN the low-poly
+    // city has no reason to bring in the hill, and symmetric semantics would make
+    // every association a 2-cycle by construction. An author who wants both
+    // directions writes the relation twice, where it is visible.
+    //
+    // The tags stay wholly SEPARATE CONTENT. This is not a LOD pair and not a
+    // mutual exclusion: nothing here makes the two tags aware of each other beyond
+    // "loading A also loads B", and whether both are resident at once is the
+    // author's choice, expressed by which tags they associate and which radii they
+    // set. Nothing is generated, decimated or derived between them.
+    //
+    // Following is TRANSITIVE but hard-capped (stream::kMaxAssocDepth hops), and the
+    // propagation is seeded from DISTANCE only - never from association-derived
+    // residency - so a cycle terminates and collapses the moment no member of it is
+    // within its own unload radius. See Scene/StreamPolicy.h RULE 6.
+    std::vector<std::string> associates;
 };
 
 struct ProjectSettings {
@@ -233,6 +259,17 @@ struct ProjectSettings {
     // see the Engine's boot sequence and Project::ParseSettings. That is a real
     // branch, not a default string: a half-migrated project must still boot.
     std::string bootDocument;
+
+    // 3D MAIN MENU. When menuWorld is on, the flow binds the startup scene as a
+    // MENU BACKDROP (stream::BindMode::MenuWorld) while in the MainMenu state: the
+    // world is genuinely there behind the menu, distance streaming runs against the
+    // menu camera, and NOTHING touches world:: persistence - the menu always shows
+    // the AUTHORED world and leaves no trace in a save (no visit bump, no captures).
+    // menuCamera names the CameraComponent entity that frames the menu; empty = the
+    // scene's primary camera. Both defaults MUST match the .value() fallbacks in
+    // Project.cpp (the two-places-default rule).
+    bool menuWorld = false;
+    std::string menuCamera;
     // THE game UI: ONE `.hbui` DOCUMENT PER SCREEN (MainMenu / Settings / Loading
     // / HUD / Pause ...), each holding that screen's UIPanel subtree. EVERY entry
     // is opened at boot and stays RESIDENT for the process lifetime - nothing here

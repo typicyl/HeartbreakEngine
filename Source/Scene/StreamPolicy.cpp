@@ -33,6 +33,49 @@ using Candidate = PolicyCandidate; // ranking scratch lives in PolicyOut (see th
 
 } // namespace
 
+void AssocPass::BeginSeed() {
+    seed.assign(graph.edges.size(), 0u);
+    marked.assign(graph.edges.size(), 0u);
+    visited.assign(graph.edges.size(), 0u);
+}
+
+void AssocPass::Run() {
+    const usize n = graph.edges.size();
+    if (marked.size() != n) marked.assign(n, 0u);
+    else std::fill(marked.begin(), marked.end(), 0u);
+    if (visited.size() != n) visited.assign(n, 0u);
+    else std::fill(visited.begin(), visited.end(), 0u);
+    if (n == 0 || seed.size() != n) return;
+
+    // `visited` is the TERMINATION GUARD and nothing else. `marked` is the OUTPUT:
+    // "some driver reaches this tag". They are separate arrays because a tag can be
+    // seeded AND driven at the same time - a multi-shard tag with one shard in range
+    // is exactly that - and folding the two into one bit made the driven half of such
+    // a tag silently unload while its driver was still driving.
+    frontier.clear();
+    for (usize t = 0; t < n; ++t)
+        if (seed[t]) {
+            visited[t] = 1u;
+            frontier.push_back(static_cast<u32>(t));
+        }
+
+    for (u32 depth = 0; depth < kMaxAssocDepth && !frontier.empty(); ++depth) {
+        next.clear();
+        for (const u32 t : frontier) {
+            for (const u32 to : graph.edges[t]) {
+                if (to >= n) continue; // an unresolved edge cannot exist here
+                // Reached from a driver: MARK IT, even if it is itself a seed or was
+                // already visited. Marking is idempotent, so this cannot loop.
+                marked[to] = 1u;
+                if (visited[to]) continue; // the cycle guard
+                visited[to] = 1u;
+                next.push_back(to);
+            }
+        }
+        frontier.swap(next);
+    }
+}
+
 void Evaluate(const PolicyIn& in, PolicyOut& out) {
     out.load.clear();
     out.unload.clear();
@@ -82,7 +125,10 @@ void Evaluate(const PolicyIn& in, PolicyOut& out) {
         if (d <= s.loadRadius) ++out.inRange;
 
         if (s.resident) {
-            if (s.pinned) continue;
+            // RULE 6's HOLD half. `associated` is ORed with `pinned` rather than
+            // folded into it: the two answer different questions and the author-facing
+            // readout has to be able to say which one is keeping this shard alive.
+            if (s.pinned || s.associated) continue;
             // RULE 2: outside the UNLOAD radius, which is strictly larger than the load
             // radius, so the boundary cannot oscillate. The `d > 0` half is belt and
             // braces: a corrected band already implies it, but a shard the focus is
@@ -91,7 +137,12 @@ void Evaluate(const PolicyIn& in, PolicyOut& out) {
             continue;
         }
         if (s.busy || s.failed) continue;
-        if (d <= s.loadRadius) loads.push_back({i, s.priority, d});
+        // RULE 6's LOAD half - and it is the half `pinned` could never supply, because
+        // a driven shard is by definition out of its own range. It enters the SAME
+        // ranked list with its own priority and its TRUE (large) distance, so among
+        // equal priorities the thing under the player's feet still lands first; an
+        // author who needs the vista promptly raises that tag's priority.
+        if (d <= s.loadRadius || s.associated) loads.push_back({i, s.priority, d});
     }
 
     // RULE 4: priority first, then nearest. stable_sort so an exact tie keeps shard
@@ -375,6 +426,146 @@ bool PolicySelfTest() {
         expect(out.load.size() == 1 && out.load[0] == 3 && out.unload.empty(),
                "DISABLED loads the idle shard regardless of distance and unloads nothing");
         expect(out.residentCount == 1, "residentCount is reported either way");
+    }
+
+    // --- 6. RULE 6: association ---------------------------------------------
+    {
+        // Two shards 10 km apart. 0 = the driver ("Hill"), 1 = the driven
+        // ("City_LowPoly") - separate content, its own box, its own band.
+        std::vector<PolicyShard> ss(2);
+        ss[0].min = glm::vec3(-5.0f);
+        ss[0].max = glm::vec3(5.0f);
+        ss[0].loadRadius = 100.0f;
+        ss[0].unloadRadius = band(100.0f);
+        ss[1].min = glm::vec3(10000.0f, 0.0f, 0.0f);
+        ss[1].max = glm::vec3(10010.0f, 10.0f, 10.0f);
+        ss[1].loadRadius = 100.0f;
+        ss[1].unloadRadius = band(100.0f);
+        const glm::vec3 onTheHill(0.0f);
+        PolicyIn in;
+        in.shards = ss.data();
+        in.count = 2;
+        in.foci = &onTheHill;
+        in.fociCount = 1;
+        in.maxConcurrent = 8;
+        in.maxUnloads = 8;
+
+        Evaluate(in, out);
+        expect(out.load.size() == 1 && out.load[0] == 0,
+               "without an association only the shard in range loads");
+
+        ss[1].associated = true;
+        Evaluate(in, out);
+        expect(out.load.size() == 2,
+               "an ASSOCIATED shard loads from 10 km away - the half `pinned` could "
+               "never supply");
+        expect(out.load[0] == 0 && out.load[1] == 1,
+               "and it queues behind the near one on its TRUE distance, not ahead of it");
+
+        // Resident + still associated: never unloaded, however far away.
+        ss[0].resident = ss[1].resident = true;
+        Evaluate(in, out);
+        expect(out.unload.empty(), "an associated shard does not unload while it is driven");
+
+        // The driver goes away: the caller stops setting the flag, and the driven
+        // shard unloads on its own terms.
+        ss[1].associated = false;
+        Evaluate(in, out);
+        expect(out.unload.size() == 1 && out.unload[0] == 1,
+               "losing the association releases it - it is not sticky");
+
+        // RESIDENT FOR TWO REASONS survives losing either one. Put the focus inside
+        // the far shard AND drive it. (The near shard steps out of the picture so
+        // every assertion below is about the driven one.)
+        ss[0].resident = false;
+        ss[1].resident = true;
+        ss[1].associated = true;
+        const glm::vec3 inTheCity(10005.0f, 5.0f, 5.0f);
+        in.foci = &inTheCity;
+        Evaluate(in, out);
+        expect(out.unload.empty(), "in range AND associated: obviously resident");
+        ss[1].associated = false; // lose the association, keep the distance
+        Evaluate(in, out);
+        expect(out.unload.empty(), "losing the ASSOCIATION leaves the distance reason standing");
+        ss[1].associated = true;
+        in.foci = &onTheHill; // lose the distance, keep the association
+        Evaluate(in, out);
+        expect(out.unload.empty(), "losing the DISTANCE leaves the association standing");
+
+        // A FAILED shard is still terminal - rule 6 does not resurrect it, because a
+        // shard that cannot stage would otherwise retry every evaluation forever.
+        ss[1].resident = false;
+        ss[1].failed = true;
+        Evaluate(in, out);
+        expect(out.load.size() == 1 && out.load[0] == 0,
+               "an association never re-orders a FAILED shard (only the in-range one "
+               "is ordered)");
+        ss[1].failed = false;
+    }
+
+    // --- 6b. The propagation itself: transitivity, the cap, and cycles -------
+    {
+        AssocPass ap;
+        // 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 6, a seven-deep chain.
+        ap.graph.edges.assign(7, {});
+        for (u32 t = 0; t + 1 < 7; ++t) ap.graph.edges[t].push_back(t + 1);
+        ap.BeginSeed();
+        ap.seed[0] = 1u;
+        ap.Run();
+        expect(!ap.marked[0],
+               "a tag NOTHING points at is not marked, seeded or not - `marked` means "
+               "'some driver reaches this'");
+        expect(ap.marked[1] && ap.marked[2] && ap.marked[3] && ap.marked[4],
+               "association is TRANSITIVE for kMaxAssocDepth hops");
+        expect(!ap.marked[5] && !ap.marked[6],
+               "and stops there rather than following the chain forever");
+
+        // A 2-CYCLE with no seed at all marks nothing - the leak this design exists
+        // to avoid. Seeded from association-derived residency instead of distance,
+        // each would hold the other resident with the player 10 km away, forever.
+        ap.graph.edges.assign(2, {});
+        ap.graph.edges[0].push_back(1);
+        ap.graph.edges[1].push_back(0);
+        ap.BeginSeed();
+        ap.Run();
+        expect(!ap.marked[0] && !ap.marked[1],
+               "a mutual pair with NO distance seed marks nothing: the cycle collapses");
+        ap.BeginSeed();
+        ap.seed[0] = 1u;
+        ap.Run();
+        expect(ap.marked[1] && ap.marked[0],
+               "seeding one end of a cycle marks the other, marks the seed back (it IS "
+               "reached) and TERMINATES");
+
+        // A self-edge and a longer cycle: still terminates, still marks only what a
+        // seed reaches. (tags::Normalize erases self-references; this proves the
+        // propagation is safe even if one arrives from a hand-edited file.)
+        ap.graph.edges.assign(3, {});
+        ap.graph.edges[0] = {0u, 1u};
+        ap.graph.edges[1] = {2u};
+        ap.graph.edges[2] = {0u, 1u};
+        ap.BeginSeed();
+        ap.seed[0] = 1u;
+        ap.Run();
+        expect(ap.marked[0] && ap.marked[1] && ap.marked[2],
+               "a self-edge inside a cycle terminates and marks the reachable rest");
+
+        // A TAG THAT DRIVES AND IS DRIVEN AT THE SAME TIME. Hill -> Vista, and Vista
+        // is seeded because ONE of its shards walked into its own radius. The other
+        // shards of Vista are still held by the hill, so Vista must STILL be marked.
+        // This is the multi-shard bug, reduced to the propagation that caused it: with
+        // seed and visited sharing one array, `marked[Vista]` came back false and every
+        // out-of-range shard of Vista despawned under a live driver.
+        ap.graph.edges.assign(2, {});
+        ap.graph.edges[0].push_back(1); // Hill -> Vista
+        ap.BeginSeed();
+        ap.seed[0] = 1u; // the hill is in range
+        ap.seed[1] = 1u; // ...and so is one shard of the vista
+        ap.Run();
+        expect(ap.marked[1],
+               "a tag that is seeded by one of its own shards is STILL marked while a "
+               "driver reaches it - its other shards depend on that mark");
+        expect(!ap.marked[0], "and the driver, which nothing points at, is still not marked");
     }
 
     if (ok) HBE_INFO("tagpolicy: PASS");

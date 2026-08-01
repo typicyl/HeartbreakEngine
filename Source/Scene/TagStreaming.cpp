@@ -16,6 +16,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <glm/gtc/matrix_transform.hpp> // glm::translate - the association self-test's bake rows
+
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -346,6 +348,7 @@ void Streamer::DrainInFlight() const {
 void Streamer::PublishResidency(Scene& scene) const {
     StreamingResidency r;
     r.bound = bound_;
+    r.authoring = authoring_;
     r.shardCount = static_cast<u32>(shards_.size());
     if (bound_) {
         for (usize i = 0; i < shards_.size(); ++i) {
@@ -369,6 +372,8 @@ void Streamer::Reset(Scene* scene) {
     DrainInFlight();
     bound_ = false;
     trusted_ = true;
+    authoring_ = false;
+    silent_ = false;
     untrustedReason_.clear();
     levelPath_.clear();
     assetsDir_.clear();
@@ -384,7 +389,142 @@ void Streamer::Reset(Scene* scene) {
     lastEvalFoci_.clear();
     forceEval_ = true;
     policyScratch_.clear();
+    assoc_.graph.Clear();
+    assoc_.seed.clear();
+    assoc_.marked.clear();
+    assoc_.visited.clear();
+    assocActive_ = false;
+    shardTag_.clear();
+    alwaysLoadedTag_.clear();
+    shardAssociated_.clear();
+    // Session hysteresis for the association seed: it describes shards that no longer
+    // exist, so carrying it across a rebind would hand shard 3's band to whatever shard
+    // 3 becomes in the next level.
+    shardSelfSeed_.clear();
+    // A manual override is SESSION state that describes shards that no longer exist.
+    // Carrying it across a rebind would apply shard 3's "forced out" to whatever shard
+    // 3 happens to be in the next level.
+    shardForce_.clear();
+    heldShard_ = -1;
     if (scene) PublishResidency(*scene); // bound_ is false now: clears the summary
+}
+
+// RE-RESOLVE THE ASSOCIATION GRAPH AGAINST AN EDITED TAG LIST, mid-bind.
+//
+// BindLevel resolves it exactly once, which is right for a game (the project's tags
+// cannot change while a level is running) and wrong for the editor, where the Tags
+// panel edits the very list the bound streamer resolved from. Without this, an author
+// with live zones on who associates Hill -> Vista and then stands on the hill sees
+// NOTHING happen, with no log line and no warning, until they save (which re-binds).
+//
+// Deliberately touches ONLY the graph and its derived index tables. It does not read
+// or write shards_, residency, forces or the seed history, so it is safe at any point
+// in a bind; the next evaluation simply propagates over the new edges. forceEval_
+// makes that evaluation the next frame rather than up to four frames away.
+void Streamer::RefreshAssociations(const std::vector<TagDef>& defs) {
+    if (!bound_) return;
+    std::vector<std::string> unresolved;
+    tags::BuildAssocGraph(defs, assoc_.graph, &unresolved);
+    for (const std::string& u : unresolved)
+        HBE_WARN("TagStream: association '{}' names a tag this project does not list; the "
+                 "link is ignored (the authored name is kept).",
+                 u);
+    assocActive_ = false;
+    for (const std::vector<u32>& e : assoc_.graph.edges)
+        if (!e.empty()) {
+            assocActive_ = true;
+            break;
+        }
+    alwaysLoadedTag_.assign(defs.size(), 0u);
+    for (usize t = 0; t < defs.size(); ++t)
+        alwaysLoadedTag_[t] = defs[t].alwaysLoaded ? 1u : 0u;
+    std::unordered_map<std::string, u32> tagIndex;
+    tagIndex.reserve(defs.size());
+    for (usize t = 0; t < defs.size(); ++t) tagIndex.emplace(defs[t].name, static_cast<u32>(t));
+    shardTag_.assign(shards_.size(), kNoAssocTag);
+    for (usize i = 0; i < shards_.size(); ++i) {
+        const auto it = tagIndex.find(shards_[i]->desc.tag);
+        if (it != tagIndex.end()) shardTag_[i] = it->second;
+    }
+    // The marks are DERIVED, so they are simply re-derived next evaluation. Clearing
+    // them here would drop a hold for one frame and despawn a zone the author is
+    // looking at, for no reason.
+    shardAssociated_.resize(shards_.size(), 0u);
+    shardSelfSeed_.resize(shards_.size(), 0u);
+    forceEval_ = true;
+}
+
+// --- Manual overrides ---------------------------------------------------------
+
+void Streamer::SetShardForce(u32 i, ShardForce f) {
+    if (i >= shards_.size()) return;
+    // Stay empty until something is actually forced: that is what makes the whole
+    // feature free in the shipping runtime.
+    if (shardForce_.empty()) {
+        if (f == ShardForce::Auto) return;
+        shardForce_.assign(shards_.size(), static_cast<u8>(ShardForce::Auto));
+    }
+    shardForce_[i] = static_cast<u8>(f);
+    forceEval_ = true; // act on it now, not in up to four frames' time
+}
+
+ShardForce Streamer::ShardForceOf(u32 i) const {
+    if (i >= shardForce_.size()) return ShardForce::Auto;
+    return static_cast<ShardForce>(shardForce_[i]);
+}
+
+void Streamer::ClearShardForces() {
+    shardForce_.clear();
+    forceEval_ = true;
+}
+
+u32 Streamer::ForcedShardCount() const {
+    u32 n = 0;
+    for (const u8 f : shardForce_)
+        if (static_cast<ShardForce>(f) != ShardForce::Auto) ++n;
+    return n;
+}
+
+u32 Streamer::SpawnAllShards(Scene& scene, Renderer& renderer) {
+    if (!bound_) return 0;
+    // A staging job may be writing into a shard right now, and a shard already in
+    // Ready would be finalized by a LATER Update - on top of the spawn below, which is
+    // the double-spawn this drain-and-discard exists to prevent. Re-staging next time
+    // is cheap (the process-wide caches make StageAssets skip anything resident).
+    DrainInFlight();
+    for (auto& sr : shards_) {
+        const auto s = static_cast<salvage::RegionState>(sr->state.load(std::memory_order_acquire));
+        if (s == salvage::RegionState::Ready || s == salvage::RegionState::Loading) {
+            sr->staged = scene::StagedAssets{};
+            sr->state.store(static_cast<int>(salvage::RegionState::Unloaded),
+                            std::memory_order_release);
+            sr->deferred = false;
+        }
+    }
+    u32 missing = 0;
+    for (usize i = 0; i < shards_.size(); ++i) {
+        if (shards_[i]->resident) continue;
+        // A Failed shard is TERMINAL and stays that way (see the header): spawning it
+        // synchronously here would be the every-frame retry SALVAGE 3 removed. It is
+        // counted instead, so the caller - the save path - still refuses.
+        const auto s =
+            static_cast<salvage::RegionState>(shards_[i]->state.load(std::memory_order_acquire));
+        if (s == salvage::RegionState::Failed) {
+            ++missing;
+            continue;
+        }
+        if (!SpawnShard(scene, renderer, static_cast<u32>(i))) ++missing;
+    }
+    PublishResidency(scene);
+    return missing;
+}
+
+void Streamer::ClearMembership(Scene& scene) const {
+    entt::registry& reg = scene.Registry();
+    std::vector<entt::entity> holders;
+    for (const entt::entity e : reg.view<const StreamShard>()) holders.push_back(e);
+    for (const entt::entity e : holders)
+        if (reg.valid(e)) reg.remove<StreamShard>(e);
 }
 
 std::string Streamer::ShardKey(u32 i) const {
@@ -433,8 +573,14 @@ bool Streamer::BindLevel(Scene& scene, Renderer& renderer, const std::filesystem
     // level's resident set and shards were holding. Skipped for AdoptWorld: the world
     // in the registry there is the INCOMING one (a save snapshot), not the outgoing
     // one, so "capturing" it would record the destination over the origin.
-    if (bound_ && mode == BindMode::Fresh) UnloadAll(scene);
+    if (bound_ && (mode == BindMode::Fresh || mode == BindMode::MenuWorld))
+        UnloadAll(scene); // capture inside is gated on authoring_/silent_
     Reset(&scene);
+    // Set AFTER Reset, which clears it. Everything below that asks "is this the
+    // editor's world?" reads this flag, including SpawnRows/DespawnShard's world::
+    // calls, so it has to be true before the first spawn of the bind.
+    authoring_ = (mode == BindMode::AuthorWorld);
+    silent_ = (mode == BindMode::MenuWorld);
     source_ = std::move(parsed);
     levelPath_ = sceneFile;
     assetsDir_ = assetsDir;
@@ -473,6 +619,48 @@ bool Streamer::BindLevel(Scene& scene, Renderer& renderer, const std::filesystem
     for (usize r = 0; r < source_.entities.size(); ++r)
         if (rowToShard_[r] < 0) residentRows_.push_back(static_cast<u32>(r));
 
+    // --- RULE 6: resolve the association graph, ONCE -------------------------
+    // Names become indices here and never again: the per-evaluation pass is integer
+    // adjacency with no string work. A name the project does not list cannot become
+    // an index, so it is dropped and reported ONCE PER BIND - not per evaluation and
+    // certainly not per frame, which is the difference between a diagnostic and a
+    // log flood.
+    {
+        std::vector<std::string> unresolved;
+        tags::BuildAssocGraph(defs, assoc_.graph, &unresolved);
+        for (const std::string& u : unresolved) {
+            HBE_WARN("TagStream: association '{}' names a tag this project does not list; "
+                     "the link is ignored (the authored name is kept, so adding the tag "
+                     "restores it).",
+                     u);
+        }
+        assocActive_ = false;
+        for (const std::vector<u32>& e : assoc_.graph.edges)
+            if (!e.empty()) {
+                assocActive_ = true;
+                break;
+            }
+        // An alwaysLoaded tag has no ShardRuntime at all, so it could never enter a
+        // shard-derived seed set - and silently doing nothing when the author wrote
+        // an association on it is the astonishing outcome. It is PERMANENTLY seeded:
+        // it always drives, which is the literal reading of the relation. The bake
+        // warns loudly that its targets can therefore never unload.
+        alwaysLoadedTag_.assign(defs.size(), 0u);
+        for (usize t = 0; t < defs.size(); ++t)
+            alwaysLoadedTag_[t] = defs[t].alwaysLoaded ? 1u : 0u;
+        std::unordered_map<std::string, u32> tagIndex;
+        tagIndex.reserve(defs.size());
+        for (usize t = 0; t < defs.size(); ++t)
+            tagIndex.emplace(defs[t].name, static_cast<u32>(t));
+        shardTag_.assign(shards_.size(), kNoAssocTag);
+        for (usize i = 0; i < shards_.size(); ++i) {
+            const auto it = tagIndex.find(shards_[i]->desc.tag);
+            if (it != tagIndex.end()) shardTag_[i] = it->second;
+        }
+        shardAssociated_.assign(shards_.size(), 0u);
+        shardSelfSeed_.assign(shards_.size(), 0u);
+    }
+
     for (usize r = 0; r < source_.entities.size(); ++r) {
         const scene::EntityData& d = source_.entities[r];
         // First row wins for a duplicate, matching Scene::FindByName's documented
@@ -484,14 +672,37 @@ bool Streamer::BindLevel(Scene& scene, Renderer& renderer, const std::filesystem
     bound_ = true;
     forceEval_ = true; // the first Update after a bind evaluates, cadence or not
 
-    if (mode == BindMode::Fresh) {
+    if (mode == BindMode::Fresh || mode == BindMode::MenuWorld) {
         // THE LEVEL owns the environment, not a shard: this clears the previous world
         // and applies ambient/exposure/shadowDistance/post/giSource exactly as a full
         // LoadMode::Replace would, which a slice may never do. Calling BindLevel twice
         // re-binds rather than stacking a second world.
         scene::BindWorld(scene, renderer, source_);
-        world::EnterArea(areaId_); // one visit per area entry, before any RestoreGroup
+        // MenuWorld is the one Fresh-shaped bind that does NOT enter the area: a menu
+        // is not a visit (AreaVisitCount.FirstVisit must survive for the real entry),
+        // and with no current area the silent_ gates below have nothing to write.
+        if (mode == BindMode::Fresh)
+            world::EnterArea(areaId_); // one visit per area entry, before any RestoreGroup
         SpawnRows(scene, renderer, residentRows_, world::kResidentKey, -1, nullptr);
+    } else if (mode == BindMode::AuthorWorld) {
+        // THE EDITOR'S BIND, AND THE FOUR THINGS IT DOES NOT DO.
+        //
+        //   * NOT scene::BindWorld. Its first statement is DestroyWorld, which wipes
+        //     every non-Persistent entity and BumpWorldTokens - i.e. it destroys the
+        //     scene being edited and then makes Ctrl+S refuse it forever. This one
+        //     call is the entire reason the editor could not stream, and skipping it
+        //     is the whole trick.
+        //   * NOT ApplyEnvironment. The editor's own load already applied it; doing
+        //     it again would stamp the FILE's environment over any unsaved lighting.
+        //   * NOT world::EnterArea / SetCurrentArea. A visit bump is player progress,
+        //     and authoring must never write it.
+        //   * NOT SpawnRows(residentRows_). Those rows are already standing. Spawning
+        //     them again would not even produce duplicates of the same objects - it
+        //     would produce duplicates with FRESH GUIDS, because guid::Claim refuses
+        //     to adopt a guid that is already taken.
+        //
+        // Nothing at all happens here, deliberately. AdoptResidency is what makes the
+        // streamer own what is already in the registry.
     } else {
         // AdoptWorld: the registry already holds the world (a `.hbsave` snapshot). Make
         // the area current WITHOUT bumping its visit count - the player did not
@@ -503,7 +714,10 @@ bool Streamer::BindLevel(Scene& scene, Renderer& renderer, const std::filesystem
     HBE_INFO("TagStream: bound '{}' as area '{}' - {} resident rows, {} streamed shard(s){}{}.",
              sceneFile.filename().string(), areaId_, residentRows_.size(), shards_.size(),
              trusted_ ? "" : " (shard table UNTRUSTED: everything resident)",
-             mode == BindMode::AdoptWorld ? " (adopting a restored world)" : "");
+             mode == BindMode::AdoptWorld  ? " (adopting a restored world)"
+             : mode == BindMode::AuthorWorld ? " (AUTHORING the editor's world in place)"
+             : mode == BindMode::MenuWorld   ? " (MENU backdrop: no visits, no captures)"
+                                             : "");
     // The world in this Scene is now a STREAMED world: complete only while every
     // shard happens to be spawned. Anything that writes it back to an authored file
     // reads this (see Scene::Streaming / scene::SaveRefusal).
@@ -580,14 +794,62 @@ void Streamer::SpawnRows(Scene& scene, Renderer& renderer, const std::vector<u32
     }
     // Replay the captured deltas the same frame the entities appear, so nothing ever
     // observes the authored state of a shard the player already changed.
-    world::RestoreGroup(scene, areaId_, shardKey, created);
+    //
+    // NOT WHILE AUTHORING. world:: holds PLAYER PROGRESS - opened doors, killed NPCs,
+    // taken pickups - and RestoreGroup will DESTROY any member that was absent when
+    // the group was captured. In the editor nothing reverts those writes, so a zone
+    // toggled off and on again would come back missing whatever the last play session
+    // had removed. Authoring has no deltas worth preserving; it wants the authored
+    // rows, every time.
+    if (!authoring_ && !silent_) world::RestoreGroup(scene, areaId_, shardKey, created);
     if (createdOut) *createdOut = std::move(created);
+}
+
+// Respawns an authoring shard from the string DespawnShard captured off the live
+// registry, rather than from the level file. False when there is no snapshot or it
+// does not parse - the caller then falls back to the file, which is the old behaviour
+// and still better than not spawning at all.
+bool Streamer::SpawnAuthorSnapshot(Scene& scene, Renderer& renderer, u32 i) {
+    ShardRuntime& sr = *shards_[i];
+    if (sr.authorSnapshot.empty()) return false;
+    scene::SceneData data;
+    if (!scene::ParseSceneString(sr.authorSnapshot, data)) {
+        HBE_WARN("TagStream: the authoring snapshot for '{}' did not parse; respawning from "
+                 "the file instead (edits made inside that zone are lost).",
+                 ShardKey(i));
+        sr.authorSnapshot.clear();
+        return false;
+    }
+    scene::StagedAssets staged;
+    scene::StageAssets(data, assetsDir_, staged);
+    std::vector<entt::entity> created;
+    // ADDITIVE, so no environment is applied and no WorldToken is bumped - the same
+    // shape SpawnRows uses. The guids were freed by the destroy, so they come back
+    // unchanged and every membership/adoption table still answers correctly.
+    scene::Instantiate(scene, renderer, data, staged, scene::LoadMode::Additive, &created);
+    entt::registry& reg = scene.Registry();
+    for (const entt::entity e : created)
+        if (reg.valid(e)) reg.emplace_or_replace<StreamShard>(e, StreamShard{i});
+    sr.lastCreated = std::move(created);
+    return true;
 }
 
 bool Streamer::SpawnShard(Scene& scene, Renderer& renderer, u32 i) {
     if (!bound_ || i >= shards_.size()) return false;
     ShardRuntime& sr = *shards_[i];
     if (sr.resident) return false;
+    if (authoring_ && SpawnAuthorSnapshot(scene, renderer, i)) {
+        ++stats_.syncStages;
+        sr.resident = true;
+        sr.state.store(static_cast<int>(salvage::RegionState::Loaded), std::memory_order_release);
+        ++stats_.spawns;
+        stats_.residentPeak = glm::max(stats_.residentPeak, ResidentShardCount());
+        PublishResidency(scene);
+        HBE_TRACE("TagStream: respawned authoring shard '{}' from its editor snapshot ({} "
+                  "entities).",
+                  ShardKey(i), sr.lastCreated.size());
+        return true;
+    }
     // The SYNCHRONOUS path: stage and instantiate in one call. Used by a manual spawn
     // (the editor, a save restore, a self-test) and as the fallback when the job system
     // is not running. Automatic streaming goes through StageJob + Finalize instead so
@@ -613,12 +875,30 @@ bool Streamer::DespawnShard(Scene& scene, u32 i) {
     CollectShardEntities(scene, i, members);
     // Encounters/spawners first: this is what stops a walked-away-from fight reading as
     // CLEARED on the next gameplay tick, and it has to run before the capture so the
-    // re-armed spawner progress is what gets recorded.
-    MarkStreamedOutPopulation(scene, members);
+    // re-armed spawner progress is what gets recorded. (Authoring skips it with the
+    // capture below - there is no encounter in progress to re-arm.)
+    if (!authoring_ && !silent_) MarkStreamedOutPopulation(scene, members);
     // CAPTURE FIRST, ALWAYS. Everything below this line is irreversible, and a despawn
     // that destroys before it records is exactly the regression that made automatic
     // streaming unshippable without this step.
-    world::CaptureGroup(scene, areaId_, ShardKey(i), members);
+    // See SpawnRows: an AUTHORING bind writes nothing into world::. Capturing here
+    // would record the AUTHORED scene as a set of player-progress deltas against
+    // itself, which the next real play session would then replay.
+    if (!authoring_ && !silent_) world::CaptureGroup(scene, areaId_, ShardKey(i), members);
+    // AUTHORING'S EQUIVALENT OF THAT CAPTURE, and for the same reason: everything below
+    // this line is irreversible. The editor's respawn source becomes what is standing
+    // now, not what the file said at bind - so a move, a component edit or a brand-new
+    // child inside this zone survives the round trip instead of being silently reverted
+    // (or, for something the file has never heard of, destroyed for good). See
+    // ShardRuntime::authorSnapshot.
+    if (authoring_) {
+        std::unordered_set<u32> keep;
+        keep.reserve(members.size() * 2);
+        for (const entt::entity e : members) keep.insert(static_cast<u32>(e));
+        sr.authorSnapshot = scene::SaveSceneToString(scene, [&keep](entt::entity e) {
+            return keep.count(static_cast<u32>(e)) > 0;
+        });
+    }
     const usize destroyed = DestroyClosure(scene, members);
 
     sr.resident = false;
@@ -649,14 +929,14 @@ void Streamer::UnloadAll(Scene& scene) {
         }
     }
     // The resident set is captured too: leaving a level must not lose the state of the
-    // always-loaded half of it.
-    world::CaptureArea(scene, areaId_);
+    // always-loaded half of it. (Authoring writes no world:: state - see SpawnRows.)
+    if (!authoring_ && !silent_) world::CaptureArea(scene, areaId_);
     for (usize i = 0; i < shards_.size(); ++i)
         if (shards_[i]->resident) DespawnShard(scene, static_cast<u32>(i));
 }
 
 void Streamer::CaptureAllLoaded(const Scene& scene) {
-    if (!bound_) return;
+    if (!bound_ || authoring_ || silent_) return; // authoring/menu write no world:: state
     world::CaptureArea(scene, areaId_);
     for (usize i = 0; i < shards_.size(); ++i) {
         if (!shards_[i]->resident) continue;
@@ -706,7 +986,15 @@ void Streamer::Finalize(Scene& scene, Renderer& renderer, u32 i) {
         if (reg.valid(e)) reg.emplace_or_replace<StreamShard>(e, StreamShard{i});
     // Replay the captured deltas the same frame the entities appear, so nothing ever
     // observes the authored state of a shard the player already changed.
-    world::RestoreGroup(scene, areaId_, ShardKey(i), created);
+    //
+    // NOT WHILE AUTHORING - the same guard SpawnRows, DespawnShard, UnloadAll and
+    // CaptureAllLoaded all carry, and this was the one path missing it. It is the path
+    // the EDITOR actually takes: Engine::Initialize starts the job system, so every
+    // automatic respawn goes StageJob -> Ready -> here, never through SpawnRows.
+    // RestoreGroup DESTROYS members that were absent when the group was captured and
+    // overwrites component state on the rest - on the world the author is editing,
+    // which the next Ctrl+S then writes.
+    if (!authoring_ && !silent_) world::RestoreGroup(scene, areaId_, ShardKey(i), created);
     sr.lastCreated = std::move(created);
     sr.resident = true;
     sr.state.store(static_cast<int>(salvage::RegionState::Loaded), std::memory_order_release);
@@ -851,6 +1139,100 @@ void Streamer::Update(Scene& scene, Renderer& renderer, const std::vector<glm::v
             }
         }
     }
+    // RULE 6: WHICH SHARDS ARE HELD BY AN ASSOCIATED TAG. Two steps, both O(tags +
+    // edges + shards) and both inside the timed region below, so the added cost is
+    // reported honestly in stats_.lastEvalMs rather than hidden:
+    //
+    //   1. SEED, FROM DISTANCE ONLY. A tag is seeded when one of its shards is in
+    //      range on its OWN terms - inside its load radius, or still inside its
+    //      unload radius having been inside the load radius. Seeding from
+    //      association-derived residency instead would let a mutual pair hold each
+    //      other resident forever with the player 10 km away.
+    //
+    //      THE SEED CARRIES ITS OWN HYSTERESIS (shardSelfSeed_) rather than borrowing
+    //      the shard's `resident` flag. `resident` only becomes true at the main-thread
+    //      finalize - and NEVER for a Failed shard, which is terminal - so borrowing it
+    //      degenerated the band to the bare `d <= loadRadius` test for every driver
+    //      that had not finished staging or could not stage at all. A focus oscillating
+    //      on such a driver's load boundary then toggled the seed, hence the driven
+    //      tag's `associated`, hence a spawn/despawn of an entire distant city every
+    //      few frames - exactly the thrash RULE 2 exists to prevent, reintroduced
+    //      through the association path. shardSelfSeed_ is still purely
+    //      DISTANCE-derived (it clears the moment d exceeds the unload radius), so the
+    //      cycle-collapse argument in StreamPolicy.h is untouched.
+    //   2. PROPAGATE, capped and cycle-safe (stream::AssocPass - the same call the
+    //      editor's prediction makes).
+    //
+    // Skipped entirely when the project authored no association at all, so a project
+    // that does not use the feature pays one branch. Skipped with NO FOCUS too:
+    // rule 3 says an empty focus list changes nothing, and re-deriving the marks from
+    // "everything is infinitely far away" would drop them.
+    //
+    // A MANUAL OVERRIDE COMPOSES THROUGH THIS SAME SEED SET rather than being a
+    // second notion of residency: "force resident" SEEDS the tag (so forcing the hill
+    // brings in the vista, which is what an author forcing a zone in expects), and
+    // "force unloaded" is excluded from seeding (so it stops driving) and has its
+    // mark cleared afterwards (so it stops being driven). One mechanism, not two.
+    if (assocActive_ && !foci.empty()) {
+        assoc_.BeginSeed();
+        for (usize t = 0; t < alwaysLoadedTag_.size() && t < assoc_.seed.size(); ++t)
+            if (alwaysLoadedTag_[t]) assoc_.seed[t] = 1u;
+        // EVERY shard is measured, not just the ones that would flip a not-yet-set
+        // seed: shardSelfSeed_ is per-SHARD state (it carries that shard's own
+        // hysteresis) and it is also the "is this shard here on its own terms?"
+        // answer the author-facing readout needs. O(shards x foci), the same order
+        // Evaluate below already is.
+        shardSelfSeed_.resize(shards_.size(), 0u);
+        for (usize i = 0; i < shards_.size(); ++i) {
+            const ShardRuntime& sr = *shards_[i];
+            const f32 d = NearestFocusDistance(static_cast<u32>(i), foci);
+            bool self = d <= sr.loadRadius ||
+                        (shardSelfSeed_[i] != 0u && d <= sr.unloadRadius);
+            switch (ShardForceOf(static_cast<u32>(i))) {
+            case ShardForce::Unloaded: self = false; break; // a zone forced out drives nothing
+            case ShardForce::Resident: self = true; break;  // ...and one forced in DOES drive
+            case ShardForce::Auto: break;
+            }
+            shardSelfSeed_[i] = self ? 1u : 0u;
+            const u32 t = shardTag_[i];
+            if (self && t != kNoAssocTag && t < assoc_.seed.size()) assoc_.seed[t] = 1u;
+        }
+        assoc_.Run();
+        // MARK EVERY SHARD OF A DRIVEN TAG. The seed is OR'd over a tag's shards but a
+        // hold has to apply to each of them individually: with a tag that autoShards
+        // into three cells, one cell coming into its own range must not release the
+        // other two while the driver is still driving. That is what the seed/visited
+        // split in AssocPass::Run is for - `marked` is now set on a tag even when the
+        // tag is itself seeded.
+        shardAssociated_.assign(shards_.size(), 0u);
+        for (usize i = 0; i < shards_.size(); ++i) {
+            const u32 t = shardTag_[i];
+            if (t != kNoAssocTag && t < assoc_.marked.size() && assoc_.marked[t])
+                shardAssociated_[i] = 1u;
+        }
+    } else if (!assocActive_ && !shardForce_.empty()) {
+        // No association graph at all, but the overrides still have to be expressible:
+        // the flag is the vehicle for "resident for a reason that is not distance", so
+        // a forced-in shard uses it here exactly as an associated one would.
+        //
+        // Deliberately NOT the `assocActive_ && foci.empty()` case. Rule 3 says an
+        // empty focus list changes nothing, so the marks from the last evaluation must
+        // survive it; clearing them here would drop a driven shard the moment the
+        // player and the camera both went away.
+        shardAssociated_.assign(shards_.size(), 0u);
+    }
+    // Apply the overrides to the derived flag, AFTER propagation: Unloaded beats being
+    // driven, Resident is held the same way an association holds a shard.
+    if (!shardForce_.empty()) {
+        shardAssociated_.resize(shards_.size(), 0u);
+        for (usize i = 0; i < shards_.size(); ++i) {
+            switch (ShardForceOf(static_cast<u32>(i))) {
+            case ShardForce::Resident: shardAssociated_[i] = 1u; break;
+            case ShardForce::Unloaded: shardAssociated_[i] = 0u; break;
+            case ShardForce::Auto: break;
+            }
+        }
+    }
     policyScratch_.resize(shards_.size());
     for (usize i = 0; i < shards_.size(); ++i) {
         const ShardRuntime& sr = *shards_[i];
@@ -863,8 +1245,15 @@ void Streamer::Update(Scene& scene, Renderer& renderer, const std::vector<glm::v
         p.priority = sr.priority;
         p.resident = sr.resident;
         p.busy = (s == salvage::RegionState::Loading || s == salvage::RegionState::Ready);
-        p.pinned = pinnedByMember_[i] != 0u;
+        // heldShard_ is the editor holding the SELECTION's shard. It is OR'd into
+        // `pinned` because that is already exactly "never unload this", and it is
+        // deliberately not a third bool: the author never sees it and it must not read
+        // as a manual override in the panel.
+        p.pinned = pinnedByMember_[i] != 0u || static_cast<i32>(i) == heldShard_;
         p.failed = (s == salvage::RegionState::Failed);
+        // Kept SEPARATE from `pinned` on purpose: the two are different answers to
+        // "why is this shard here?", and the readout has to be able to say which.
+        p.associated = i < shardAssociated_.size() && shardAssociated_[i] != 0u;
     }
     PolicyIn in;
     in.shards = policyScratch_.data();
@@ -891,8 +1280,46 @@ void Streamer::Update(Scene& scene, Renderer& renderer, const std::vector<glm::v
     forceEval_ = policyOut_.moreWork;
 
     // --- 4) Act --------------------------------------------------------------
+    // MANUAL "FORCE UNLOADED" IS APPLIED HERE, NOT IN THE POLICY. Rule 2 refuses to
+    // unload a shard a focus is inside, and that refusal is load-bearing - it is what
+    // stops boundary thrash - so a seventh policy rule that punched through it would
+    // weaken the thing every other caller depends on. An override is not a streaming
+    // rule; it is the author overruling the streamer for this session, and it belongs
+    // where the streamer acts. The list is EMPTY in the shipping runtime.
+    if (!shardForce_.empty()) {
+        // Never START a load for a zone the author has switched off - including the
+        // loads `enabled == false` orders, which is how "live streaming off" and "this
+        // one zone off" coexist.
+        policyOut_.load.erase(std::remove_if(policyOut_.load.begin(), policyOut_.load.end(),
+                                             [this](u32 i) {
+                                                 return ShardForceOf(i) == ShardForce::Unloaded;
+                                             }),
+                              policyOut_.load.end());
+        // And despawn it however close the focus is. Appended rather than replacing the
+        // policy's list, and deduplicated, so a shard the policy ALSO wanted gone is
+        // not despawned twice (DespawnShard is a no-op on a non-resident shard, but
+        // relying on that would make the stats lie).
+        for (usize i = 0; i < shards_.size(); ++i) {
+            if (ShardForceOf(static_cast<u32>(i)) != ShardForce::Unloaded) continue;
+            if (!shards_[i]->resident) continue;
+            const u32 idx = static_cast<u32>(i);
+            if (std::find(policyOut_.unload.begin(), policyOut_.unload.end(), idx) ==
+                policyOut_.unload.end())
+                policyOut_.unload.push_back(idx);
+        }
+    }
     for (const u32 i : policyOut_.load) {
         ShardRuntime& sr = *shards_[i];
+        // AN AUTHORING SHARD WITH AN EDITOR SNAPSHOT COMES BACK FROM THE SNAPSHOT, and
+        // therefore synchronously: the staging job reads the level FILE, which is
+        // exactly the source that would revert the author's edits. This is the editor,
+        // one zone at a time, so a synchronous spawn here is the same cost
+        // SpawnAllShards already pays on every save.
+        if (authoring_ && !sr.authorSnapshot.empty()) {
+            const u32 idx = i;
+            timeStructural([&] { SpawnShard(scene, renderer, idx); });
+            continue;
+        }
         sr.state.store(static_cast<int>(salvage::RegionState::Loading), std::memory_order_release);
         if (jobs::IsInitialized()) {
             ++stats_.asyncStages;
@@ -920,8 +1347,23 @@ bool Streamer::IsSettled(const std::vector<glm::vec3>& foci) const {
             static_cast<salvage::RegionState>(shards_[i]->state.load(std::memory_order_acquire));
         // "In range" is the same distance-to-BOX test the policy uses; with no focus at
         // all nothing is in range, which is right - there is nothing to wait for.
+        //
+        // RULE 6 COUNTS AS IN RANGE. A shard held by an association is out of range BY
+        // DEFINITION, so without this clause an Unloaded associated shard reads as
+        // settled and the loading screen drops before it appears - which is exactly
+        // the pop the screen exists to hide, and the difference between the distant
+        // city fading in behind the curtain and popping in front of the player.
+        //
+        // AND A MANUALLY UNLOADED ZONE IS SETTLED, whatever the distance says. The
+        // author switched it off; waiting for it to appear would hang forever.
+        if (ShardForceOf(static_cast<u32>(i)) == ShardForce::Unloaded) {
+            if (!salvage::RegionSettled(s, false)) return false;
+            continue;
+        }
         const bool inRange =
-            !foci.empty() && NearestFocusDistance(static_cast<u32>(i), foci) <= shards_[i]->loadRadius;
+            (!foci.empty() &&
+             NearestFocusDistance(static_cast<u32>(i), foci) <= shards_[i]->loadRadius) ||
+            (i < shardAssociated_.size() && shardAssociated_[i] != 0u);
         if (!salvage::RegionSettled(s, inRange)) return false;
     }
     return true;
@@ -1843,10 +2285,574 @@ bool SelfTest() {
         }
     }
 
+    // --- MenuWorld: a menu backdrop leaves ZERO trace in persistence ----------
+    // The 3D main menu binds the startup scene behind the menu. The contract, and
+    // the save-corruption risk it prevents: a menu is NOT a visit (the
+    // AreaVisitCount schematic node's FirstVisit must still fire on the player's
+    // REAL first entry), and menu-time spawn/despawn must never capture - a capture
+    // would write the AUTHORED state over whatever a real save holds.
+    {
+        world::Get().Clear();
+        world::SetCurrentArea({});
+        const std::string blankBlob = world::Get().Serialize();
+
+        Scene sm;
+        Streamer stm;
+        expect(stm.BindLevel(sm, renderer, file, dir, defs, BindMode::MenuWorld),
+               "MenuWorld binds the fixture level");
+        expect(LiveCount(sm) > 0, "the resident slice really spawned (a backdrop is visible)");
+        expect(world::CurrentArea().empty(),
+               "MenuWorld did NOT enter the area (a menu is not a visit)");
+
+        // Stream a shard in and out again, as the menu camera would by distance.
+        const i32 cm = stm.FindShard("Camp#0");
+        expect(cm >= 0, "the fixture shard exists");
+        if (cm >= 0) {
+            expect(stm.SpawnShard(sm, renderer, static_cast<u32>(cm)),
+                   "a shard spawns behind the menu");
+            expect(stm.DespawnShard(sm, static_cast<u32>(cm)),
+                   "and despawns when the menu camera moves off");
+        }
+        expect(world::Get().Serialize() == blankBlob,
+               "a full menu spawn/despawn cycle wrote NOTHING into world:: - zero trace");
+
+        // Teardown mirrors FlowPlay: Reset (no capture), then the REAL first entry.
+        stm.Reset(&sm);
+        expect(world::Get().Serialize() == blankBlob,
+               "tearing the menu down for Play captured nothing either");
+        Scene sp;
+        Streamer stp;
+        expect(stp.BindLevel(sp, renderer, file, dir, defs, BindMode::Fresh),
+               "the real Play bind still works after a menu bind");
+        expect(!world::CurrentArea().empty(), "Fresh entered the area");
+        expect(world::Get().VisitCount(world::CurrentArea()) == 1,
+               "and the PLAYER'S entry is visit #1 - the menu consumed no FirstVisit");
+        stp.Reset(&sp);
+    }
+
     fs::remove_all(dir, ec);
     world::Get().Clear();
     world::SetCurrentArea({});
     if (ok) HBE_INFO("shardstate: PASS");
+    return ok;
+}
+
+// --- --test-assoctags: RULE 6, associated tags --------------------------------
+
+bool AssocSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("assoctags: FAILED - {}", what);
+        }
+    };
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path(ec) / "hbe_assoctags";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path file = dir / "Valley.hbscene";
+
+    // THE AUTHORED SCENARIO, BY NAME. Three tags, THREE SEPARATE PIECES OF CONTENT,
+    // each with its own objects, its own baked bounds and its own radii:
+    //
+    //   City          the real city, x in [0, 100]      - load 100
+    //   City_LowPoly  a DIFFERENT asset the author made for distant viewing,
+    //                 x in [200, 300]                   - load 60
+    //   Hill          the vantage point, x around 2000  - load 300
+    //
+    // Hill ASSOCIATES City_LowPoly, one-way. Nothing else relates them: City and
+    // City_LowPoly do not know about each other, are not a LOD pair, and are not
+    // mutually exclusive. Whether both are resident at once is the author's business
+    // and this test asserts NOTHING about it.
+    const auto makeDefs = [] {
+        TagDef untagged;
+        untagged.name = tags::kUntaggedName;
+        TagDef city;
+        city.name = "City";
+        city.loadRadius = 100.0f;
+        city.unloadRadius = 130.0f;
+        TagDef low;
+        low.name = "City_LowPoly";
+        low.loadRadius = 60.0f;
+        low.unloadRadius = 80.0f;
+        TagDef hill;
+        hill.name = "Hill";
+        hill.loadRadius = 300.0f;
+        hill.unloadRadius = 400.0f;
+        std::vector<TagDef> d = {untagged, city, low, hill};
+        return d;
+    };
+    std::vector<TagDef> defs = makeDefs();
+    defs[3].associates.push_back("City_LowPoly"); // Hill pulls in the low-poly city
+    tags::Normalize(defs);
+    tags::SeedFromProject(defs);
+    expect(defs.size() == 4 && defs[3].name == "Hill" && defs[3].associates.size() == 1,
+           "the authored tag list survives Normalize with its association intact");
+
+    const TagId tCity = tags::Intern("City"), tLow = tags::Intern("City_LowPoly"),
+                tHill = tags::Intern("Hill");
+    u64 gLowFirst = 0, gHillFirst = 0;
+    {
+        Scene s;
+        auto& reg = s.Registry();
+        const auto make = [&](const char* n, const glm::vec3& p, TagId tag) {
+            const entt::entity e = s.CreateEntity(n);
+            Transform t;
+            t.position = p;
+            reg.emplace<Transform>(e, t);
+            reg.emplace<AABB>(e, AABB{glm::vec3(-0.5f), glm::vec3(0.5f)});
+            tags::Assign(reg, e, tag);
+            return e;
+        };
+        make("Ground", {0.0f, -1.0f, 0.0f}, kTagUntagged); // untagged: always resident
+        for (int i = 0; i < 5; ++i)
+            make("CityBlock", {25.0f * static_cast<f32>(i), 0.0f, 0.0f}, tCity);
+        for (int i = 0; i < 5; ++i) {
+            const entt::entity e =
+                make("CityBlock_LowPoly", {200.0f + 25.0f * static_cast<f32>(i), 0.0f, 0.0f}, tLow);
+            if (gLowFirst == 0) gLowFirst = reg.get<Guid>(e).value;
+        }
+        for (int i = 0; i < 3; ++i) {
+            const entt::entity e =
+                make("HillRock", {1990.0f + 10.0f * static_cast<f32>(i), 0.0f, 0.0f}, tHill);
+            if (gHillFirst == 0) gHillFirst = reg.get<Guid>(e).value;
+        }
+        const tagshard::BakeReport rep = tagshard::BakeScene(s, defs);
+        expect(rep.errors == 0, "the three-tag valley bakes without errors");
+        expect(rep.warnings == 0,
+               "and WITHOUT warnings: an association whose driver and target are both in "
+               "this level is the correct case and must be silent");
+        expect(scene::SaveScene(s, file, {}, SceneKind::Full, &rep.shards),
+               "save the valley with its baked shard header");
+    }
+
+    Renderer renderer; // device-less: UploadMesh returns an invalid handle, no GPU
+    const glm::vec3 kOnTheHill(2000.0f, 0.0f, 0.0f);
+    const glm::vec3 kInTheLowPolyCity(250.0f, 0.0f, 0.0f);
+    const glm::vec3 kFarAway(100000.0f, 0.0f, 0.0f);
+    const auto pump = [&renderer](Streamer& st, Scene& s, const glm::vec3& p, int frames) {
+        std::vector<glm::vec3> foci{p};
+        for (int i = 0; i < frames; ++i) st.Update(s, renderer, foci);
+    };
+
+    f64 worstEvalMs = 0.0, meanEvalMs = 0.0;
+
+    // --- 1. The scenario itself ----------------------------------------------
+    {
+        world::Get().Clear();
+        world::SetCurrentArea({});
+        Scene s;
+        Streamer st;
+        expect(st.BindLevel(s, renderer, file, dir, defs), "bind the valley");
+        if (!ok) {
+            fs::remove_all(dir, ec);
+            return false;
+        }
+        const i32 iCity = st.FindShard("City#0"), iLow = st.FindShard("City_LowPoly#0"),
+                  iHill = st.FindShard("Hill#0");
+        expect(iCity >= 0 && iLow >= 0 && iHill >= 0,
+               "all three tags baked to their OWN shard - they are separate content");
+        if (!ok) {
+            fs::remove_all(dir, ec);
+            return false;
+        }
+        const u32 uCity = static_cast<u32>(iCity), uLow = static_cast<u32>(iLow),
+                  uHill = static_cast<u32>(iHill);
+        const usize base = LiveCount(s);
+
+        pump(st, s, kFarAway, 8);
+        expect(st.ResidentShardCount() == 0, "100 km away nothing is resident");
+
+        // THE FEATURE. Stand on the hill: the hill loads by distance, and the low-poly
+        // city - 1.7 km away, far outside its own 60 m load radius - comes with it.
+        pump(st, s, kOnTheHill, 12);
+        expect(st.IsResident(uHill), "standing on the hill loads the Hill tag by distance");
+        expect(st.IsResident(uLow),
+               "and City_LowPoly becomes resident TOO, 1.7 km outside its own load radius, "
+               "purely because Hill associates it");
+        expect(st.IsAssociated(uLow),
+               "and the streamer can say WHY: it is held by an association, not by distance");
+        expect(!st.IsAssociated(uHill), "the driver itself is not 'associated' - it is in range");
+        expect(!st.IsResident(uCity),
+               "the REAL city is 1.9 km away and nothing associates it, so it stays out");
+        expect(ByGuid(s, gLowFirst) != entt::null,
+               "the low-poly city's entities really spawned - this is a spawn, not a flag");
+        expect(ByGuid(s, gHillFirst) != entt::null, "and so did the hill's");
+
+        // LEAVING THE HILL RELEASES IT - unless it is in range on its own. Walk from
+        // the hill straight into the low-poly city: the hill unloads (association
+        // gone) but the low-poly city is now inside its OWN radius and must NEVER be
+        // despawned in between. Exactly one despawn happens: the hill's.
+        const u32 despawnsBefore = st.Stats().despawns;
+        pump(st, s, kInTheLowPolyCity, 12);
+        expect(!st.IsResident(uHill), "walking off the hill unloads the Hill tag");
+        expect(st.IsResident(uLow), "the low-poly city stays: it is now in range on its OWN");
+        expect(!st.IsAssociated(uLow), "and the reason has changed from association to distance");
+        expect(st.Stats().despawns - despawnsBefore == 1,
+               "a shard resident for TWO reasons survives losing one: exactly ONE despawn "
+               "(the hill) happened, so City_LowPoly was never dropped and respawned");
+
+        // Now lose the second reason too.
+        pump(st, s, kFarAway, 24);
+        expect(st.ResidentShardCount() == 0,
+               "with neither the association nor the distance, everything unloads");
+        expect(LiveCount(s) == base, "and the entity count returns exactly to the baseline");
+
+        // And it is reproducible, not a one-shot.
+        pump(st, s, kOnTheHill, 12);
+        expect(st.IsResident(uLow) && st.IsAssociated(uLow),
+               "returning to the hill pulls the low-poly city back in");
+        pump(st, s, kFarAway, 24);
+        expect(st.ResidentShardCount() == 0 && LiveCount(s) == base,
+               "and leaving releases it again - the association leaks nothing");
+        worstEvalMs = glm::max(worstEvalMs, st.Stats().maxEvalMs);
+        // The MEAN is the number that describes the steady state. The maximum above
+        // is the FIRST evaluation after a bind, which pays for the one-off `assign`
+        // of every scratch vector in the pass and is not what a running frame costs.
+        if (st.Stats().evaluations > 0)
+            meanEvalMs = st.Stats().totalEvalMs / static_cast<f64>(st.Stats().evaluations);
+    }
+
+    // --- 2. A CYCLE terminates ------------------------------------------------
+    // Mutual association is an authoring mistake, not a crash and not a leak. The
+    // propagation is seeded from DISTANCE only, so once neither member is within its
+    // own unload radius the whole cycle collapses. Seeded from association-derived
+    // residency it would hold itself resident forever with the player 100 km away.
+    {
+        std::vector<TagDef> cyc = makeDefs();
+        cyc[3].associates.push_back("City_LowPoly");
+        cyc[2].associates.push_back("Hill"); // ... and back again
+        tags::Normalize(cyc);
+        world::Get().Clear();
+        world::SetCurrentArea({});
+        Scene s;
+        Streamer st;
+        expect(st.BindLevel(s, renderer, file, dir, cyc), "bind with a MUTUAL association");
+        const i32 iLow = st.FindShard("City_LowPoly#0"), iHill = st.FindShard("Hill#0");
+        if (iLow >= 0 && iHill >= 0) {
+            const u32 uLow = static_cast<u32>(iLow), uHill = static_cast<u32>(iHill);
+            pump(st, s, kFarAway, 12);
+            expect(st.ResidentShardCount() == 0,
+                   "a cycle with NO distance seed marks nothing - it does not bootstrap "
+                   "itself into residency");
+            pump(st, s, kOnTheHill, 12);
+            expect(st.IsResident(uHill) && st.IsResident(uLow),
+                   "standing on the hill still loads both ends of the cycle");
+            pump(st, s, kFarAway, 30);
+            expect(st.ResidentShardCount() == 0,
+                   "and walking away UNLOADS BOTH: the cycle terminates instead of pinning "
+                   "the world resident forever");
+        }
+        worstEvalMs = glm::max(worstEvalMs, st.Stats().maxEvalMs);
+    }
+
+    // --- 3. A MISSING target warns and does not crash -------------------------
+    {
+        std::vector<TagDef> ghost = makeDefs();
+        ghost[3].associates.push_back("City_LowPoly_ThatWasRenamed"); // no such tag
+        tags::Normalize(ghost);
+        expect(ghost[3].associates.size() == 1,
+               "Normalize KEEPS a dangling association - validation is a report, not a "
+               "deletion of authored intent");
+        world::Get().Clear();
+        world::SetCurrentArea({});
+        Scene s;
+        Streamer st;
+        expect(st.BindLevel(s, renderer, file, dir, ghost),
+               "a binding whose association names a tag that does not exist still BINDS");
+        const i32 iLow = st.FindShard("City_LowPoly#0"), iHill = st.FindShard("Hill#0");
+        if (iLow >= 0 && iHill >= 0) {
+            pump(st, s, kOnTheHill, 12);
+            expect(st.IsResident(static_cast<u32>(iHill)),
+                   "the driver streams normally - a broken link costs the LINK, not the tag");
+            expect(!st.IsResident(static_cast<u32>(iLow)),
+                   "and the unresolvable link pulls nothing in");
+            pump(st, s, kFarAway, 24);
+            expect(st.ResidentShardCount() == 0, "and unloading still works");
+        }
+    }
+
+    // --- 4. Cost -------------------------------------------------------------
+    // The pass is O(tags + edges) on an EVALUATION frame only, so it inherits the
+    // 4-frame / 2-metre cadence. Measured against the streamer's own eval timer,
+    // which is the number the engine's Perf line prints.
+    {
+        expect(meanEvalMs < 0.01,
+               "the MEAN evaluation, association pass included, stays inside the "
+               "0.002-0.006 ms envelope streaming already had");
+        expect(worstEvalMs < 0.25,
+               "and even the first-evaluation-after-bind worst case (which pays for the "
+               "one-off scratch allocation) stays far inside the streaming budget");
+        // And at a realistic project scale, isolated: 32 tags, 40 edges, 20k runs.
+        AssocPass ap;
+        constexpr u32 kTags = 32;
+        ap.graph.edges.assign(kTags, {});
+        for (u32 t = 0; t < 40; ++t) ap.graph.edges[t % kTags].push_back((t * 7 + 3) % kTags);
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        constexpr u32 kRuns = 20000;
+        u32 sink = 0;
+        for (u32 r = 0; r < kRuns; ++r) {
+            ap.BeginSeed();
+            ap.seed[r % kTags] = 1u;
+            ap.Run();
+            for (const u8 m : ap.marked) sink += m;
+        }
+        const f64 perRunMs =
+            std::chrono::duration<f64, std::milli>(std::chrono::high_resolution_clock::now() - t0)
+                .count() /
+            static_cast<f64>(kRuns);
+        expect(sink > 0, "the scale benchmark actually propagated something");
+        expect(perRunMs < 0.01,
+               "32 tags and 40 edges propagate in well under 0.01 ms - inside the noise "
+               "floor of the 0.002-0.006 ms evaluation it is added to");
+        HBE_INFO("assoctags: EVALUATION cost with associations live - mean {:.5f} ms, "
+                 "worst (first eval after bind) {:.4f} ms. Isolated propagation over 32 "
+                 "tags / 40 edges: {:.5f} ms per run.",
+                 meanEvalMs, worstEvalMs, perRunMs);
+    }
+
+    // --- 5. Bake-time validation ---------------------------------------------
+    {
+        std::vector<TagDef> bad;
+        TagDef untagged;
+        untagged.name = tags::kUntaggedName;
+        TagDef a;
+        a.name = "A";
+        a.associates = {"A", "NoSuchTag", "B"}; // self, missing, and a real cycle partner
+        TagDef b;
+        b.name = "B";
+        b.associates = {"A"};
+        TagDef solo;
+        solo.name = "Solo";
+        solo.associates = {"Elsewhere"}; // defined, but has no shards in this bake
+        TagDef elsewhere;
+        elsewhere.name = "Elsewhere";
+        bad = {untagged, a, b, solo, elsewhere};
+        // NOT normalized: the self-reference has to survive to prove the bake reports
+        // it (a hand-edited `.hbproj` reaches Bake without passing the editor).
+        tags::Reset();
+        for (const TagDef& d : bad) tags::Intern(d.name);
+
+        std::vector<tagshard::BakeRow> rows;
+        const auto row = [&](const char* tag, f32 x) {
+            tagshard::BakeRow r;
+            r.tag = tags::Intern(tag);
+            r.world = glm::translate(glm::mat4(1.0f), glm::vec3(x, 0.0f, 0.0f));
+            r.localMin = glm::vec3(-0.5f);
+            r.localMax = glm::vec3(0.5f);
+            r.hasExtent = true;
+            r.name = tag;
+            rows.push_back(r);
+        };
+        row("A", 0.0f);
+        row("B", 50.0f);
+        row("Solo", 100.0f);
+        const tagshard::BakeReport rep = tagshard::Bake(rows, bad);
+        const auto saw = [&rep](const char* needle) {
+            for (const tagshard::Diagnostic& d : rep.diagnostics)
+                if (d.message.find(needle) != std::string::npos) return true;
+            return false;
+        };
+        expect(saw("associates ITSELF"), "the bake reports a SELF-association");
+        expect(saw("which this project does not list as a tag"),
+               "the bake reports an association naming a tag that does not exist");
+        expect(saw("Association CYCLE"), "the bake reports a CYCLE");
+        expect(saw("A -> B -> A") || saw("B -> A -> B"),
+               "and NAMES it, so the finding is actionable");
+        expect(saw("no object in this level carries 'Elsewhere'"),
+               "the bake distinguishes 'the tag exists but has no content HERE' from "
+               "'the tag does not exist' - they look identical at runtime");
+        expect(rep.errors == 0,
+               "every association finding is a WARNING: none of them refuses the save");
+    }
+
+    // --- 6. The `.hbproj` round trip -----------------------------------------
+    {
+        const fs::path projDir = dir / "P";
+        expect(Project::Active().Create(projDir, "P"), "create a scratch project");
+        ProjectSettings& s = Project::Active().Settings();
+        s.tags = makeDefs();
+        s.tags[3].associates = {"City_LowPoly"};
+        tags::Normalize(s.tags);
+        expect(Project::Active().Save(), "save the project with an association");
+        expect(Project::Active().Open(projDir / "P.hbproj"), "reopen it");
+        const std::vector<TagDef>& t = Project::Active().Settings().tags;
+        expect(t.size() == 4 && t[3].name == "Hill" && t[3].associates.size() == 1 &&
+                   t[3].associates[0] == "City_LowPoly",
+               "the association round-trips through the .hbproj as a NAME");
+        expect(t[1].associates.empty() && t[2].associates.empty(),
+               "and a tag with no association parses back as an EMPTY list, not a missing "
+               "one (the struct default and the JSON fallback are the same {})");
+
+        // Deleting the TARGET scrubs the dangling name instead of leaving it behind -
+        // a string erase, which is exactly why associations are names and not ids.
+        std::vector<TagDef> defs2 = Project::Active().Settings().tags;
+        Scene sc;
+        const usize lowIndex = 2; // City_LowPoly
+        expect(defs2[lowIndex].name == "City_LowPoly", "City_LowPoly is where we think it is");
+        expect(tags::RemoveTag(sc.Registry(), defs2, lowIndex), "delete City_LowPoly");
+        bool dangling = false;
+        for (const TagDef& d : defs2)
+            for (const std::string& an : d.associates)
+                if (an == "City_LowPoly") dangling = true;
+        expect(!dangling, "RemoveTag erases the dead name from every other tag's associates");
+    }
+
+    // --- 7. A DRIVEN TAG WITH MORE THAN ONE SHARD ------------------------------
+    // The configuration every other case in this file misses: every tag above has
+    // autoShard off, so every tag has exactly ONE shard - the only shape in which the
+    // seed being per-TAG and the hold being per-SHARD cannot disagree.
+    //
+    // Turn autoShard on for the driven tag and the two facts come apart. The seed is
+    // OR'd over a tag's shards, so ONE cell of the low-poly city walking into its own
+    // radius made the whole tag "seeded"; with seed and visited sharing one array a
+    // seeded tag could never be marked, so every OTHER cell lost `associated` and
+    // despawned - while the hill was still driving them. Author-visible as: walk to the
+    // near end of the distant city and the far end of it vanishes.
+    {
+        std::vector<TagDef> wide = makeDefs();
+        wide[2].autoShard = true;   // City_LowPoly splits by space
+        wide[3].loadRadius = 3000.0f; // a hill you can see the whole valley from
+        wide[3].unloadRadius = 3500.0f;
+        wide[3].associates.push_back("City_LowPoly");
+        tags::Normalize(wide);
+        tags::SeedFromProject(wide);
+        const TagId wLow = tags::Intern("City_LowPoly"), wHill = tags::Intern("Hill");
+        const fs::path wideFile = dir / "WideValley.hbscene";
+        {
+            Scene s;
+            auto& reg = s.Registry();
+            const auto make = [&](const char* n, const glm::vec3& p, TagId tag) {
+                const entt::entity e = s.CreateEntity(n);
+                Transform t;
+                t.position = p;
+                reg.emplace<Transform>(e, t);
+                reg.emplace<AABB>(e, AABB{glm::vec3(-0.5f), glm::vec3(0.5f)});
+                tags::Assign(reg, e, tag);
+            };
+            make("Ground", {0.0f, -1.0f, 0.0f}, kTagUntagged);
+            // Two clusters 600 m apart: further than the tag's shard cell (its 60 m
+            // load radius), so the bake gives them a shard each.
+            for (int i = 0; i < 4; ++i)
+                make("LowA", {200.0f + 25.0f * static_cast<f32>(i), 0.0f, 0.0f}, wLow);
+            for (int i = 0; i < 4; ++i)
+                make("LowB", {900.0f + 25.0f * static_cast<f32>(i), 0.0f, 0.0f}, wLow);
+            for (int i = 0; i < 3; ++i)
+                make("HillRock", {1990.0f + 10.0f * static_cast<f32>(i), 0.0f, 0.0f}, wHill);
+            const tagshard::BakeReport rep = tagshard::BakeScene(s, wide);
+            expect(rep.errors == 0, "the wide valley bakes");
+            expect(scene::SaveScene(s, wideFile, {}, SceneKind::Full, &rep.shards),
+                   "save the wide valley");
+        }
+        world::Get().Clear();
+        world::SetCurrentArea({});
+        Scene s;
+        Streamer st;
+        expect(st.BindLevel(s, renderer, wideFile, dir, wide), "bind the wide valley");
+        const i32 iA = st.FindShard("City_LowPoly#0"), iB = st.FindShard("City_LowPoly#1"),
+                  iHill = st.FindShard("Hill#0");
+        expect(iA >= 0 && iB >= 0 && iHill >= 0,
+               "City_LowPoly really baked into TWO shards - without that this test proves "
+               "nothing");
+        if (iA >= 0 && iB >= 0 && iHill >= 0) {
+            // Which key got which cluster is the bake's business, so ask rather than
+            // assume: A is the cell the walk below stands in.
+            const bool zeroIsNear = st.Shard(static_cast<u32>(iA)).desc.min.x < 500.0f;
+            const u32 uA = static_cast<u32>(zeroIsNear ? iA : iB),
+                      uB = static_cast<u32>(zeroIsNear ? iB : iA);
+            pump(st, s, kFarAway, 12);
+            expect(st.ResidentShardCount() == 0, "100 km away nothing is resident");
+
+            pump(st, s, kOnTheHill, 16);
+            expect(st.IsResident(uA) && st.IsResident(uB),
+                   "standing on the hill pulls in BOTH cells of the low-poly city");
+            expect(st.IsAssociated(uA) && st.IsAssociated(uB),
+                   "and both know they are held by the association");
+
+            // THE REGRESSION. Walk into cell A. The hill's 3 km radius still reaches
+            // here, so it is still driving - and cell B, 650 m away and far outside its
+            // own 60 m radius, must still be held.
+            const u32 despawnsBefore = st.Stats().despawns;
+            const glm::vec3 kInCellA(250.0f, 0.0f, 0.0f);
+            pump(st, s, kInCellA, 16);
+            expect(st.IsResident(uA), "cell A is now in range on its OWN terms");
+            expect(st.IsResident(uB),
+                   "and cell B is STILL HELD by the hill, which is still driving - one "
+                   "shard of a tag coming into range must not release the tag's others");
+            expect(st.IsAssociated(uB),
+                   "...and still says so: the mark is per SHARD, and a tag that is both "
+                   "seeded and driven is still driven");
+            expect(!st.IsSelfHeld(uB), "cell B is here for the association, not for distance");
+            expect(st.IsSelfHeld(uA), "while cell A is here on its own distance");
+            expect(st.Stats().despawns == despawnsBefore,
+                   "nothing was despawned at all on the walk - the bug was a despawn of "
+                   "every other shard of the driven tag");
+
+            pump(st, s, kFarAway, 30);
+            expect(st.ResidentShardCount() == 0,
+                   "and leaving the valley still releases every cell - the wider hold "
+                   "leaks nothing");
+        }
+        worstEvalMs = glm::max(worstEvalMs, st.Stats().maxEvalMs);
+    }
+
+    // --- 8. THE SEED'S HYSTERESIS DOES NOT DEPEND ON THE DRIVER BEING RESIDENT --
+    // `resident` is false for the whole staging window and forever for a Failed shard,
+    // so a seed that borrowed it degenerated to the bare `d <= loadRadius` test with NO
+    // dead band - and a focus oscillating on the driver's boundary then spawned and
+    // despawned an entire distant city, forever. Here the driver is never allowed to
+    // become resident at all (it is forced out on the frames it would have loaded), and
+    // the driven tag must still not thrash.
+    {
+        world::Get().Clear();
+        world::SetCurrentArea({});
+        Scene s;
+        Streamer st;
+        std::vector<TagDef> d2 = makeDefs();
+        d2[3].associates.push_back("City_LowPoly");
+        tags::Normalize(d2);
+        expect(st.BindLevel(s, renderer, file, dir, d2), "bind for the boundary walk");
+        const i32 iHill = st.FindShard("Hill#0"), iLow = st.FindShard("City_LowPoly#0");
+        if (iHill >= 0 && iLow >= 0) {
+            // Hill spans x in [1989.5, 2010.5] with load 300 / unload 400. Oscillate ONE
+            // FRAME either side of the 300 m boundary, which is the case that used to
+            // fail: a shard only becomes `resident` at its finalize, so for the whole
+            // staging window - and forever, for a Failed shard - the old seed had no
+            // dead band at all and the driven city spawned and despawned on every
+            // crossing.
+            const glm::vec3 justInside(1989.5f - 299.0f, 0.0f, 0.0f);
+            const glm::vec3 justOutside(1989.5f - 301.0f, 0.0f, 0.0f);
+            pump(st, s, kFarAway, 16);
+            expect(st.ResidentShardCount() == 0, "start the boundary walk with nothing loaded");
+            const u32 spawnsBefore = st.Stats().spawns, despawnsBefore = st.Stats().despawns;
+            for (int i = 0; i < 30; ++i) {
+                pump(st, s, justInside, 1);
+                pump(st, s, justOutside, 1);
+            }
+            expect(st.Stats().despawns == despawnsBefore,
+                   "30 crossings of the DRIVER's load boundary cause ZERO despawns of the "
+                   "driven tag - the seed carries its own hysteresis and does not borrow "
+                   "the driver's residency");
+            expect(st.Stats().spawns - spawnsBefore <= 2,
+                   "...and at most two spawns happen in total (the hill and the city, once "
+                   "each), not one per crossing");
+            expect(st.IsResident(static_cast<u32>(iLow)),
+                   "and the driven city is still standing at the end of it");
+        }
+    }
+
+    fs::remove_all(dir, ec);
+    world::Get().Clear();
+    world::SetCurrentArea({});
+    tags::Reset();
+    if (ok) {
+        HBE_INFO("assoctags: PASS - standing on 'Hill' makes the SEPARATE 'City_LowPoly' "
+                 "content resident 1.7 km outside its own radius; leaving releases it "
+                 "unless it is in range on its own; two reasons survive losing one; a "
+                 "cycle terminates; a missing target warns and streams on.");
+    }
     return ok;
 }
 

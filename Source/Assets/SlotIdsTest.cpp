@@ -645,10 +645,55 @@ void TestExtraFileReservation() {
     fs::remove_all(s.root, ec);
 }
 
+// The slot contract as the project owner wrote it, encoded verbatim so the spec is
+// executable rather than prose. Every other test here covers a mechanism; this one
+// covers the AGREEMENT, and is deliberately written in their names and their order:
+//
+//   Tree=0, Rock=1, Player=2, Ghost=3
+//   Remove Rock  -> slot 1 empty
+//   Import Chair -> Chair takes slot 1
+//   Remove Ghost -> slot 3 empty
+//   Import Table -> Table takes slot 3
+//   Tree, Player and every other existing asset stay where they were.
+//
+// It intentionally overlaps TestAllocationLifecycle. If a future change breaks the
+// contract, this is the failure that names WHAT was promised rather than which
+// internal invariant tripped.
+void TestOwnerSpecExample() {
+    const Scratch s = MakeScratch("hbe_slotids_spec");
+
+    CheckEq(CreateAsset(s, "World/Tree.uaf"), 0, "Tree should take slot 0");
+    CheckEq(CreateAsset(s, "World/Rock.uaf"), 1, "Rock should take slot 1");
+    CheckEq(CreateAsset(s, "World/Player.uaf"), 2, "Player should take slot 2");
+    CheckEq(CreateAsset(s, "World/Ghost.uaf"), 3, "Ghost should take slot 3");
+
+    DeleteAsset(s, "World/Rock.uaf"); // slot 1 becomes EMPTY - not reclaimed by shifting
+    CheckEq(CreateAsset(s, "World/Chair.uaf"), 1,
+            "Chair must fill the LOWEST empty slot (1, freed by Rock)");
+
+    DeleteAsset(s, "World/Ghost.uaf"); // slot 3 becomes EMPTY
+    CheckEq(CreateAsset(s, "World/Table.uaf"), 3,
+            "Table must fill the LOWEST empty slot (3, freed by Ghost)");
+
+    // The whole point: nothing that survived moved, on disk, at any step.
+    CheckEq(OnDisk(s, "World/Tree.uaf"), 0, "Tree MOVED - existing assets must never shift");
+    CheckEq(OnDisk(s, "World/Player.uaf"), 2, "Player MOVED - existing assets must never shift");
+    CheckEq(OnDisk(s, "World/Chair.uaf"), 1, "Chair did not keep the slot it was given");
+    CheckEq(OnDisk(s, "World/Table.uaf"), 3, "Table did not keep the slot it was given");
+
+    // And the next import goes past the high-water mark, never onto a live slot.
+    CheckEq(CreateAsset(s, "World/Lamp.uaf"), 4,
+            "with no holes left, the next import must extend rather than displace");
+
+    std::error_code ec;
+    fs::remove_all(s.root, ec);
+}
+
 } // namespace
 
 bool SlotIdSelfTest() {
     g_failures = 0;
+    TestOwnerSpecExample();
     TestAllocationLifecycle();
     TestPreservation();
     TestPackBoundary();

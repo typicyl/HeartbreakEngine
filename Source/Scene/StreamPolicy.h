@@ -8,7 +8,7 @@
 // behaviour in a running game. Scene/TagStreaming.{h,cpp} owns everything with a side
 // effect.
 //
-// THE FIVE RULES, and why each is not negotiable:
+// THE SIX RULES, and why each is not negotiable:
 //
 // 1. DISTANCE IS TO THE SHARD'S AABB, NEVER TO ITS CENTRE. The deleted `.hbworld`
 //    streamer measured to the centre. For a 300 m wall or a long street that is
@@ -44,6 +44,31 @@
 //    a cadence, not every frame; without this flag a backlog would drain at one item
 //    per cadence period instead of one per frame, which is exactly the case (a
 //    loading screen ending, a corner turned) that the budget exists to smooth.
+//
+// 6. AN ASSOCIATED SHARD LOADS OUT OF RANGE, AND DOES NOT UNLOAD WHILE IT IS
+//    ASSOCIATED. `PolicyShard::associated` means "some tag the author said pulls
+//    this one in is resident by DISTANCE". It has to touch BOTH sites: `pinned`
+//    only blocks the unload, so a non-resident pinned shard still falls through to
+//    the load test and still needs d <= loadRadius - which is exactly the half an
+//    association cannot supply, since the whole point is that the driven content is
+//    out of range. The motivating case is a hill you can see a distant city from:
+//    the low-poly city is separate content with its own tag, associated with the
+//    hill's, and it must appear while the player is nowhere near it.
+//
+//    THE FLAG IS DERIVED, NEVER REFERENCE-COUNTED. It is recomputed from scratch on
+//    every evaluation (AssocPass below) from a seed set that is purely distance-
+//    derived, so a shard resident for two reasons at once - in range AND driven -
+//    survives losing either one with no bookkeeping, and a cycle cannot leak: an
+//    association is never seeded from association-derived residency, so a mutual
+//    pair collapses the moment neither member is within its own unload radius.
+//    A refcount would need matched increment/decrement across bind, despawn, stage
+//    failure, level transition and rebind - five leak sites for a flag that has no
+//    lifetime at all.
+//
+//    IT IS DELIBERATELY NOT `pinned`. Two bools are the "why is this resident?"
+//    answer the codebase otherwise lacks: `pinned` = a live member walked out of the
+//    box, `associated` = a driver is holding it. The editor readout and the Tags
+//    panel's State column both depend on being able to tell them apart.
 #pragma once
 
 #include "Core/Types.h"
@@ -71,6 +96,10 @@ struct PolicyShard {
                          // has pinned for the duration of a cutscene/conversation)
     bool failed = false; // terminal: never a load candidate again (see SALVAGE 3's
                          // correction - a durably broken shard must not retry forever)
+    // RULE 6: a tag the author associated with this shard's tag is resident BY
+    // DISTANCE, so this shard loads however far away it is and does not unload while
+    // that stays true. Derived fresh every evaluation by AssocPass; never stored.
+    bool associated = false;
 };
 
 struct PolicyIn {
@@ -115,24 +144,86 @@ struct PolicyOut {
     bool moreWork = false;
 };
 
+// --- RULE 6: tag association ---------------------------------------------------
+// How many hops are followed from a seeded tag. Hill -> Vista -> Lake is honoured
+// because the author's mental model is "loading the hill loads the vista, and the
+// vista is whatever the vista tag says it is"; refusing the second hop would be
+// arbitrary. Four is deep enough that no sane authoring reaches it and shallow
+// enough that the cost is a constant. The bake warns about a longer chain.
+inline constexpr u32 kMaxAssocDepth = 4;
+// "This shard's tag is not a node in the graph" - the project does not list it. Such
+// a tag still STREAMS on default radii (see TagStreaming.cpp DefForTag); it simply
+// neither drives nor is driven.
+inline constexpr u32 kNoAssocTag = 0xFFFFFFFFu;
+
+// The association graph as INTEGER ADJACENCY - one entry per tag, holding the tags
+// that tag pulls in. Names are resolved to indices by the caller (tags::
+// BuildAssocGraph), which is what keeps this file free of strings, of the project
+// and of any notion of what a tag is.
+struct AssocGraph {
+    std::vector<std::vector<u32>> edges; // edges[t] = tags t pulls in
+    void Clear() { edges.clear(); }
+    usize TagCount() const { return edges.size(); }
+};
+
+// ONE implementation of the propagation, called from BOTH the runtime streamer and
+// the editor's Tags-panel prediction. Duplicating it would be a lockstep hazard of
+// the same class as the panel-enum rule: the prediction would silently disagree with
+// the runtime. The lockstep here reduces to "both call Run()", which greps.
+//
+// `seed[t]` is set by the caller for every tag that DRIVES - one of its shards is
+// resident on its own terms: distance (inside the load radius, or inside its own
+// hysteresis band having been inside the load radius) or alwaysLoaded. `marked[t]`
+// comes back true for every tag REACHED from a seed in 1..kMaxAssocDepth hops.
+//
+// SEEDING AND BEING MARKED ARE INDEPENDENT, AND THAT IS THE POINT. They answer
+// different questions - "does t drive?" and "is t driven?" - and a tag can be both
+// at once. They used to share one array (a seeded tag could never be marked), which
+// made `marked` read as "held by a driver AND not in range". That is wrong the
+// moment a tag has more than one shard: the seed is OR'd over the tag's shards, so
+// ONE shard walking into its own radius cleared the mark for ALL of them and the
+// tag's other shards unloaded while their driver was still driving. The mark is now
+// set on every reached tag, seeded or not, and "which REASON is holding this
+// particular shard" is answered per shard by its own distance (see
+// Streamer::IsSelfHeld) rather than by squeezing two facts into one bit.
+//
+// CYCLES TERMINATE BY CONSTRUCTION: a SEPARATE `visited` set makes the walk monotone,
+// so A -> B -> A adds nothing on the second visit and the whole pass ends in at most
+// kMaxAssocDepth rounds whatever the graph shape. (The guard never depended on being
+// the same array as `marked`; sharing them was only ever the "a seed is not marked"
+// convention.) Reused scratch, so a warm pass allocates nothing.
+struct AssocPass {
+    AssocGraph graph;
+    std::vector<u8> seed;   // IN, parallel to graph.edges
+    std::vector<u8> marked; // OUT, parallel to graph.edges
+    std::vector<u8> visited; // scratch: the termination guard, NOT the output
+    std::vector<u32> frontier, next; // scratch
+    // Resizes seed/marked to the graph and clears the seed. Call before filling it.
+    void BeginSeed();
+    void Run();
+};
+
 // Distance from `p` to the axis-aligned box, 0 when inside. (tagshard::
 // DistanceToShard is this function applied to a scene::ShardDesc; this overload
 // exists so the policy has no dependency on the scene format.)
 f32 DistanceToBox(const glm::vec3& mn, const glm::vec3& mx, const glm::vec3& p);
 
-// Applies the five rules. Pure: same input, same output. Allocation-free once warm -
+// Applies the six rules. Pure: same input, same output. Allocation-free once warm -
 // every vector it uses (the two outputs and the two ranking scratches) lives in
 // PolicyOut and is cleared, not reallocated, on reuse. Pass the SAME PolicyOut each
 // frame, which is what the streamer does.
 void Evaluate(const PolicyIn& in, PolicyOut& out);
 
-// Headless proof of all five rules (--test-tagpolicy): a focus oscillating exactly
+// Headless proof of all six rules (--test-tagpolicy): a focus oscillating exactly
 // on the boundary does not thrash; an elongated shard is measured to its box and not
 // its centre; two foci union for loading and intersect for unloading; priority beats
 // distance and distance breaks priority ties; the concurrency throttle and the unload
 // cap both report moreWork; a focus inside the box can never unload it; an empty
-// focus list changes nothing; pinned and failed shards are respected; and disabled
-// means everything loads and nothing unloads. No GPU, no window, no registry.
+// focus list changes nothing; pinned and failed shards are respected; disabled
+// means everything loads and nothing unloads; and (rule 6) an associated shard loads
+// out of range, never unloads while associated, survives losing either of two
+// reasons, and a cycle terminates instead of leaking residency. No GPU, no window,
+// no registry.
 bool PolicySelfTest();
 
 } // namespace hbe::stream

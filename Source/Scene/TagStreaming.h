@@ -158,6 +158,22 @@ struct ShardRuntime {
     // CPU memory a spawn never gives back. Re-staging on the next load is cheap: the
     // process-wide mesh cache makes StageAssets skip anything already GPU-resident.
     scene::StagedAssets staged;
+    // AUTHORING ONLY (BindMode::AuthorWorld). What this shard looked like IN THE
+    // REGISTRY the last time it was despawned, as a scene JSON string - and the source
+    // it respawns from instead of the level FILE.
+    //
+    // The file is the wrong source in the editor, and silently so. `source_` was parsed
+    // at bind, so a despawn/respawn cycle reverted every edit the author had made inside
+    // that zone since the last save (and the save path itself triggers the respawn, so
+    // Ctrl+S then wrote the reverted content). Worse, an entity CREATED inside the zone -
+    // Ctrl+D on a window that is a child of a streamed building - is in no file row at
+    // all: the despawn's Parent closure destroyed it and nothing could ever bring it
+    // back, with no undo entry, because streamed despawns deliberately never PushUndo.
+    //
+    // Deliberately NOT world:: - an authoring bind writes nothing there (see SpawnRows),
+    // and player-progress deltas are the wrong shape for authored edits anyway. Empty
+    // until the first authoring despawn, so a shipping runtime never allocates it.
+    std::string authorSnapshot;
     bool failWarned = false; // a Failed shard warns once, then stays quiet
     // Already counted as a deferred finalize. Without it the counter increments once per
     // Ready shard per missed FRAME, so four shards ready together read as six deferrals
@@ -206,6 +222,49 @@ enum class BindMode {
     // (it is already there - spawning it again is the double-spawn P7 has to avoid).
     // Follow it with AdoptResidency.
     AdoptWorld,
+    // A 3D MAIN MENU backdrop. Binds like Fresh - scene::BindWorld (destroy + apply
+    // the level's environment) and spawn the always-resident slice, so the world is
+    // genuinely THERE behind the menu - but leaves world:: persistence completely
+    // alone: no EnterArea (a menu is not a visit, and the AreaVisitCount schematic
+    // node's FirstVisit output must still fire on the player's REAL first entry), no
+    // SetCurrentArea, and - enforced by the same silence on the way out - no
+    // CaptureGroup/CaptureArea when the menu world is torn down for Play. The menu
+    // always shows the AUTHORED world, never save-modified state, and leaves zero
+    // trace in any save. Distance streaming runs normally against it (the menu
+    // camera is a focus), so a tagged menu zone loads exactly as it would in game.
+    MenuWorld,
+    // THE EDITOR'S path (live zones). The registry already holds the AUTHORED world,
+    // loaded by the editor's own scene load, and it must survive: this mode does not
+    // UnloadAll, does not call scene::BindWorld (whose first statement is DestroyWorld
+    // - the single reason the editor could never stream), does not re-apply the
+    // environment, does not spawn the resident slice (it is already standing, and
+    // spawning it again would duplicate it with fresh guids because guid::Claim
+    // refuses to adopt a guid that is taken), and does not touch world:: persistence
+    // at all.
+    //
+    // WHY NO world:: WRITES. A despawn calls world::CaptureGroup and a respawn calls
+    // world::RestoreGroup; both read and write game:: player-progress state that
+    // NOTHING reverts while authoring, and RestoreGroup will re-destroy any member
+    // that happened to be absent at capture time. Authoring has no progress deltas to
+    // preserve, so the whole layer is skipped rather than trusted to a partial net.
+    //
+    // Follow it with AdoptResidency (with an EMPTY key list): in the editor every
+    // entity of the file is already live, so every shard is adopted by guid, nothing
+    // is spawned, and the streamer ends up owning exactly what is already there.
+    AuthorWorld,
+};
+
+// A MANUAL residency override, per shard. Editor-facing: the author says "show me
+// this zone" or "get it out of my way" and distance stops deciding.
+//
+// SESSION-ONLY BY CONSTRUCTION - it lives here, in the streamer, and nowhere in
+// TagDef or the `.hbproj`. A persisted override would ship a project whose streaming
+// silently differs from the runtime's for a reason invisible in the runtime, and a
+// forgotten "force unloaded" surviving a save would look exactly like content loss.
+enum class ShardForce : u8 {
+    Auto = 0, // distance + associations decide (the runtime rule)
+    Resident, // load however far away, never unload - AND drive this tag's associations
+    Unloaded, // despawn however close, never load - beats associations and distance
 };
 
 // The streaming FOCI: the player's world position (the CharacterController, if there
@@ -261,6 +320,10 @@ public:
     void PublishResidency(Scene& scene) const;
 
     bool IsBound() const { return bound_; }
+    // True for a BindMode::AuthorWorld bind: this streamer is driving the EDITOR's
+    // authored world, not a runtime level. Published onto the Scene so the save path
+    // can tell the two apart (StreamingResidency::authoring).
+    bool Authoring() const { return authoring_; }
     bool Trusted() const { return trusted_; }
     const std::string& UntrustedReason() const { return untrustedReason_; }
     const std::string& AreaId() const { return areaId_; }
@@ -273,6 +336,28 @@ public:
     // -1 when no shard has that key.
     i32 FindShard(const std::string& key) const;
     bool IsResident(u32 i) const { return i < shards_.size() && shards_[i]->resident; }
+    // RULE 6: is this shard being held resident by an ASSOCIATED tag (rather than by
+    // its own distance)? The answer from the last evaluation - it is derived, not
+    // stored, so it is only meaningful once one has run. The author-facing "why is
+    // this here?" readout.
+    bool IsAssociated(u32 i) const {
+        return i < shardAssociated_.size() && shardAssociated_[i] != 0u;
+    }
+    // Is this shard in range ON ITS OWN TERMS (inside its load radius, or still inside
+    // its own hysteresis band having been)? The other half of the "why is this here?"
+    // readout: `associated` alone can no longer answer it, because a shard can be BOTH
+    // driven and in range and the mark is deliberately set in that case (a tag's other
+    // shards depend on it). "Held ONLY by an association" is IsAssociated && !IsSelfHeld.
+    bool IsSelfHeld(u32 i) const {
+        return i < shardSelfSeed_.size() && shardSelfSeed_[i] != 0u;
+    }
+    // Re-resolves the tag->tag association graph against a new project tag list WITHOUT
+    // touching the binding, the shards or any residency. The editor calls this when the
+    // author edits an association in the Tags panel: the graph is otherwise resolved
+    // exactly once, at BindLevel, so a live-bound streamer would go on using the
+    // relations the project had when the scene was last saved and the author's edit
+    // would silently do nothing.
+    void RefreshAssociations(const std::vector<TagDef>& defs);
     u32 ResidentShardCount() const;
     // Keys of every resident shard, sorted - what a `.hbsave` records.
     std::vector<std::string> ResidentKeys() const;
@@ -290,6 +375,53 @@ public:
     // because the loading screen waits on IsSettled and a streamer that does not run
     // behind the curtain can never settle.
     void Update(Scene& scene, Renderer& renderer, const std::vector<glm::vec3>& foci);
+
+    // --- MANUAL residency override (per shard) --------------------------------
+    // Composes with everything else through ONE mechanism - the association seed set -
+    // rather than being a second, parallel notion of residency. Precedence, strictly:
+    //
+    //   1. An alwaysLoaded tag has NO ShardRuntime at all, so there is nothing here to
+    //      force. It is already resident forever.
+    //   2. Unloaded beats associations and distance: the shard is excluded from the
+    //      seed set (it stops DRIVING), its `associated` flag is cleared (it stops
+    //      being driven) and it despawns however close a focus is.
+    //   3. Resident beats distance: the shard's tag is ADDED to the seed set, so it
+    //      also pulls in its own associations - force the hill, get the vista, which
+    //      is the useful behaviour - and the shard itself is held exactly the way an
+    //      associated shard is held (loads out of range, never unloads).
+    //   4. Auto is the runtime rule, unchanged.
+    //
+    // The backing vector is EMPTY until the first non-Auto call, so a shipping runtime
+    // that never touches this pays one `empty()` branch per evaluation.
+    void SetShardForce(u32 i, ShardForce f);
+    ShardForce ShardForceOf(u32 i) const;
+    void ClearShardForces();
+    u32 ForcedShardCount() const;
+
+    // ONE shard held resident for as long as the caller says so, on top of whatever
+    // the policy decides and WITHOUT reading as a manual override in the UI. The
+    // editor points this at the shard owning the current selection: despawning the
+    // object the author has selected - possibly is dragging - is the worst failure
+    // this feature has, and it must not look like a forced zone afterwards. -1 = none.
+    void SetHeldShard(i32 i) { heldShard_ = i; }
+    i32 HeldShard() const { return heldShard_; }
+
+    // BRING EVERY SHARD RESIDENT, SYNCHRONOUSLY, RIGHT NOW. Drains any staging job,
+    // discards half-finished loads (a Ready shard finalized later would double-spawn
+    // what this call already spawned) and then SpawnShards the rest inline.
+    //
+    // This is what makes a mid-stream SAVE safe: the save path calls it first, so the
+    // completeness refusal is never even reached in the normal case. Returns the
+    // number of shards STILL not resident - which can only be Failed ones, and which
+    // is exactly the count that must keep the save refused.
+    u32 SpawnAllShards(Scene& scene, Renderer& renderer);
+
+    // Removes the StreamShard membership stamp from every live entity. The editor
+    // calls it when it unbinds, so "nothing is bound" really does mean "nothing in
+    // this viewport is streamed" - the stamp is NOT serialized, so a stamp left
+    // behind after an unbind is a label with no owner, and the Hierarchy would go on
+    // colouring authored objects as streamed content forever.
+    void ClearMembership(Scene& scene) const;
 
     // false PINS EVERYTHING LOADED (the semantics the deleted StreamingWorld::LoadAll
     // had): every shard loads and none unloads. "Streaming off" has to mean "the whole
@@ -363,6 +495,10 @@ private:
     // Main-thread half of an async load: instantiate the staged slice, stamp
     // membership, replay persisted state, free the staged payload.
     void Finalize(Scene& scene, Renderer& renderer, u32 i);
+    // AUTHORING respawn from ShardRuntime::authorSnapshot instead of the level file.
+    // False when there is no snapshot (or it will not parse), which sends the caller
+    // down the normal file path.
+    bool SpawnAuthorSnapshot(Scene& scene, Renderer& renderer, u32 i);
     // The staging job body (worker thread). `arg` is a ShardRuntime*.
     static void StageJob(void* arg);
     // Blocks until no staging job is in flight. MAIN THREAD ONLY.
@@ -372,6 +508,11 @@ private:
     bool bound_ = false;
     bool trusted_ = true;
     bool enabled_ = true;
+    bool authoring_ = false; // BindMode::AuthorWorld - see the enum
+    // BindMode::MenuWorld. Shares authoring_'s world:: silence (no visit, no capture,
+    // no restore) WITHOUT its editor behaviours (author snapshots, adopt-in-place).
+    // Kept separate because overloading authoring_ would drag those in too.
+    bool silent_ = false;
     std::string untrustedReason_;
     std::filesystem::path levelPath_, assetsDir_;
     std::string areaId_;
@@ -398,6 +539,33 @@ private:
     // pursuing NPC is never destroyed in the player's face just because his home
     // shard's BAKED box went out of range. Reused; no per-evaluation allocation.
     std::vector<u8> pinnedByMember_;
+    // --- RULE 6: tag association --------------------------------------------
+    // The tag->tag graph, resolved ONCE at BindLevel from the project's tag list, so
+    // the per-evaluation pass is O(tags + edges) with no string work and no
+    // allocation. Per evaluation the streamer fills assoc_.seed from DISTANCE ALONE
+    // (plus alwaysLoaded, which always drives) and runs the SHARED propagation -
+    // the same stream::AssocPass the editor's Tags-panel prediction runs, so the two
+    // cannot disagree. Nothing here persists across an evaluation except the graph.
+    stream::AssocPass assoc_;
+    bool assocActive_ = false;        // any edge at all; false = the pass is skipped entirely
+    std::vector<u32> shardTag_;       // shard -> node in assoc_.graph (kNoAssocTag = none)
+    std::vector<u8> alwaysLoadedTag_; // tag -> permanently seeded (see BindLevel)
+    // Shard -> "held by a driver", from the LAST evaluation. Read by the fill loop,
+    // by IsSettled (an associated shard is out of range by definition, so without
+    // this the loading screen would drop before the vista appeared) and by the
+    // author-facing readout.
+    std::vector<u8> shardAssociated_;
+    // Shard -> "in range on its OWN terms", from the last evaluation. This is the seed
+    // input to the propagation AND it carries the seed's hysteresis: it is set inside
+    // the load radius and only cleared outside the UNLOAD radius, so a focus sitting on
+    // a driver's load boundary cannot toggle what that driver pulls in. Deliberately
+    // NOT the shard's `resident` flag, which is false for the whole staging window and
+    // forever for a Failed shard - see the seed loop in Update.
+    std::vector<u8> shardSelfSeed_;
+    // Per-shard ShardForce. EMPTY unless something actually forced a shard, so the
+    // runtime cost of the whole manual-override feature is one empty() test.
+    std::vector<u8> shardForce_;
+    i32 heldShard_ = -1; // see SetHeldShard
     PolicyOut policyOut_;
     StreamStats stats_;
     // guid -> shard index (-1 = always resident). Built once at BindLevel from the
@@ -438,6 +606,22 @@ void CollectShardEntities(const Scene& scene, u32 shard, std::vector<entt::entit
 // snapshot is ADOPTED so the streamer can manage what it restored. Both the job-system
 // path and the synchronous fallback are exercised. No GPU, no window.
 bool SelfTest();
+
+// Headless proof of RULE 6, ASSOCIATED TAGS, end to end through a real Streamer
+// (--test-assoctags). The authored scenario is the motivating one, by name: three
+// SEPARATE tags - City, City_LowPoly and Hill - each with its own content, its own
+// baked bounds and its own radii, with Hill associating City_LowPoly. Standing on
+// the hill spawns the low-poly city from kilometres away; leaving the hill releases
+// it unless it is in range on its own; a shard resident for both reasons survives
+// losing either; a cycle terminates instead of pinning the world; an association
+// naming a tag that does not exist warns once and streams normally; and the added
+// evaluation cost stays inside the streaming budget. Also the `.hbproj` round trip
+// and the bake's association diagnostics. No GPU, no window.
+//
+// It asserts NOTHING about City and City_LowPoly excluding each other, deliberately:
+// they are separate assets and may be co-resident. That is the author's business,
+// expressed by the radii they set, and not the engine's to prevent.
+bool AssocSelfTest();
 
 } // namespace stream
 } // namespace hbe

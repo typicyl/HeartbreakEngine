@@ -381,11 +381,20 @@ std::string SaveRefusal(const Scene& scene, u64 expectedWorldToken) {
                " streaming shard(s) are NOT loaded (" + s.missing +
                "), so this world is missing objects that are in the file.";
     }
-    // Every shard happens to be resident - but a world owned by the streamer is a
-    // world whose contents change with the camera, and a save is not atomic with
+    // Every shard happens to be resident - but a world owned by the RUNTIME streamer
+    // is a world whose contents change with the camera, and a save is not atomic with
     // respect to that. Authoring belongs to the editor's own load path.
-    return "this world is owned by the tag STREAMER (a bound level), whose contents "
-           "change with the camera. Load the level in the editor to author it.";
+    //
+    // AN AUTHORING BIND IS THE EXCEPTION, and only this clause bends for it. The
+    // editor's own streamer binds the world the editor already loaded (no BindWorld,
+    // no DestroyWorld) precisely so that world can still be authored, and it settles
+    // every shard resident BEFORE it reaches this function. The dangerous clause is
+    // the one above - a world with holes - and that one fires for an authoring bind
+    // exactly as it does for a runtime one.
+    if (!s.authoring)
+        return "this world is owned by the tag STREAMER (a bound level), whose contents "
+               "change with the camera. Load the level in the editor to author it.";
+    return {};
 }
 
 namespace {
@@ -527,6 +536,9 @@ json BuildSceneJson(const Scene& scene,
     root["shadowDistance"] = hdr.shadowDistance;
     root["post"] = PostToJson(hdr.post);
     if (!hdr.giSource.empty()) root["giSource"] = hdr.giSource;
+    // Slot identity survives the round trip (see SceneData::packSlot). Written only
+    // when the source carried one, so a never-stamped scene stays byte-identical.
+    if (hdr.packSlot != SceneData::kNoPackSlot) root["packSlot"] = hdr.packSlot;
     // Written only when the scene AUTHORED an override, so a level that inherits the
     // project's cycle stays byte-for-byte what it was before the keys existed.
     if (hdr.hasDayNight) {
@@ -1302,6 +1314,8 @@ void ParseSceneJson(const json& root, SceneData& out) {
     out.kind = SceneKindFromString(root.value("kind", std::string("full")));
     out.ambientIntensity = root.value("ambientIntensity", 1.0f);
     out.giSource = root.value("giSource", std::string());
+    if (const auto ps = root.find("packSlot"); ps != root.end() && ps->is_number_unsigned())
+        out.packSlot = ps->get<u32>();
     out.exposure = root.value("exposure", 1.0f);
     out.shadowDistance = root.value("shadowDistance", 150.0f);
     if (const auto it = root.find("post"); it != root.end() && it->is_object()) {
@@ -2007,8 +2021,33 @@ void ParseSceneJson(const json& root, SceneData& out) {
 bool SaveScene(const Scene& scene, const fs::path& path,
                const std::function<bool(entt::entity)>& include, SceneKind kind,
                const std::vector<ShardDesc>* shards, const SceneData* headerFrom) {
-    const json root =
+    json root =
         BuildSceneJson(scene, include, kind, /*runtimeTags*/ false, shards, headerFrom);
+
+    // CARRY THE PACK SLOT. A scene is a packable asset and owns its slot for life
+    // (--test-slotids), but BuildSceneJson rebuilds the document from scratch and
+    // knows nothing about slots. The EDITOR papers over that with a post-save
+    // re-stamp sweep (Editor::StampSavedAssets), but every NON-editor writer -
+    // migrations, tools, headless tests - reached this function directly and
+    // silently stripped the id, renumbering the asset at the next cook. The writer
+    // itself now carries the key from the file it is replacing, so no caller can
+    // lose it. (--test-scenesave's "no source header key may be dropped" rule is
+    // what caught this.)
+    if (fs::exists(path)) {
+        std::ifstream prev(path, std::ios::binary);
+        if (prev) {
+            try {
+                json old;
+                prev >> old;
+                if (const auto it = old.find("packSlot");
+                    it != old.end() && it->is_number_unsigned())
+                    root["packSlot"] = *it;
+            } catch (const std::exception&) {
+                // Unreadable previous file: nothing to carry; the editor sweep or
+                // the next cook re-stamps. Never block the save over it.
+            }
+        }
+    }
 
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);

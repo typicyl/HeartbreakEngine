@@ -729,6 +729,14 @@ void Editor::BuildUI(Engine& engine) {
 
     ConsumeDroppedFiles(engine); // import any files dropped from the OS this frame
 
+    // LIVE ZONES, if the author turned them on: the real streamer spawning and
+    // despawning against the real world. FIRST, before any panel reads the registry,
+    // so the whole frame - hierarchy, gizmo, overlay, icons, the Tags table - sees ONE
+    // consistent world rather than a half-updated one. It holds the selection's shard
+    // resident and suspends itself during a gizmo drag, so nothing under the author's
+    // cursor can disappear mid-frame.
+    LiveStreamTick(engine);
+
     // Every panel below is gated by its panelOpen_ flag; the artist build
     // (artMode_) just defaults that set to the painting panels, so the same draw
     // path serves both the full editor and the focused Art Editor exe.
@@ -2086,10 +2094,62 @@ bool Editor::SeparationSelfTest() {
     return ok;
 }
 
-void Editor::AdoptWorld(const Scene& scene) { sceneWorldToken_ = scene.WorldToken(); }
+void Editor::AdoptWorld(const Scene& scene) {
+    sceneWorldToken_ = scene.WorldToken();
+    // A WORLD REPLACE UNBINDS LIVE ZONES. Every caller of this function has just put a
+    // (possibly different) world into the registry - a scene load, an undo/redo or
+    // Play->Stop restore, New Scene - and StreamShard is not serialized, so every
+    // membership stamp the streamer relied on is gone while its `resident` flags
+    // survive as lies. CollectShardEntities would then return nothing and DespawnShard
+    // would destroy nothing while flipping resident=false: the entities become
+    // permanently orphaned. Re-adopting by guid would be worse (it would mark despawned
+    // shards resident), so this fails closed and the author re-enables live zones
+    // explicitly.
+    //
+    // NO SETTLE HERE. The Replace has already happened by the time this runs, so
+    // "bring every zone back" would spawn into the wrong world. The paths that Replace
+    // all capture first (CaptureSnapshot / SaveSceneToDisk settle before anything is
+    // written or destroyed), so the world that was replaced was already complete.
+    if (liveStream_.IsBound())
+        LiveStreamUnbind(const_cast<Scene&>(scene), /*renderer*/ nullptr);
+}
 
 bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
     auto& reg = scene.Registry();
+    // === LIVE ZONES: SETTLE BEFORE ANYTHING ELSE =============================
+    // A SAVE MUST NEVER WRITE A PARTIAL WORLD. scene::SaveRefusal below is the guard
+    // that guarantees it and it is NOT weakened - this is a convenience layered on
+    // top, so that the common case (the author hits Ctrl+S while zones happen to be
+    // despawned) succeeds instead of refusing. It brings every zone resident
+    // synchronously and drops every manual override; if a zone cannot come back (a
+    // Failed shard is terminal) the refusal below still fires and still names it.
+    const bool wasLiveBound = liveStream_.IsBound();
+    // Captured BEFORE anything can unbind: AdoptWorld clears liveRenderer_ and drops
+    // the follow-the-camera switch, and the re-bind at the end of a successful save
+    // needs both back. Saving must not silently turn the author's live mode off.
+    Renderer* const saveRenderer = liveRenderer_;
+    const bool saveLiveAuto = liveStreamAuto_;
+    // A REFUSED SAVE MUST NOT SILENTLY DISCARD THE AUTHOR'S MANUAL OVERRIDES. Settling
+    // is part of every save (it is what stops a partial world reaching the writer) and
+    // it deliberately clears every In/Out force - but a save that then REFUSES returns
+    // without re-binding, so the forces were gone, the banner was gone, forced-out zones
+    // were back and forced-in zones released, with nothing saying so. Remembered here
+    // and put back on every refusal path below. (The forces cannot simply be restored
+    // after a SUCCESSFUL save: that save re-binds, and the new binding's shard indices
+    // are re-derived from the file it just wrote.)
+    std::vector<stream::ShardForce> savedForces;
+    if (wasLiveBound && saveRenderer) {
+        savedForces.resize(liveStream_.ShardCount(), stream::ShardForce::Auto);
+        for (usize i = 0; i < savedForces.size(); ++i)
+            savedForces[i] = liveStream_.ShardForceOf(static_cast<u32>(i));
+        LiveStreamSettle(scene, *saveRenderer);
+    }
+    const auto restoreForces = [this, &savedForces] {
+        if (!liveStream_.IsBound()) return;
+        for (usize i = 0; i < savedForces.size() && i < liveStream_.ShardCount(); ++i)
+            if (savedForces[i] != stream::ShardForce::Auto)
+                liveStream_.SetShardForce(static_cast<u32>(i), savedForces[i]);
+    };
     // === REFUSALS ============================================================
     // ALL of them run BEFORE anything is written - including SavePaintCanvases
     // below, which writes `.hbpaint` files of its own. A refusal that has already
@@ -2098,6 +2158,7 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
         uiDocError_ = why;
         panelOpen_[Panel_UIDocument] = true; // the refusal has to be SEEN
         HBE_ERROR("SaveScene refused: a non-document entity carries a UI component.");
+        restoreForces();
         return false;
     }
     // PLAY MODE. The Play world is a snapshot-restored COPY that gameplay is
@@ -2116,6 +2177,7 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
         SetSaveStatus("PLAYING - scene saves are disabled. Press Stop (Esc) to save. '" +
                           path.filename().string() + "' was NOT written.",
                       true);
+        restoreForces();
         return false;
     }
     // WORLD IDENTITY + STREAMING COMPLETENESS. See scene::SaveRefusal: the registry
@@ -2130,6 +2192,7 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
         SetSaveStatus("SCENE SAVE REFUSED - " + why + " '" + path.filename().string() +
                           "' was NOT written.",
                       true);
+        restoreForces();
         return false;
     }
     // THE SCENE IS POSED BY A PREVIEW. Cutscene preview and the movie renderer are
@@ -2147,6 +2210,7 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
                           ". Stop it to save. '" + path.filename().string() +
                           "' was NOT written.",
                       true);
+        restoreForces();
         return false;
     }
     // AN EMPTY WORLD OVER A POPULATED FILE. Probed HERE, with the other refusals,
@@ -2172,6 +2236,7 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
                               " object(s). Nothing was written. Delete the file if that "
                               "is really what you want.",
                           true);
+            restoreForces();
             return false;
         }
     }
@@ -2224,7 +2289,12 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
         const bool wrote = scene::SaveScene(scene, activePath, activeOnly, SceneKind::Full);
         if (wrote) HBE_INFO("SaveScene: wrote an EMPTY scene to '{}'.", activePath.string());
         StampSavedAssets(saveMark);
-        if (ok && wrote) AdoptWorld(scene);
+        if (ok && wrote) {
+            currentScenePath_ = activePath; // see the note at the other write site
+            AdoptWorld(scene);              // unbinds live zones - see AdoptWorld
+        }
+        if (wasLiveBound && saveRenderer) LiveStreamBind(scene, *saveRenderer);
+        if (liveStream_.IsBound()) liveStreamAuto_ = saveLiveAuto;
         return ok && wrote;
     }
     if (hasActive && !activePath.empty()) {
@@ -2245,7 +2315,26 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
     StampSavedAssets(saveMark);
     // The file on disk now describes THIS world, so this is the world identity the
     // next save is allowed to write to that path (see Scene::WorldToken).
-    if (ok) AdoptWorld(scene);
+    if (ok) {
+        // RE-BIND TO THE FILE WE JUST WROTE, WHICH IS NOT ALWAYS currentScenePath_.
+        // SAVE AS calls this with a NEW path and only assigns currentScenePath_ after
+        // the call returns - but LiveStreamBind two lines down reads currentScenePath_,
+        // so the streamer re-bound to the OLD file. Adoption succeeds (a Save As does
+        // not change any guid), nothing refuses, and from then on every despawn/respawn
+        // re-instantiated that zone from the file the author is no longer editing -
+        // reverting everything done since the last save of the old level, into the new
+        // one. Assigning here means "the streamer follows the write", which is the only
+        // relationship that is ever correct.
+        currentScenePath_ = activePath;
+        AdoptWorld(scene); // unbinds live zones - see AdoptWorld
+    }
+    // RE-BIND AFTER THE WRITE, not before it. The save re-baked the shard table from
+    // whatever is live, so the streamer's parsed `source_` and its shard indices are
+    // stale the instant the file changes; re-binding is the only way the two stay the
+    // same level. Silently leaving it unbound would be the other honest option, but an
+    // author who saves every few minutes would have to re-enable it every few minutes.
+    if (wasLiveBound && saveRenderer) LiveStreamBind(scene, *saveRenderer);
+    if (liveStream_.IsBound()) liveStreamAuto_ = saveLiveAuto;
     return ok;
 }
 
@@ -2345,6 +2434,55 @@ void Editor::UpdateStreamSim() {
         p.pinned = def.alwaysLoaded;
         streamSimDist_[i] = stream::DistanceToBox(d.min, d.max, streamSimFocus_);
     }
+    // RULE 6: resolve the association graph once, then re-derive the per-shard flag
+    // on every pass below (it depends on `resident`, which the passes change).
+    //
+    // THE PROPAGATION IS THE SHARED stream::AssocPass, NOT A COPY. A second
+    // implementation here would be a lockstep hazard of the same class as the panel
+    // enum: the prediction would silently disagree with the runtime, which is the one
+    // thing this whole panel exists to rule out. This is called on events (a focus
+    // drag, a re-bake), never per frame, so building the graph here is free.
+    stream::AssocPass assoc;
+    std::vector<u32> shardTag(shardDescs_.size(), stream::kNoAssocTag);
+    {
+        tags::BuildAssocGraph(defs, assoc.graph);
+        std::unordered_map<std::string, u32> byName;
+        for (usize t = 0; t < defs.size(); ++t) byName.emplace(defs[t].name, static_cast<u32>(t));
+        for (usize i = 0; i < shardDescs_.size(); ++i) {
+            const auto it = byName.find(shardDescs_[i].tag);
+            if (it != byName.end()) shardTag[i] = it->second;
+        }
+    }
+    const auto propagate = [&] {
+        assoc.BeginSeed();
+        // Seeded from DISTANCE ONLY (plus alwaysLoaded), exactly as the streamer does
+        // - an association seeded from association-derived residency would never let
+        // a cycle release.
+        for (usize t = 0; t < defs.size() && t < assoc.seed.size(); ++t)
+            if (defs[t].alwaysLoaded) assoc.seed[t] = 1u;
+        for (usize i = 0; i < streamSimShards_.size(); ++i) {
+            const u32 t = shardTag[i];
+            if (t == stream::kNoAssocTag || t >= assoc.seed.size() || assoc.seed[t]) continue;
+            const stream::PolicyShard& p = streamSimShards_[i];
+            const f32 d = streamSimDist_[i];
+            // DISTANCE ONLY, and specifically NOT `p.resident`. This is a STEADY-STATE
+            // prediction for a stationary focus, so the runtime's hysteresis band never
+            // activates here (shardSelfSeed_ starts clear and only sets inside the load
+            // radius, which is the same fixed point). Reading `p.resident` instead was
+            // also a hole: the loop below marks association-loaded shards resident, so a
+            // driven shard sitting inside its own unload band would have seeded the
+            // graph from association-derived residency - the one thing that lets a
+            // mutual pair hold itself resident forever.
+            if (d <= p.loadRadius) assoc.seed[t] = 1u;
+        }
+        assoc.Run();
+        for (usize i = 0; i < streamSimShards_.size(); ++i) {
+            const u32 t = shardTag[i];
+            streamSimShards_[i].associated =
+                t != stream::kNoAssocTag && t < assoc.marked.size() && assoc.marked[t] != 0u;
+        }
+    };
+
     // Iterate the policy to a FIXED POINT: one Evaluate reports only what it would order
     // THIS frame (the throttle caps it at 4), and the author wants the steady state -
     // "standing here, what is loaded" - not "what would start loading in the next
@@ -2356,6 +2494,7 @@ void Editor::UpdateStreamSim() {
     in.maxUnloads = static_cast<u32>(streamSimShards_.size()) + 1;
     in.enabled = streamSimEnabled_;
     for (u32 pass = 0; pass < 4; ++pass) {
+        propagate();
         in.shards = streamSimShards_.data();
         in.count = static_cast<u32>(streamSimShards_.size());
         stream::Evaluate(in, streamSimOut_);
@@ -2363,8 +2502,145 @@ void Editor::UpdateStreamSim() {
         for (const u32 i : streamSimOut_.load) streamSimShards_[i].resident = true;
         for (const u32 i : streamSimOut_.unload) streamSimShards_[i].resident = false;
     }
+    propagate(); // so the State column reports the flag of the SETTLED set, not the last pass's
     for (usize i = 0; i < streamSimShards_.size(); ++i)
         streamSimResident_[i] = streamSimShards_[i].resident ? 1u : 0u;
+}
+
+// --- LIVE editor zones ---------------------------------------------------------
+// The streamer, for real, against the world the author is editing. Everything
+// dangerous about that is handled in exactly three places: the bind is
+// non-destructive (stream::BindMode::AuthorWorld), every capture and every save
+// settles the world resident FIRST, and an unbind scrubs the membership stamps so a
+// stale label can never outlive its owner.
+
+bool Editor::LiveStreamBind(Scene& scene, Renderer& renderer) {
+    liveStreamError_.clear();
+    if (!Project::HasActive()) {
+        liveStreamError_ = "No project is open.";
+        return false;
+    }
+    if (playMode_ || csPreview_ || movieActive_) {
+        liveStreamError_ = "Not while playing or previewing.";
+        return false;
+    }
+    // THE STREAMER'S RESPAWN SOURCE IS THE FILE ON DISK. A shard it despawns comes
+    // back from `source_`, which was parsed from currentScenePath_ - so an unsaved
+    // move would be silently reverted by the first despawn/respawn cycle, and an
+    // entity created since the last save has a guid that is in no shard and can never
+    // be adopted. Live zones therefore REQUIRE a saved scene. This is stated, not
+    // worked around.
+    std::error_code ec;
+    if (currentScenePath_.empty() || !std::filesystem::exists(currentScenePath_, ec)) {
+        liveStreamError_ = "Save the scene first - live zones respawn from the FILE.";
+        return false;
+    }
+    // Idempotent, and it also drops any stale membership stamps from a previous bind.
+    LiveStreamUnbind(scene, &renderer);
+    if (!liveStream_.BindLevel(scene, renderer, currentScenePath_,
+                               Project::Active().AssetsDir(),
+                               Project::Active().Settings().tags,
+                               stream::BindMode::AuthorWorld)) {
+        liveStreamError_ = "Could not parse '" + currentScenePath_.filename().string() + "'.";
+        return false;
+    }
+    // ADOPT, NEVER SPAWN. Every entity of the file is already live, so this stamps
+    // membership by guid and spawns nothing. An empty key list is deliberate: there is
+    // no save telling us what "was" resident - what IS resident is what is standing.
+    liveStream_.AdoptResidency(scene, renderer, {});
+
+    // FAIL CLOSED ON A SHARD THAT COULD NOT BE ADOPTED. Its rows exist in the file but
+    // nothing live carries their guids - the scene has been edited since it was saved,
+    // or those objects were deleted. The streamer would then believe the shard is
+    // unloaded and, the moment the camera came near, INSTANTIATE it: scene::Instantiate
+    // mints fresh guids for any guid already taken, so that is not "restoring" the
+    // objects, it is duplicating whatever is left of them. Refuse instead, and say why.
+    if (liveStream_.ResidentShardCount() != liveStream_.ShardCount()) {
+        const u32 missing = static_cast<u32>(liveStream_.ShardCount()) -
+                            liveStream_.ResidentShardCount();
+        liveStream_.Reset(&scene);
+        liveStream_.ClearMembership(scene);
+        liveStreamError_ = std::to_string(missing) +
+                           " zone(s) in the file are not in this world - save the scene, "
+                           "then enable live zones again.";
+        HBE_WARN("LiveZones: refused to bind '{}' - {} shard(s) could not be adopted by guid.",
+                 currentScenePath_.filename().string(), missing);
+        return false;
+    }
+    // Re-bake the preview so the panel's rows and the streamer's shards are the SAME
+    // shards: the bind above required a saved scene, so the save-time bake and this
+    // one see the same entities and the "<tag>#<index>" keys line up exactly.
+    RebakeShardPreview(scene);
+    // Remembered so the save path - which has a Scene but no Engine - can settle the
+    // world before it writes. Cleared on unbind.
+    liveRenderer_ = &renderer;
+    HBE_INFO("LiveZones: bound '{}' for AUTHORING - {} zone(s), all resident.",
+             currentScenePath_.filename().string(),
+             static_cast<u32>(liveStream_.ShardCount()));
+    return true;
+}
+
+void Editor::LiveStreamUnbind(Scene& scene, Renderer* renderer) {
+    if (liveStream_.IsBound() && renderer) {
+        // Hand the world back COMPLETE. An unbind that left zones despawned would
+        // leave the author looking at a level with holes and no streamer to fill them,
+        // and the next Ctrl+S would write exactly that (the save-time bake re-derives
+        // itself from whatever is live, so the file would be internally consistent and
+        // nothing downstream would ever report a problem).
+        liveStream_.ClearShardForces();
+        liveStream_.SetEnabled(true);
+        liveStream_.SpawnAllShards(scene, *renderer);
+        HBE_INFO("LiveZones: unbound; every zone was made resident first.");
+    }
+    // WITHOUT a renderer this is the post-REPLACE path (AdoptWorld). The registry no
+    // longer holds the world the streamer was bound to, so spawning anything into it
+    // would inject one level's shards into another - and every `resident` flag the
+    // streamer holds is already a lie, because the Replace dropped the StreamShard
+    // stamps that gave it meaning. Forget the binding and let the author re-enable it.
+    if (liveStream_.IsBound()) liveStream_.Reset(&scene);
+    // Unconditional: StreamShard is NOT serialized, so any Replace (undo, redo,
+    // Play->Stop) drops the stamps while a streamer would still believe those shards
+    // are resident. Scrubbing here makes "not bound" mean "nothing in this viewport is
+    // streamed", which is what the Hierarchy's tint promises.
+    liveStream_.ClearMembership(scene);
+    liveStreamAuto_ = false;
+    liveRenderer_ = nullptr;
+}
+
+void Editor::LiveStreamTick(Engine& engine) {
+    if (!liveStream_.IsBound()) return;
+    // SUSPENDED, not unbound, for the transient states. Play runs on a snapshot copy
+    // and Engine::UpdateTagStreaming's own guards keep the runtime streamer out of the
+    // editor entirely; a cutscene/movie preview poses the scene; and despawning
+    // something mid-gizmo-drag would leave the drag writing to a destroyed entity.
+    if (playMode_ || csPreview_ || movieActive_) return;
+    if (ImGuizmo::IsUsing()) return;
+    Scene& scene = engine.GetScene();
+    // OFF means "the whole level is here" (StreamPolicy.h's own words), never "half of
+    // it is missing and nothing will fix it" - so the automatic switch IS SetEnabled.
+    // Manual overrides still apply either way: they are acted on after the policy.
+    liveStream_.SetEnabled(liveStreamAuto_);
+    // HOLD THE SELECTION'S SHARD. Despawning the object the author has selected is the
+    // single worst failure mode this feature has.
+    i32 held = -1;
+    if (scene.Registry().valid(selected_)) {
+        if (const StreamShard* ss = scene.Registry().try_get<StreamShard>(selected_))
+            held = static_cast<i32>(ss->index);
+    }
+    liveStream_.SetHeldShard(held);
+    // The editor camera is the focus. The streamer's own cadence (4 frames / 2 m)
+    // still applies - the editor does not re-implement it.
+    const std::vector<glm::vec3> foci{engine.GetRenderer().GetCamera().Position()};
+    liveStream_.Update(scene, engine.GetRenderer(), foci);
+}
+
+u32 Editor::LiveStreamSettle(Scene& scene, Renderer& renderer) {
+    if (!liveStream_.IsBound()) return 0;
+    // Clearing the overrides is part of settling: a zone the author forced OUT is
+    // still content the file describes, and a save must not write a world without it.
+    liveStream_.ClearShardForces();
+    liveStream_.SetEnabled(true);
+    return liveStream_.SpawnAllShards(scene, renderer);
 }
 
 // The baked shard boxes + their load/unload radii, in the viewport. Drawn regardless of
@@ -2417,12 +2693,26 @@ void Editor::DrawShardOverlay(Scene& scene, Renderer& renderer) {
         }
     };
 
+    const bool live = liveStream_.IsBound();
     for (usize i = 0; i < shardDescs_.size(); ++i) {
         const scene::ShardDesc& d = shardDescs_[i];
-        const bool res = i < streamSimResident_.size() && streamSimResident_[i] != 0;
-        // Green = would be resident here, grey-blue = streamed out. The same two states
-        // the runtime has, in the same order, so the colours mean one thing.
-        const ImU32 col = res ? IM_COL32(90, 225, 130, 210) : IM_COL32(110, 130, 165, 130);
+        // Bound: report the STREAMER (matched by the "<tag>#<index>" key, because the
+        // preview bake and the file's shard table are different index spaces).
+        // Unbound: report the simulation, exactly as before.
+        const i32 liveIdx =
+            live ? liveStream_.FindShard(d.tag + "#" + std::to_string(d.index)) : -1;
+        const bool res = live ? (liveIdx >= 0 && liveStream_.IsResident(static_cast<u32>(liveIdx)))
+                              : (i < streamSimResident_.size() && streamSimResident_[i] != 0);
+        const stream::ShardForce force = liveIdx >= 0
+                                             ? liveStream_.ShardForceOf(static_cast<u32>(liveIdx))
+                                             : stream::ShardForce::Auto;
+        // Green = resident, grey-blue = streamed out. The same two states the runtime
+        // has, in the same order, so the colours mean one thing - plus the two
+        // saturated override colours, which are the same amber/red the State column
+        // uses so "FORCED OUT" reads identically in the table and in the world.
+        ImU32 col = res ? IM_COL32(90, 225, 130, 210) : IM_COL32(110, 130, 165, 130);
+        if (force == stream::ShardForce::Resident) col = IM_COL32(255, 199, 51, 235);
+        else if (force == stream::ShardForce::Unloaded) col = IM_COL32(255, 107, 89, 235);
         if (streamSimDrawBoxes_) box(d.min, d.max, col, res ? 2.0f : 1.0f);
         const glm::vec3 centre = (d.min + d.max) * 0.5f;
         if (streamSimDrawRadii_ && i < streamSimShards_.size()) {
@@ -5285,6 +5575,13 @@ void Editor::EnterPlayMode(Engine& engine) {
         // survive Stop.)
         playSnapshot_ = CaptureSnapshot(engine);
         playSnapshotValid_ = true;
+        // LIVE ZONES DO NOT SURVIVE INTO PLAY. CaptureSnapshot above already made the
+        // world whole, so the snapshot holds every zone as authored content; this hands
+        // the world back and scrubs the membership stamps, so Play sees a plain,
+        // complete scene and Stop's Replace has nothing streaming to disagree with.
+        // (Engine::UpdateTagStreaming's own guards keep the RUNTIME streamer out of an
+        // editor session regardless - none of them are touched by this feature.)
+        LiveStreamUnbind(engine.GetScene(), &engine.GetRenderer());
         gameStateSnapshot_ = game::SerializeState();
         // Fresh story flags/objectives/checkpoints each Play so the developer tests
         // the first-time/locked state (mirrors the runtime's LoadGameplayWorld).
@@ -5869,11 +6166,20 @@ void Editor::DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e) {
 
     // Editor-only visibility: hidden entities (and their subtrees) are dimmed.
     const bool selfHidden = reg.all_of<EditorHidden>(e);
+    // STREAMED, NOT AUTHORED. While live zones are bound, an entity carrying
+    // StreamShard was put here by the streamer and can be taken away again - which
+    // makes it categorically different from something the author placed, and the
+    // difference has to be visible without clicking. The stamp is scrubbed on unbind,
+    // so this tint can never outlive the streamer that justifies it.
+    const StreamShard* memberOf = liveStream_.IsBound() ? reg.try_get<StreamShard>(e) : nullptr;
+    std::string zoneSuffix;
+    if (memberOf) zoneSuffix = "   [" + liveStream_.ShardKey(memberOf->index) + "]";
     if (selfHidden) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.48f, 0.50f, 0.56f, 1.0f));
+    else if (memberOf) ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.80f, 1.0f, 1.0f));
     const bool open = ImGui::TreeNodeEx(
         reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<u32>(e))), flags,
-        "%s", label);
-    if (selfHidden) ImGui::PopStyleColor();
+        "%s%s", label, zoneSuffix.c_str());
+    if (selfHidden || memberOf) ImGui::PopStyleColor();
     // The ROW rect, captured while the tree node is still the "last item" (the eye
     // button below would replace it). The drop handler splits it into three bands.
     const ImVec2 rowMin = ImGui::GetItemRectMin();
@@ -6820,6 +7126,32 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         undoOnActivate();
         ImGui::SameLine();
         if (ImGui::Button("Add Component")) ImGui::OpenPopup("AddComponent");
+    }
+
+    // --- Live zone membership (read-only) ------------------------------------
+    // "Why is this here, and can it disappear?" - answerable in one line. The REASON
+    // clause is what keeping `pinned` and `associated` as separate bools bought: an
+    // object held by an association is not the same situation as one the camera is
+    // standing next to, and an author debugging a pop needs to know which.
+    if (liveStream_.IsBound()) {
+        if (const StreamShard* ss = reg.try_get<StreamShard>(sel)) {
+            const u32 zi = ss->index;
+            const bool res = liveStream_.IsResident(zi);
+            const char* why = !res                        ? "streamed out"
+                              : liveStream_.ShardForceOf(zi) == stream::ShardForce::Resident
+                                  ? "resident - FORCED IN by hand"
+                              : liveStream_.IsAssociated(zi) ? "resident - pulled in by an "
+                                                               "associated tag"
+                                                             : "resident - the camera is in range";
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.80f, 1.0f, 1.0f));
+            ImGui::TextWrapped("Streaming: zone %s - %s", liveStream_.ShardKey(zi).c_str(), why);
+            ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("This object was SPAWNED by the streamer, not placed here\n"
+                                  "by the scene load. It belongs to a streaming zone and can\n"
+                                  "be despawned again. A save brings every zone back first.");
+            ImGui::Separator();
+        }
     }
 
     // --- Prefab instance: linked to a .hbprefab source ----------------------
@@ -10884,6 +11216,20 @@ std::string Editor::CaptureDocumentSnapshotJson(Scene& scene,
 
 Editor::Snapshot Editor::CaptureSnapshot(Engine& engine) const {
     Snapshot snap;
+    // LIVE ZONES: MATERIALISE THE WORLD BEFORE CAPTURING IT.
+    //
+    // This capture is unfiltered and is what undo, redo and Play->Stop restore. With
+    // zones despawned it would bake "whatever happened to be resident when the camera
+    // was there" in as the AUTHORED world, and the Replace that restores it would then
+    // delete everything that was streamed out - permanently, because the streamer is
+    // unbound by that same Replace (see AdoptWorld).
+    //
+    // Filtering StreamShard holders out instead - the shape Engine::SaveGame uses - is
+    // NOT available here: the runtime can drop them because the streamer respawns them
+    // from the level file afterwards, and after an editor restore there is no streamer
+    // left to do that. So the world is made whole first. An edit while streaming costs
+    // one materialisation; that is the honest price and it is bounded.
+    const_cast<Editor*>(this)->LiveStreamSettle(engine.GetScene(), engine.GetRenderer());
     // A never-yet-saved paint canvas has no `source`, and BuildSceneJson skips those -
     // so it would be absent from this snapshot and destroyed by the Replace that
     // Stop-Play / Undo perform. Give it a file first. (const_cast for the same reason
@@ -10929,6 +11275,10 @@ void Editor::PushUndo(Scene& scene) {
         PushUndo(*engine_);
         return;
     }
+    // Same reason as CaptureSnapshot's: an unfiltered capture taken with zones
+    // despawned would bake a world with holes in as the authored one, and the Replace
+    // that restores it would make the holes permanent.
+    if (liveStream_.IsBound() && liveRenderer_) LiveStreamSettle(scene, *liveRenderer_);
     Snapshot snap;
     snap.scene = scene::SaveSceneToString(scene);
     undoStack_.push_back(std::move(snap));
@@ -11668,10 +12018,25 @@ void Editor::OpenCutscene(Engine& engine, const std::filesystem::path& path) {
 
 void Editor::CutscenePreviewBegin(Engine& engine) {
     if (csPreview_ || playMode_ || !editedCutsceneValid_) return;
+    // LIVE ZONES: MATERIALISE THE WORLD BEFORE CAPTURING IT - the same rule
+    // CaptureSnapshot and SaveSceneToDisk state at length, and this was one of the two
+    // sites that had not been told. The snapshot below is RESTORED THROUGH
+    // LoadMode::Replace when the preview ends, so a snapshot taken with a zone
+    // streamed out deletes that zone's objects permanently: the Replace unbinds the
+    // streamer (AdoptWorld), so nothing is left to bring them back, and because the
+    // save-time shard bake re-derives itself from whatever is live, the next Ctrl+S
+    // writes the hole into the level with nothing downstream reporting a thing.
+    CaptureSceneSettle(engine);
     // Snapshot the scene so scrubbing/playback can freely pose entities and we
     // restore the authored transforms exactly when preview ends.
     csPreviewSnapshot_ = scene::SaveSceneToString(engine.GetScene());
     csPreview_ = true;
+}
+
+// The one-liner both string-snapshot sites owe the streamer, named so a future third
+// site is a grep away from finding it. See CaptureSnapshot for the argument in full.
+void Editor::CaptureSceneSettle(Engine& engine) {
+    if (liveStream_.IsBound()) LiveStreamSettle(engine.GetScene(), engine.GetRenderer());
 }
 
 void Editor::CutscenePreviewEnd(Engine& engine) {
@@ -13573,8 +13938,13 @@ void Editor::DrawCharacterEditor(Engine& engine) {
 // (ProjectSettings::tags), and both re-seed the process-wide table afterwards
 // because a TagId is an INDEX into that list.
 //
-// NOTHING HERE STREAMS. P4 is authoring only: a tag is data on an entity and a
-// row in the `.hbproj`. The radii below are read by nothing yet.
+// THIS PANEL NOW STREAMS, FOR REAL, when "Live zones" is on (DrawLiveZoneControls
+// below binds stream::Streamer to the world being edited via BindMode::AuthorWorld).
+// The radii, priorities and associations edited here are read by Streamer::BindLevel
+// and by the prediction in UpdateStreamSim. It said the opposite for the whole of P4
+// and leaving that standing once it had become false would be worse than never having
+// written it - the same reason the author-facing caveat is inverted at the "(!) this
+// is spawning and despawning FOR REAL" line.
 
 TagId Editor::CreateProjectTag(const std::string& name) {
     if (name.empty() || !Project::HasActive()) return kTagUntagged;
@@ -13591,6 +13961,65 @@ TagId Editor::CreateProjectTag(const std::string& name) {
     // step. (Deleting a tag, which mutates live entities, is Tags-panel only.)
     Project::Active().Save();
     return id;
+}
+
+// ONE EDIT, BOTH CONSUMERS. An association is resolved to integer adjacency exactly
+// once per bind (Streamer::BindLevel) and once per UpdateStreamSim call, so editing
+// one in the panel changed a `.hbproj` row and NOTHING else: with live zones on, the
+// author associated Hill -> Vista, stood on the hill and saw nothing happen - no log
+// line, no warning - until they next saved (which re-binds). The panel's own
+// prediction was equally stale until they happened to drag the Focus. Both are
+// refreshed here, from the one place the edit is made.
+void Editor::OnAssociationsEdited() {
+    if (liveStream_.IsBound() && Project::HasActive())
+        liveStream_.RefreshAssociations(Project::Active().Settings().tags);
+    UpdateStreamSim();
+}
+
+// The live-zone switchboard, inside the Tags panel's streaming section. Two controls
+// and one banner, and the banner is the important one: a forgotten manual override
+// makes the viewport disagree with the level for a reason the author cannot see.
+void Editor::DrawLiveZoneControls(Engine& engine) {
+    const bool bound = liveStream_.IsBound();
+    bool want = bound;
+    if (ImGui::Checkbox("Live zones (spawn/despawn for real)", &want)) {
+        if (want) LiveStreamBind(engine.GetScene(), engine.GetRenderer());
+        else LiveStreamUnbind(engine.GetScene(), &engine.GetRenderer());
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Binds the REAL streamer to the world you are editing, without\n"
+                          "destroying it. Zones can then be switched on and off by hand\n"
+                          "below, and - with 'Follow the camera' on - automatically as\n"
+                          "you fly around.\n\n"
+                          "Requires a SAVED scene: a zone that is despawned and respawned\n"
+                          "comes back from the FILE, so unsaved moves inside one would be\n"
+                          "reverted. Saving re-binds automatically.");
+    if (!bound) {
+        if (!liveStreamError_.empty()) {
+            ImGui::TextColored(ImVec4(0.96f, 0.74f, 0.35f, 1.0f), "%s", liveStreamError_.c_str());
+        }
+        return;
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Follow the camera", &liveStreamAuto_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("OFF (default): every zone stays loaded and only the manual\n"
+                          "In/Out buttons move anything. Content vanishing while you\n"
+                          "work is worse than content you have to ask for.\n\n"
+                          "ON: the editor camera is the streaming focus and zones spawn\n"
+                          "and despawn by distance, exactly as they will in game. The\n"
+                          "zone holding your SELECTION is held resident, and streaming\n"
+                          "pauses while you are dragging the gizmo.");
+    const u32 forced = liveStream_.ForcedShardCount();
+    if (forced > 0) {
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.2f, 1.0f),
+                           "%u zone(s) are under a MANUAL override - the viewport is not "
+                           "showing what the game would.",
+                           forced);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear all overrides")) liveStream_.ClearShardForces();
+    }
+    ImGui::TextDisabled("Overrides are session-only: nothing is written to the project.");
 }
 
 void Editor::DrawTagsPanel(Engine& engine) {
@@ -13708,31 +14137,62 @@ void Editor::DrawTagsPanel(Engine& engine) {
             }
             u32 residentN = 0;
             for (const u8 r : streamSimResident_) residentN += r ? 1u : 0u;
-            ImGui::Text("Would be resident here: %u of %u shard(s)", residentN,
-                        static_cast<u32>(shardDescs_.size()));
-            // THE HONEST CAVEAT, in the UI and not only in a comment. The editor does not
-            // spawn or despawn: a streamer here would have to BindWorld, which destroys
-            // the scene being edited.
-            ImGui::TextDisabled("(?) this simulates the DECISION, not the spawn");
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("The editor runs the real distance/hysteresis policy\n"
-                                  "against the real baked boxes, but never spawns or\n"
-                                  "despawns - that would mean destroying the scene you are\n"
-                                  "editing. Spawn/despawn is exercised by the runtime and\n"
-                                  "by --tagstreamtest.");
-            if (ImGui::BeginTable("shardsim", 5,
+            const bool live = liveStream_.IsBound();
+            if (live)
+                ImGui::Text("LIVE: %u of %u zone(s) are actually spawned right now",
+                            liveStream_.ResidentShardCount(),
+                            static_cast<u32>(liveStream_.ShardCount()));
+            else
+                ImGui::Text("Would be resident here: %u of %u shard(s)", residentN,
+                            static_cast<u32>(shardDescs_.size()));
+            // THE HONEST CAVEAT, AND ITS INVERSE. Unbound, the editor genuinely only
+            // simulates. Bound, it genuinely spawns and despawns - and leaving the old
+            // sentence standing once it has become false would be worse than never
+            // having written it.
+            if (live) {
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                                   "(!) this is spawning and despawning FOR REAL");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Objects in a streamed-out zone are GONE from the\n"
+                                      "registry, not hidden. The file on disk is unchanged\n"
+                                      "until you save, and a save brings every zone back\n"
+                                      "first - it can never write a level with holes.");
+            } else {
+                ImGui::TextDisabled("(?) this simulates the DECISION, not the spawn");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("The editor runs the real distance/hysteresis policy\n"
+                                      "against the real baked boxes, but is not spawning or\n"
+                                      "despawning anything. Turn on 'Live zones' below to\n"
+                                      "make it real.");
+            }
+            DrawLiveZoneControls(engine);
+            if (ImGui::BeginTable("shardsim", live ? 6 : 5,
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp |
                                       ImGuiTableFlags_ScrollY,
-                                  ImVec2(0.0f, 160.0f))) {
+                                  ImVec2(0.0f, 180.0f))) {
                 ImGui::TableSetupColumn("Shard");
                 ImGui::TableSetupColumn("Obj");
                 ImGui::TableSetupColumn("Dist");
                 ImGui::TableSetupColumn("Load/Unload");
                 ImGui::TableSetupColumn("State");
+                if (live) ImGui::TableSetupColumn("Manual");
                 ImGui::TableHeadersRow();
                 for (usize i = 0; i < shardDescs_.size(); ++i) {
                     const scene::ShardDesc& d = shardDescs_[i];
-                    const bool res = i < streamSimResident_.size() && streamSimResident_[i] != 0;
+                    // WHEN BOUND, THE TABLE REPORTS THE STREAMER, NOT THE SIMULATION.
+                    // The two index spaces are different (the sim indexes the preview
+                    // bake, the streamer indexes the FILE), so they are matched by the
+                    // "<tag>#<index>" key - the same key persistence and `.hbsave` use.
+                    const i32 liveIdx =
+                        live ? liveStream_.FindShard(d.tag + "#" + std::to_string(d.index)) : -1;
+                    const bool res = live ? (liveIdx >= 0 &&
+                                             liveStream_.IsResident(static_cast<u32>(liveIdx)))
+                                          : (i < streamSimResident_.size() &&
+                                             streamSimResident_[i] != 0);
+                    const stream::ShardForce force =
+                        liveIdx >= 0 ? liveStream_.ShardForceOf(static_cast<u32>(liveIdx))
+                                     : stream::ShardForce::Auto;
+                    ImGui::PushID(static_cast<int>(i));
                     ImGui::TableNextRow();
                     ImGui::TableNextColumn();
                     ImGui::Text("%s#%u", d.tag.c_str(), d.index);
@@ -13745,12 +14205,106 @@ void Editor::DrawTagsPanel(Engine& engine) {
                         ImGui::Text("%.0f / %.0f", streamSimShards_[i].loadRadius,
                                     streamSimShards_[i].unloadRadius);
                     ImGui::TableNextColumn();
-                    if (i < streamSimShards_.size() && streamSimShards_[i].pinned)
+                    // "ASSOCIATION IS THE REASON THIS IS HERE" - which is NOT the same
+                    // as "an association reaches it". A shard can be in range on its own
+                    // terms AND be driven, and the mark is deliberately set in that case
+                    // (a tag's other shards depend on it), so the reason is derived from
+                    // the shard's OWN distance instead of from the mark alone. Otherwise
+                    // the driver's neighbour would read "resident (assoc)" while the
+                    // player is standing on top of it.
+                    const bool selfHeld =
+                        live ? (liveIdx >= 0 && liveStream_.IsSelfHeld(static_cast<u32>(liveIdx)))
+                             : (i < streamSimShards_.size() && i < streamSimDist_.size() &&
+                                streamSimDist_[i] <= streamSimShards_[i].loadRadius);
+                    const bool assoc =
+                        !selfHeld &&
+                        (live ? (liveIdx >= 0 &&
+                                 liveStream_.IsAssociated(static_cast<u32>(liveIdx)))
+                              : (i < streamSimShards_.size() && streamSimShards_[i].associated));
+                    // An alwaysLoaded tag has no ShardRuntime, so it has no live index -
+                    // but neither does a preview shard the BOUND FILE has never heard of
+                    // (hit "Re-bake now" after tagging a new object and the preview bake
+                    // invents keys the streamer cannot match). Reporting the second as
+                    // "Always Loaded" is a lie about the one thing this column exists to
+                    // say, so the flag is read from the tag, not inferred from the miss.
+                    bool tagAlwaysLoaded = false;
+                    for (const TagDef& td : defs)
+                        if (td.name == d.tag) {
+                            tagAlwaysLoaded = td.alwaysLoaded;
+                            break;
+                        }
+                    // FIVE WORDS, and the two forced ones are saturated on purpose: a
+                    // forgotten override must be impossible to miss.
+                    if (force == stream::ShardForce::Resident)
+                        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.2f, 1.0f), "FORCED IN");
+                    else if (force == stream::ShardForce::Unloaded)
+                        ImGui::TextColored(ImVec4(1.0f, 0.42f, 0.35f, 1.0f), "FORCED OUT");
+                    else if (live && liveIdx < 0 && tagAlwaysLoaded)
+                        ImGui::TextDisabled("always");
+                    else if (live && liveIdx < 0) {
+                        ImGui::TextColored(ImVec4(0.96f, 0.74f, 0.35f, 1.0f), "not in the file");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("This zone came from the PREVIEW bake; the bound "
+                                              "file\nhas no zone with this key, so the streamer "
+                                              "knows\nnothing about it. Save the scene to make "
+                                              "the two\nagree.");
+                    }
+                    else if (!live && i < streamSimShards_.size() && streamSimShards_[i].pinned)
                         ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "always");
-                    else if (res)
+                    else if (res && assoc) {
+                        // WHY it is here, not just that it is. This is the whole reason
+                        // `associated` is a separate bool from `pinned`.
+                        ImGui::TextColored(ImVec4(0.75f, 0.7f, 1.0f, 1.0f), "resident (assoc)");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Pulled in by an ASSOCIATED tag, not by distance.\n"
+                                              "Another tag that is resident near the focus lists\n"
+                                              "'%s' in its Associated Tags.",
+                                              d.tag.c_str());
+                    } else if (res)
                         ImGui::TextColored(ImVec4(0.35f, 0.88f, 0.5f, 1.0f), "resident");
                     else
                         ImGui::TextDisabled("streamed out");
+                    if (live) {
+                        ImGui::TableNextColumn();
+                        if (liveIdx < 0) {
+                            // An alwaysLoaded tag has no ShardRuntime at all, so there
+                            // is nothing to force - and saying that is better than
+                            // offering a button that would do nothing.
+                            ImGui::TextDisabled("-");
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip(
+                                    tagAlwaysLoaded
+                                        ? "This tag is Always Loaded: it is not streamed,\n"
+                                          "so there is nothing to enable or disable."
+                                        : "The bound file has no zone with this key, so there\n"
+                                          "is nothing to enable or disable. Save the scene and\n"
+                                          "the preview and the streamer will agree again.");
+                        } else {
+                            const u32 li = static_cast<u32>(liveIdx);
+                            const auto set = [&](stream::ShardForce f) {
+                                liveStream_.SetShardForce(
+                                    li, force == f ? stream::ShardForce::Auto : f);
+                            };
+                            if (ImGui::SmallButton(force == stream::ShardForce::Resident ? "[In]"
+                                                                                         : "In"))
+                                set(stream::ShardForce::Resident);
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Force this zone RESIDENT regardless of distance.\n"
+                                                  "It also drives its Associated Tags, so forcing a\n"
+                                                  "vantage point in brings its vista with it.\n"
+                                                  "Click again to release.");
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton(force == stream::ShardForce::Unloaded ? "[Out]"
+                                                                                         : "Out"))
+                                set(stream::ShardForce::Unloaded);
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Force this zone UNLOADED regardless of distance.\n"
+                                                  "It stops driving its associations too. A save\n"
+                                                  "brings it back first - this can never write a\n"
+                                                  "level with holes.\nClick again to release.");
+                        }
+                    }
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }
@@ -13798,6 +14352,99 @@ void Editor::DrawTagsPanel(Engine& engine) {
                 ImGui::DragInt("Priority", &d.priority, 0.1f, -100, 100);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Higher = spawned first when the frame budget throttles.");
+
+                // --- Associated tags (RULE 6) ---------------------------------
+                // The relation is ONE-WAY and stated in those words, because the
+                // whole feature is unusable if the author has to guess the
+                // direction. Both halves are shown: what this tag PULLS IN, and
+                // what PULLS IT IN - the second is not derivable by eye from a
+                // list of twenty tags, and it is the answer to "why did this
+                // appear?".
+                ImGui::Spacing();
+                ImGui::TextDisabled("Associated Tags - loading THIS tag also loads:");
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip(
+                        "ONE-WAY. When '%s' is resident because the player is\n"
+                        "near it, every tag listed here becomes resident too,\n"
+                        "however far away it is. The reverse does NOT happen.\n\n"
+                        "The case this is for: a hill you can see a distant city\n"
+                        "from. Author the low-poly city as its OWN content with\n"
+                        "its own tag, then associate it with the hill's tag.\n"
+                        "The two remain completely separate assets - nothing is\n"
+                        "swapped, derived or excluded between them.",
+                        d.name.c_str());
+                int dropAssoc = -1;
+                for (usize a = 0; a < d.associates.size(); ++a) {
+                    ImGui::PushID(static_cast<int>(1000 + a));
+                    if (ImGui::SmallButton("x")) dropAssoc = static_cast<int>(a);
+                    ImGui::SameLine();
+                    bool known = false;
+                    for (const TagDef& o : defs)
+                        if (o.name == d.associates[a]) {
+                            known = true;
+                            break;
+                        }
+                    if (known) ImGui::TextUnformatted(d.associates[a].c_str());
+                    else {
+                        ImGui::TextColored(ImVec4(0.96f, 0.74f, 0.35f, 1.0f), "%s  (no such tag)",
+                                           d.associates[a].c_str());
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("This project lists no tag by that name, so the\n"
+                                              "link does nothing at runtime. The name is KEPT\n"
+                                              "(adding the tag restores the link); the shard\n"
+                                              "bake reports it on every save.");
+                    }
+                    ImGui::PopID();
+                }
+                if (d.associates.empty()) ImGui::TextDisabled("  (none)");
+                ImGui::SetNextItemWidth(200.0f);
+                if (ImGui::BeginCombo("##addassoc", "Associate a tag...")) {
+                    for (usize o = 1; o < defs.size(); ++o) { // never "Untagged"
+                        if (o == i) continue;                 // and never itself
+                        bool have = false;
+                        for (const std::string& a : d.associates)
+                            if (a == defs[o].name) {
+                                have = true;
+                                break;
+                            }
+                        if (have) continue;
+                        if (ImGui::Selectable(defs[o].name.c_str())) {
+                            d.associates.push_back(defs[o].name);
+                            Project::Active().Save();
+                            OnAssociationsEdited();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+                if (dropAssoc >= 0) {
+                    d.associates.erase(d.associates.begin() +
+                                       static_cast<std::ptrdiff_t>(dropAssoc));
+                    Project::Active().Save();
+                    OnAssociationsEdited();
+                }
+                // The reverse view. Read-only: an association is edited where it is
+                // authored, on the tag that owns it.
+                {
+                    std::string pulledBy;
+                    for (usize o = 0; o < defs.size(); ++o) {
+                        if (o == i) continue;
+                        for (const std::string& a : defs[o].associates)
+                            if (a == d.name) {
+                                if (!pulledBy.empty()) pulledBy += ", ";
+                                pulledBy += defs[o].name;
+                                break;
+                            }
+                    }
+                    if (pulledBy.empty()) ImGui::TextDisabled("Pulled in by: (nothing)");
+                    else ImGui::TextDisabled("Pulled in by: %s", pulledBy.c_str());
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Tags that list '%s' in THEIR associated tags, so\n"
+                                          "being near any of them brings this one in.\n"
+                                          "Edit the link on the tag that owns it.",
+                                          d.name.c_str());
+                }
+                ImGui::Spacing();
+
                 ImGui::Checkbox("Always Loaded", &d.alwaysLoaded);
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Spawns with the level and never despawns\n"
@@ -14316,6 +14963,13 @@ void Editor::DrawMovieRender(Engine& engine) {
             cfg.fps = static_cast<u32>(movieFps_);
             cfg.warmupFrames = static_cast<u32>(movieWarmup_);
             cfg.duration = movieDuration_;
+            // MovieJob::Start takes its own SaveSceneToString snapshot and restores it
+            // through LoadMode::Replace when the render ends, so it has exactly the
+            // hazard CutscenePreviewBegin has: a zone streamed out at this instant is
+            // deleted from the edited world for good (and the .mp4 has holes in it).
+            // movieActive_ is only set on the next line, so neither LiveStreamTick's
+            // suspend nor LiveStreamBind's refusal covers this.
+            CaptureSceneSettle(engine);
             movieJob_.Start(engine, assets, cfg);
             movieActive_ = movieJob_.Active();
             if (!movieActive_) buildResult_ = "Movie render: " + movieJob_.Status();
@@ -15163,6 +15817,36 @@ void Editor::DrawSceneManager(Engine& engine) {
                                    : currentScenePath_.stem().string().c_str());
     ImGui::Separator();
 
+    // --- 3D main menu: the startup scene doubles as the menu backdrop -----------
+    {
+        bool mw = project.Settings().menuWorld;
+        if (ImGui::Checkbox("3D main menu (startup scene behind the menu)", &mw)) {
+            project.Settings().menuWorld = mw;
+            project.Save();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Binds the startup scene as a MENU BACKDROP while the main menu is up.\n"
+                "The world is really there (tags stream against the menu camera), but\n"
+                "it is a no-trace bind: no area visit, no state captures - the menu\n"
+                "always shows the AUTHORED world and never touches a save.");
+        if (project.Settings().menuWorld) {
+            char camBuf[128];
+            std::snprintf(camBuf, sizeof(camBuf), "%s",
+                          project.Settings().menuCamera.c_str());
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::InputText("Menu Camera", camBuf, sizeof(camBuf)))
+                project.Settings().menuCamera = camBuf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) project.Save();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Entity NAME of the CameraComponent that frames the menu.\n"
+                    "Empty = the scene's primary camera. A missing name falls back\n"
+                    "to the primary camera with a warning, never a black screen.");
+        }
+    }
+    ImGui::Separator();
+
     if (sceneList_.empty()) {
         ImGui::TextDisabled("No scenes yet - use Save As to create one.");
     }
@@ -15508,11 +16192,21 @@ bool Editor::BuildShipping(std::string& outMessage) {
         HBE_WARN("BuildShipping: no Release runtime found - shipping the '{}' build, which "
                  "runs SLOWER. Build the Release config and re-ship for best performance.",
                  shipCfg);
-    } else if (!freshestPath.empty() && freshestCfg != "Release" &&
-               freshest > fs::last_write_time(runtimeDir / "HeartbreakRuntime.exe", ec)) {
-        HBE_WARN("BuildShipping: your '{}' build is newer than Release - shipping Release "
-                 "(fastest) anyway. Rebuild the Release config to ship your latest code.",
-                 freshestCfg);
+    } else if (!freshestPath.empty() && freshestCfg != "Release") {
+        // Staleness is inferred from a SIBLING config's mtime, because the shipping
+        // path has no source tree to compare against. That proxy has one false
+        // positive: building several configs in one session links them seconds apart,
+        // so whichever finishes last looks "newer" even though both were built from
+        // identical source. Only a gap larger than a plausible link stagger means the
+        // author actually rebuilt one config and forgot the other.
+        const auto relT = fs::last_write_time(runtimeDir / "HeartbreakRuntime.exe", ec);
+        const auto gap = std::chrono::duration_cast<std::chrono::seconds>(freshest - relT);
+        if (gap > std::chrono::seconds(120)) {
+            HBE_WARN("BuildShipping: your '{}' runtime is {} minute(s) newer than Release - "
+                     "shipping Release (fastest) anyway. Rebuild the Release config if that "
+                     "gap means Release is missing your latest code.",
+                     freshestCfg, gap.count() / 60);
+        }
     }
 
     const auto copy = [&](const fs::path& from, const fs::path& to) {
@@ -16139,6 +16833,17 @@ void Editor::AddRecentProject(const std::filesystem::path& hbproj) {
 }
 
 void Editor::OnProjectChanged() {
+    // LIVE ZONES BELONG TO THE PREVIOUS PROJECT - unbind FIRST, before anything else
+    // here invalidates the handles the streamer needs to hand the world back whole.
+    // Every other cross-project handle below is cleared by name; this one was missed,
+    // and the binding survived a project switch: LiveStreamTick went on streaming
+    // project A's zones (out of the assetsDir_ captured at bind) into the live registry
+    // while Project::Active() was B, currentScenePath_ was cleared two dozen lines down
+    // so Ctrl+S opened Save As, and accepting it materialised A's zone content into a
+    // file under B's Scenes/. Passing the renderer is deliberate: the unbind spawns
+    // every zone back first, so the world A leaves behind is never one with holes.
+    if (engine_) LiveStreamUnbind(engine_->GetScene(), &engine_->GetRenderer());
+    liveStreamError_.clear();
     // Process-wide gameplay caches key by asset path -> invalidate on project switch.
     spawn::ClearPrefabCache();
     facial::ClearEnvelopeCache();

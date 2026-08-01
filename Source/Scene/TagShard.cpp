@@ -3,6 +3,7 @@
 
 #include "Core/Log.h"
 #include "Scene/Scene.h"
+#include "Scene/StreamPolicy.h" // stream::kMaxAssocDepth - RULE 6's hop cap
 #include "Scene/TagTable.h"
 #include "Scene/TerrainSystem.h" // terrain::ExtentXZ - the ONE heightfield layout
 
@@ -15,6 +16,7 @@
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace hbe::tagshard {
@@ -602,6 +604,188 @@ BakeReport Bake(std::vector<BakeRow>& rows, const std::vector<TagDef>& defs) {
                                "RE-UPLOADED on every respawn with no way to free them - so each "
                                "streaming cycle grows VRAM. Mark the tag alwaysLoaded, or move "
                                "the terrain out of it.");
+            }
+        }
+    }
+
+    // --- 5b. RULE 6: ASSOCIATED TAGS -------------------------------------------
+    // An association is a PROJECT-level relation, but whether it does anything is a
+    // LEVEL-level question, so it is validated here where both are in hand. Every
+    // finding is a WARNING and none blocks the save: the same reasoning as the rest
+    // of this file, and more so - refusing to write a level over a tag relation that
+    // is not in the file being written would throw away authored work for nothing.
+    //
+    // Scoped to DRIVERS PRESENT IN THIS BAKE. The editor re-bakes once per scene
+    // source, so reporting every project-wide relation from every bake would say the
+    // same thing N times about tags this level has never heard of.
+    {
+        std::unordered_set<std::string> present;
+        for (const scene::ShardDesc& sd : rep.shards) present.insert(sd.tag);
+        std::unordered_map<std::string, usize> byName;
+        byName.reserve(defs.size());
+        for (usize t = 0; t < defs.size(); ++t) byName.emplace(defs[t].name, t);
+
+        // THREE BUDGETS, NOT ONE. These used to share a counter, so eight dangling or
+        // content-less associations - routine in a multi-scene project, where "the
+        // target has no shards in this level" fires once per bake and the editor re-bakes
+        // once per scene source - consumed the whole allowance and the CYCLE and DEPTH
+        // scans below never ran at all. The cycle message is the finding this validation
+        // most exists to produce, and it was the one silently dropped.
+        usize linkFindings = 0, cycleFindings = 0, depthFindings = 0;
+        const auto sayIn = [&](usize& budget, const std::string& tag, std::string msg) {
+            if (budget++ >= kMaxSameKind) return;
+            report.Add(Severity::Warning, tag, std::move(msg));
+        };
+        const auto say = [&](const std::string& tag, std::string msg) {
+            sayIn(linkFindings, tag, std::move(msg));
+        };
+        const auto sayCycle = [&](const std::string& tag, std::string msg) {
+            sayIn(cycleFindings, tag, std::move(msg));
+        };
+        const auto sayDepth = [&](const std::string& tag, std::string msg) {
+            sayIn(depthFindings, tag, std::move(msg));
+        };
+        // Integer adjacency, same shape the runtime resolves (tags::BuildAssocGraph).
+        std::vector<std::vector<usize>> adj(defs.size());
+        bool anyPresentDriver = false;
+        for (usize t = 0; t < defs.size(); ++t) {
+            const TagDef& d = defs[t];
+            for (const std::string& a : d.associates) {
+                const auto it = byName.find(a);
+                if (it != byName.end() && it->second != t) adj[t].push_back(it->second);
+            }
+            if (!d.associates.empty() && present.count(d.name) > 0) anyPresentDriver = true;
+        }
+
+        for (usize t = 0; t < defs.size(); ++t) {
+            const TagDef& d = defs[t];
+            if (d.associates.empty() || present.count(d.name) == 0) continue;
+            for (const std::string& a : d.associates) {
+                if (a == d.name) {
+                    say(d.name, "Tag '" + d.name +
+                                    "' associates ITSELF. A tag cannot pull itself in; the "
+                                    "entry does nothing and is dropped when the tag list is "
+                                    "normalized.");
+                    continue;
+                }
+                const auto it = byName.find(a);
+                if (it == byName.end()) {
+                    say(d.name, "Tag '" + d.name + "' associates '" + a +
+                                    "', which this project does not list as a tag. The link "
+                                    "is IGNORED at runtime - '" + d.name +
+                                    "' still streams normally. Add the tag (Tags panel), or "
+                                    "remove the association.");
+                    continue;
+                }
+                const TagDef& td = defs[it->second];
+                if (td.alwaysLoaded) {
+                    say(d.name, "Tag '" + d.name + "' associates '" + a +
+                                    "', which is ALWAYS LOADED. The association is a no-op: "
+                                    "'" + a + "' is resident for the whole level anyway.");
+                    continue;
+                }
+                if (present.count(a) == 0) {
+                    say(d.name, "Tag '" + d.name + "' associates '" + a +
+                                    "', but no object in this level carries '" + a +
+                                    "' - so there is nothing here for it to pull in and the "
+                                    "association does NOTHING in this level. (Associations "
+                                    "do not reach across scene files.)");
+                }
+            }
+            if (d.alwaysLoaded) {
+                say(d.name, "Tag '" + d.name +
+                                "' is ALWAYS LOADED and associates other tags. It therefore "
+                                "drives them for the entire level, so everything it pulls in "
+                                "(and everything those pull in) can NEVER unload. That is the "
+                                "literal reading of the relation and it is honoured - but it "
+                                "is rarely what an author means.");
+            }
+        }
+
+        if (anyPresentDriver) {
+            // CYCLES. Not a parse error and not refused: the propagation terminates by
+            // construction (a visited set) and collapses as soon as no member is in
+            // range on its own. But while any one of them IS in range they hold each
+            // other resident, which the author has to be told in those words.
+            std::vector<u8> colour(defs.size(), 0u); // 0 white, 1 grey, 2 black
+            std::vector<i32> parent(defs.size(), -1);
+            std::vector<std::pair<usize, usize>> stack;
+            for (usize s = 0; s < defs.size() && cycleFindings < kMaxSameKind; ++s) {
+                if (colour[s] != 0u) continue;
+                colour[s] = 1u;
+                stack.clear();
+                stack.emplace_back(s, 0u);
+                while (!stack.empty()) {
+                    const usize u = stack.back().first;
+                    if (stack.back().second < adj[u].size()) {
+                        const usize v = adj[u][stack.back().second++];
+                        if (colour[v] == 0u) {
+                            colour[v] = 1u;
+                            parent[v] = static_cast<i32>(u);
+                            stack.emplace_back(v, 0u);
+                        } else if (colour[v] == 1u) {
+                            // Back edge u -> v: walk the parent chain back to v to
+                            // NAME the cycle. A message that says "there is a cycle"
+                            // without saying which tags is not actionable.
+                            std::vector<usize> path{u};
+                            for (usize w = u; w != v && parent[w] >= 0;) {
+                                w = static_cast<usize>(parent[w]);
+                                path.push_back(w);
+                                if (path.size() > defs.size()) break;
+                            }
+                            std::string chain;
+                            for (usize k = path.size(); k-- > 0;)
+                                chain += defs[path[k]].name + " -> ";
+                            chain += defs[v].name;
+                            sayCycle(defs[v].name,
+                                "Association CYCLE: " + chain +
+                                    ". It terminates (each tag is visited once) and it "
+                                    "collapses as soon as none of them is within its own "
+                                    "unload radius - but while ANY one of them is in range, "
+                                    "every tag in the cycle is held resident.");
+                            // No break: the DFS is allowed to finish so no node is
+                            // left grey, which would make the NEXT tree report a
+                            // cycle that is not there.
+                        }
+                    } else {
+                        colour[u] = 2u;
+                        stack.pop_back();
+                    }
+                }
+            }
+
+            // DEPTH. Only kMaxAssocDepth hops are followed, so a longer chain has a
+            // tail that silently never arrives. Breadth-first from each present
+            // driver, one hop past the cap.
+            std::vector<u8> seen(defs.size(), 0u);
+            std::vector<usize> frontier, next;
+            for (usize s = 0; s < defs.size() && depthFindings < kMaxSameKind; ++s) {
+                if (defs[s].associates.empty() || present.count(defs[s].name) == 0) continue;
+                std::fill(seen.begin(), seen.end(), 0u);
+                seen[s] = 1u;
+                frontier.assign(1, s);
+                for (u32 depth = 0; depth <= stream::kMaxAssocDepth && !frontier.empty();
+                     ++depth) {
+                    next.clear();
+                    for (const usize u : frontier)
+                        for (const usize v : adj[u]) {
+                            if (seen[v]) continue;
+                            seen[v] = 1u;
+                            next.push_back(v);
+                        }
+                    if (depth == stream::kMaxAssocDepth && !next.empty()) {
+                        sayDepth(defs[s].name,
+                            "Tag '" + defs[s].name + "' associates a chain more than " +
+                                std::to_string(stream::kMaxAssocDepth) +
+                                " hops deep (e.g. '" + defs[next[0]].name +
+                                "'). Only the first " +
+                                std::to_string(stream::kMaxAssocDepth) +
+                                " hops are followed; anything beyond them is never pulled "
+                                "in. Associate it directly if you meant it.");
+                        break;
+                    }
+                    frontier.swap(next);
+                }
             }
         }
     }

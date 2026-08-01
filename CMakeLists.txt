@@ -135,6 +135,7 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/Editor.cpp"
     "Source/Editor/SaveDispatch.cpp"
     "Source/Editor/SceneSaveTest.cpp"
+    "Source/Editor/EditorZoneTest.cpp"
     "Source/Editor/PasteParentTest.cpp"
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/UIEditor.cpp"

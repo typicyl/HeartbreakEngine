@@ -363,6 +363,18 @@ private:
     // screen (and only then - during gameplay the level's post owns the look).
     rhi::PostSettings uiScenePost_;
     bool uiScenePostValid_ = false;
+
+    // 3D MAIN MENU (ProjectSettings::menuWorld). True while the startup scene is
+    // bound as a MENU BACKDROP (stream::BindMode::MenuWorld - no visits, no
+    // captures). Gates: ApplyMenuPost becomes a no-op (the scene's authored look
+    // wins), streaming runs during MainMenu, and the camera below owns the view.
+    bool menuWorldBound_ = false;
+    // ProjectSettings::menuCamera resolved by name at bind. entt::null = let the
+    // camera system pick the scene's primary camera instead.
+    entt::entity menuCamEntity_ = entt::null;
+    // Binds/rebinds the menu backdrop. Safe to call when menuWorld is off (no-op);
+    // a failed bind falls back to the classic flat menu rather than a black screen.
+    void BindMenuWorld();
     void ApplyMenuPost(); // env.post <- uiScenePost_ (no-op when not captured)
     ui::UIContext uiCtx_;           // cached UI layout/interaction/text state
     // GPU VERTEX EXPANSION (ParticleEmitter::gpuExpand). One per-frame-in-flight

@@ -294,6 +294,49 @@ int main(int argc, char** argv) {
         // shard can never unload it, that an empty focus list changes nothing, and that
         // "streaming off" pins everything LOADED. Pure data: no registry, no GPU, no
         // filesystem. Same contract as --test-seamweld.
+        // --test-assoctags: ASSOCIATED TAGS (StreamPolicy.h RULE 6), end to end
+        // through a real Streamer and by the author's own names. Three SEPARATE
+        // pieces of content - City, City_LowPoly and Hill, each with its own
+        // objects, bounds and radii - with Hill associating City_LowPoly. Proves
+        // that standing on the hill makes the low-poly city resident 1.7 km outside
+        // its own load radius; that leaving the hill releases it UNLESS it is in
+        // range on its own; that a shard resident for both reasons survives losing
+        // one (exactly one despawn, not a drop and a respawn); that a mutual
+        // association TERMINATES and unloads instead of pinning the world; that an
+        // association naming a tag that does not exist warns and streams on; and
+        // that the added evaluation cost stays inside the streaming budget. Also
+        // the bake's association diagnostics and the `.hbproj` round trip.
+        //
+        // It deliberately asserts NOTHING about City and City_LowPoly excluding each
+        // other: they are separate assets and may be co-resident. That is the
+        // author's choice, not the engine's business. Headless: no GPU, no window.
+        if (std::strcmp(argv[i], "--test-assoctags") == 0) {
+            const bool ok = hbe::stream::AssocSelfTest();
+            std::printf("assoctags %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-editorzones: LIVE EDITOR ZONES - the streamer spawning and despawning
+        // against the world the EDITOR is authoring. Proves the bind is
+        // non-destructive (the entity set, every guid in it and Scene::WorldToken are
+        // unchanged, so scene::BindWorld's DestroyWorld never ran); that a sweep
+        // touches only streamed content and writes NO world::/game:: player-progress
+        // state; that a manual override forces residency in both directions - out of a
+        // zone the focus is standing inside, and into one 5 km away - and composes
+        // with associations through the same seed set; that A SAVE NEVER WRITES A
+        // PARTIAL WORLD (refused with the file untouched bytes AND mtime while a zone
+        // is genuinely missing, allowed once the save path has settled the world,
+        // still refused for a RUNTIME bind); that the Play/Stop snapshot round-trips
+        // with streamed content present; and that a stream event never enters the undo
+        // stack while an edit taken mid-stream still captures the whole world.
+        //
+        // Builds its own scratch project and level under the temp directory. Headless:
+        // no GPU, no window, no ImGui context. Same contract as --test-scenesave, and
+        // it never touches the user's project.
+        if (std::strcmp(argv[i], "--test-editorzones") == 0) {
+            const bool ok = hbe::Editor::EditorZoneSelfTest();
+            std::printf("editorzones %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
         if (std::strcmp(argv[i], "--test-tagpolicy") == 0) {
             const bool ok = hbe::stream::PolicySelfTest();
             std::printf("tagpolicy %s\n", ok ? "PASS" : "FAIL");

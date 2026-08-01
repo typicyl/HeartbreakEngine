@@ -22,6 +22,7 @@
 #include "Scene/SceneStreamer.h"
 #include "Scene/StreamPolicy.h" // stream::Evaluate (the editor's streaming SIMULATION)
 #include "Scene/TagShard.h" // save-time spatial shard bake (BakeReport / TagStat)
+#include "Scene/TagStreaming.h" // stream::Streamer - the editor's own LIVE zone streamer
 #include "UI/UIDocument.h" // `.hbui` documents: the UI Document panel authors these
 
 #include <entt/entt.hpp>
@@ -200,6 +201,21 @@ public:
     //
     // Headless: no GPU, no window, no ImGui context.
     static bool SceneSaveSelfTest(const std::filesystem::path& sceneFile);
+
+    // `--test-editorzones`: LIVE EDITOR ZONES, end to end through the real Editor.
+    //
+    // Proves the non-destructive bind (a stream::Streamer bound to the editor's world
+    // spawns and despawns without a single authored entity being touched, and without
+    // BindWorld / DestroyWorld ever running); that a MANUAL override forces residency
+    // in BOTH directions and composes with associations and with alwaysLoaded; that a
+    // SAVE attempted mid-stream behaves exactly per the decision - refused with the
+    // file untouched while a shard is genuinely missing, allowed once the save path
+    // has settled the world, and still refused for a RUNTIME bind; that the Play/Stop
+    // snapshot round-trips with streamed content present; and that undo after a stream
+    // event does not undo the stream.
+    //
+    // Headless: no GPU, no window, no ImGui context, its own scratch level.
+    static bool EditorZoneSelfTest();
 
 private:
     void DrawViewport(Engine& engine);
@@ -890,6 +906,13 @@ private:
     // an index into it, and deleting a row goes through tags::RemoveTag so live
     // entities are remapped rather than silently repointed at the next tag.
     void DrawTagsPanel(Engine& engine);
+    // The live-zone switchboard inside it (bind/unbind, follow-the-camera, the
+    // forgotten-override banner).
+    void DrawLiveZoneControls(Engine& engine);
+    // Called from every site that mutates TagDef::associates. Re-resolves the bound
+    // streamer's association graph AND the panel's prediction, so an edit takes effect
+    // where the author is looking instead of at the next save.
+    void OnAssociationsEdited();
     char tagNewName_[64] = {};   // "New Tag..." / Add-tag name buffer
     bool tagNewPopupOpen_ = false; // request to open the Inspector's naming modal
     // Creates `name` in the project's tag list (no-op when it already exists),
@@ -1301,6 +1324,59 @@ private:
     // Rebuilds shardDescs_/shardStats_ from the live scene WITHOUT saving, so the
     // overlay is available before the first Ctrl+S of a session.
     void RebakeShardPreview(Scene& scene);
+
+    // -- LIVE editor zones (the streamer, for real, in the editor) -----------------
+    // THE EDITOR OWNS ITS OWN STREAMER. Engine::tagStream_ is private with no
+    // accessor, and Engine::UpdateTagStreaming's three guards - including the
+    // `onInit_` line whose absence once let a dev-overlay bind write a surviving
+    // fragment over the level - are unchanged, byte for byte. Nothing in the shipping
+    // runtime path is involved in this feature at all.
+    //
+    // It binds with stream::BindMode::AuthorWorld: no BindWorld, no DestroyWorld, no
+    // environment re-apply, no resident-slice spawn, no world:: persistence. The
+    // world the author loaded stays exactly where it is and the streamer adopts it by
+    // guid.
+    stream::Streamer liveStream_;
+    // AUTOMATIC spawn/despawn as the editor camera moves. DEFAULT OFF, deliberately:
+    // content vanishing while you work is worse than content you have to ask for, and
+    // an author placing a prop 300 m out would watch it despawn under the gizmo. With
+    // it off the streamer is still bound and still obeys MANUAL overrides - "off"
+    // means SetEnabled(false), which is the existing "pin everything loaded".
+    bool liveStreamAuto_ = false;
+    // Why the last bind attempt was refused, shown in the Tags panel.
+    std::string liveStreamError_;
+    // The Renderer a respawn instantiates through, remembered by LiveStreamBind. The
+    // save path has a Scene but no Engine, and a bound streamer must be settleable
+    // from there; this is how. Null whenever nothing is bound.
+    Renderer* liveRenderer_ = nullptr;
+    // Binds liveStream_ to currentScenePath_ and adopts the live world. REFUSES, with
+    // a reason in liveStreamError_ and nothing bound, unless the scene on disk really
+    // describes the world in the registry: every shard in the file must be adoptable
+    // by guid, or a later respawn would duplicate content with fresh guids instead of
+    // restoring it. Saving first is the fix, and the panel says so.
+    bool LiveStreamBind(Scene& scene, Renderer& renderer);
+    // Unbinds and scrubs the StreamShard stamps, so "not bound" really means "nothing
+    // here is streamed". Safe to call unbound.
+    //
+    // A NON-NULL `renderer` brings every zone resident FIRST, which is what the
+    // author-facing switch must do: handing back a world with holes would let the very
+    // next Ctrl+S write it. Pass NULL on the post-Replace path (AdoptWorld) - the
+    // registry is a different world by then, and spawning into it would inject one
+    // level's zones into another.
+    void LiveStreamUnbind(Scene& scene, Renderer* renderer);
+    // One call per frame from BuildUI. Suspends itself during Play, a cutscene or
+    // movie preview and a gizmo drag, holds the selection's shard resident, and feeds
+    // the editor camera in as the streaming focus.
+    void LiveStreamTick(Engine& engine);
+    // Brings every shard resident right now (stream::Streamer::SpawnAllShards) and
+    // returns how many could not be - which can only be Failed shards. Called before
+    // ANY save and before ANY undo/Play snapshot: both must see the whole world.
+    u32 LiveStreamSettle(Scene& scene, Renderer& renderer);
+    // Settles live zones before a scene::SaveSceneToString snapshot that will later be
+    // restored through LoadMode::Replace (the cutscene preview and the movie render).
+    // CaptureSnapshot and SaveSceneToDisk do this inline; these two did not, and a
+    // snapshot taken with a zone streamed out makes that zone's loss PERMANENT.
+    void CaptureSceneSettle(Engine& engine);
 
     // -- Window menu / panel visibility ------------------------------------------
     // Every dockable panel can be shown/hidden from the Window menu (and via its

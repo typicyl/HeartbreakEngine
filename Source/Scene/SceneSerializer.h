@@ -238,6 +238,13 @@ struct SceneData {
     f32 exposure = 1.0f;
     f32 shadowDistance = 150.0f;
     std::string giSource; // cached .hbgi GI volume (rel to Assets)
+    // The scene's PERMANENT pack slot (top-level "packSlot"; see Assets/SlotIds.h).
+    // kNoPackSlot = the file carries none (slot 0 is a VALID slot - Tree=0 in the
+    // owner-spec test - so absence needs a sentinel, not zero). Parsed and re-emitted
+    // so a parse -> save round trip through ANY writer keeps the asset's identity;
+    // dropping it renumbers the asset at the next cook.
+    static constexpr u32 kNoPackSlot = 0xFFFFFFFFu;
+    u32 packSlot = kNoPackSlot;
     rhi::PostSettings post; // HDR post-process stack (defaults = effects on)
     // PER-SCENE DAY/NIGHT OVERRIDE (header keys "timeOfDay"/"dayLengthSeconds"/
     // "dynamicSky"). Optional, and `hasDayNight` is the whole point of it being

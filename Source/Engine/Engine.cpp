@@ -2050,9 +2050,10 @@ int Engine::Run(const EngineConfig& configIn) {
             flowActive_ = true;
             sceneBuilt = true; // UI-only overlay; the gameplay world loads on Play
             if (!studioSplash) { // no splash: go straight to the initial (menu) panel
+                BindMenuWorld(); // 3D menu backdrop, if the project asks for one
                 uiManager_.ShowInitial(scene);
                 gameState_ = GameState::MainMenu;
-                ApplyMenuPost();
+                ApplyMenuPost(); // no-op while the backdrop owns the look
             }
             HBE_INFO("Boot: {} resident UI screen document(s) loaded ({} entities): {}.",
                      uiDocs_.size(), count, names);
@@ -2697,7 +2698,12 @@ int Engine::Run(const EngineConfig& configIn) {
         // Player/character input intent BEFORE physics, which drives the capsule
         // CharacterVirtual (gravity + world collision). Camera-relative movement
         // uses the current view's forward.
-        if (physics.IsRunning())
+        // In the shipped flow, player INTENT only exists while Playing: a 3D main
+        // menu binds a world whose Player entity is resident, physics runs (idle
+        // anim, settling props), and without this gate WASD would walk the player
+        // around behind the menu. The editor keeps its old behaviour (flowActive_
+        // is false there) - play-in-editor characters still move.
+        if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing))
             character::Update(scene, input, dt, renderer.GetCamera().Forward());
         physics.Update(scene, dt);
         // Destruction runs immediately after physics so this frame's contacts are
@@ -2961,8 +2967,25 @@ int Engine::Run(const EngineConfig& configIn) {
             // frame's answer. The editor never locks the cursor - that would trap
             // it away from the panels - so play-in-editor keeps look enabled.
             const bool lookEnabled = !flowActive_ || IsCursorLocked();
-            if (cam::Update(scene, renderer.GetCamera(), cameraState, dt, input, camRay,
-                            renderer.GetCamera().Aspect(), lookEnabled)) {
+            // 3D menu with a NAMED camera: that entity owns the view outright -
+            // cam::Update is skipped so the scene's primary/zone cameras cannot
+            // fight it. Entity forward is local -Z (the engine-wide convention,
+            // see CameraSystem.cpp). With no named camera the normal camera
+            // system runs and the scene's primary camera frames the menu.
+            const bool menuCam = menuWorldBound_ && gameState_ == GameState::MainMenu &&
+                                 menuCamEntity_ != entt::null &&
+                                 scene.Registry().valid(menuCamEntity_);
+            if (menuCam) {
+                const glm::mat4 W = scene.WorldMatrix(menuCamEntity_);
+                const glm::vec3 eye(W[3]);
+                const glm::vec3 fwd = -glm::normalize(glm::vec3(W[2]));
+                renderer.GetCamera().LookAt(eye, eye + fwd);
+                if (const CameraComponent* cc =
+                        scene.Registry().try_get<CameraComponent>(menuCamEntity_))
+                    renderer.GetCamera().SetFovY(cc->fovY);
+                renderer.SetOrbitEnabled(false); // the menu camera owns the view
+            } else if (cam::Update(scene, renderer.GetCamera(), cameraState, dt, input,
+                                   camRay, renderer.GetCamera().Aspect(), lookEnabled)) {
                 renderer.SetOrbitEnabled(false); // the game camera owns the view
             }
         }
@@ -3235,7 +3258,8 @@ void Engine::UpdateTagStreaming(Scene& scene, Renderer& renderer) {
     // the shipping runtime (Loading is not an oversight - see above), plus the explicit
     // test driver. Anything else - MainMenu, Boot, and every editor frame - returns.
     if (!tagStreamTestActive_ && gameState_ != GameState::Playing &&
-        gameState_ != GameState::Loading)
+        gameState_ != GameState::Loading &&
+        !(gameState_ == GameState::MainMenu && menuWorldBound_)) // 3D menu backdrop
         return;
     // And the editor's AUTHORING world never streams at all, whatever gameState_ says.
     // onInit_ is set only by the editor (see its other uses); --tagstreamtest runs
@@ -3960,6 +3984,40 @@ void Engine::AuditScreenActions(Scene& scene) {
     }
 }
 
+void Engine::BindMenuWorld() {
+    menuWorldBound_ = false;
+    menuCamEntity_ = entt::null;
+    if (!scene_ || !renderer_ || !Project::HasActive()) return;
+    const ProjectSettings& s = Project::Active().Settings();
+    if (!s.menuWorld || s.startupScene.empty()) return;
+    const std::filesystem::path assets = Project::Active().AssetsDir();
+    const std::filesystem::path gp = assets / s.startupScene;
+    if (!vfs::Exists(gp) ||
+        !tagStream_.BindLevel(*scene_, *renderer_, gp, assets, s.tags,
+                              stream::BindMode::MenuWorld)) {
+        // Fall back to the classic flat menu - a missing scene must cost the
+        // backdrop, never the menu itself.
+        HBE_WARN("Flow: menuWorld is on but '{}' could not bind; using the flat menu.",
+                 s.startupScene);
+        tagStream_.Reset(scene_);
+        return;
+    }
+    menuWorldBound_ = true;
+    if (!s.menuCamera.empty()) {
+        menuCamEntity_ = scene_->FindByName(s.menuCamera);
+        if (menuCamEntity_ == entt::null ||
+            !scene_->Registry().all_of<CameraComponent>(menuCamEntity_)) {
+            HBE_WARN("Flow: menuCamera '{}' not found (or has no CameraComponent); "
+                     "the scene's primary camera frames the menu instead.",
+                     s.menuCamera);
+            menuCamEntity_ = entt::null;
+        }
+    }
+    HBE_INFO("Flow: menu backdrop bound ('{}'{}).", s.startupScene,
+             menuCamEntity_ != entt::null ? ", menu camera '" + s.menuCamera + "'"
+                                          : ", primary camera");
+}
+
 void Engine::FlowMainMenu() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
     if (!uiManagerMode_) return; // no menu concept without a UI scene
@@ -3996,6 +4054,9 @@ void Engine::FlowMainMenu() {
     cutsceneTime_ = -1.0f;
     if (physics_) physics_->SetRunning(true);
     fadeAlpha_ = 0.0f; // clear any leftover fade curtain from an interrupted load
+    // 3D menu: rebind the AUTHORED backdrop (MenuWorld mode - the teardown above
+    // already captured the gameplay run; this bind writes no world:: state at all).
+    BindMenuWorld();
     uiManager_.ShowInitial(*scene_);
     SetCursorLocked(false);
     gameState_ = GameState::MainMenu;
@@ -4011,6 +4072,16 @@ void Engine::FlowMainMenu() {
 
 void Engine::FlowPlay() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
+    // Leaving a 3D menu: the backdrop is DISPOSABLE. Its bind never entered an
+    // area, so it must not be captured; Reset (no capture) forgets it and
+    // LoadGameplayWorld's Fresh bind sweeps the leftover entities. Clearing the
+    // flag first also restores ApplyMenuPost/streaming/camera to their flat-menu
+    // behaviour if Play fails partway.
+    if (menuWorldBound_) {
+        tagStream_.Reset(scene_);
+        menuWorldBound_ = false;
+        menuCamEntity_ = entt::null;
+    }
 
     // The "Loading" UIPanel (in the persistent UI scene) is the loading screen.
     const bool hasLoading = uiManagerMode_ && uiManager_.Has(*scene_, "Loading");
@@ -4606,6 +4677,11 @@ void Engine::PushCaption(const std::string& text, f32 seconds) {
 
 void Engine::ApplyMenuPost() {
     if (!uiScenePostValid_ || !scene_) return;
+    // A 3D menu renders the STARTUP SCENE, and scene::BindWorld just applied that
+    // scene's authored post/exposure/ambient. Stamping the menu document's post
+    // over it would give the world the UI's look - the exact class of clobber
+    // ApplyEnvironment exists to prevent.
+    if (menuWorldBound_) return;
     // The menu IS the UI scene, so it renders with that scene's authored post.
     // Without this the menu inherited whatever was last stamped into the
     // environment - at boot the PROJECT default, after gameplay the LEVEL's -

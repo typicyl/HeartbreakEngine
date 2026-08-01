@@ -42,6 +42,9 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     // at all, because uiManagerMode_ is set at exactly one site.
     // Save() writes only the new keys, so the first save migrates the file.
     s.bootDocument = j.value("bootDocument", j.value("studioLoadingScene", ""));
+    // 3D main menu (defaults here MUST match ProjectSettings' in-struct defaults).
+    s.menuWorld = j.value("menuWorld", false);
+    s.menuCamera = j.value("menuCamera", "");
     s.uiDocument = j.value("uiDocument", j.value("uiScene", ""));
     // SCREEN LIST. `uiDocuments` (one .hbui per screen) is authoritative when
     // present; otherwise it is SEEDED from the single-document key above, so a
@@ -125,6 +128,22 @@ void ParseSettings(const json& j, ProjectSettings& s) {
             // omits the key silently behaves differently from a freshly created one.
             t.autoShard = jt.value("autoShard", false);
             t.shardCell = jt.value("shardCell", 0.0f);
+            // Associated tags, by NAME. Read with find + is_array rather than
+            // `.value(key, {})`: an ARRAY has no scalar fallback, and the
+            // two-places-default rule is satisfied by construction here - the struct
+            // default is {} and an absent key leaves the freshly constructed {}, so
+            // there is no second default to disagree with. Junk entries are skipped
+            // the way every other list in this parser skips them; tags::Normalize
+            // below then drops self-references and duplicates. A name this project
+            // does not list is deliberately KEPT: validation is a bake-time report,
+            // not a parse-time deletion of authored intent (see Scene/TagShard.cpp).
+            if (const auto ja = jt.find("associates"); ja != jt.end() && ja->is_array()) {
+                for (const json& jn : *ja) {
+                    if (!jn.is_string()) continue;
+                    std::string n = jn.get<std::string>();
+                    if (!n.empty()) t.associates.push_back(std::move(n));
+                }
+            }
             if (!t.name.empty()) s.tags.push_back(std::move(t));
         }
     }
@@ -309,6 +328,8 @@ bool Project::Save() const {
     // New keys only - the legacy uiScene/studioLoadingScene are read on load and
     // dropped on the first save, which is how a project migrates itself.
     j["bootDocument"] = settings_.bootDocument;
+    j["menuWorld"] = settings_.menuWorld;
+    j["menuCamera"] = settings_.menuCamera;
     // Both keys, always. `uiDocuments` is the truth; `uiDocument` is its first
     // entry, emitted so an older reader (or anything still keyed on the old slot)
     // gets the MENU document rather than a silently blank slot.
@@ -354,7 +375,8 @@ bool Project::Save() const {
                            {"priority", t.priority},
                            {"alwaysLoaded", t.alwaysLoaded},
                            {"autoShard", t.autoShard},
-                           {"shardCell", t.shardCell}});
+                           {"shardCell", t.shardCell},
+                           {"associates", t.associates}});
         j["tags"] = std::move(arr);
     }
     j["engine"] = "HeartbreakEngine";
