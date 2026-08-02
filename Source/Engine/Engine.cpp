@@ -1933,6 +1933,16 @@ int Engine::Run(const EngineConfig& configIn) {
     scene::SetupEnvironment(scene, renderer);
     if (studioSplash) PresentBootSplash(0.5f); // refresh: IBL done, log advanced
 
+    // 3D MAIN MENU: bind the world BEHIND THE SPLASH, not when the menu appears.
+    // The splash is already covering a ~second of IBL bake, so the menu set loads
+    // inside time the player is spending anyway and is STANDING when the splash
+    // lifts. Binding later would show an empty menu that pops its geometry in a
+    // frame or two afterwards. Safe here: BindMenuWorld is a no-op unless the
+    // project asks for it, and it falls back to the flat menu rather than a black
+    // screen if the scene will not bind.
+    BindMenuWorld();
+    if (studioSplash && menuWorldBound_) PresentBootSplash(0.75f); // world is up
+
     // THE resident UI layer: open the `.hbui` document holding ALL screens
     // (UIPanel subtrees) ONCE and keep it resident across gameplay scene swaps.
     // Residency is structural now - both Replace sweeps spare
@@ -2050,7 +2060,10 @@ int Engine::Run(const EngineConfig& configIn) {
             flowActive_ = true;
             sceneBuilt = true; // UI-only overlay; the gameplay world loads on Play
             if (!studioSplash) { // no splash: go straight to the initial (menu) panel
-                BindMenuWorld(); // 3D menu backdrop, if the project asks for one
+                // Already bound above, behind the splash - this only runs when there
+                // was no splash to hide it behind. Re-binding would UnloadAll and
+                // rebuild the same world for nothing.
+                if (!menuWorldBound_) BindMenuWorld();
                 uiManager_.ShowInitial(scene);
                 gameState_ = GameState::MainMenu;
                 ApplyMenuPost(); // no-op while the backdrop owns the look
@@ -4013,9 +4026,40 @@ void Engine::BindMenuWorld() {
             menuCamEntity_ = entt::null;
         }
     }
-    HBE_INFO("Flow: menu backdrop bound ('{}'{}).", s.startupScene,
+    // FORCE THE MENU SET RESIDENT. A menu's 3D geometry is not something distance
+    // should decide - the menu camera may sit nowhere near it, and "the set is
+    // missing until you happen to be close" is never what an author means. Forcing
+    // it also pulls in whatever that tag ASSOCIATES (ShardForce::Resident adds the
+    // tag to the association seed set), so a menu set built from several tags works
+    // by authoring one association rather than listing them here.
+    u32 forced = 0;
+    if (!s.menuTag.empty()) {
+        for (u32 i = 0; i < static_cast<u32>(tagStream_.ShardCount()); ++i) {
+            // ShardKey is "<tag>#<index>"; the tag is everything before the '#'.
+            const std::string key = tagStream_.ShardKey(i);
+            const usize hash = key.rfind('#');
+            if (hash != std::string::npos && key.compare(0, hash, s.menuTag) == 0) {
+                tagStream_.SetShardForce(i, stream::ShardForce::Resident);
+                ++forced;
+            }
+        }
+        if (forced == 0) {
+            // Not fatal: an alwaysLoaded menu tag has no shards to force (it is
+            // already resident), and so does a tag whose content lives in another
+            // file. Say so rather than leaving the author wondering.
+            HBE_WARN("Flow: menuTag '{}' matched no streamed shard in '{}'. If that tag "
+                     "is alwaysLoaded it is already resident; otherwise check the tag "
+                     "name and that the scene has been saved since tagging (the shard "
+                     "table is baked on save).",
+                     s.menuTag, s.startupScene);
+        }
+    }
+    HBE_INFO("Flow: menu backdrop bound ('{}'{}{}).", s.startupScene,
              menuCamEntity_ != entt::null ? ", menu camera '" + s.menuCamera + "'"
-                                          : ", primary camera");
+                                          : ", primary camera",
+             forced ? ", " + std::to_string(forced) + " shard(s) of menuTag '" +
+                          s.menuTag + "' forced resident"
+                    : "");
 }
 
 void Engine::FlowMainMenu() {
@@ -4056,7 +4100,14 @@ void Engine::FlowMainMenu() {
     fadeAlpha_ = 0.0f; // clear any leftover fade curtain from an interrupted load
     // 3D menu: rebind the AUTHORED backdrop (MenuWorld mode - the teardown above
     // already captured the gameplay run; this bind writes no world:: state at all).
-    BindMenuWorld();
+    //
+    // ONLY WHEN NOTHING IS BOUND. Two paths reach here: quit-to-menu, where the
+    // sweep above just destroyed the world and a rebind is the point; and
+    // FlowAfterBoot, where the splash ALREADY bound it. Rebinding at boot would
+    // UnloadAll and rebuild the exact world the splash spent its time loading -
+    // undoing the load-behind-the-splash this feature exists for. FlowPlay clears
+    // the flag, so the quit-to-menu path still binds.
+    if (!menuWorldBound_) BindMenuWorld();
     uiManager_.ShowInitial(*scene_);
     SetCursorLocked(false);
     gameState_ = GameState::MainMenu;
@@ -4078,6 +4129,12 @@ void Engine::FlowPlay() {
     // flag first also restores ApplyMenuPost/streaming/camera to their flat-menu
     // behaviour if Play fails partway.
     if (menuWorldBound_) {
+        // Drop the menuTag force EXPLICITLY before forgetting the binding. Reset
+        // frees the shard vector the forces are indexed by, so this is belt and
+        // braces - but a force that survived into the gameplay bind would pin that
+        // tag resident for the whole run, and the symptom (one zone that never
+        // streams out) looks nothing like its cause.
+        tagStream_.ClearShardForces();
         tagStream_.Reset(scene_);
         menuWorldBound_ = false;
         menuCamEntity_ = entt::null;

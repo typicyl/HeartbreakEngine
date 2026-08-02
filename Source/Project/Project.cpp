@@ -45,6 +45,7 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     // 3D main menu (defaults here MUST match ProjectSettings' in-struct defaults).
     s.menuWorld = j.value("menuWorld", false);
     s.menuCamera = j.value("menuCamera", "");
+    s.menuTag = j.value("menuTag", "");
     s.uiDocument = j.value("uiDocument", j.value("uiScene", ""));
     // SCREEN LIST. `uiDocuments` (one .hbui per screen) is authoritative when
     // present; otherwise it is SEEDED from the single-document key above, so a
@@ -330,6 +331,7 @@ bool Project::Save() const {
     j["bootDocument"] = settings_.bootDocument;
     j["menuWorld"] = settings_.menuWorld;
     j["menuCamera"] = settings_.menuCamera;
+    j["menuTag"] = settings_.menuTag;
     // Both keys, always. `uiDocuments` is the truth; `uiDocument` is its first
     // entry, emitted so an older reader (or anything still keyed on the old slot)
     // gets the MENU document rather than a silently blank slot.

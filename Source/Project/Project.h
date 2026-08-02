@@ -266,10 +266,23 @@ struct ProjectSettings {
     // menu camera, and NOTHING touches world:: persistence - the menu always shows
     // the AUTHORED world and leaves no trace in a save (no visit bump, no captures).
     // menuCamera names the CameraComponent entity that frames the menu; empty = the
-    // scene's primary camera. Both defaults MUST match the .value() fallbacks in
-    // Project.cpp (the two-places-default rule).
+    // scene's primary camera.
+    //
+    // menuTag names the TAG carrying the menu's 3D set. Its shards are FORCED
+    // RESIDENT for as long as the menu is up (stream::ShardForce::Resident), so the
+    // menu geometry is standing no matter where the menu camera sits - a menu set is
+    // not something distance should decide. The bind happens BEHIND THE STUDIO
+    // SPLASH, so the splash is covering a real load and the set is already there when
+    // it lifts. Empty = no forcing: only untagged + alwaysLoaded content is resident,
+    // which is the whole scene for a project that has not tagged anything yet.
+    // Leaving the menu (FlowPlay) clears the force and normal streaming resumes -
+    // there is no scene swap at any point.
+    //
+    // All three defaults MUST match the .value() fallbacks in Project.cpp (the
+    // two-places-default rule).
     bool menuWorld = false;
     std::string menuCamera;
+    std::string menuTag;
     // THE game UI: ONE `.hbui` DOCUMENT PER SCREEN (MainMenu / Settings / Loading
     // / HUD / Pause ...), each holding that screen's UIPanel subtree. EVERY entry
     // is opened at boot and stays RESIDENT for the process lifetime - nothing here

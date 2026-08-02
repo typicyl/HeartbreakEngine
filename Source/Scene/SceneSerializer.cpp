@@ -407,6 +407,12 @@ SceneData HeaderOf(const SceneEnvironment& env) {
     h.exposure = env.exposure;
     h.shadowDistance = env.shadowDistance;
     h.giSource = env.giSource;
+    // Slot identity survives file -> live scene -> save. Without this hop a save to
+    // a NEW path (Save As, a migration, a headless tool) silently strips the asset's
+    // permanent pack slot, renumbering it at the next cook. SaveScene also carries
+    // the key off the file it overwrites, but that only covers saves over an
+    // existing file - this is the path that covers the rest.
+    h.packSlot = env.packSlot;
     h.post = env.post;
     h.hasDayNight = env.dayNightAuthored != 0;
     h.timeOfDay = env.timeOfDay;
@@ -2584,6 +2590,12 @@ void ApplyEnvironment(Scene& scene, Renderer& renderer, const SceneData& data) {
     env.ambientIntensity = data.ambientIntensity;
     env.exposure = data.exposure;
     env.shadowDistance = data.shadowDistance;
+    // Packaging identity, not rendering state - it rides the environment because that
+    // is the one thing that survives from the file into the live scene, so a later
+    // save can re-emit it (HeaderOf). Set HERE, above the GI fast-path `return`
+    // below: putting it after that would skip it whenever the same volume is already
+    // bound, which is the common case on undo/redo and Stop-Play.
+    env.packSlot = data.packSlot;
     env.post = data.post;
     // The optional per-scene day/night override. Applied here so it lands through
     // the SAME one writer as the rest of the header - the clock is lighting, and a

@@ -15831,6 +15831,20 @@ void Editor::DrawSceneManager(Engine& engine) {
                 "it is a no-trace bind: no area visit, no state captures - the menu\n"
                 "always shows the AUTHORED world and never touches a save.");
         if (project.Settings().menuWorld) {
+            char tagBuf[128];
+            std::snprintf(tagBuf, sizeof(tagBuf), "%s",
+                          project.Settings().menuTag.c_str());
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::InputText("Menu Tag", tagBuf, sizeof(tagBuf)))
+                project.Settings().menuTag = tagBuf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) project.Save();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "TAG carrying the menu's 3D set. Its shards are forced RESIDENT\n"
+                    "while the menu is up, so the set is there regardless of where the\n"
+                    "menu camera sits, and it loads BEHIND THE STUDIO SPLASH.\n"
+                    "Empty = only untagged / alwaysLoaded content is resident.\n"
+                    "The shard table is baked on SAVE - tag, then save the scene.");
             char camBuf[128];
             std::snprintf(camBuf, sizeof(camBuf), "%s",
                           project.Settings().menuCamera.c_str());
