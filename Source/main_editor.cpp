@@ -111,6 +111,10 @@ int main(int argc, char** argv) {
 #endif
     // --test-seamweld: run the modular-rig seam-weld bit-identity proof (headless,
     // no GPU/window) and exit. Used by CI / the build discipline.
+    // --collab-verbose: dump the ICE negotiation into the log. Scanned BEFORE the
+    // command loop because the logger initialises once, on the first transport created.
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--collab-verbose") == 0) hbe::collab::SetVerboseLogging(true);
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--test-seamweld") == 0) {
             const bool ok = hbe::weld::SelfTest();
@@ -499,6 +503,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-projectsync") == 0) {
             const bool ok = hbe::collab::ProjectSyncSelfTest();
             std::printf("projectsync %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-staleinvite [seconds]: the delay a HUMAN introduces carrying blobs
+        // between two machines. Default 60s; the fast suite never waits.
+        if (std::strcmp(argv[i], "--test-staleinvite") == 0) {
+            int secs = 60;
+            if (i + 1 < argc) secs = std::atoi(argv[i + 1]) > 0 ? std::atoi(argv[i + 1]) : 60;
+            const bool ok = hbe::collab::WebRtcStaleInviteTest(secs);
+            std::puts(ok ? "staleinvite PASS" : "staleinvite FAIL");
             return ok ? 0 : 1;
         }
         if (std::strcmp(argv[i], "--test-webrtc") == 0) {

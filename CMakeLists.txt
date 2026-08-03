@@ -149,13 +149,14 @@ set(HBE_COLLAB_SOURCES
     "Source/Collab/TcpTransport.cpp"
     "Source/Collab/Identity.cpp"
     "Source/Collab/SecureChannel.cpp"
+    "Source/Collab/ProjectSync.cpp"
+    "Source/Collab/ProjectFetch.cpp"
     "Source/Collab/CollabSelfTest.cpp")
 
 # Peer-to-peer transport. EDITOR ONLY - see hbe_configure_engine_lib. Kept out of
 # HBE_COLLAB_SOURCES on purpose so the shipped runtime never links libdatachannel.
 set(HBE_COLLAB_P2P_SOURCES
     "Source/Collab/Signaling.cpp"
-    "Source/Collab/ProjectSync.cpp"
     "Source/Collab/WebRtcTransport.cpp"
     "Source/Editor/CollabSession.cpp"
     "Source/Editor/CollabPanels.cpp")
@@ -163,13 +164,34 @@ set(HBE_COLLAB_P2P_SOURCES
 # Hub / launcher: engine version, update manifest, HTTPS fetch, safe zip extraction
 # and the staged-swap installer. Core/ + Windows only - the Hub must be able to run in
 # order to REPAIR a broken engine install, so it must not need one to start.
+# THE HUB IS WHERE SOMEONE GETS EVERYTHING, so it must be able to JOIN a session and
+# pull a project down BEFORE any engine or project exists. Requiring them to install the
+# engine, invent an empty project and open it just to reach the download defeats the
+# point of having a launcher at all.
+#
+# This is only possible because Source/Collab/ was kept free of engine includes: the
+# client half - identity, the secure channel, ICE, the protocol, the file transfer -
+# links here with no scene, no renderer and no entt. The SERVER half and the journal
+# stay out; the Hub joins, it does not host.
+set(HBE_HUB_COLLAB_SOURCES
+    "Source/Collab/Protocol.cpp"
+    "Source/Collab/Identity.cpp"
+    "Source/Collab/SecureChannel.cpp"
+    "Source/Collab/Signaling.cpp"
+    "Source/Collab/CollabClient.cpp"
+    "Source/Collab/WebRtcTransport.cpp"
+    "Source/Collab/ProjectSync.cpp"
+    "Source/Collab/ProjectFetch.cpp"
+    "Source/Hub/HubJoin.cpp")
+
 set(HBE_HUB_SOURCES
     "Source/Hub/UpdateCheck.cpp"
     "Source/Hub/ZipArchive.cpp"
     "Source/Hub/Updater.cpp"
     "Source/Hub/HubConfig.cpp"
     "Source/Hub/ProjectCatalog.cpp"
-    "Source/Hub/HubSelfTest.cpp")
+    "Source/Hub/HubSelfTest.cpp"
+    ${HBE_HUB_COLLAB_SOURCES})
 
 # Editor-only sources (added only to hbe_editor).
 set(HBE_EDITOR_SOURCES
@@ -399,7 +421,11 @@ target_link_libraries(hbe_hubcore PRIVATE nlohmann_json::nlohmann_json zlibstati
 target_include_directories(hbe_hubcore PRIVATE
     "${assimp_SOURCE_DIR}/contrib/zlib" "${assimp_BINARY_DIR}/contrib/zlib")
 # All in-box Windows libs: WinHTTP (https), BCrypt (SHA-256). No third-party runtime.
-target_link_libraries(hbe_hubcore PRIVATE winhttp bcrypt)
+target_compile_definitions(hbe_hubcore PRIVATE HBE_COLLAB_JOIN_ONLY=1)
+target_link_libraries(hbe_hubcore PRIVATE winhttp bcrypt ws2_32)
+# The same peer-to-peer stack the editor uses - see HBE_HUB_COLLAB_SOURCES.
+target_link_libraries(hbe_hubcore PRIVATE mbedtls mbedx509 mbedcrypto)
+target_link_libraries(hbe_hubcore PRIVATE LibDataChannel::LibDataChannelStatic)
 target_compile_definitions(hbe_hubcore PUBLIC
     HBE_VERSION_MAJOR=1 HBE_VERSION_MINOR=0 HBE_VERSION_PATCH=0)
 

@@ -884,12 +884,29 @@ void Editor::DrawWindowMenu() {
         // appending to the enum needs no edit here - only a decision.)
         static const Panel kArtPanels[] = {Panel_Viewport, Panel_ArtEditor,
                                            Panel_Hierarchy, Panel_Inspector,
-                                           Panel_Scenes, Panel_Assets};
+                                           Panel_Scenes, Panel_Assets,
+                                           // COLLABORATION IS FOR ARTISTS TOO. The art
+                                           // build is the one where two people painting
+                                           // the same surface is the actual workflow -
+                                           // paint operations are deliberately NOT
+                                           // lock-gated for exactly that reason (see
+                                           // CollabServer::OnPaintOp). Leaving these out
+                                           // of this list compiled the whole feature into
+                                           // HeartbreakArtEditor.exe and gave it no way
+                                           // to be opened.
+                                           Panel_Collaborate, Panel_People, Panel_Review};
         for (const Panel p : kArtPanels) ImGui::MenuItem(kNames[p], nullptr, &panelOpen_[p]);
         ImGui::Separator();
         if (ImGui::MenuItem("Reset Layout")) {
             for (bool& b : panelOpen_) b = false;
             for (const Panel p : kArtPanels) panelOpen_[p] = true;
+            // ...but LISTED is not the same as OPEN BY DEFAULT. kArtPanels is now both
+            // "what the menu offers" and "what a reset restores", and a reset that
+            // reopened the collaboration panels would put three windows an artist did
+            // not ask for into a layout they just asked to have cleaned up.
+            panelOpen_[Panel_Collaborate] = false;
+            panelOpen_[Panel_People] = false;
+            panelOpen_[Panel_Review] = false;
             layoutBuilt_ = false;
         }
         ImGui::EndMenu();
@@ -3094,6 +3111,10 @@ void Editor::CommitStroke(entt::entity e, PaintComponent& pc, paint::Stroke&& s)
     pc.strokes.push_back(std::move(s));
     paintStrokeOrder_.push_back(e);
     paintStrokeRedo_.clear();
+    // THE one place a finished stroke exists - the brush release, Fill and Clear all
+    // arrive here - so it is the only place that needs to know about collaboration.
+    // Sent from the stored copy, not from `s`, which was just moved from.
+    collab_.SendStroke(pc.source, pc.strokes.back());
 }
 
 // Stroke-level undo: pop the last committed stroke (across all painted canvases)
@@ -4406,6 +4427,15 @@ void Editor::UpdateArtTool(Engine& engine) {
             curStroke_ = paint::Stroke{};
             curStroke_.type = paint::StrokeType::Path;
             curStroke_.layer = pc->activeLayer;
+            // ...AND THE STABLE ID, which a painted stroke was never given. Only Fill and
+            // Clear set it, so every brush stroke went into the database with layerId 0
+            // and fell back to the legacy INDEX - the exact case PaintLayer::id exists to
+            // prevent, because one layer reorder then repoints every stroke at the wrong
+            // layer. It also has to be right before a stroke can be sent to anyone: the
+            // wire carries the id, not the index.
+            if (pc->activeLayer >= 0 &&
+                static_cast<usize>(pc->activeLayer) < pc->layers.size())
+                curStroke_.layerId = pc->layers[static_cast<usize>(pc->activeLayer)].id;
             curStroke_.projection = pc->projection; // mesh-uv / box / 3D projection
             curStroke_.brush = brushDef_;
             curStroke_.color = brushColor_;

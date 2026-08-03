@@ -40,6 +40,8 @@ struct ClientCallbacks {
     std::function<void(const MsgPeerJoined&)> onPeerJoined;
     std::function<void(const MsgPeerLeft&)> onPeerLeft;
     // The host's file list, in reply to RequestProject().
+    // An entity appeared or disappeared, in server order.
+    std::function<void(const MsgEntityLived&)> onLived;
     std::function<void(const MsgSyncManifest&)> onManifest;
     // Bytes of a file we asked for. In order, one file at a time.
     std::function<void(const MsgFileChunk&)> onFileChunk;
@@ -75,6 +77,9 @@ public:
 
     // --- getting the project from someone who has it -------------------------
     // Asks for the file list. The reply arrives on onManifest.
+    // Tell everyone an entity was created or destroyed here.
+    void SendLife(const EntityKey& k, bool destroy, const std::string& name);
+
     void RequestProject();
     // Asks for one file. Chunks arrive on onFileChunk until `last`. Request them ONE AT
     // A TIME: the server serves one per peer and would otherwise just forget the first.

@@ -35,8 +35,10 @@
 #include "Collab/CollabServer.h"
 #include "Collab/Identity.h"
 #include "Collab/Journal.h"
+#include "Collab/ProjectFetch.h"
 #include "Collab/ProjectSync.h"
 #include "Collab/WebRtcTransport.h"
+#include "Scene/PaintSystem.h"
 #include "Scene/SceneJournal.h"
 
 #include <entt/entt.hpp>
@@ -45,6 +47,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -92,6 +95,9 @@ public:
     // host candidates alone and needs no internet.
     void SetIceConfig(const collab::IceConfig& cfg) { ice_ = cfg; }
     std::string MyFingerprint() const;
+    // The full public key, for a host to pre-authorise this machine before it has ever
+    // connected. A fingerprint cannot do that job - see Identity.h.
+    const collab::PublicKey& MyKey() const { return id_.Public(); }
 
     // --- people (the host's allowlist) ------------------------------------
     void SetProjectRoot(const std::filesystem::path& root);
@@ -117,6 +123,10 @@ public:
     bool CreateInvitation();
     const std::string& Invitation() const { return invitation_; }
     collab::LinkState InvitationState() const;
+    // The guest's own link, for the same reason: "connecting" with no detail is not a
+    // diagnosis. Closed when there is no session.
+    collab::LinkState GuestLinkState() const;
+    const char* GuestLinkError() const;
     bool AcceptReply(const std::string& replyText);
     usize PeerCount() const;
 
@@ -159,6 +169,17 @@ public:
     // Whether the author may edit this entity right now. True when offline - a session
     // that is not running must never make the editor read-only.
     bool CanEdit(u64 guid) const;
+    // --- painting ---------------------------------------------------------
+    //
+    // Paint has its OWN channel and is deliberately NOT lock-gated: two artists on one
+    // canvas is the feature, not a conflict. It also cannot ride the component deltas -
+    // PaintComponent is excluded from that table because it needs staged assets.
+    //
+    // Call when a stroke is COMMITTED locally. `source` is the canvas's .hbpaint path.
+    void SendStroke(const std::string& source, const paint::Stroke& s);
+    // Strokes from other artists, drained by LiveSync and applied to their canvas.
+    usize StrokesAppliedThisFrame() const { return strokesApplied_; }
+
     // Changes received from other people and applied to the scene this frame.
     usize AppliedThisFrame() const { return appliedThisFrame_; }
 
@@ -169,20 +190,29 @@ public:
     // to it; that assumption has to be established somehow, and "email them a zip first"
     // is the step where the two copies silently diverge before anyone has edited
     // anything.
-    enum class DownloadPhase : u8 { Idle, AskingForList, Downloading, Done, Failed };
-    static const char* DownloadPhaseName(DownloadPhase p);
+    // The download machine itself lives in Collab/ProjectFetch so the Hub can run it
+    // with no engine linked. These are the editor's view of it.
+    using DownloadPhase = collab::ProjectFetch::Phase;
+    static const char* DownloadPhaseName(DownloadPhase p) {
+        return collab::ProjectFetch::PhaseName(p);
+    }
 
     // HOST: offer the current project. Walks and hashes it once - not per frame.
     bool ShareProject();
     usize SharedFileCount() const { return shared_.files.size(); }
+    // Peers who asked for the project and got an empty answer. Non-zero means someone is
+    // sitting in front of a screen that says the copy finished, with no files in it.
+    usize AsksWithNothingToSend() const {
+        return server_ ? server_->AsksWithNothingToSend() : 0;
+    }
 
     // GUEST: pull everything the host has that we do not, into `into`.
     bool StartDownload(const std::filesystem::path& into);
-    DownloadPhase Download() const { return phase_; }
-    usize DownloadFilesDone() const { return rx_.FilesDone(); }
-    usize DownloadFilesTotal() const { return wanted_.size(); }
-    u64 DownloadBytes() const { return rx_.BytesReceived(); }
-    const std::string& DownloadError() const { return downloadErr_; }
+    DownloadPhase Download() const { return fetch_.State(); }
+    usize DownloadFilesDone() const { return fetch_.FilesDone(); }
+    usize DownloadFilesTotal() const { return fetch_.FilesTotal(); }
+    u64 DownloadBytes() const { return fetch_.BytesReceived(); }
+    const std::string& DownloadError() const { return fetch_.Error(); }
     const std::filesystem::path& DownloadRoot() const { return downloadRoot_; }
 
     // --- history ----------------------------------------------------------
@@ -247,6 +277,8 @@ private:
     std::unique_ptr<collab::WebRtcServerTransport> host_;
     std::unique_ptr<collab::CollabServer> server_;
     collab::ConnId invite_ = 0;
+    // Last reported link state, so a CHANGE is announced once rather than every frame.
+    collab::LinkState lastInviteState_ = collab::LinkState::Gathering;
     std::string invitation_;
 
     std::unique_ptr<collab::WebRtcClientTransport> guest_;
@@ -266,6 +298,16 @@ private:
 
     // --- live-sync state ---
     void QueueRemote(const collab::MsgDeltaApplied& d);
+    void QueueLife(const collab::MsgEntityLived& l);
+    std::vector<collab::MsgEntityLived> remoteLife_;
+    void QueuePaint(const collab::MsgPaintCommitted& p);
+    std::vector<collab::MsgPaintCommitted> remotePaint_;
+    usize strokesApplied_ = 0;
+    // Every guid we have seen in this scene. Diffed each frame: a guid that appears is a
+    // creation, one that vanishes is a deletion. Cheap - it reads one component per
+    // entity and serializes nothing.
+    std::unordered_map<u64, char> knownGuids_;
+    bool guidsSeeded_ = false;
     void WireCallbacks();
     u64 lockedGuid_ = 0;
     u64 lastLockTryMs_ = 0;                              // the entity we hold, 0 = none
@@ -278,13 +320,9 @@ private:
     void OnManifest(const collab::MsgSyncManifest& m);
     void OnFileChunk(const collab::MsgFileChunk& c);
     void RequestNextFile();
-    DownloadPhase phase_ = DownloadPhase::Idle;
-    collab::MsgSyncManifest shared_;             // host: what we offer
-    collab::SyncReceiver rx_;                    // guest: where it lands
-    std::vector<collab::SyncFile> wanted_;       // guest: still to fetch
-    usize nextWanted_ = 0;
+    collab::MsgSyncManifest shared_;   // host: what we offer
+    collab::ProjectFetch fetch_;       // guest: the shared download machine
     std::filesystem::path downloadRoot_;
-    std::string downloadErr_;
 
     bool hasReview_ = false;
     collab::MergePlan review_;

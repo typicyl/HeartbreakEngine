@@ -620,6 +620,87 @@ bool TcpTransportSelfTest() {
         Check(ssrv.PeerCount() == 1,
               "ONLY the allowed peer may become a session on the server");
 
+        // --- IDENTITY IS THE KEY, NOT THE NAME --------------------------------
+        //
+        // The display name in MsgHello is a string the peer chose. While the server
+        // keyed UserIds on it, anyone who typed a colleague's name while that colleague
+        // was offline INHERITED their UserId - and with it every lock the reclaim path
+        // hands back and every future commit attributed to them. On an authenticated
+        // transport the server now keys on the proven key, so the name is a label.
+        {
+            const collab::UserId anaUser = G.User();
+            Check(anaUser != 0, "the allowed peer should have a UserId");
+
+            // The stranger is invited too, so it gets in - but it MUST NOT become 'ana'
+            // by saying so.
+            allow.Add(strangerId.Public(), "someone else");
+            allow.Save(dir / "authorized.txt");
+
+            TcpServerTransport sec2;
+            sec2.EnableSecurity(hostId,
+                                [&allow](const PublicKey& k) { return allow.Allows(k); });
+            Check(sec2.Listen(0), "a second secured server should listen");
+            CollabServer srv2(&sec2);
+            TcpClientTransport c1, c2;
+            c1.EnableSecurity(peerId, expectHost);
+            c2.EnableSecurity(strangerId, expectHost);
+            Check(c1.Connect("127.0.0.1", sec2.BoundPort()), "first peer connects");
+            Check(c2.Connect("127.0.0.1", sec2.BoundPort()), "impostor connects");
+            ClientCallbacks n2;
+            CollabClient C1(&c1, n2), C2(&c2, n2);
+            u64 t2 = 9000;
+            const auto tick2 = [&]() {
+                for (int i = 0; i < 8; ++i) {
+                    t2 += 5;
+                    C1.Pump(t2);
+                    C2.Pump(t2);
+                    c1.Poll();
+                    c2.Poll();
+                    sec2.Poll();
+                    srv2.Tick(t2);
+                    sec2.Poll();
+                    c1.Poll();
+                    c2.Poll();
+                    C1.Pump(t2);
+                    C2.Pump(t2);
+                }
+            };
+            // BOTH claim the same display name. Different keys, so they must be
+            // different people.
+            C1.Hello("ana");
+            C2.Hello("ana");
+            tick2();
+            Check(C1.Ready() && C2.Ready(), "both authenticated peers should be welcomed");
+            Check(C1.User() != C2.User(),
+                  "TWO DIFFERENT KEYS CLAIMING ONE NAME MUST BE TWO PEOPLE - a name is a "
+                  "label, and letting it decide identity is how someone inherits a "
+                  "colleague's locks by typing their name");
+
+            // ...and the same KEY under a DIFFERENT name is the same person coming back.
+            const collab::UserId wasC1 = C1.User();
+            c1.Disconnect();
+            tick2();
+            TcpClientTransport c3;
+            c3.EnableSecurity(peerId, expectHost);
+            Check(c3.Connect("127.0.0.1", sec2.BoundPort()), "the same person reconnects");
+            CollabClient C3(&c3, n2);
+            C3.Hello("a completely different name");
+            for (int i = 0; i < 8; ++i) {
+                t2 += 5;
+                C3.Pump(t2);
+                c3.Poll();
+                sec2.Poll();
+                srv2.Tick(t2);
+                sec2.Poll();
+                c3.Poll();
+                C3.Pump(t2);
+            }
+            Check(C3.Ready(), "the returning peer should be welcomed");
+            Check(C3.User() == wasC1,
+                  "THE SAME KEY IS THE SAME PERSON however they label themselves - "
+                  "otherwise a rename loses every lock and orphans their attribution");
+        }
+
         // The refused sockets must also not have been reported as peers arriving and
         // then leaving - a phantom join/leave desyncs every user list in the editor.
         stick(10);

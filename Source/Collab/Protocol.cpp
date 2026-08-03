@@ -46,6 +46,8 @@ const char* MsgTypeName(MsgType t) {
         case MsgType::SyncManifest: return "SyncManifest";
         case MsgType::FileRequest: return "FileRequest";
         case MsgType::FileChunk: return "FileChunk";
+        case MsgType::EntityLife: return "EntityLife";
+        case MsgType::EntityLived: return "EntityLived";
         case MsgType::Count: break;
     }
     return "?";
@@ -156,6 +158,54 @@ void EncodeDeltaRejected(std::vector<u8>& out, const MsgDeltaRejected& m) {
     w.Pod(m.currentRevision);
     Emit(out, MsgType::DeltaRejected, w);
 }
+void EncodeEntityLife(std::vector<u8>& out, const MsgEntityLife& m) {
+    BinaryWriter w;
+    w.Pod(m.key.doc);
+    w.Pod(m.key.guid);
+    w.Pod(static_cast<u8>(m.destroy ? 1 : 0));
+    w.Str(m.name);
+    Emit(out, MsgType::EntityLife, w);
+}
+
+void EncodeEntityLived(std::vector<u8>& out, const MsgEntityLived& m) {
+    BinaryWriter w;
+    w.Pod(m.key.doc);
+    w.Pod(m.key.guid);
+    w.Pod(static_cast<u8>(m.destroy ? 1 : 0));
+    w.Str(m.name);
+    w.Pod(m.seq);
+    w.Pod(m.author);
+    Emit(out, MsgType::EntityLived, w);
+}
+
+std::optional<MsgEntityLife> DecodeEntityLife(const u8* p, usize n) {
+    BinaryReader r(p, n);
+    MsgEntityLife m;
+    r.Pod(m.key.doc);
+    r.Pod(m.key.guid);
+    u8 d = 0;
+    r.Pod(d);
+    r.Str(m.name);
+    if (!r.Ok()) return std::nullopt;
+    m.destroy = d != 0;
+    return m;
+}
+
+std::optional<MsgEntityLived> DecodeEntityLived(const u8* p, usize n) {
+    BinaryReader r(p, n);
+    MsgEntityLived m;
+    r.Pod(m.key.doc);
+    r.Pod(m.key.guid);
+    u8 d = 0;
+    r.Pod(d);
+    r.Str(m.name);
+    r.Pod(m.seq);
+    r.Pod(m.author);
+    if (!r.Ok()) return std::nullopt;
+    m.destroy = d != 0;
+    return m;
+}
+
 // --- project transfer ---------------------------------------------------------
 
 void EncodeSyncRequest(std::vector<u8>& out, const MsgSyncRequest& m) {

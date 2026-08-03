@@ -11,6 +11,7 @@ const std::vector<MsgPaintCommitted> kNoHistory;
 
 void CollabServer::Tick(u64 nowMs) {
     if (!transport_) return;
+    lastTickMs_ = nowMs;
 
     std::vector<ConnId> fresh;
     transport_->PollNewConnections(fresh);
@@ -130,6 +131,9 @@ void CollabServer::HandleFrame(Peer& p, const Frame& f, u64 nowMs) {
         case MsgType::PaintPreview:
             if (const auto m = DecodePaintPreview(f.payload, f.size)) OnPaintPreview(p, *m);
             break;
+        case MsgType::EntityLife:
+            if (const auto m = DecodeEntityLife(f.payload, f.size)) OnEntityLife(p, *m);
+            break;
         case MsgType::SyncRequest:
             if (DecodeSyncRequest(f.payload, f.size)) OnSyncRequest(p);
             break;
@@ -156,6 +160,39 @@ void CollabServer::OnHello(Peer& p, const MsgHello& m, u64 nowMs) {
     // reporting CanEdit()==true while its edits were refused. Two people who happen to
     // pick the same display name is not exotic - "artist" and an unconfigured default
     // are the common cases.
+    // IDENTITY IS THE PROVEN KEY WHEN THERE IS ONE.
+    //
+    // The name-based path below is what a peer gets on a transport that cannot
+    // authenticate (the loopback, an unsecured LAN socket). On an authenticated
+    // transport it is not merely inferior, it is wrong: MsgHello.displayName is a string
+    // the peer chose, so anyone who typed a colleague's name while that colleague was
+    // offline INHERITED their UserId, and with it every lock ReclaimForUser hands back
+    // and every future commit attributed to them. The transport is the only party that
+    // watched a signature over a fresh nonce, so it is the only party that knows.
+    std::array<u8, 64> proven{};
+    if (transport_ && transport_->PeerKey(p.conn, proven)) {
+        p.key = proven;
+        p.keyed = true;
+        const auto byKey = keyUsers_.find(proven);
+        bool keyOnline = false;
+        if (byKey != keyUsers_.end()) {
+            for (const auto& [c2, p2] : peers_)
+                if (p2.user == byKey->second && p2.helloed && &p2 != &p) {
+                    keyOnline = true;
+                    break;
+                }
+        }
+        // A second LIVE connection from the same key is a second seat, not a resume -
+        // otherwise one person on two machines would steal their own locks back and
+        // forth. A key that is NOT online is a genuine reconnect.
+        if (byKey != keyUsers_.end() && !keyOnline) p.user = byKey->second;
+        else p.user = nextUser_++;
+        keyUsers_[proven] = p.user;
+        p.session = nextSession_++;
+        FinishHello(p);
+        return;
+    }
+
     const auto known = knownUsers_.find(p.name);
     bool nameOnline = false;
     if (known != knownUsers_.end()) {
@@ -174,6 +211,13 @@ void CollabServer::OnHello(Peer& p, const MsgHello& m, u64 nowMs) {
     }
     knownUsers_[p.name] = p.user;
     p.session = nextSession_++;
+    FinishHello(p);
+}
+
+// The half of OnHello that is the same however identity was decided: welcome, reclaim
+// locks, announce. Shared so the key path and the name path cannot drift.
+void CollabServer::FinishHello(Peer& p) {
+    const u64 nowMs = lastTickMs_;
 
     if (writer_ == 0) writer_ = p.user;
 
@@ -258,7 +302,10 @@ const SyncEntry* CollabServer::SharedEntry(const std::string& path) const {
 void CollabServer::OnSyncRequest(Peer& p) {
     if (p.user == 0) return; // not authenticated as a session yet
     // An empty manifest is a real answer: "I am sharing nothing." The alternative,
-    // silence, is indistinguishable from a dropped message.
+    // silence, is indistinguishable from a dropped message. But COUNT it - the asker
+    // treats this as a finished copy and goes quiet, so without this nobody on either
+    // machine ever learns that a transfer completed with no files in it.
+    if (!Sharing()) ++asksWithNothingToSend_;
     std::vector<u8> bytes;
     EncodeSyncManifest(bytes, shareManifest_);
     SendTo(p, bytes);
@@ -320,6 +367,22 @@ void CollabServer::PumpFileSends() {
     }
 }
 
+void CollabServer::LocalPaint(CanvasId canvas, u32 layerId,
+                              const std::vector<u8>& strokeBlob) {
+    MsgPaintCommitted c;
+    c.canvas = canvas;
+    c.layerId = layerId;
+    c.strokeBlob = strokeBlob;
+    c.seq = ++seq_;
+    c.author = kLocalUser;
+    paintLog_[canvas].push_back(c);
+    std::vector<u8> bytes;
+    EncodePaintCommitted(bytes, c);
+    // To the guests. The host already has this stroke on its own canvas; handing it back
+    // would stamp it twice.
+    Broadcast(bytes);
+}
+
 // --- the host's own edits -----------------------------------------------------
 
 bool CollabServer::LocalLock(const EntityKey& k, u64 nowMs) {
@@ -355,6 +418,42 @@ bool CollabServer::LocalDelta(const EntityKey& k, const std::string& componentKe
     EncodeDeltaApplied(bytes, a);
     // To the guests only - the host already has this change in its own registry, and
     // handing it back would make the editor re-apply what the author is still dragging.
+    Broadcast(bytes);
+    return true;
+}
+
+void CollabServer::OnEntityLife(Peer& p, const MsgEntityLife& m) {
+    if (p.user == 0) return;
+    // DESTROY NEEDS THE LOCK. Creating does not - there is no entity to hold yet, and
+    // requiring a lock for it would mean asking permission for something nobody else
+    // knows about. Deleting is the opposite: an object somebody else is holding must not
+    // vanish under them.
+    if (m.destroy && !locks_.HoldsLock(m.key, p.user, p.session)) return;
+    if (m.destroy) state_.erase(m.key);
+
+    MsgEntityLived a;
+    a.key = m.key;
+    a.destroy = m.destroy;
+    a.name = m.name;
+    a.seq = ++seq_;
+    a.author = p.user;
+    std::vector<u8> bytes;
+    EncodeEntityLived(bytes, a);
+    Broadcast(bytes);
+    if (onLived) onLived(a);
+}
+
+bool CollabServer::LocalLife(const EntityKey& k, bool destroy, const std::string& name) {
+    if (destroy && !locks_.HoldsLock(k, kLocalUser, kLocalSession)) return false;
+    if (destroy) state_.erase(k);
+    MsgEntityLived a;
+    a.key = k;
+    a.destroy = destroy;
+    a.name = name;
+    a.seq = ++seq_;
+    a.author = kLocalUser;
+    std::vector<u8> bytes;
+    EncodeEntityLived(bytes, a);
     Broadcast(bytes);
     return true;
 }
@@ -430,6 +529,8 @@ void CollabServer::OnPaintOp(Peer& p, const MsgPaintOp& m) {
     std::vector<u8> bytes;
     EncodePaintCommitted(bytes, c);
     Broadcast(bytes);
+    // The host's own canvas is the one thing a broadcast does not reach.
+    if (onPainted) onPainted(c);
 }
 
 void CollabServer::OnPaintPreview(Peer& p, const MsgPaintPreview& m) {

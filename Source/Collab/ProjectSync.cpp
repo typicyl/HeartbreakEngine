@@ -1,6 +1,7 @@
 // Collab/ProjectSync.cpp
 #include "Collab/ProjectSync.h"
 
+#include "Collab/ProjectFetch.h"
 #include "Hub/Updater.h"    // Sha256File - already used by the installer
 #include "Hub/ZipArchive.h" // SafeJoin - the zip-slip guard, reused rather than reinvented
 
@@ -333,6 +334,7 @@ void WriteFile(const fs::path& p, const std::string& text) {
 
 bool ProjectSyncSelfTest() {
     g_psFails = 0;
+    if (!ProjectFetchSelfTest()) ++g_psFails;
     std::error_code ec;
     const fs::path dir = fs::temp_directory_path() / "hbe_projectsync_test";
     fs::remove_all(dir, ec);

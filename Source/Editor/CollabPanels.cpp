@@ -58,17 +58,27 @@ void Editor::DrawCollaborate(Engine& engine) {
     editor::CollabSession& s = collab_;
     if (!s.HasIdentity()) s.EnsureIdentity();
 
-    if (!Project::HasActive()) {
-        ImGui::TextColored(kWarn, "%s", "Open a project first.");
-        ImGui::End();
-        return;
-    }
-    s.SetProjectRoot(Project::Active().Root());
+    // NO PROJECT IS NOT AN ERROR HERE, and gating this panel on one was a real
+    // chicken-and-egg: JOINING is how a person WITHOUT a project gets one, so refusing to
+    // draw the panel until they had opened something left them with a working feature
+    // they could not reach. HOSTING needs a project (you are sharing yours); joining and
+    // downloading do not.
+    const bool haveProject = Project::HasActive();
+    if (haveProject) s.SetProjectRoot(Project::Active().Root());
 
     Fingerprint("This machine:", s.MyFingerprint());
     ImGui::SameLine();
     CopyButton("Copy##fp", s.MyFingerprint());
-    ImGui::TextDisabled("%s", "Read this out to whoever is hosting so they can let you in.");
+    ImGui::SameLine();
+    // THE FULL KEY, not the fingerprint. The fingerprint is 8 bytes of a hash - a human
+    // check, not something that can authorise anyone - so pre-authorising a colleague
+    // BEFORE they have ever connected needs the whole thing.
+    if (ImGui::Button("Copy my key"))
+        ImGui::SetClipboardText(collab::KeyToHex(s.MyKey()).c_str());
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Send this to the host so they can add you before you connect.");
+    ImGui::TextDisabled("%s", "Read the fingerprint out to whoever is hosting so they can "
+                              "check it; send them the key so they can add you.");
     ImGui::Separator();
 
     ImGui::TextColored(s.Live() ? kGood : ImGui::GetStyle().Colors[ImGuiCol_Text], "%s",
@@ -77,7 +87,11 @@ void Editor::DrawCollaborate(Engine& engine) {
 
     switch (s.Role()) {
     case editor::SessionRole::Offline: {
+        ImGui::BeginDisabled(!haveProject);
         if (ImGui::Button("Host a session")) s.StartHosting();
+        ImGui::EndDisabled();
+        if (!haveProject && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Open the project you want to share first.");
         ImGui::SameLine();
         if (ImGui::Button("Join with an invitation")) {
             if (const char* t = ImGui::GetClipboardText()) {
@@ -105,12 +119,29 @@ void Editor::DrawCollaborate(Engine& engine) {
             if (ImGui::Button("Paste their reply")) {
                 if (const char* t = ImGui::GetClipboardText()) s.AcceptReply(t);
             }
+            // THE RAW LINK STATE, always visible. "Connecting..." on its own is not a
+            // diagnosis - this says whether it is still finding addresses, waiting on the
+            // far side, actually linking, or already dead.
+            ImGui::TextDisabled("Link: %s", collab::LinkStateName(st));
+            if (st == collab::LinkState::Closed || st == collab::LinkState::Failed)
+                ImGui::TextColored(kBad, "%s",
+                                   "This invitation is finished. Create a new one.");
         }
         ImGui::Separator();
         ImGui::Text("People connected: %d", static_cast<int>(s.PeerCount()));
         // Sharing the FILES, as opposed to the live edits. Someone joining with an empty
         // folder needs this or they have nothing to edit.
         if (s.SharedFileCount() == 0) {
+            // The host is the only one who can fix this, and the guest's screen claims the
+            // copy succeeded - so this is the only place the truth can appear at all.
+            if (s.AsksWithNothingToSend() > 0)
+                ImGui::TextColored(kBad,
+                                   "%d request(s) for this project got nothing back - "
+                                   "share it and ask them to try again.",
+                                   static_cast<int>(s.AsksWithNothingToSend()));
+            else if (s.PeerCount() > 0)
+                ImGui::TextColored(kWarn, "%s",
+                                   "Nobody can copy this project until you share it.");
             if (ImGui::Button("Share the project files")) s.ShareProject();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Lets someone who has nothing copy the whole project. "
@@ -136,6 +167,9 @@ void Editor::DrawCollaborate(Engine& engine) {
         break;
     }
     case editor::SessionRole::Joining: {
+        ImGui::TextDisabled("Link: %s", collab::LinkStateName(s.GuestLinkState()));
+        if (s.GuestLinkError() && *s.GuestLinkError())
+            ImGui::TextColored(kBad, "%s", s.GuestLinkError());
         if (s.Reply().empty()) {
             ImGui::TextDisabled("%s", "Preparing a reply...");
         } else {
@@ -173,8 +207,31 @@ void Editor::DrawCollaborate(Engine& engine) {
                 ImGui::SetTooltip("Choose where to put it first.");
             if (s.Download() == editor::CollabSession::DownloadPhase::Failed)
                 ImGui::TextColored(kBad, "%s", s.DownloadError().c_str());
-            else if (s.Download() == editor::CollabSession::DownloadPhase::Done)
-                ImGui::TextColored(kGood, "%s", "Copied. Open it from the Project menu.");
+            else if (s.Download() == editor::CollabSession::DownloadPhase::Done) {
+                ImGui::TextColored(kGood, "%s", "Copied.");
+                // OPEN IT FROM HERE. Telling someone who just arrived with nothing to go
+                // and find the project themselves is the step where this stops feeling
+                // like it worked - and they may not have a project open at all, which is
+                // exactly the state this whole flow exists to get them out of.
+                ImGui::SameLine();
+                if (ImGui::Button("Open this project")) {
+                    const std::filesystem::path root = s.DownloadRoot();
+                    std::error_code ec;
+                    std::filesystem::path hbproj;
+                    for (const auto& de : std::filesystem::directory_iterator(root, ec))
+                        if (de.path().extension() == ".hbproj") { hbproj = de.path(); break; }
+                    if (hbproj.empty()) {
+                        SetSaveStatus("That folder has no .hbproj in it - the sender may "
+                                      "not have shared a whole project.",
+                                      true);
+                    } else if (Project::Active().Open(hbproj)) {
+                        OnProjectChanged();
+                        SetSaveStatus("Opened " + hbproj.filename().string() + ".", false);
+                    } else {
+                        SetSaveStatus("Could not open that project.", true);
+                    }
+                }
+            }
             break;
         }
         default:
@@ -293,6 +350,38 @@ void Editor::DrawCollabPeople(Engine&) {
     ImGui::TextWrapped("%s",
                        "Only the people listed here can join this project. The list "
                        "starts empty, which means nobody.");
+    ImGui::Separator();
+
+    // ADD SOMEONE WHO HAS NEVER CONNECTED.
+    //
+    // Without this the ONLY way in was the knock below - they had to try, be refused, and
+    // be admitted afterwards. That is fine once a link works, and useless when it does
+    // not: if the connection never reaches the handshake there is no knock, and no way to
+    // authorise anyone at all.
+    ImGui::TextDisabled("%s", "Add someone by their key (they click 'Copy my key'):");
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::InputTextWithHint("##newname", "their name", collabLabelBuf_,
+                             sizeof(collabLabelBuf_));
+    ImGui::SameLine();
+    const bool namedNew = collabLabelBuf_[0] != 0;
+    ImGui::BeginDisabled(!namedNew);
+    if (ImGui::Button("Paste their key")) {
+        collab::PublicKey k{};
+        const char* t = ImGui::GetClipboardText();
+        if (!t || !collab::KeyFromHex(t, k)) {
+            SetSaveStatus("That is not a key. It is 128 characters - a fingerprint like "
+                          "a1b2:c3d4 is not enough to add someone.",
+                          true);
+        } else if (s.AllowPerson(k, collabLabelBuf_)) {
+            SetSaveStatus(std::string("Added ") + collabLabelBuf_ + " (" +
+                              collab::Fingerprint(k) + ").",
+                          false);
+            collabLabelBuf_[0] = 0;
+        }
+    }
+    ImGui::EndDisabled();
+    if (!namedNew && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Give them a name first.");
     ImGui::Separator();
 
     // Anyone who tried and was turned away. This IS the invite flow: a host who cannot

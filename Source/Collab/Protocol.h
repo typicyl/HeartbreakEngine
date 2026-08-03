@@ -61,6 +61,8 @@ enum class MsgType : u16 {
     SyncManifest, // server -> client: the list, with a hash per file
     FileRequest,  // client -> server: "send me this one"
     FileChunk,    // server -> client: bytes, in order, with a final marker
+    EntityLife,   // client -> server: an entity was CREATED or DESTROYED
+    EntityLived,  // server -> client: the accepted creation/destruction, in order
     Count
 };
 const char* MsgTypeName(MsgType t);
@@ -227,6 +229,33 @@ struct SyncEntry {
     std::string sha256; // lowercase hex - what makes "do I already have this?" answerable
 };
 
+// AN ENTITY APPEARING OR DISAPPEARING, which no component delta can express.
+//
+// MsgEntityDelta mutates one component of an entity the receiver must ALREADY have by
+// guid, and empty json removes a COMPONENT, not the entity. So without this, "real time"
+// meant real time for objects both sides already had - adding or deleting one simply did
+// not travel, and the two scenes silently diverged until someone saved.
+//
+// DESTROY IS ONE ENTITY, NOT A SUBTREE. Hierarchy lives in `parent`, which is serialized
+// as a FILE ROW INDEX and therefore cannot cross machines at all; inventing a recursive
+// delete on top of a relationship the wire cannot see would delete the wrong things on
+// the far side. The editor deletes children explicitly, so each arrives as its own
+// message.
+struct MsgEntityLife {
+    EntityKey key;
+    bool destroy = false;
+    std::string name; // on create; ignored on destroy
+};
+
+// The accepted version, in server order.
+struct MsgEntityLived {
+    EntityKey key;
+    bool destroy = false;
+    std::string name;
+    Seq seq = 0;
+    UserId author = 0;
+};
+
 struct MsgSyncRequest {
     u32 unused = 0; // room to ask for a subset later without a new kind
 };
@@ -255,6 +284,11 @@ inline constexpr usize kFileChunkBytes = 256u * 1024u;
 // A hostile or broken manifest must not be able to make the receiver allocate without
 // bound before a single byte is verified.
 inline constexpr usize kMaxSyncFiles = 200000;
+
+void EncodeEntityLife(std::vector<u8>& out, const MsgEntityLife& m);
+void EncodeEntityLived(std::vector<u8>& out, const MsgEntityLived& m);
+std::optional<MsgEntityLife> DecodeEntityLife(const u8* p, usize n);
+std::optional<MsgEntityLived> DecodeEntityLived(const u8* p, usize n);
 
 void EncodeSyncRequest(std::vector<u8>& out, const MsgSyncRequest& m);
 void EncodeSyncManifest(std::vector<u8>& out, const MsgSyncManifest& m);

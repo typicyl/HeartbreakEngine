@@ -84,6 +84,40 @@ std::string Fingerprint(const PublicKey& k) {
     return buf;
 }
 
+std::string KeyToHex(const PublicKey& k) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(k.size() * 2);
+    for (const u8 b : k) {
+        out += kHex[b >> 4];
+        out += kHex[b & 0xF];
+    }
+    return out;
+}
+
+bool KeyFromHex(const std::string& hex, PublicKey& out) {
+    // Tolerant of the whitespace a paste picks up, strict about everything else: a key
+    // that is short, long or contains junk is REFUSED rather than padded, because a
+    // half-parsed key would silently authorise nobody and look like it worked.
+    std::string clean;
+    clean.reserve(hex.size());
+    for (const char c : hex)
+        if (c != ' ' && c != 0x0A && c != 0x0D && c != 0x09 && c != ':') clean += c;
+    if (clean.size() != out.size() * 2) return false;
+    const auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (usize i = 0; i < out.size(); ++i) {
+        const int hi = nib(clean[i * 2]), lo = nib(clean[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<u8>((hi << 4) | lo);
+    }
+    return true;
+}
+
 u64 PeerIdFromKey(const PublicKey& k) {
     u8 d[32];
     if (!Sha256(k.data(), k.size(), d)) return 0;
@@ -361,6 +395,27 @@ bool IdentitySelfTest() {
 
     // THE ALLOWLIST, default-deny.
     {
+        // PRE-AUTHORISING SOMEONE who has never connected. The whole key has to travel as
+        // text for that, and a fingerprint cannot stand in for it.
+        {
+            const std::string hex = KeyToHex(a.Public());
+            check(hex.size() == 128, "a key should be 128 hex characters");
+            PublicKey back{};
+            check(KeyFromHex(hex, back) && back == a.Public(),
+                  "a key must survive being copied as text - this is how a colleague is "
+                  "added BEFORE they have ever connected");
+            check(KeyFromHex("  " + hex + "  ", back) && back == a.Public(),
+                  "whitespace from a paste must be tolerated");
+            PublicKey junk{};
+            check(!KeyFromHex("abc", junk), "a short key must be refused");
+            check(!KeyFromHex(hex + "00", junk), "an over-long key must be refused");
+            check(!KeyFromHex(std::string(128, 'z'), junk), "a non-hex key must be refused");
+            check(!KeyFromHex(Fingerprint(a.Public()), junk),
+                  "A FINGERPRINT MUST NOT BE ACCEPTED AS A KEY - it is 8 bytes of a hash, "
+                  "so it cannot authorise anyone, and quietly taking it would add an "
+                  "entry that never matches");
+        }
+
         Allowlist list;
         check(list.Empty(), "a new allowlist is empty");
         check(!list.Allows(a.Public()),
@@ -388,7 +443,8 @@ bool IdentitySelfTest() {
     if (fails == 0) {
         std::printf("identity: P-256 keypairs persist and stay stable; challenges never "
                     "repeat; a genuine signature verifies while impersonation, replay, "
-                    "tampered signatures and tampered data all fail; an EMPTY allowlist "
+                    "tampered signatures and tampered data all fail; a whole key round-trips as "
+                    "text while a fingerprint is refused as one; an EMPTY allowlist "
                     "admits nobody\n");
     }
     return fails == 0;

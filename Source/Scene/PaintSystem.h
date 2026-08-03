@@ -259,6 +259,30 @@ void Flatten(PaintComponent& p);
 void Sync(Renderer& renderer, PaintComponent& p, bool dilateEdges = true);
 
 // `.hbpaint` binary persistence (magic + version + resolution + both buffers).
+// ONE stroke as opaque bytes, for the collaboration wire (Collab/Protocol.h's
+// MsgPaintOp::strokeBlob). Shares its field order with the `.hbpaint` writer - see
+// PutStroke/GetStroke in the .cpp - so a stroke cannot mean one thing in a file and
+// another over the network.
+//
+// Versioned independently of the file: a `.hbpaint` on disk is migrated forward, but a
+// stroke on the wire either matches this build or is refused. There is no half-read.
+inline constexpr u32 kStrokeWireVersion = 1;
+// The `.hbpaint` version whose stroke layout EncodeStroke writes. Distinct from the wire
+// version above: one says "which build wrote this", the other says "which field layout".
+// Conflating them silently misaligns the reader - see DecodeStroke.
+inline constexpr u32 kStrokeLayoutVersion = 5;
+std::vector<u8> EncodeStroke(const Stroke& s);
+bool DecodeStroke(const u8* data, usize n, Stroke& out);
+
+// A stable id for a canvas, derived from its `.hbpaint` path.
+//
+// A PaintComponent has NO id of its own - `source` is its only identity - so this is what
+// makes "the same canvas on two machines" answerable. Derived rather than stored: a
+// stored id would have to be minted, written into every existing file, and kept in sync
+// with a rename, and two artists would have to agree on it before they could agree on
+// anything else.
+u64 CanvasIdOf(const std::string& source);
+
 bool Save(const std::filesystem::path& absPath, const PaintComponent& p);
 // Reads through the VFS (pack-aware), like the other asset loaders. `absPath` is
 // the canvas file (typically assetsDir / source).

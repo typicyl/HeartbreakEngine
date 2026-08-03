@@ -1030,6 +1030,65 @@ void ReadBrushDef(BinaryReader& r, BrushDef& d) {
     r.Pod(d.customSize);
     r.Vec(d.customAlpha);
 }
+
+// ONE FIELD ORDER FOR THE FILE AND FOR THE WIRE.
+//
+// This layout used to live inline inside Save() and Load(). It now has to serve a second
+// caller - EncodeStroke/DecodeStroke, which put a single stroke on the collaboration
+// wire - and writing that out a second time next to the network code would be two
+// encoders for the same bytes. They would agree on the day they were written and then
+// drift, and the failure is silent: a colleague's stroke would replay with the wrong
+// brush or the wrong path and look like a painting bug, not a protocol one.
+//
+// `version` on the read side is the .hbpaint file version. A stroke on the wire is always
+// written by this build, so it passes kStrokeWireVersion.
+void PutStroke(BinaryWriter& w, const Stroke& s) {
+    w.Pod<i32>(static_cast<i32>(s.type));
+    w.Pod<i32>(s.layer);      // legacy index, still written so v4 readers survive
+    w.Pod<u32>(s.layerId);    // v5: the authoritative reference
+    w.Pod<i32>(s.projection); // v4
+    WriteBrushDef(w, s.brush);
+    w.Pod<glm::vec4>(s.color);
+    w.Pod<f32>(s.metallic); w.Pod<f32>(s.roughness); w.Pod<f32>(s.height);
+    w.Pod<f32>(s.flow); w.Pod<f32>(s.colorVar);
+    w.Pod<u8>(s.paintColor ? 1 : 0);
+    w.Pod<u8>(s.paintMaterial ? 1 : 0);
+    w.Pod<u8>(s.erase ? 1 : 0);
+    w.Pod<u32>(static_cast<u32>(s.path.size()));
+    for (const StrokePoint& pt : s.path) {
+        w.Pod<glm::vec2>(pt.uv);
+        w.Pod<f32>(pt.radius);
+        w.Pod<f32>(pt.pressure);
+        w.Pod<glm::vec3>(pt.localPos);     // v4 (projection)
+        w.Pod<glm::vec3>(pt.localNormal);  // v4
+        w.Pod<f32>(pt.localRadius);        // v4
+    }
+}
+
+void GetStroke(BinaryReader& r, Stroke& s, u32 version) {
+    i32 ty = 0; r.Pod(ty); s.type = static_cast<StrokeType>(ty);
+    r.Pod(s.layer);
+    if (version >= 5) r.Pod(s.layerId);
+    if (version >= 4) r.Pod(s.projection);
+    ReadBrushDef(r, s.brush);
+    r.Pod(s.color);
+    r.Pod(s.metallic); r.Pod(s.roughness); r.Pod(s.height);
+    r.Pod(s.flow); r.Pod(s.colorVar);
+    u8 pc8 = 1, pm = 1, er = 0;
+    r.Pod(pc8); r.Pod(pm); r.Pod(er);
+    s.paintColor = pc8 != 0; s.paintMaterial = pm != 0; s.erase = er != 0;
+    u32 pn = 0; r.Pod(pn);
+    if (!r.Ok()) return;
+    s.path.reserve(pn);
+    for (u32 k = 0; k < pn && r.Ok(); ++k) {
+        StrokePoint pt;
+        r.Pod(pt.uv); r.Pod(pt.radius); r.Pod(pt.pressure);
+        if (version >= 4) {
+            r.Pod(pt.localPos); r.Pod(pt.localNormal); r.Pod(pt.localRadius);
+        }
+        s.path.push_back(pt);
+    }
+}
 } // namespace
 
 bool Save(const std::filesystem::path& absPath, const PaintComponent& p) {
@@ -1057,28 +1116,7 @@ bool Save(const std::filesystem::path& absPath, const PaintComponent& p) {
     // Stroke database: the editable source of truth (runtime ignores it; the baked
     // layers above are the fast load path).
     w.Pod<u32>(static_cast<u32>(p.strokes.size()));
-    for (const Stroke& s : p.strokes) {
-        w.Pod<i32>(static_cast<i32>(s.type));
-        w.Pod<i32>(s.layer);      // legacy index, still written so v4 readers survive
-        w.Pod<u32>(s.layerId);    // v5: the authoritative reference
-        w.Pod<i32>(s.projection); // v4
-        WriteBrushDef(w, s.brush);
-        w.Pod<glm::vec4>(s.color);
-        w.Pod<f32>(s.metallic); w.Pod<f32>(s.roughness); w.Pod<f32>(s.height);
-        w.Pod<f32>(s.flow); w.Pod<f32>(s.colorVar);
-        w.Pod<u8>(s.paintColor ? 1 : 0);
-        w.Pod<u8>(s.paintMaterial ? 1 : 0);
-        w.Pod<u8>(s.erase ? 1 : 0);
-        w.Pod<u32>(static_cast<u32>(s.path.size()));
-        for (const StrokePoint& pt : s.path) {
-            w.Pod<glm::vec2>(pt.uv);
-            w.Pod<f32>(pt.radius);
-            w.Pod<f32>(pt.pressure);
-            w.Pod<glm::vec3>(pt.localPos);     // v4 (projection)
-            w.Pod<glm::vec3>(pt.localNormal);  // v4
-            w.Pod<f32>(pt.localRadius);        // v4
-        }
-    }
+    for (const Stroke& s : p.strokes) PutStroke(w, s);
     return w.SaveToFile(absPath);
 }
 
@@ -1161,31 +1199,55 @@ bool Load(const std::filesystem::path& absPath, PaintComponent& p) {
         r.Pod(sc);
         for (u32 i = 0; i < sc && r.Ok(); ++i) {
             Stroke s;
-            i32 ty = 0; r.Pod(ty); s.type = static_cast<StrokeType>(ty);
-            r.Pod(s.layer);
-            if (version >= 5) r.Pod(s.layerId);
-            if (version >= 4) r.Pod(s.projection);
-            ReadBrushDef(r, s.brush);
-            r.Pod(s.color);
-            r.Pod(s.metallic); r.Pod(s.roughness); r.Pod(s.height);
-            r.Pod(s.flow); r.Pod(s.colorVar);
-            u8 pc8 = 1, pm = 1, er = 0;
-            r.Pod(pc8); r.Pod(pm); r.Pod(er);
-            s.paintColor = pc8 != 0; s.paintMaterial = pm != 0; s.erase = er != 0;
-            u32 pn = 0; r.Pod(pn);
-            s.path.reserve(pn);
-            for (u32 k = 0; k < pn && r.Ok(); ++k) {
-                StrokePoint pt;
-                r.Pod(pt.uv); r.Pod(pt.radius); r.Pod(pt.pressure);
-                if (version >= 4) {
-                    r.Pod(pt.localPos); r.Pod(pt.localNormal); r.Pod(pt.localRadius);
-                }
-                s.path.push_back(pt);
-            }
+            GetStroke(r, s, version);
             if (r.Ok()) p.strokes.push_back(std::move(s));
         }
     }
     return true;
+}
+
+// --- one stroke, for the collaboration wire ------------------------------------
+
+u64 CanvasIdOf(const std::string& source) {
+    if (source.empty()) return 0; // an unsaved canvas cannot be named to anyone else
+    u64 h = 1469598103934665603ull;
+    for (const char c : source) {
+        // Case-folded and slash-normalised: the same asset reached as "Art/Wall.hbpaint"
+        // and "art\Wall.hbpaint" is one canvas, and Windows paths make both spellings
+        // routine.
+        char n = (c == '\\') ? '/' : c;
+        if (n >= 'A' && n <= 'Z') n = static_cast<char>(n - 'A' + 'a');
+        h ^= static_cast<u8>(n);
+        h *= 1099511628211ull;
+    }
+    return h ? h : 1ull;
+}
+
+std::vector<u8> EncodeStroke(const Stroke& s) {
+    BinaryWriter w;
+    w.Pod<u32>(kStrokeWireVersion);
+    PutStroke(w, s);
+    return w.Data();
+}
+
+bool DecodeStroke(const u8* data, usize n, Stroke& out) {
+    BinaryReader r(data, n);
+    u32 version = 0;
+    if (!r.Pod(version)) return false;
+    // A stroke from a build that writes a layout this one does not know is REFUSED, not
+    // read as far as it parses. BinaryReader treats trailing bytes as success, so a
+    // half-understood stroke would decode into something plausible and paint the wrong
+    // marks on somebody's canvas.
+    if (version != kStrokeWireVersion) return false;
+    out = Stroke{};
+    // NOT `version`. GetStroke's parameter is the .hbpaint FILE version, which it uses to
+    // decide whether the older, shorter layouts are in play (`>= 4` for the projection
+    // fields, `>= 5` for the stable layer id). The wire version is a different number
+    // space entirely, and passing it here made the reader skip three fields the writer
+    // had just written - every stroke decoded misaligned. PutStroke always emits the
+    // CURRENT layout, so the reader must be told exactly that.
+    GetStroke(r, out, kStrokeLayoutVersion);
+    return r.Ok();
 }
 
 } // namespace hbe::paint

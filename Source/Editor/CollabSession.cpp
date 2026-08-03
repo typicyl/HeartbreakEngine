@@ -161,8 +161,24 @@ bool CollabSession::StartHosting() {
     server_ = std::make_unique<collab::CollabServer>(host_.get());
     // The host is the authority, so nothing broadcasts a guest's edit back to it.
     server_->onApplied = [this](const collab::MsgDeltaApplied& d) { QueueRemote(d); };
+    server_->onLived = [this](const collab::MsgEntityLived& l) { QueueLife(l); };
+    server_->onPainted = [this](const collab::MsgPaintCommitted& p) { QueuePaint(p); };
     role_ = SessionRole::Hosting;
-    status_ = "Hosting. Create an invitation to add someone.";
+    // HOSTING IS SHARING. Until now a SECOND, separate click was needed before a joiner
+    // could receive a single byte, and nothing on either screen named it. A host that has
+    // not shared answers every SyncRequest with an EMPTY manifest, which the far end
+    // reports as a COMPLETED COPY OF NOTHING - so both people see success and no files.
+    // Worse, the Hub asks automatically the moment the link opens, so the host had no
+    // window in which to click in time: across two machines the invitation is ferried by
+    // chat over minutes, and "People connected: 1" is the cue that finally prompts the
+    // click - by which point the empty answer has already been sent, and nothing ever
+    // asks again. ShareProject() is a no-op without a project root; the button and
+    // "Rescan" remain for files added later.
+    ShareProject(); // writes status_ itself, so it MUST run before the line below
+    status_ = shared_.files.empty()
+                  ? std::string("Hosting. Create an invitation to add someone.")
+                  : "Hosting " + std::to_string(shared_.files.size()) +
+                        " file(s). Create an invitation to add someone.";
     return true;
 }
 
@@ -191,6 +207,14 @@ bool CollabSession::AcceptReply(const std::string& replyText) {
     }
     status_ = "Connecting...";
     return true;
+}
+
+collab::LinkState CollabSession::GuestLinkState() const {
+    return guest_ ? guest_->State() : collab::LinkState::Closed;
+}
+
+const char* CollabSession::GuestLinkError() const {
+    return guest_ ? guest_->Error() : "";
 }
 
 usize CollabSession::PeerCount() const { return server_ ? server_->PeerCount() : 0; }
@@ -255,8 +279,12 @@ void CollabSession::Leave() {
     if (guest_) guest_->Disconnect();
     client_.reset();
     guest_.reset();
-    server_.reset();
+    server_.reset(); // shareRoot_/shareManifest_ die with it...
     host_.reset();
+    // ...so this must not keep claiming otherwise. SharedFileCount() is what hides the
+    // Share button, so a stale value showed a green "Sharing N file(s)" over a brand-new
+    // server that was sharing nothing - the "worked once, never again" shape.
+    shared_.files.clear();
     invite_ = 0;
     invitation_.clear();
     reply_.clear();
@@ -270,6 +298,8 @@ void CollabSession::Leave() {
 // --- per frame ----------------------------------------------------------------
 
 void CollabSession::Tick(u64 nowMs) {
+    // A stalled download has to fail on its own; nothing upstream reports a refusal.
+    fetch_.Tick(nowMs);
     if (host_) {
         host_->Poll();
         if (server_) server_->Tick(nowMs);
@@ -279,9 +309,42 @@ void CollabSession::Tick(u64 nowMs) {
             invitation_ = host_->Invitation(invite_);
             status_ = "Invitation ready - send it to them.";
         }
-        if (invite_ != 0 && host_->StateOf(invite_) == collab::LinkState::Open &&
-            !invitation_.empty()) {
-            status_ = "Connected. " + std::to_string(PeerCount()) + " here.";
+        // REPORT EVERY STATE, not just success.
+        //
+        // This used to react only to Open, so ANY other outcome left the host reading
+        // "Connecting..." forever: a link that fails ICE, or one that is dropped because
+        // the guest was refused, is REMOVED from the transport - StateOf then answers
+        // Closed and nothing was looking. The person is left staring at a word that is no
+        // longer true, on a screen with nothing else to go on.
+        if (invite_ != 0) {
+            const collab::LinkState st = host_->StateOf(invite_);
+            if (st != lastInviteState_) {
+                lastInviteState_ = st;
+                switch (st) {
+                case collab::LinkState::Open:
+                    status_ = "Connected. " + std::to_string(PeerCount()) + " here.";
+                    break;
+                case collab::LinkState::Connecting:
+                    status_ = "Connecting to them...";
+                    break;
+                case collab::LinkState::Failed:
+                case collab::LinkState::Closed:
+                    // Do NOT clobber a knock. "Someone tried to join <fingerprint>" is
+                    // the single most useful thing the host can be told, and it is set by
+                    // the policy callback a moment before the link is dropped.
+                    if (knocks_.empty()) {
+                        status_ = "That connection did not come up. Create a new "
+                                  "invitation and try again - an invitation goes stale "
+                                  "once the addresses in it change.";
+                    }
+                    // Let them start over; the old invitation is dead either way.
+                    invite_ = 0;
+                    invitation_.clear();
+                    break;
+                default:
+                    break;
+                }
+            }
         }
     }
     if (guest_) {
@@ -302,10 +365,16 @@ void CollabSession::Tick(u64 nowMs) {
                 client_->Hello(collab::Fingerprint(id_.Public()));
                 client_->JoinDocument(docId_);
             }
-        } else if (guest_->State() == collab::LinkState::Failed) {
+        } else if (guest_->State() == collab::LinkState::Failed ||
+                   guest_->State() == collab::LinkState::Closed) {
+            // Closed covers a link that dies after opening; Failed only ever covers one
+            // that never opened. Testing Failed alone left a dropped session reading
+            // "Connected." forever.
             const char* why = guest_->Error();
-            status_ = (why && *why) ? std::string("Could not connect: ") + why
-                                    : std::string("Could not connect.");
+            status_ = (why && *why)
+                          ? std::string("Could not connect: ") + why
+                          : std::string("The connection dropped. Ask them for a fresh "
+                                        "invitation and try again.");
             role_ = SessionRole::Offline;
             client_.reset();
             guest_.reset();
@@ -315,16 +384,6 @@ void CollabSession::Tick(u64 nowMs) {
 
 // --- getting the whole project --------------------------------------------------
 
-const char* CollabSession::DownloadPhaseName(DownloadPhase p) {
-    switch (p) {
-    case DownloadPhase::Idle: return "idle";
-    case DownloadPhase::AskingForList: return "asking what they have";
-    case DownloadPhase::Downloading: return "copying files";
-    case DownloadPhase::Done: return "done";
-    case DownloadPhase::Failed: return "failed";
-    }
-    return "?";
-}
 
 bool CollabSession::ShareProject() {
     if (!server_ || projectRoot_.empty()) return false;
@@ -347,91 +406,32 @@ bool CollabSession::ShareProject() {
 
 bool CollabSession::StartDownload(const fs::path& into) {
     if (role_ != SessionRole::Joined || !client_) return false;
-    if (into.empty()) return false;
+    // DELEGATED, not reimplemented. The Hub has to run exactly this without an engine
+    // attached, so the state machine lives in Collab/ProjectFetch and both drive the same
+    // one - two copies would agree today and drift quietly afterwards.
+    fetch_.Attach(client_.get());
     downloadRoot_ = into;
-    downloadErr_.clear();
-    wanted_.clear();
-    nextWanted_ = 0;
-    phase_ = DownloadPhase::AskingForList;
+    if (!fetch_.Start(into)) return false;
     status_ = "Asking what they have...";
-    client_->RequestProject();
     return true;
 }
 
 void CollabSession::OnManifest(const collab::MsgSyncManifest& m) {
-    if (phase_ != DownloadPhase::AskingForList) return;
-    collab::ProjectManifest theirs;
-    theirs.files.reserve(m.files.size());
-    for (const collab::SyncEntry& e : m.files)
-        theirs.files.push_back(collab::SyncFile{e.path, e.size, e.sha256});
-
-    // What we ALREADY have. An empty folder yields an empty manifest and we take
-    // everything; a folder that is already most of the way there takes only what differs,
-    // compared BY CONTENT rather than by timestamp.
-    collab::ProjectManifest mine;
-    collab::BuildManifest(downloadRoot_, mine, nullptr, nullptr);
-    const collab::ProjectManifest missing = collab::Missing(theirs, mine);
-    wanted_ = missing.files;
-    nextWanted_ = 0;
-
-    if (wanted_.empty()) {
-        phase_ = DownloadPhase::Done;
-        status_ = theirs.files.empty() ? "They are not sharing a project."
-                                       : "Already up to date.";
-        return;
-    }
-    // Staged BESIDE the project, not inside it: a transfer that dies halfway must not
-    // leave a half-updated project that looks like a working one.
-    const fs::path staging = downloadRoot_.parent_path() /
-                             (downloadRoot_.filename().string() + ".incoming");
-    if (!rx_.Begin(downloadRoot_, staging, missing)) {
-        phase_ = DownloadPhase::Failed;
-        downloadErr_ = rx_.Error();
-        return;
-    }
-    phase_ = DownloadPhase::Downloading;
-    RequestNextFile();
-}
-
-void CollabSession::RequestNextFile() {
-    if (nextWanted_ >= wanted_.size()) {
-        if (!rx_.Commit()) {
-            phase_ = DownloadPhase::Failed;
-            downloadErr_ = rx_.Error();
-            return;
-        }
-        phase_ = DownloadPhase::Done;
-        status_ = "Copied " + std::to_string(wanted_.size()) + " file(s).";
-        return;
-    }
-    // ONE AT A TIME. The server serves one file per peer, so asking for several would
-    // simply forget all but the last and the transfer would stall on a file nobody is
-    // sending.
-    client_->RequestFile(wanted_[nextWanted_].path);
+    fetch_.OnManifest(m);
+    // Prefer the REASON over the phase name. "Project: Done" is what an empty manifest
+    // used to print - technically true and completely useless.
+    status_ = !fetch_.Error().empty()
+                  ? fetch_.Error()
+                  : std::string("Project: ") + collab::ProjectFetch::PhaseName(fetch_.State());
 }
 
 void CollabSession::OnFileChunk(const collab::MsgFileChunk& c) {
-    if (phase_ != DownloadPhase::Downloading) return;
-    if (nextWanted_ >= wanted_.size()) return;
-    if (c.path != wanted_[nextWanted_].path) return; // a stale chunk from a cancelled ask
-
-    if (!c.data.empty() && !rx_.Write(c.path, c.data.data(), c.data.size())) {
-        phase_ = DownloadPhase::Failed;
-        downloadErr_ = rx_.Error();
-        return;
-    }
-    if (!c.last) return;
-    if (!rx_.Finish(c.path)) {
-        // A hash mismatch or a short file. Stopping is right: continuing would commit a
-        // project containing one asset that is quietly wrong.
-        phase_ = DownloadPhase::Failed;
-        downloadErr_ = rx_.Error();
-        return;
-    }
-    ++nextWanted_;
-    status_ = "Copying... " + std::to_string(nextWanted_) + "/" +
-              std::to_string(wanted_.size());
-    RequestNextFile();
+    fetch_.OnChunk(c);
+    if (fetch_.State() == collab::ProjectFetch::Phase::Downloading)
+        status_ = "Copying... " + std::to_string(fetch_.FilesDone()) + "/" +
+                  std::to_string(fetch_.FilesTotal());
+    else if (fetch_.State() == collab::ProjectFetch::Phase::Done)
+        status_ = "Copied " + std::to_string(fetch_.FilesTotal()) + " file(s).";
 }
 
 // --- real time ------------------------------------------------------------------
@@ -444,7 +444,34 @@ void CollabSession::QueueRemote(const collab::MsgDeltaApplied& d) {
     remote_.push_back(d);
 }
 
+void CollabSession::QueueLife(const collab::MsgEntityLived& l) { remoteLife_.push_back(l); }
+
+void CollabSession::QueuePaint(const collab::MsgPaintCommitted& p) { remotePaint_.push_back(p); }
+
+void CollabSession::SendStroke(const std::string& source, const paint::Stroke& s) {
+    if (!Live()) return;
+    const u64 canvas = paint::CanvasIdOf(source);
+    // A canvas that has never been saved has no identity anyone else can resolve, so
+    // there is nothing to send it TO. Silently dropping would be worse than not trying:
+    // the artist would see their strokes never arrive with no reason given.
+    if (canvas == 0) {
+        status_ = "Save this canvas once before your strokes can be shared.";
+        return;
+    }
+    const std::vector<u8> blob = paint::EncodeStroke(s);
+    if (blob.empty()) return;
+    if (server_) {
+        // The host is the authority and does not go through the wire. Commit it to the
+        // paint history and broadcast, exactly as OnPaintOp would for a guest.
+        server_->LocalPaint(canvas, s.layerId, blob);
+    } else if (client_) {
+        client_->SendPaintOp(canvas, s.layerId, blob);
+    }
+}
+
 void CollabSession::WireCallbacks() {
+    callbacks_.onLived = [this](const collab::MsgEntityLived& l) { QueueLife(l); };
+    callbacks_.onPaint = [this](const collab::MsgPaintCommitted& p) { QueuePaint(p); };
     callbacks_.onDelta = [this](const collab::MsgDeltaApplied& d) { QueueRemote(d); };
     callbacks_.onManifest = [this](const collab::MsgSyncManifest& m) { OnManifest(m); };
     callbacks_.onFileChunk = [this](const collab::MsgFileChunk& c) { OnFileChunk(c); };
@@ -485,7 +512,88 @@ void CollabSession::LiveSync(Scene& s, entt::entity selected, u64 nowMs) {
     }
     entt::registry& reg = s.Registry();
 
-    // --- 1. apply what other people did --------------------------------------
+    // --- 1. entities that appeared or disappeared elsewhere ------------------
+    //
+    // BEFORE the component deltas, and that ordering is load-bearing. A newly created
+    // object's creation and its components are sent in the SAME tick, so applying deltas
+    // first means every one of them names a guid this scene does not have yet - they are
+    // skipped, and the far side is left holding a nameless empty object that looks like a
+    // corrupt scene.
+    for (const collab::MsgEntityLived& l : remoteLife_) {
+        if (l.key.doc != docId_) continue;
+        entt::entity found = entt::null;
+        for (const entt::entity e : reg.view<Guid>())
+            if (reg.get<Guid>(e).value == l.key.guid) { found = e; break; }
+        if (l.destroy) {
+            if (found != entt::null) {
+                // ONE entity, matching what the message means. Children are not implied:
+                // hierarchy rides on `parent`, which is a file row index and cannot cross
+                // machines, so a recursive delete here would guess - and guess wrong.
+                // The editor deletes children explicitly, and each arrives as its own
+                // message.
+                reg.destroy(found);
+                ++appliedThisFrame_;
+            }
+            knownGuids_.erase(l.key.guid);
+            if (lockedGuid_ == l.key.guid) {
+                // The thing we were holding is gone. Forget it, or the next diff would
+                // resurrect it component by component.
+                lockedGuid_ = 0;
+                liveBaseline_.clear();
+            }
+        } else if (found == entt::null) {
+            const entt::entity e = s.CreateEntity(l.name.empty() ? "Object" : l.name);
+            // The guid is the identity, so it must be THEIRS, not a fresh one - the two
+            // copies would otherwise never refer to the same object again.
+            reg.emplace_or_replace<Guid>(e, Guid{l.key.guid});
+            knownGuids_[l.key.guid] = 1;
+            ++appliedThisFrame_;
+        }
+    }
+    remoteLife_.clear();
+
+
+    // --- 1b. strokes other artists painted -----------------------------------
+    //
+    // DELIBERATELY NOT THROUGH Editor::CommitStroke. That pushes onto the local paint
+    // undo stack and clears the redo stack, so a colleague's stroke would land in YOUR
+    // Ctrl+Z history - undoing your own work would silently undo theirs instead, and
+    // their stroke would come off a canvas they are still painting on.
+    strokesApplied_ = 0;
+    for (const collab::MsgPaintCommitted& msg : remotePaint_) {
+        entt::entity target = entt::null;
+        PaintComponent* pc = nullptr;
+        for (const entt::entity e : reg.view<PaintComponent>()) {
+            PaintComponent& c = reg.get<PaintComponent>(e);
+            if (paint::CanvasIdOf(c.source) == msg.canvas) {
+                target = e;
+                pc = &c;
+                break;
+            }
+        }
+        if (!pc) continue; // a canvas this copy does not have open
+        // A pre-v3 canvas was loaded as baked pixels with NO stroke history, and
+        // BakeFromStrokes refuses to run on one. Appending here would put the stroke in
+        // the list and produce no paint at all - the artist would see nothing happen and
+        // have no idea why.
+        if (!pc->strokesComplete) {
+            status_ = "A collaborator painted on a canvas that has no editable history "
+                      "here, so it could not be applied. Re-save it to upgrade it.";
+            continue;
+        }
+        paint::Stroke s;
+        if (!paint::DecodeStroke(msg.strokeBlob.data(), msg.strokeBlob.size(), s)) continue;
+        pc->strokes.push_back(std::move(s));
+        // Pure CPU. The GPU upload is paint::Sync, which the editor already runs from its
+        // own draw path - doing it here would need a Renderer this layer does not have.
+        paint::BakeFromStrokes(*pc);
+        pc->dirty = true;
+        (void)target;
+        ++strokesApplied_;
+    }
+    remotePaint_.clear();
+
+    // --- 2. apply what other people changed ----------------------------------
     for (const collab::MsgDeltaApplied& d : remote_) {
         // DOC FILTER. Every broadcast reaches every peer regardless of which document
         // they have open, so without this one scene's edits land in another.
@@ -506,6 +614,66 @@ void CollabSession::LiveSync(Scene& s, entt::entity selected, u64 nowMs) {
         }
     }
     remote_.clear();
+
+    // --- 1c. entities that appeared or disappeared HERE ----------------------
+    {
+        std::unordered_map<u64, char> now;
+        for (const entt::entity e : reg.view<Guid>()) {
+            if (include_ && !include_(reg, e)) continue; // another document's entity
+            const u64 g = reg.get<Guid>(e).value;
+            if (g != 0) now[g] = 1;
+        }
+        if (!guidsSeeded_) {
+            // First frame of a session: everything is "already there", not "just
+            // created". Without this, joining would broadcast the entire scene as new.
+            knownGuids_ = now;
+            guidsSeeded_ = true;
+        } else {
+            for (const auto& [g, _] : now) {
+                if (knownGuids_.count(g)) continue;
+                collab::EntityKey k;
+                k.doc = docId_;
+                k.guid = g;
+                entt::entity e = entt::null;
+                for (const entt::entity c : reg.view<Guid>())
+                    if (reg.get<Guid>(c).value == g) { e = c; break; }
+                const Name* nm = (e != entt::null) ? reg.try_get<Name>(e) : nullptr;
+                const std::string label = nm ? nm->value : std::string();
+                if (server_) server_->LocalLife(k, false, label);
+                else if (client_) client_->SendLife(k, false, label);
+                // A new object arrives with no components on the far side, so push its
+                // whole state once. It is one entity, and waiting for the author to
+                // select it would leave a nameless empty object on their screen.
+                if (e != entt::null) {
+                    if (server_) server_->LocalLock(k, nowMs);
+                    for (const std::string& key : scene::DeltaComponentKeys()) {
+                        std::string j;
+                        if (!scene::ComponentToJson(s, e, key, j)) continue;
+                        if (server_) server_->LocalDelta(k, key, j);
+                        else client_->SendDelta(k, key, j);
+                    }
+                    if (server_) server_->LocalUnlock(k);
+                }
+            }
+            for (const auto& [g, _] : knownGuids_) {
+                if (now.count(g)) continue;
+                collab::EntityKey k;
+                k.doc = docId_;
+                k.guid = g;
+                // Deleting needs the lock. Take it first: the author deleted it locally
+                // already, and without the lock the far side would keep the object.
+                if (server_) {
+                    server_->LocalLock(k, nowMs);
+                    server_->LocalLife(k, true, std::string());
+                    server_->LocalUnlock(k);
+                } else if (client_) {
+                    client_->RequestLock(k);
+                    client_->SendLife(k, true, std::string());
+                }
+            }
+            knownGuids_ = std::move(now);
+        }
+    }
 
     // --- 2. follow the selection with a lock ---------------------------------
     u64 wantGuid = 0;
@@ -608,6 +776,9 @@ void CollabSession::NoteSceneOpened(const Scene& s, const fs::path& scenePath,
     docId_ = s.Environment().docId;
     epoch_ = s.Environment().guidEpoch;
     snapshot_ = scene::SnapshotForJournal(s, include_);
+    // A different scene: everything in it is 'already there', not newly created.
+    guidsSeeded_ = false;
+    knownGuids_.clear();
     journal_.Clear();
     if (!scenePath.empty()) {
         bool truncated = false;
@@ -776,6 +947,7 @@ bool CollabSessionSelfTest() {
     g_csFails = 0;
     std::error_code ec;
     const fs::path dir = fs::temp_directory_path() / "hbe_collabsession_test";
+
     fs::remove_all(dir, ec);
     fs::create_directories(dir, ec);
 
@@ -847,6 +1019,75 @@ bool CollabSessionSelfTest() {
         if (cs.History().Commits().size() == 2)
             Check(cs.History().Commits()[1].parent == cs.History().Commits()[0].id,
                   "the second change set must name the first as its parent");
+    }
+
+    // ================================================================
+    // PART 1b - THE STROKE CODEC. One field order for the file and the
+    // wire; a stroke that survives the trip byte-for-byte is the whole
+    // precondition for two artists seeing the same painting.
+    // ================================================================
+    {
+        paint::Stroke s;
+        s.type = paint::StrokeType::Path;
+        s.layer = 2;
+        s.layerId = 77;
+        s.projection = 1;
+        s.brush.name = "Round soft";
+        s.brush.hardness = 0.33f;
+        s.brush.customSize = 2;
+        s.brush.customAlpha = {1, 2, 3, 4};
+        s.color = {0.25f, 0.5f, 0.75f, 1.0f};
+        s.metallic = 0.1f;
+        s.roughness = 0.2f;
+        s.erase = true;
+        s.paintMaterial = false;
+        for (int i = 0; i < 4; ++i) {
+            paint::StrokePoint pt;
+            pt.uv = {0.1f * i, 0.2f * i};
+            pt.radius = 0.05f + 0.01f * i;
+            pt.pressure = 0.5f;
+            pt.localPos = {1.0f * i, 2.0f, 3.0f};
+            pt.localNormal = {0.0f, 1.0f, 0.0f};
+            pt.localRadius = 0.4f;
+            s.path.push_back(pt);
+        }
+        const std::vector<u8> blob = paint::EncodeStroke(s);
+        Check(!blob.empty(), "a stroke should encode");
+        paint::Stroke back;
+        Check(paint::DecodeStroke(blob.data(), blob.size(), back),
+              "a stroke should decode");
+        Check(back.layerId == s.layerId,
+              "the STABLE layer id must survive - an index cannot, and a stroke that "
+              "lands on the wrong layer is worse than one that does not land");
+        Check(back.path.size() == s.path.size(), "the path length must survive");
+        Check(back.brush.name == s.brush.name && back.brush.customAlpha == s.brush.customAlpha,
+              "the brush, including a custom tip, must survive or the stroke paints "
+              "different marks on the other machine");
+        Check(back.erase == s.erase && back.paintMaterial == s.paintMaterial,
+              "the stroke's flags must survive");
+        Check(!back.path.empty() &&
+                  std::abs(back.path[3].radius - s.path[3].radius) < 1e-6f &&
+                  std::abs(back.path[3].localPos.x - s.path[3].localPos.x) < 1e-6f,
+              "every point field must survive");
+        // Junk and truncation are refused, never half-read.
+        paint::Stroke junk;
+        Check(!paint::DecodeStroke(blob.data(), 3, junk),
+              "a truncated stroke must be refused");
+        std::vector<u8> wrongVersion = blob;
+        wrongVersion[0] = 0xEE;
+        Check(!paint::DecodeStroke(wrongVersion.data(), wrongVersion.size(), junk),
+              "a stroke from an unknown build must be REFUSED - BinaryReader treats "
+              "trailing bytes as success, so a half-understood stroke would paint "
+              "plausible-looking wrong marks");
+
+        // The canvas id: derived from the path, stable, and case/slash insensitive.
+        Check(paint::CanvasIdOf("Art/Wall.hbpaint") == paint::CanvasIdOf("art\\Wall.hbpaint"),
+              "the same canvas reached by two spellings must be ONE canvas - Windows "
+              "paths make both routine");
+        Check(paint::CanvasIdOf("Art/Wall.hbpaint") != paint::CanvasIdOf("Art/Floor.hbpaint"),
+              "two canvases must not collide");
+        Check(paint::CanvasIdOf("") == 0,
+              "an unsaved canvas has no identity anyone else could resolve");
     }
 
     // ================================================================
@@ -1160,6 +1401,213 @@ bool CollabSessionSelfTest() {
               "the GUEST's edit did not reach the host - the authority is the one peer "
               "nothing broadcasts back to, and it needs its own hook");
 
+        // ============================================================
+        // ADDING AND REMOVING OBJECTS. No component delta can say this:
+        // a delta mutates a component of an entity the far side must
+        // already have, and empty json removes a COMPONENT, not the
+        // object. Without it, adding or deleting simply did not travel
+        // and the two scenes silently diverged until someone saved.
+        // ============================================================
+        constexpr u64 kNewGuid = 555001;
+        {
+            const entt::entity fresh = hs.CreateEntity("SpawnedByHost");
+            hs.Registry().emplace_or_replace<Guid>(fresh, Guid{kNewGuid});
+            Transform t;
+            t.position = {7.0f, 8.0f, 9.0f};
+            hs.Registry().emplace_or_replace<Transform>(fresh, t);
+
+            entt::entity landed = entt::null;
+            WaitUntil(
+                [&] {
+                    for (const entt::entity e : gs.Registry().view<Guid>())
+                        if (gs.Registry().get<Guid>(e).value == kNewGuid) {
+                            landed = e;
+                            return true;
+                        }
+                    return false;
+                },
+                20000,
+                [&] {
+                    clock += 100;
+                    host2.LiveSync(hs, fresh, clock);
+                    guest2.LiveSync(gs, entt::null, clock);
+                    host2.Tick(clock);
+                    guest2.Tick(clock);
+                });
+            Check(landed != entt::null,
+                  "A NEW OBJECT DID NOT APPEAR on the other machine");
+            if (landed != entt::null) {
+                Check(gs.Registry().get<Name>(landed).value == "SpawnedByHost",
+                      "the new object arrived without its name");
+                // Its components must come with it - an empty nameless object would be
+                // worse than nothing, because it looks like a bug in the scene.
+                const bool posed = WaitUntil(
+                    [&] {
+                        const Transform* gt = gs.Registry().try_get<Transform>(landed);
+                        return gt && std::abs(gt->position.x - 7.0f) < 1e-3f;
+                    },
+                    20000,
+                    [&] {
+                        clock += 100;
+                        host2.LiveSync(hs, fresh, clock);
+                        guest2.LiveSync(gs, entt::null, clock);
+                        host2.Tick(clock);
+                        guest2.Tick(clock);
+                    });
+                Check(posed,
+                      "a newly created object arrived with no components - the far side "
+                      "gets an empty placeholder that looks like a corrupt scene");
+            }
+
+            // ...and DELETING it removes it there too.
+            hs.Registry().destroy(fresh);
+            const bool gone = WaitUntil(
+                [&] {
+                    for (const entt::entity e : gs.Registry().view<Guid>())
+                        if (gs.Registry().get<Guid>(e).value == kNewGuid) return false;
+                    return true;
+                },
+                20000,
+                [&] {
+                    clock += 100;
+                    host2.LiveSync(hs, entt::null, clock);
+                    guest2.LiveSync(gs, entt::null, clock);
+                    host2.Tick(clock);
+                    guest2.Tick(clock);
+                });
+            Check(gone, "A DELETED OBJECT SURVIVED on the other machine");
+
+            // And it does not come back: a deletion that the sender then re-broadcasts
+            // as a creation is an object that flickers forever.
+            for (int i = 0; i < 10; ++i) {
+                clock += 100;
+                host2.LiveSync(hs, entt::null, clock);
+                guest2.LiveSync(gs, entt::null, clock);
+                host2.Tick(clock);
+                guest2.Tick(clock);
+            }
+            bool reappeared = false;
+            for (const entt::entity e : gs.Registry().view<Guid>())
+                if (gs.Registry().get<Guid>(e).value == kNewGuid) reappeared = true;
+            Check(!reappeared, "a deleted object came BACK - the deletion echoed");
+        }
+
+        // ============================================================
+        // PAINTING TOGETHER. Two artists on one canvas is the workflow
+        // the art build exists for, so paint is deliberately NOT
+        // lock-gated - both sides' strokes must land, not race.
+        // ============================================================
+        {
+            const std::string kCanvas = "Art/Wall.hbpaint";
+            PaintComponent* hpc = nullptr;
+            PaintComponent* gpc = nullptr;
+            for (auto* pair : {&hs, &gs}) {
+                Scene& sc = *pair;
+                const entt::entity e = sc.CreateEntity("PaintedSurface");
+                sc.Registry().emplace_or_replace<Guid>(e, Guid{424242});
+                PaintComponent pc;
+                pc.resolution = 32;
+                pc.source = kCanvas;
+                pc.strokesComplete = true;
+                PaintLayer layer;
+                layer.id = 1;
+                layer.color.assign(32u * 32u * 4u, 0);
+                layer.material.assign(32u * 32u * 4u, 0);
+                pc.layers.push_back(std::move(layer));
+                sc.Registry().emplace_or_replace<PaintComponent>(e, std::move(pc));
+                (&sc == &hs ? hpc : gpc) = &sc.Registry().get<PaintComponent>(e);
+            }
+            Check(hpc && gpc, "both sides should have the canvas");
+
+            paint::Stroke brush;
+            brush.type = paint::StrokeType::Path;
+            brush.layerId = 1;
+            brush.color = {1.0f, 0.0f, 0.0f, 1.0f};
+            paint::StrokePoint pt;
+            pt.uv = {0.5f, 0.5f};
+            pt.radius = 0.2f;
+            pt.pressure = 1.0f;
+            brush.path.push_back(pt);
+
+            const usize guestBefore = gpc->strokes.size();
+            hpc->strokes.push_back(brush);
+            host2.SendStroke(kCanvas, hpc->strokes.back());
+
+            const bool arrived = WaitUntil(
+                [&] { return gpc->strokes.size() > guestBefore; }, 20000,
+                [&] {
+                    clock += 100;
+                    host2.LiveSync(hs, entt::null, clock);
+                    guest2.LiveSync(gs, entt::null, clock);
+                    host2.Tick(clock);
+                    guest2.Tick(clock);
+                });
+            Check(arrived, "A BRUSH STROKE DID NOT REACH THE OTHER ARTIST");
+            if (arrived) {
+                Check(gpc->strokes.back().layerId == 1,
+                      "the stroke landed with the wrong layer id");
+                Check(!gpc->strokes.back().path.empty() &&
+                          std::abs(gpc->strokes.back().path[0].uv.x - 0.5f) < 1e-5f,
+                      "the stroke arrived but its path is wrong");
+            }
+            // The host must not stamp its own stroke twice.
+            const usize hostAfter = hpc->strokes.size();
+            for (int i = 0; i < 6; ++i) {
+                clock += 100;
+                host2.LiveSync(hs, entt::null, clock);
+                guest2.LiveSync(gs, entt::null, clock);
+                host2.Tick(clock);
+                guest2.Tick(clock);
+            }
+            Check(hpc->strokes.size() == hostAfter,
+                  "the host applied its OWN stroke a second time - it is the authority "
+                  "and already has it");
+
+            // ...and the other direction, over the wire rather than the host shortcut.
+            const usize hostBefore = hpc->strokes.size();
+            paint::Stroke reply = brush;
+            reply.color = {0.0f, 1.0f, 0.0f, 1.0f};
+            gpc->strokes.push_back(reply);
+            guest2.SendStroke(kCanvas, gpc->strokes.back());
+            const bool back = WaitUntil(
+                [&] { return hpc->strokes.size() > hostBefore; }, 20000,
+                [&] {
+                    clock += 100;
+                    host2.LiveSync(hs, entt::null, clock);
+                    guest2.LiveSync(gs, entt::null, clock);
+                    host2.Tick(clock);
+                    guest2.Tick(clock);
+                });
+            Check(back,
+                  "a GUEST artist's stroke did not reach the host - paint has its own "
+                  "channel and the host is the one peer nothing broadcasts back to");
+        }
+
+        // THE OTHER DIRECTION, which is a DIFFERENT code path: a guest's creation goes
+        // over the wire to the server handler, not through the host's local shortcut.
+        {
+            constexpr u64 kGuestGuid = 555002;
+            const entt::entity mk = gs.CreateEntity("SpawnedByGuest");
+            gs.Registry().emplace_or_replace<Guid>(mk, Guid{kGuestGuid});
+            const bool arrived = WaitUntil(
+                [&] {
+                    for (const entt::entity e : hs.Registry().view<Guid>())
+                        if (hs.Registry().get<Guid>(e).value == kGuestGuid) return true;
+                    return false;
+                },
+                20000,
+                [&] {
+                    clock += 100;
+                    host2.LiveSync(hs, entt::null, clock);
+                    guest2.LiveSync(gs, mk, clock);
+                    host2.Tick(clock);
+                    guest2.Tick(clock);
+                });
+            Check(arrived,
+                  "a GUEST's new object did not reach the host - the wire path for "
+                  "creation is separate from the host's own shortcut");
+        }
+
         // Bad text is named, not silently ignored.
         CollabSession g3;
         g3.EnsureIdentity(dir / "g3.hbkey");
@@ -1168,6 +1616,75 @@ bool CollabSessionSelfTest() {
               "a REPLY pasted where an invitation belongs must be refused");
         host2.Leave();
         guest2.Leave();
+        // ============================================================
+        // THE LOSING ORDER. Everything above shares BEFORE the guest asks,
+        // which is the one ordering that always worked - so it could never
+        // have caught the bug people actually hit. Across two machines the
+        // invitation is ferried by chat over minutes and the Hub asks the
+        // instant the link opens, so the ask ALWAYS arrives first. A host
+        // that had not shared answered with an EMPTY manifest, which the far
+        // end reported as a finished copy of nothing, and nothing ever asked
+        // again. This runs LAST, and on its own sessions, because it has to
+        // tear a host down to prove the second half.
+        // ============================================================
+        {
+            CollabSession host3, guest3;
+            host3.EnsureIdentity(dir / "host.hbkey");
+            guest3.EnsureIdentity(dir / "guest.hbkey");
+            host3.SetIceConfig(localOnly);
+            guest3.SetIceConfig(localOnly);
+            host3.SetProjectRoot(hostProj);
+            const auto pump3 = [&]() {
+                host3.Tick(0);
+                guest3.Tick(0);
+            };
+
+            // HOSTING IS SHARING. There is no second click to forget.
+            Check(host3.StartHosting(), "the third session should start hosting");
+            Check(host3.SharedFileCount() > 0,
+                  "HOSTING MUST IMPLY SHARING - a joiner cannot receive a single byte "
+                  "until the host has shared, and nothing on either screen said so");
+
+            Check(host3.CreateInvitation(), "third invitation");
+            Check(WaitUntil([&] { return !host3.Invitation().empty(); }, 10000, pump3),
+                  "third invitation never became ready");
+            Check(guest3.PrepareJoin(host3.Invitation()) && guest3.ConfirmJoin(),
+                  "guest joins the third session");
+            Check(WaitUntil([&] { return !guest3.Reply().empty(); }, 10000, pump3),
+                  "third reply never became ready");
+            Check(host3.AcceptReply(guest3.Reply()), "host accepts the third reply");
+            Check(WaitUntil([&] { return guest3.Live(); }, 20000, pump3),
+                  "the third guest must connect");
+
+            // The guest asks WITHOUT anybody ever pressing Share.
+            const fs::path landing3 = dir / "unshared";
+            Check(guest3.StartDownload(landing3), "the third download should start");
+            Check(WaitUntil(
+                      [&] {
+                          return guest3.Download() == CollabSession::DownloadPhase::Done ||
+                                 guest3.Download() == CollabSession::DownloadPhase::Failed;
+                      },
+                      40000, pump3),
+                  "the third download never finished");
+            if (guest3.Download() == CollabSession::DownloadPhase::Failed)
+                std::printf("  unshared download failed: %s\n",
+                            guest3.DownloadError().c_str());
+            Check(fs::exists(landing3 / "Game.hbproj"),
+                  "THE PROJECT MUST ARRIVE WITHOUT A SEPARATE SHARE CLICK - this is the "
+                  "two-machine failure: connected, handshake clean, and no files");
+
+            // And a re-host must not inherit the old share. SharedFileCount() is what
+            // hides the Share button, so a stale value showed a green "Sharing N file(s)"
+            // over a brand-new server that was serving nothing - "worked once, never
+            // again". Re-hosting must also re-share by itself.
+            host3.Leave();
+            guest3.Leave();
+            Check(host3.SharedFileCount() == 0,
+                  "Leave() must clear the share, or a re-host silently serves nothing");
+            Check(host3.StartHosting() && host3.SharedFileCount() > 0,
+                  "a SECOND hosting session must share again on its own");
+            host3.Leave();
+        }
     }
 
     fs::remove_all(dir, ec);

@@ -54,6 +54,13 @@ using Signature = std::array<u8, 64>; // r || s
 // people actually do out loud. SHA-256 of the key, first 8 bytes, grouped hex.
 std::string Fingerprint(const PublicKey& k);
 
+// The full key as hex, and back. A FINGERPRINT IS NOT ENOUGH to add someone: it is 8
+// bytes of a hash, so a key cannot be reconstructed from it - it exists for a human to
+// read out and compare, not for the machine to act on. Pre-authorising a colleague before
+// they have ever connected therefore needs the whole key.
+std::string KeyToHex(const PublicKey& k);
+bool KeyFromHex(const std::string& hex, PublicKey& out);
+
 // A stable 64-bit id DERIVED from the public key, for use where a compact key is needed
 // (map keys, the wire's UserId). Derived, never assigned: a counter would collide
 // across hosts, and a durable journal recording author=3 would be wrong forever.

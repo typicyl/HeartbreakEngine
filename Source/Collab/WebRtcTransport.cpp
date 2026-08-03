@@ -2,7 +2,9 @@
 #include "Collab/WebRtcTransport.h"
 
 #include "Collab/CollabClient.h"
-#include "Collab/CollabServer.h"
+#ifndef HBE_COLLAB_JOIN_ONLY
+#  include "Collab/CollabServer.h"
+#endif
 
 #include <rtc/rtc.hpp>
 
@@ -24,11 +26,17 @@ namespace {
 // into a STREAM parser and SCTP delivers reliably and in order.
 constexpr usize kChunk = 16 * 1024;
 
+bool g_verbose = false;
+
 void EnsureLogger() {
     static const bool once = [] {
         // Errors only. libdatachannel is chatty at Info and this shares a console with
         // the engine's own log.
-        rtc::InitLogger(rtc::LogLevel::Error);
+        // Verbose prints EVERY ICE candidate pair, every connectivity check and the
+        // reason the agent gives up - which is the only thing that answers "both ends see
+        // STUN, so why can't they reach each other". Off by default because it is a
+        // torrent and shares the console with the engine log.
+        rtc::InitLogger(g_verbose ? rtc::LogLevel::Verbose : rtc::LogLevel::Error);
         return true;
     }();
     (void)once;
@@ -75,8 +83,19 @@ void WatchPeerConnection(Link& L) {
     });
     L.pc->onStateChange([&L](rtc::PeerConnection::State s) {
         if (s == rtc::PeerConnection::State::Failed ||
-            s == rtc::PeerConnection::State::Closed)
+            s == rtc::PeerConnection::State::Closed) {
+            // RECORD WHY. No callback ever wrote L.err, so Error() was empty for every
+            // network-level failure - including the one that actually happens - and the
+            // editor's Failed branch printed nothing. A peer that gives up in silence is
+            // indistinguishable from one that is still trying.
+            if (L.err.empty() && !L.channelOpen) {
+                L.err = "the two machines could not reach each other in time. ICE gives "
+                        "up after about 40 seconds, and that clock starts when the "
+                        "invitation is opened - so the reply has to be pasted back "
+                        "within that window.";
+            }
             L.broken = true;
+        }
     });
 }
 
@@ -140,6 +159,8 @@ void PumpSecurity(Link& L, bool asServer, const Identity& me, const PeerPolicy& 
 }
 
 } // namespace
+
+void SetVerboseLogging(bool on) { g_verbose = on; }
 
 IceConfig IceConfig::Default() {
     IceConfig c;
@@ -222,6 +243,10 @@ bool WebRtcServerTransport::AcceptReply(ConnId c, const std::string& replyText) 
     const auto it = impl_->links.find(c);
     if (it == impl_->links.end()) return false;
     Link& L = *it->second;
+    // A DEAD LINK MUST NOT BE RESURRECTED. AcceptReply only checked that the ConnId was
+    // still in the map, so a link already Closed/Failed was pushed back to Connecting -
+    // the host then reported "connecting" against a connection that could never come up.
+    if (L.state == LinkState::Closed || L.state == LinkState::Failed) return false;
     SessionBlob blob;
     if (!DecodeSessionBlob(replyText, blob)) return false;
     // An INVITATION pasted where a reply belongs would be set as a remote offer and put
@@ -430,7 +455,11 @@ void WebRtcClientTransport::Poll() {
     if (L.state == LinkState::Connecting || L.state == LinkState::Open ||
         L.state == LinkState::Failed)
         PumpSecurity(L, /*asServer=*/false, *impl_->id, impl_->policy);
-    if (L.broken && L.state != LinkState::Failed) L.state = LinkState::Closed;
+    // FAILED, NOT CLOSED. Mapping a broken link to Closed meant CollabSession's Failed
+    // branch never fired, so the guest sat on "Reply ready - send it back to them."
+    // forever while its connection was already dead underneath.
+    if (L.broken && L.state != LinkState::Failed)
+        L.state = L.err.empty() ? LinkState::Closed : LinkState::Failed;
 }
 
 bool WebRtcClientTransport::Connected() const {
@@ -491,6 +520,86 @@ bool WaitUntil(Fn cond, int maxMs, const std::function<void()>& pump) {
 }
 
 } // namespace
+
+#ifndef HBE_COLLAB_JOIN_ONLY
+// --test-staleinvite: THE THING A HUMAN ACTUALLY DOES.
+//
+// Every other test completes the handshake in milliseconds because both peers live in one
+// process. In real use somebody creates an invitation, copies it into a chat window, walks
+// to another machine, pastes it, waits for a reply, walks back, and pastes that. Minutes
+// pass with the host holding a gathered PeerConnection that has no remote description.
+//
+// If ICE, DTLS or the UDP socket gives up during that window, the link is already dead by
+// the time the reply arrives - which looks exactly like "I pasted the reply and nothing
+// happened", with both ends reporting a healthy network.
+bool WebRtcStaleInviteTest(int delaySeconds) {
+    g_rtcFails = 0;
+    std::error_code ec;
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "hbe_staleinvite_test";
+    std::filesystem::remove_all(dir, ec);
+    Identity hostId, guestId;
+    Check(hostId.LoadOrCreate(dir / "h.hbkey"), "host key");
+    Check(guestId.LoadOrCreate(dir / "g.hbkey"), "guest key");
+
+    Allowlist allow;
+    allow.Add(guestId.Public(), "guest");
+    const PublicKey hostKey = hostId.Public();
+
+    IceConfig local; // host candidates only - hermetic, and enough to link on one machine
+
+    WebRtcServerTransport host;
+    host.EnableSecurity(hostId, [&allow](const PublicKey& k) { return allow.Allows(k); });
+    host.SetIceConfig(local);
+    WebRtcClientTransport guest;
+    guest.EnableSecurity(guestId, [&hostKey](const PublicKey& k) { return k == hostKey; });
+    guest.SetIceConfig(local);
+
+    const ConnId c = host.CreateInvitation();
+    Check(c != 0, "an invitation should start");
+    const auto pump = [&]() {
+        host.Poll();
+        guest.Poll();
+    };
+    Check(WaitUntil([&] { return host.StateOf(c) == LinkState::WaitingForPeer; }, 10000, pump),
+          "the invitation never became ready");
+    const std::string invitation = host.Invitation(c);
+
+    // THE HUMAN DELAY. Polled throughout, exactly as the editor does every frame.
+    std::printf("  holding the invitation for %d seconds...\n", delaySeconds);
+    for (int i = 0; i < delaySeconds * 10; ++i) {
+        pump();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    Check(host.StateOf(c) == LinkState::WaitingForPeer,
+          "THE INVITATION WENT STALE WHILE NOBODY TOUCHED IT - the host's link died on "
+          "its own before any reply arrived, which is exactly the 'I pasted the reply and "
+          "nothing happened' report");
+    if (host.StateOf(c) != LinkState::WaitingForPeer)
+        std::puts(LinkStateName(host.StateOf(c)));
+
+    // Now do what the person does next.
+    Check(guest.BeginFromInvitation(invitation), "the guest accepts the invitation");
+    Check(WaitUntil([&] { return !guest.Reply().empty(); }, 10000, pump),
+          "the reply never became ready");
+    // ...and ANOTHER delay while they carry the reply back.
+    std::puts("  holding the reply, as a person carrying it would...");
+    for (int i = 0; i < delaySeconds * 10; ++i) {
+        pump();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    Check(host.AcceptReply(c, guest.Reply()), "the host should accept the reply");
+    Check(WaitUntil([&] { return guest.Connected(); }, 30000, pump),
+          "THE LINK DID NOT COME UP after a realistic human delay, even though it comes "
+          "up instantly when the same code runs back to back");
+    if (!guest.Connected()) std::puts(guest.Error());
+
+    std::filesystem::remove_all(dir, ec);
+    if (g_rtcFails == 0)
+        std::puts("staleinvite: an invitation survives being carried between machines and still connects");
+    return g_rtcFails == 0;
+}
+#endif
 
 bool NetCheck() {
     EnsureLogger();
@@ -564,6 +673,12 @@ bool NetCheck() {
     return host > 0;
 }
 
+#ifdef HBE_COLLAB_JOIN_ONLY
+// The Hub links the CLIENT half of collaboration and nothing else - it joins, it does not
+// host. This self-test drives a real CollabServer, so compiling it there would drag the
+// authority, the lock table and the paint log into a launcher that will never run them.
+bool WebRtcSelfTest() { return true; }
+#else
 bool WebRtcSelfTest() {
     g_rtcFails = 0;
     if (!SignalingSelfTest()) ++g_rtcFails;
@@ -623,8 +738,7 @@ bool WebRtcSelfTest() {
 
     Check(WaitUntil([&] { return guest.Connected(); }, 15000, pumpBoth),
           "the peer-to-peer link never opened and authenticated");
-    if (!guest.Connected()) std::printf("  guest: %s\n", guest.Error());
-
+    if (!guest.Connected()) std::puts(guest.Error());
     PublicKey proven{};
     Check(guest.PeerKey(proven) && proven == hostId.Public(),
           "the guest must PROVE which host it reached, not take the invitation's word");
@@ -746,5 +860,6 @@ bool WebRtcSelfTest() {
     }
     return g_rtcFails == 0;
 }
+#endif // HBE_COLLAB_JOIN_ONLY
 
 } // namespace hbe::collab

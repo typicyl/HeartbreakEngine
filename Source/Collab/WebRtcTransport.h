@@ -63,6 +63,12 @@ enum class LinkState : u8 {
 
 const char* LinkStateName(LinkState s);
 
+// Turns on libdatachannel's own ICE logging. MUST be called before the first transport is
+// created - the logger is initialised once. This is what answers "both machines reach
+// STUN, so why can they not reach each other": it names every candidate pair tried and
+// why the agent gave up.
+void SetVerboseLogging(bool on);
+
 // The host. One invitation per guest - WebRTC links are point to point, so a host with
 // three collaborators holds three of them.
 class WebRtcServerTransport final : public IServerTransport {
@@ -158,6 +164,11 @@ bool WebRtcSelfTest();
 // Separate from the self-test on purpose. This one needs the internet, so it must never
 // be something CI or a developer on a train can fail; and it is a DIAGNOSTIC - the thing
 // to run when someone says "it won't connect" - rather than an assertion about our code.
+// --test-staleinvite [seconds]: holds an invitation, and then the reply, for a realistic
+// human delay before completing the handshake. Everything else in the suite links two
+// peers in milliseconds, which is the one thing real use never does.
+bool WebRtcStaleInviteTest(int delaySeconds);
+
 bool NetCheck();
 
 } // namespace hbe::collab

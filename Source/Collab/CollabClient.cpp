@@ -99,6 +99,10 @@ void CollabClient::Dispatch(const Frame& f) {
             if (const auto m = DecodePeerJoined(f.payload, f.size))
                 if (cb_.onPeerJoined) cb_.onPeerJoined(*m);
             break;
+        case MsgType::EntityLived:
+            if (const auto m = DecodeEntityLived(f.payload, f.size))
+                if (cb_.onLived) cb_.onLived(*m);
+            break;
         case MsgType::SyncManifest:
             if (const auto m = DecodeSyncManifest(f.payload, f.size))
                 if (cb_.onManifest) cb_.onManifest(*m);
@@ -154,6 +158,15 @@ void CollabClient::SendPaintPreview(CanvasId canvas, u32 layerId,
     m.layerId = layerId;
     m.partialBlob = partial;
     EncodePaintPreview(outbox_, m);
+    Flush();
+}
+
+void CollabClient::SendLife(const EntityKey& k, bool destroy, const std::string& name) {
+    MsgEntityLife m;
+    m.key = k;
+    m.destroy = destroy;
+    m.name = name;
+    EncodeEntityLife(outbox_, m);
     Flush();
 }
 

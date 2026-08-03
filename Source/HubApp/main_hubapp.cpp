@@ -29,6 +29,7 @@
 #include <shobjidl.h>
 
 #include "Hub/HubConfig.h"
+#include "Hub/HubJoin.h"
 #include "Hub/ProjectCatalog.h"
 #include "Hub/UpdateCheck.h"
 #include "Hub/Updater.h"
@@ -246,6 +247,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     bool installed = hbe::hub::LooksInstalled(cfg.installRoot);
 
     std::string status, rollbackMsg;
+    // Joining a colleague's session to fetch a project - see HubJoin.h.
+    hbe::hub::JoinSession join;
+    bool showJoin = false;
+    char joinPath[512] = {};
     bool checking = false;
     // Latches the one-shot "record the install" work so it does not re-run every frame
     // while the Done screen is up.
@@ -268,6 +273,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             if (msg.message == WM_QUIT) running = false;
         }
         if (!running) break;
+
+        // THE TRANSPORT PUMP BELONGS HERE, not inside the popup body where it used to
+        // live. ImGui closes a modal by itself when it is completely clipped - e.g. when
+        // this window is minimised - which stopped the transfer dead, mid-file, with no
+        // state change on either end and nothing on screen to say so.
+        join.Tick();
 
         if (checking) {
             const auto st = updater.Progress().state;
@@ -496,9 +507,100 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             }
         }
         ImGui::SameLine();
+        // GET A PROJECT FROM A COLLEAGUE. The reason this lives in the LAUNCHER and not
+        // only in the editor: the person who needs it has no project to open, so
+        // requiring them to reach the editor's Collaborate panel first meant inventing an
+        // empty project purely to get somewhere they could download the real one.
+        if (ImGui::Button("Get a project from someone...")) {
+            join.LoadIdentity(hbe::hub::IdentityFileForHub());
+            showJoin = true;
+        }
+        ImGui::SameLine();
         if (ImGui::Button("Refresh")) projects = hbe::hub::LoadProjects();
         ImGui::SameLine();
         if (!status.empty()) ImGui::TextDisabled("%s", status.c_str());
+
+        if (showJoin) {
+            ImGui::OpenPopup("Get a project");
+            showJoin = false;
+        }
+        if (ImGui::BeginPopupModal("Get a project", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            // join.Tick() runs in the frame loop above - drawing must not be what drives
+            // the network.
+            ImGui::TextDisabled("Your fingerprint (read this out so they can let you in):");
+            ImGui::Text("%s", join.Fingerprint().c_str());
+            ImGui::SameLine();
+            if (ImGui::Button("Copy")) ImGui::SetClipboardText(join.Fingerprint().c_str());
+            ImGui::Separator();
+            ImGui::TextWrapped("%s", join.Status().empty()
+                                         ? hbe::hub::JoinSession::StepName(join.State())
+                                         : join.Status().c_str());
+            ImGui::Separator();
+
+            switch (join.State()) {
+            case hbe::hub::JoinSession::Step::NeedInvitation:
+                if (ImGui::Button("Paste their invitation")) {
+                    if (const char* t = ImGui::GetClipboardText()) join.Paste(t);
+                }
+                break;
+            case hbe::hub::JoinSession::Step::Confirm:
+                ImGui::TextWrapped("This invitation says it is from:");
+                ImGui::Text("%s", join.HostFingerprint().c_str());
+                ImGui::TextWrapped("Check that against what they told you.");
+                ImGui::InputTextWithHint("##into", "folder to put the project in",
+                                         joinPath, sizeof(joinPath));
+                ImGui::SameLine();
+                if (ImGui::Button("Browse...")) {
+                    const std::wstring d = PickFile(hwnd, /*folder*/ true);
+                    if (!d.empty())
+                        std::snprintf(joinPath, sizeof(joinPath), "%s", Utf8(d).c_str());
+                }
+                ImGui::BeginDisabled(joinPath[0] == 0);
+                if (ImGui::Button("Connect")) join.Confirm(joinPath);
+                ImGui::EndDisabled();
+                break;
+            case hbe::hub::JoinSession::Step::Connecting:
+                if (!join.Reply().empty()) {
+                    ImGui::TextWrapped("Send this reply back to them:");
+                    if (ImGui::Button("Copy the reply"))
+                        ImGui::SetClipboardText(join.Reply().c_str());
+                }
+                break;
+            case hbe::hub::JoinSession::Step::Fetching:
+                ImGui::Text("%d / %d file(s), %.1f MB", static_cast<int>(join.FilesDone()),
+                            static_cast<int>(join.FilesTotal()),
+                            static_cast<double>(join.Bytes()) / (1024.0 * 1024.0));
+                break;
+            case hbe::hub::JoinSession::Step::Done: {
+                const std::filesystem::path proj = join.ProjectFile();
+                ImGui::BeginDisabled(proj.empty());
+                if (ImGui::Button("Open it")) {
+                    std::string err;
+                    if (hbe::hub::LaunchEditor(proj.wstring(), err)) {
+                        hbe::hub::TouchProject(projects, proj.wstring());
+                        hbe::hub::SaveProjects(projects);
+                        status = "Launched " + proj.filename().string();
+                        join.Cancel();
+                        ImGui::CloseCurrentPopup();
+                    } else {
+                        status = err;
+                    }
+                }
+                ImGui::EndDisabled();
+                break;
+            }
+            default:
+                break;
+            }
+
+            ImGui::Separator();
+            if (ImGui::Button("Close")) {
+                join.Cancel();
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
 
         ImGui::End();
 

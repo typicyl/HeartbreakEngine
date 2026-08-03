@@ -16,6 +16,7 @@
 #include "Collab/Transport.h"
 
 #include <string>
+#include <array>
 #include <functional>
 #include <unordered_map>
 #include <vector>
@@ -72,6 +73,20 @@ public:
     // LocalDelta - the host's own edit is already in its scene, and re-applying it would
     // fight the author's drag.
     std::function<void(const MsgDeltaApplied&)> onApplied;
+    // Same reasoning, for an entity APPEARING or DISAPPEARING.
+    std::function<void(const MsgEntityLived&)> onLived;
+    // A committed stroke from an artist, in server order. The host needs it for the same
+    // reason as the others: it is the authority, so nothing broadcasts back to it.
+    std::function<void(const MsgPaintCommitted&)> onPainted;
+
+    // The host's own committed stroke. No lock is involved - paint is deliberately not
+    // lock-gated, because two artists on one canvas is the point.
+    void LocalPaint(CanvasId canvas, u32 layerId, const std::vector<u8>& strokeBlob);
+
+    // The host's own creation/destruction. No lock is required to CREATE (there is no
+    // entity to hold yet); destroying REQUIRES the lock, so nobody can delete an object
+    // out from under someone who is editing it.
+    bool LocalLife(const EntityKey& k, bool destroy, const std::string& name);
 
     // --- SERVING THE PROJECT ---------------------------------------------------
     //
@@ -83,16 +98,26 @@ public:
     // produced by our own walk of our own project. (The RECEIVER still contains its
     // paths independently; a peer must never trust the other side's idea of a path.)
     //
-    // Not called = nothing is served. A host that has not chosen to share gets a refusal
-    // rather than an empty manifest, so "nothing came through" is distinguishable from
-    // "there is nothing to send".
+    // Not called = nothing is served. THE HEADER USED TO PROMISE A REFUSAL HERE AND THE
+    // CODE NEVER DID IT: a host that has not shared answers a SyncRequest with an EMPTY
+    // manifest (see OnSyncRequest), which the guest reads as a finished copy. The guest
+    // now reports that case by name. Turning it into a distinct refusal would need an
+    // appended MsgType, which an older peer skips silently and therefore hangs on - worse
+    // than the empty answer.
     void ShareProject(const std::string& root, MsgSyncManifest manifest);
     bool Sharing() const { return !shareRoot_.empty(); }
+
+    // How many peers asked for the project while we had nothing to give. This is the ONLY
+    // evidence a host will ever get that someone is waiting: the guest receives a
+    // successful-looking empty manifest and never asks again.
+    usize AsksWithNothingToSend() const { return asksWithNothingToSend_; }
 
 private:
     // Reserved, and deliberately not 0 (0 means "nobody" throughout) nor drawn from
     // nextUser_ (which starts at 1 for the first guest). A distinct constant means a
     // lock badge can say "you" without a special case anywhere else.
+    usize asksWithNothingToSend_ = 0;
+
     static constexpr UserId kLocalUser = 0xFFFF'FFFFu;
     static constexpr SessionId kLocalSession = 0xFFFF'FFFFu;
 
@@ -110,7 +135,22 @@ private:
         // would stall every scene delta behind it.
         std::string sendPath;
         u64 sendOffset = 0;
+        // The key this connection PROVED, when the transport authenticates. This, not
+        // `name`, is who the peer IS.
+        std::array<u8, 64> key{};
+        bool keyed = false;
     };
+    void FinishHello(Peer& p);
+    // Hashing a 64-byte key. std::hash has no specialisation for std::array.
+    struct KeyHash {
+        usize operator()(const std::array<u8, 64>& k) const {
+            usize h = 1469598103934665603ull;
+            for (const u8 b : k) { h ^= b; h *= 1099511628211ull; }
+            return h;
+        }
+    };
+    std::unordered_map<std::array<u8, 64>, UserId, KeyHash> keyUsers_;
+    u64 lastTickMs_ = 0;
     void OnSyncRequest(Peer& p);
     void OnFileRequest(Peer& p, const MsgFileRequest& m);
     void PumpFileSends();
@@ -124,6 +164,7 @@ private:
     void OnLockRequest(Peer& p, const MsgLockRequest& m, u64 nowMs);
     void OnLockRelease(Peer& p, const MsgLockRelease& m);
     void OnEntityDelta(Peer& p, const MsgEntityDelta& m);
+    void OnEntityLife(Peer& p, const MsgEntityLife& m);
     void OnPaintOp(Peer& p, const MsgPaintOp& m);
     void OnPaintPreview(Peer& p, const MsgPaintPreview& m);
 
