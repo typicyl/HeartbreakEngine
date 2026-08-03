@@ -63,11 +63,22 @@ bool Graph::Connect(u32 fromNode, u32 fromPin, u32 toNode, u32 toPin) {
     if (!fn || !tn) return false;
     if (static_cast<int>(fromPin) >= OutPinCount(*fn)) return false;
     if (tn->type == NodeType::Start) return false; // Start has no input
-    // One wire per output pin, and one wire per input pin (replace existing).
+    // ONE WIRE PER OUTPUT PIN. INPUTS TAKE MANY (fan-in).
+    //
+    // Output uniqueness is required: Follow(node, outPin) returns THE next node, so a
+    // second wire off one output would be unreachable.
+    //
+    // Input uniqueness was NOT required and was actively harmful. This loop used to
+    // erase any link matching (toNode, toPin) as well, and Line/End have a single
+    // input pin - so wiring a second branch into a node that already had one SILENTLY
+    // DELETED the first branch's wire, with nothing on screen to say so. That made the
+    // canonical dialogue shape - choice -> several branches -> rejoin at a common line
+    // - literally unauthorable, and at runtime the orphaned branch hit Follow()==0 and
+    // ended the conversation early. Nothing indexes links by their destination
+    // (traversal is forward-only through Follow), so fan-in costs nothing.
     for (usize i = 0; i < links.size();) {
         const Link& l = links[i];
-        if ((l.fromNode == fromNode && l.fromPin == fromPin) ||
-            (l.toNode == toNode && l.toPin == toPin))
+        if (l.fromNode == fromNode && l.fromPin == fromPin)
             links.erase(links.begin() + static_cast<std::ptrdiff_t>(i));
         else
             ++i;

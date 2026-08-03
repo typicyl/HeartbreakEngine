@@ -1,5 +1,6 @@
 // Editor/Editor.cpp
 #include "Editor/Editor.h"
+#include "Hub/Updater.h" // hub launcher: engine version + auto-update
 
 #include "Assets/AssetFormats.h"
 #include "Assets/AssetLoader.h"
@@ -344,7 +345,8 @@ void Editor::BuildUI(Engine& engine) {
     // clears this below).
     engine.SetUIKeyboardCaptured(true);
     if (hubMode_) {
-        // Hub: nothing but the Project Manager over the demo scene.
+        // Hub: the launcher (engine version + updates) and the Project Manager.
+        DrawHubLauncher();
         DrawProjectManager();
         return;
     }
@@ -366,6 +368,9 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_UIDocument] = false;         // .hbui authoring, opened on demand
         panelOpen_[Panel_Tags] = false;               // streaming-tag list, opened on demand
         panelOpen_[Panel_UIEditor] = false;           // dedicated .hbui canvas, opened on demand
+        panelOpen_[Panel_Collaborate] = false;        // peer-to-peer session, opened on demand
+        panelOpen_[Panel_People] = false;             // who may join this project
+        panelOpen_[Panel_Review] = false;             // opens itself when there is a merge
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -413,6 +418,7 @@ void Editor::BuildUI(Engine& engine) {
             if (worldHasContent && std::filesystem::exists(startup, ec)) {
                 currentScenePath_ = startup;
                 AdoptWorld(scene);
+                CollabNoteOpened(scene, startup); // the startup level is the open document
                 HBE_INFO("Editor: adopted the project's startup scene '{}' as the open "
                          "level, so Ctrl+S saves it rather than asking for a new name.",
                          startup.string());
@@ -449,7 +455,10 @@ void Editor::BuildUI(Engine& engine) {
                     showBuildSettings_ = true;
                 }
                 if (ImGui::MenuItem("Build", nullptr, false, hasProject)) {
-                    BuildShipping(buildResult_); // packs assets + assembles Build/
+                    // Confirm first when the ship would fall back off Release
+                    // (popups cannot be opened from inside a menu - defer a frame).
+                    if (HasReleaseRuntime()) BuildShipping(buildResult_);
+                    else wantShipConfirm_ = true;
                 }
             }
             if (!recentProjects_.empty()) {
@@ -589,43 +598,22 @@ void Editor::BuildUI(Engine& engine) {
     // frame, after every panel has had its chance to claim.
     RegisterSaveShortcuts(engine);
 
-    // Keyboard shortcuts (suppressed while a text field has focus).
+    // Keyboard shortcuts.
     {
         const ImGuiIO& io = ImGui::GetIO();
-        if (io.KeyCtrl && !io.WantTextInput) {
-            // While the *surface* paint tool is active, Ctrl+Z/Y drive the
-            // stroke-level paint history (the scene undo would not capture canvas
-            // pixels). In 3D-stroke mode the strokes are real scene entities, so
-            // undo must route to the scene history instead - otherwise undoing a
-            // 3D stroke would pop a stale surface stroke from a different mode.
-            const bool paintHistory = paintActive_ && !paintStrokeMode_ &&
-                                      (!paintStrokeOrder_.empty() || !paintStrokeRedo_.empty());
-            // NOTE the shape: the Ctrl+S / Ctrl+Shift+S branches that used to head
-            // this if/else-if chain moved to RegisterSaveShortcuts above. The paint-
-            // vs-scene undo arbitration is the chain's remaining correctness-
-            // sensitive part and must keep its order: paint history FIRST, plain
-            // scene undo as its else.
-            if (paintHistory && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
-                io.KeyShift ? PaintRedo(engine) : PaintUndo(engine);
-            } else if (ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
-                io.KeyShift ? Redo(engine) : Undo(engine);
-            }
-            if (paintHistory && ImGui::IsKeyPressed(ImGuiKey_Y, false)) PaintRedo(engine);
-            else if (ImGui::IsKeyPressed(ImGuiKey_Y, false)) Redo(engine);
-
-            // Entity clipboard: copy / paste / cut / duplicate the selection.
-            Scene& s = engine.GetScene();
-            const bool hasSel = selected_ != entt::null && s.Registry().valid(selected_);
-            if (ImGui::IsKeyPressed(ImGuiKey_C, false) && hasSel) CopySelection(s);
-            if (ImGui::IsKeyPressed(ImGuiKey_V, false)) PasteClipboard(engine);
-            if (ImGui::IsKeyPressed(ImGuiKey_X, false) && hasSel) {
-                CopySelection(s);
-                PushUndo(s);
-                DestroyRecursive(s, selected_);
-                selected_ = entt::null;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_D, false) && hasSel) DuplicateSelection(engine);
-        }
+        // Ctrl+Z/Y/X/C/V/D USED TO BE POLLED RIGHT HERE, gated only on
+        // `io.KeyCtrl && !io.WantTextInput` and with no notion of which panel was
+        // focused - so Ctrl+X with the Dialogue Editor focused ran CopySelection +
+        // PushUndo + DestroyRecursive on the SCENE selection, destroying level
+        // content from a keypress aimed at a dialogue node.
+        //
+        // They are now routed through the same claim model Ctrl+S has used for
+        // years: panels register in ClaimFocus, the global scene fallback lives in
+        // RegisterSaveShortcuts, and ProcessEditRequest executes exactly ONE action
+        // per chord per frame. The paint-vs-scene undo arbitration moved with them
+        // (EditContext::paintHistoryActive) and kept its order - paint first, scene
+        // as its else - but is now confined to the scene domain instead of firing
+        // from whichever panel happened to be focused. See Editor/SaveDispatch.h.
         // F (no modifier): frame the camera on the selection (Blender/Unity-style).
         // Only over the viewport and in edit mode, so it never steals the game camera
         // during play or fires from another panel.
@@ -658,6 +646,36 @@ void Editor::BuildUI(Engine& engine) {
             ImGui::CloseCurrentPopup();
         }
         ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // Ship-without-Release confirm. BuildShipping falls back to whatever config it
+    // can find, and used to log a warning and then report "Shipping build (72.6 MB)"
+    // as a plain success - so a Debug runtime (~23 ms CPU/frame here, measured)
+    // shipped looking exactly like a good build. The log line stays; this is the
+    // part the author actually sees.
+    if (wantShipConfirm_) {
+        ImGui::OpenPopup("Ship without Release?");
+        wantShipConfirm_ = false;
+    }
+    if (ImGui::BeginPopupModal("Ship without Release?", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                           "No Release runtime was found next to the editor.");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Shipping will fall back to a slower build. A Debug runtime");
+        ImGui::TextUnformatted("costs roughly 23 ms of CPU per frame on this engine - the");
+        ImGui::TextUnformatted("resulting game is not shippable, even though the build");
+        ImGui::TextUnformatted("itself will succeed.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Fix: build the Release config, then Build again.");
+        ImGui::Separator();
+        if (ImGui::Button("Ship anyway")) {
+            BuildShipping(buildResult_);
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::SameLine();
         if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
@@ -736,6 +754,9 @@ void Editor::BuildUI(Engine& engine) {
     // resident and suspends itself during a gizmo drag, so nothing under the author's
     // cursor can disappear mid-frame.
     LiveStreamTick(engine);
+    // Same slot and the same reason: a network poll can deliver another peer's edits, so
+    // it must land before any panel reads the world rather than between two panel draws.
+    CollabTick(engine);
 
     // Every panel below is gated by its panelOpen_ flag; the artist build
     // (artMode_) just defaults that set to the painting panels, so the same draw
@@ -774,6 +795,9 @@ void Editor::BuildUI(Engine& engine) {
     // is open its claim must win deterministically (see UIEditor.cpp).
     DrawUIEditorPanel(engine);
     DrawTagsPanel(engine);        // streaming tags: per-tag radii + usage (Window > Tags)
+    DrawCollaborate(engine);      // peer-to-peer session + this scene's history
+    DrawCollabPeople(engine);     // who is allowed to join this project
+    DrawCollabReview(engine);     // a merge that needs a person to decide
     // Baked shard boxes + radii + the simulated focus. Before the selection outline so
     // the selection stays the brightest thing on screen.
     DrawShardOverlay(scene, renderer);
@@ -823,6 +847,10 @@ void Editor::BuildUI(Engine& engine) {
     // Ctrl+S, resolved and executed LAST: every panel has drawn by now, so whichever
     // one won the route has registered its claim. Then the toast, so a save that
     // happened this frame is already on screen.
+    // Both executors run LAST, after every panel has drawn and claimed - a panel that
+    // has not drawn yet this frame has not had a chance to claim, and executing early
+    // would hand the chord to the global fallback (the scene).
+    ProcessEditRequest(engine);
     ProcessSaveRequest(engine);
     DrawSaveToast();
 }
@@ -843,7 +871,7 @@ void Editor::DrawWindowMenu() {
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
-        "Tags", "UI Editor"};
+        "Tags", "UI Editor", "Collaborate", "People", "Review changes"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -910,6 +938,38 @@ bool Editor::ClaimSave(editor::SaveSurface surface) {
     return true;
 }
 
+namespace {
+struct EditChord {
+    ImGuiKeyChord chord;
+    editor::EditVerb verb;
+};
+// Ctrl+Shift+Z and Ctrl+Y are SEPARATE registrations because Shortcut() matches
+// modifiers EXACTLY. That exactness is also what stops Ctrl+Shift+Y redoing and
+// Ctrl+Alt+D duplicating, which the old `io.KeyCtrl` modifier-DOWN test allowed -
+// the same class of bug RegisterSaveShortcuts already documents fixing for
+// Ctrl+Shift+S.
+constexpr EditChord kEditChords[] = {
+    {ImGuiMod_Ctrl | ImGuiKey_Z, editor::EditVerb::Undo},
+    {ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z, editor::EditVerb::Redo},
+    {ImGuiMod_Ctrl | ImGuiKey_Y, editor::EditVerb::Redo},
+    {ImGuiMod_Ctrl | ImGuiKey_X, editor::EditVerb::Cut},
+    {ImGuiMod_Ctrl | ImGuiKey_C, editor::EditVerb::Copy},
+    {ImGuiMod_Ctrl | ImGuiKey_V, editor::EditVerb::Paste},
+    {ImGuiMod_Ctrl | ImGuiKey_D, editor::EditVerb::Duplicate},
+};
+} // namespace
+
+void Editor::ClaimFocus(editor::SaveSurface surface) {
+    ClaimSave(surface); // unchanged; still its own function and its own chord
+    for (const EditChord& c : kEditChords) {
+        if (!ImGui::Shortcut(c.chord, ImGuiInputFlags_RouteFocused |
+                                          ImGuiInputFlags_RouteFromRootWindow))
+            continue;
+        editVerbSurface_[static_cast<u8>(c.verb)] = surface;
+        editVerbs_ |= static_cast<u8>(1u << static_cast<u8>(c.verb));
+    }
+}
+
 void Editor::RegisterSaveShortcuts(Engine& engine) {
     // Ctrl+Shift+S: ONE global route, unclaimable by any panel. "Save everything"
     // does not depend on focus, and Shortcut() matches modifiers EXACTLY, so this
@@ -932,6 +992,15 @@ void Editor::RegisterSaveShortcuts(Engine& engine) {
         saveClaim_ = editor::SaveSurface::None;
         saveRequested_ = true;
     }
+    // The six edit chords at score 1: the SCENE, exactly as before, whenever no panel
+    // claimed (viewport, hierarchy, inspector, timeline, the dockspace void). Both
+    // fallbacks live in this one function so there is a single place to read "what
+    // happens when nobody owns the key".
+    for (const EditChord& c : kEditChords) {
+        if (!ImGui::Shortcut(c.chord, ImGuiInputFlags_RouteGlobal)) continue;
+        editVerbSurface_[static_cast<u8>(c.verb)] = editor::SaveSurface::None;
+        editVerbs_ |= static_cast<u8>(1u << static_cast<u8>(c.verb));
+    }
 }
 
 editor::SaveSurface Editor::AssetViewerSurface() const {
@@ -952,6 +1021,130 @@ editor::SaveSurface Editor::AssetViewerSurface() const {
     // A texture, a scene, a cutscene/dialogue launcher, a read-only preview: nothing
     // this panel can write. NOT `None` - that would fall through to the scene.
     return editor::SaveSurface::AssetViewer;
+}
+
+void Editor::ProcessEditRequest(Engine& engine) {
+    if (!editVerbs_) return;
+    const u8 verbs = editVerbs_;
+    editVerbs_ = 0;
+    // A fixed verb order, so two chords granted in one frame behave deterministically
+    // (the old separate `if`s already ran both; this keeps that and pins the order).
+    for (u8 i = 0; i < static_cast<u8>(editor::EditVerb::Count); ++i) {
+        if (!(verbs & (1u << i))) continue;
+        editor::EditContext ctx;
+        ctx.focused = editVerbSurface_[i];
+        if (ctx.focused == editor::SaveSurface::AssetViewer)
+            ctx.focused = AssetViewerSurface(); // resolved at execution time, as Ctrl+S does
+        ctx.verb = static_cast<editor::EditVerb>(i);
+        ctx.playMode = playMode_;
+        ctx.textFieldActive = ImGui::GetIO().WantTextInput;
+        ctx.surfaceHasContent = SurfaceHasContent(engine, ctx.focused);
+        ctx.paintHistoryActive = paintActive_ && !paintStrokeMode_ &&
+                                 (!paintStrokeOrder_.empty() || !paintStrokeRedo_.empty());
+        ctx.hasSelection = SurfaceHasSelection(ctx.focused);
+        ctx.clipboardEmpty = SurfaceClipboardEmpty(ctx.focused);
+        ctx.historyEmpty = SurfaceHistoryEmpty(ctx.focused, ctx.verb);
+
+        switch (editor::DecideEdit(ctx)) {
+            case editor::EditAction::Ignored:
+                break; // deliberately silent - see EditAction::Ignored
+            case editor::EditAction::NothingOpen:
+                SetSaveStatus(std::string(editor::SaveSurfaceName(ctx.focused)) +
+                                  ": nothing open to " + editor::EditVerbName(ctx.verb) + ".",
+                              false);
+                break;
+            case editor::EditAction::RefusedPlayMode:
+                SetSaveStatus("Not while playing.", true);
+                break;
+            case editor::EditAction::SceneUndo: Undo(engine); break;
+            case editor::EditAction::SceneRedo: Redo(engine); break;
+            case editor::EditAction::SceneCopy: CopySelection(engine.GetScene()); break;
+            case editor::EditAction::ScenePaste: PasteClipboard(engine); break;
+            case editor::EditAction::SceneCut: {
+                Scene& s = engine.GetScene();
+                CopySelection(s);
+                PushUndo(s);
+                DestroyRecursive(s, selected_);
+                selected_ = entt::null;
+            } break;
+            case editor::EditAction::SceneDuplicate: DuplicateSelection(engine); break;
+            case editor::EditAction::PaintUndo: PaintUndo(engine); break;
+            case editor::EditAction::PaintRedo: PaintRedo(engine); break;
+            // Unreachable today: SurfaceHistoryEmpty reports every asset history empty
+            // and no asset editor grants a clipboard verb, so DecideEdit resolves them
+            // to Ignored. They are enumerated (not defaulted) so that adding a
+            // per-editor history is a COMPILE-visible change here, not a silent no-op.
+            case editor::EditAction::AssetUndo:
+                if (ctx.focused == editor::SaveSurface::Dialogue &&
+                    dlgHistory_.Undo(dlgGraph_)) {
+                    dlgSelected_ = 0; // the restored graph may not contain it
+                    dlgDirty_ = true;
+                }
+                break;
+            case editor::EditAction::AssetRedo:
+                if (ctx.focused == editor::SaveSurface::Dialogue &&
+                    dlgHistory_.Redo(dlgGraph_)) {
+                    dlgSelected_ = 0;
+                    dlgDirty_ = true;
+                }
+                break;
+            case editor::EditAction::AssetCut:
+            case editor::EditAction::AssetCopy:
+            case editor::EditAction::AssetPaste:
+            case editor::EditAction::AssetDuplicate:
+            case editor::EditAction::Count:
+                break;
+        }
+    }
+}
+
+bool Editor::SurfaceHasSelection(editor::SaveSurface s) const {
+    switch (s) {
+        case editor::SaveSurface::None:
+        case editor::SaveSurface::Scene:
+        case editor::SaveSurface::UIDocument:
+            // Both resolve to the SCENE selection - `.hbui` elements are entities and
+            // share selected_ with the world.
+            return selected_ != entt::null;
+        case editor::SaveSurface::Schematic: return schemSelected_ != 0;
+        case editor::SaveSurface::Dialogue: return dlgSelected_ != 0;
+        default:
+            // The remaining asset editors grant only Undo/Redo today, which do not
+            // consult a selection. Reporting false keeps a future Cut/Duplicate from
+            // silently acting on nothing the day its bit is turned on.
+            return false;
+    }
+}
+
+bool Editor::SurfaceClipboardEmpty(editor::SaveSurface s) const {
+    switch (s) {
+        case editor::SaveSurface::None:
+        case editor::SaveSurface::Scene:
+        case editor::SaveSurface::UIDocument:
+            return clipboard_.empty();
+        default: return true; // no asset editor has its own clipboard yet
+    }
+}
+
+bool Editor::SurfaceHistoryEmpty(editor::SaveSurface s, editor::EditVerb v) const {
+    const bool redo = v == editor::EditVerb::Redo;
+    // The PAINT history is checked by the caller through paintHistoryActive, not
+    // here: DecideEdit resolves paint-vs-scene before it consults this.
+    switch (s) {
+        case editor::SaveSurface::None:
+        case editor::SaveSurface::Scene:
+        case editor::SaveSurface::UIDocument:
+            return redo ? redoStack_.empty() : undoStack_.empty();
+        case editor::SaveSurface::Dialogue:
+            return redo ? dlgHistory_.redo.empty() : dlgHistory_.undo.empty();
+        default:
+            // The remaining asset editors have no history yet, so their Undo/Redo
+            // resolves to Ignored - a silent no-op. That is deliberate and is the SAFE
+            // half of the fix: before routing, these chords did not no-op, they edited
+            // the LEVEL. Each editor that gains an AssetHistory adds its case here and
+            // nothing else changes.
+            return true;
+    }
 }
 
 bool Editor::SurfaceHasContent(Engine& engine, editor::SaveSurface s) const {
@@ -1655,7 +1848,20 @@ bool Editor::SaveViewedMesh() {
                   previewPath_.string(), viewedAsset_.string());
         return false;
     }
-    if (!uaf::WriteMesh(viewedAsset_, previewModel_)) return false;
+    // PRESERVE THE RIG. uaf::WriteMesh takes the skeleton+clips as a defaulted
+    // `const Rig*` and writes `hasRig = 0` when it is null - it does not merge with
+    // what is already in the file, it REPLACES the whole asset. This call used to let
+    // that argument default, and uaf::ReadMesh (which produced previewModel_) never
+    // reads the rig, so there was nothing to write back: changing one material slot on
+    // a SKINNED character destroyed its skeleton and every animation clip in the file.
+    // Silent, immediate, and unrecoverable without a re-import.
+    //
+    // Read the rig straight back off disk and pass it through. ReadRig returns nullopt
+    // for a static mesh, which is exactly the nullptr case that was always correct.
+    const std::optional<Rig> keepRig = uaf::ReadRig(viewedAsset_);
+    if (!uaf::WriteMesh(viewedAsset_, previewModel_, /*guid*/ 0,
+                        keepRig ? &*keepRig : nullptr))
+        return false;
     StampNewAsset(viewedAsset_); // WriteHeader cleared the slot flag; restore its id
     previewMeshDirty_ = false;
     scene::ClearInstantiateCaches(); // resident copies of this mesh are now stale
@@ -2290,6 +2496,9 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
         if (wrote) HBE_INFO("SaveScene: wrote an EMPTY scene to '{}'.", activePath.string());
         StampSavedAssets(saveMark);
         if (ok && wrote) {
+            // BEFORE AdoptWorld, which re-baselines. Deleting every object and saving is
+            // a real change set, and it is the one a collaborator most needs to see.
+            CollabNoteSaved(scene, activePath);
             currentScenePath_ = activePath; // see the note at the other write site
             AdoptWorld(scene);              // unbinds live zones - see AdoptWorld
         }
@@ -2325,6 +2534,11 @@ bool Editor::SaveSceneToDisk(Scene& scene, const std::filesystem::path& path) {
         // reverting everything done since the last save of the old level, into the new
         // one. Assigning here means "the streamer follows the write", which is the only
         // relationship that is ever correct.
+        // Seal the change set BEFORE AdoptWorld and before currentScenePath_ moves: this
+        // is the one point where the file that was actually written and the world that
+        // was written from are both in hand. Every other candidate (SaveCurrent,
+        // SaveSceneWithStatus) is bypassed by Save As.
+        CollabNoteSaved(scene, activePath);
         currentScenePath_ = activePath;
         AdoptWorld(scene); // unbinds live zones - see AdoptWorld
     }
@@ -3572,7 +3786,7 @@ void Editor::DrawArtEditor(Engine& engine) {
     // SaveSceneToDisk -> SavePaintCanvases, so Ctrl+S here means the same thing it
     // means in the viewport. It claims anyway so the status line can say so.
     // Above the `Begin() == false` return - see the note in DrawUIEditor.
-    ClaimSave(editor::SaveSurface::Scene);
+    ClaimFocus(editor::SaveSurface::Scene);
     if (!artVisible) {
         ImGui::End();
         return;
@@ -3772,6 +3986,13 @@ void Editor::DrawArtEditor(Engine& engine) {
             paint::Stroke s;
             s.type = paint::StrokeType::Fill;
             s.layer = pc.activeLayer;
+            // ...and the STABLE id alongside it. `layer` is kept only so a v4 reader
+            // still loads the file; every consumer resolves through layerId, which is
+            // what survives a reorder.
+            s.layerId = (pc.activeLayer >= 0 &&
+                         pc.activeLayer < static_cast<int>(pc.layers.size()))
+                            ? pc.layers[static_cast<usize>(pc.activeLayer)].id
+                            : 0;
             s.brush = brushDef_;
             s.color = brushColor_;
             s.metallic = brushMetallic_;
@@ -3793,6 +4014,13 @@ void Editor::DrawArtEditor(Engine& engine) {
             paint::Stroke s;
             s.type = paint::StrokeType::Clear;
             s.layer = pc.activeLayer;
+            // ...and the STABLE id alongside it. `layer` is kept only so a v4 reader
+            // still loads the file; every consumer resolves through layerId, which is
+            // what survives a reorder.
+            s.layerId = (pc.activeLayer >= 0 &&
+                         pc.activeLayer < static_cast<int>(pc.layers.size()))
+                            ? pc.layers[static_cast<usize>(pc.activeLayer)].id
+                            : 0;
             paint::FillLayer(pc, pc.activeLayer, paint::Dab{}, true);
             paint::Sync(renderer, pc);
             CommitStroke(e, pc, std::move(s));
@@ -4351,6 +4579,32 @@ void Editor::DrawProjectSettings(Engine& engine) {
     // controls below, and means the day/night state ships in a build without needing
     // a manual "Save Project" (the bug where dynamic sky worked live but not built).
     static bool s_skyDirty = false;
+    if (ImGui::CollapsingHeader("Timeline", ImGuiTreeNodeFlags_DefaultOpen)) {
+        static constexpr f32 kFpsPresets[] = {23.976f, 24.0f, 25.0f, 30.0f,
+                                              48.0f,   50.0f, 60.0f, 120.0f};
+        char cur[24];
+        std::snprintf(cur, sizeof(cur), "%g fps", static_cast<double>(ps.timelineFps));
+        if (ImGui::BeginCombo("Authoring frame rate", cur)) {
+            for (const f32 f : kFpsPresets) {
+                char lbl[24];
+                std::snprintf(lbl, sizeof(lbl), "%g fps", static_cast<double>(f));
+                if (ImGui::Selectable(lbl, std::fabs(f - ps.timelineFps) < 1e-3f)) {
+                    ps.timelineFps = f;
+                    Project::Active().Save();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        // Saved on RELEASE, not per drag frame: a DragFloat fires every frame it is
+        // held, and rewriting the .hbproj sixty times a second to record an
+        // in-progress value is both wasteful and wrong (the value is not chosen yet).
+        if (ImGui::DragFloat("Custom", &ps.timelineFps, 0.1f, 1.0f, 240.0f, "%.3f",
+                             ImGuiSliderFlags_AlwaysClamp) &&
+            !ImGui::IsItemActive())
+            Project::Active().Save();
+        ImGui::TextDisabled("Timeline keys and playheads land on 1/fps boundaries.");
+        ImGui::TextDisabled("Hold Ctrl while dragging to place between frames.");
+    }
     if (ImGui::CollapsingHeader("Day / Night", ImGuiTreeNodeFlags_DefaultOpen)) {
         SceneEnvironment& se = engine.GetScene().Environment();
         ImGui::TextDisabled("Real-time analytic sky; the sun is driven by the time of day.");
@@ -4939,15 +5193,32 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
             ImGui::SetClipboardText(item.path.string().c_str());
         }
         if (ImGui::MenuItem("Delete")) {
-            std::error_code ec;
-            if (item.isFolder) {
-                std::filesystem::remove(item.path, ec); // empty folders only
-            } else {
-                std::filesystem::remove(item.path, ec);
-            }
-            if (!ec) {
-                assetsDirty_ = true;
-                scene::ClearInstantiateCaches();
+            // Arm the confirm modal instead of deleting. Deleting an asset is the
+            // one irreversible operation in the browser (no undo stack covers the
+            // filesystem), and it used to happen on a single click with the error
+            // code discarded. Compute the reference set HERE, once - the modal
+            // just displays it.
+            deleteAsset_ = item.path;
+            deleteAssetIsFolder_ = item.isFolder;
+            deleteAssetError_.clear();
+            deleteAssetRefs_.clear();
+            deleteAssetRefsKnown_ = false;
+            if (Project::HasActive()) {
+                const assets::ClosureResult closure = CollectReferencedAssets();
+                deleteAssetRefsKnown_ = closure.ok;
+                std::error_code kec;
+                const std::filesystem::path assetsDir = Project::Active().AssetsDir();
+                const std::string target =
+                    std::filesystem::relative(item.path, assetsDir, kec).generic_string();
+                if (!kec && !target.empty()) {
+                    // A folder matches every key beneath it; a file matches itself.
+                    const std::string prefix = target + "/";
+                    for (const std::string& key : closure.included) {
+                        if (key == target ||
+                            (item.isFolder && key.compare(0, prefix.size(), prefix) == 0))
+                            deleteAssetRefs_.push_back(key);
+                    }
+                }
             }
         }
         ImGui::EndPopup();
@@ -5230,6 +5501,76 @@ void Editor::DrawAssetBrowser(Engine& engine) {
         ImGui::EndPopup();
     }
 
+    // Delete modal. Deleting is the browser's only unrecoverable action - PushUndo
+    // covers the scene, never the filesystem - so it gets a confirm, a reference
+    // check against the same closure the cook uses, and a visible error when the
+    // remove() actually fails.
+    if (!deleteAsset_.empty() && !ImGui::IsPopupOpen("Delete Asset")) {
+        ImGui::OpenPopup("Delete Asset");
+    }
+    if (ImGui::BeginPopupModal("Delete Asset", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Delete %s?", deleteAssetIsFolder_ ? "this folder" : "this asset");
+        ImGui::TextDisabled("%s", deleteAsset_.filename().string().c_str());
+        ImGui::Separator();
+        if (!deleteAssetRefs_.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s",
+                               "STILL REFERENCED - deleting will break the build:");
+            int shown = 0;
+            for (const std::string& key : deleteAssetRefs_) {
+                if (shown++ >= 8) {
+                    ImGui::TextDisabled("  ...and %d more",
+                                        static_cast<int>(deleteAssetRefs_.size()) - 8);
+                    break;
+                }
+                ImGui::BulletText("%s", key.c_str());
+            }
+        } else if (deleteAssetRefsKnown_) {
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s",
+                               "Nothing in the project references this.");
+        } else {
+            // ClosureResult::ok false means the walk hit an unresolvable reference or
+            // an extension with no RefScan, so "no references" would be a guess.
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                               "Reference check INCOMPLETE - cannot prove this is unused.");
+        }
+        ImGui::TextDisabled("This cannot be undone. References are not auto-updated.");
+        if (!deleteAssetError_.empty()) {
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Delete failed: %s",
+                               deleteAssetError_.c_str());
+        }
+        ImGui::Separator();
+        if (ImGui::Button("Delete")) {
+            std::error_code ec;
+            std::filesystem::remove(deleteAsset_, ec); // folders: empty only
+            if (ec) {
+                // Surfaced, not swallowed. The common causes are a non-empty folder
+                // and a file the running game still has open.
+                deleteAssetError_ = ec.message();
+                HBE_WARN("Delete failed for '{}': {}", deleteAsset_.string(), ec.message());
+            } else {
+                HBE_INFO("Deleted '{}'{}", deleteAsset_.string(),
+                         deleteAssetRefs_.empty() ? "" : " (WAS still referenced)");
+                assetsDirty_ = true;
+                scenesScanned_ = false;
+                scene::ClearInstantiateCaches();
+                // The slot manifest self-prunes: an asset key whose file is gone
+                // loses its entry at the next cook (MergeRememberedSlots), which is
+                // exactly what frees the number for the next import. Nothing to do
+                // here - doing it here too would be a second authority.
+                deleteAsset_.clear();
+                ImGui::CloseCurrentPopup();
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            deleteAsset_.clear();
+            deleteAssetError_.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
     // Deferred mutations (the tile loop iterates assets_; don't refresh inside).
     if (!navTarget_.empty()) {
         currentDir_ = navTarget_;
@@ -5254,6 +5595,11 @@ void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path
     if (scene::LoadScene(engine.GetScene(), engine.GetRenderer(), path)) {
         currentScenePath_ = path;
         AdoptWorld(engine.GetScene()); // this registry IS that file, from now on
+        // A DIFFERENT document is open, so the history baseline moves. This is on the
+        // load path and NOT in AdoptWorld on purpose: AdoptWorld also fires for undo/redo
+        // and Play->Stop, where re-baselining would throw away the uncommitted delta and
+        // the next save would seal a change set that omits the undone work.
+        CollabNoteOpened(engine.GetScene(), path);
     }
     // A PRE-MIGRATION UI SCENE says so AT LOAD, not three edits later when the save
     // refuses. `Assets/Scenes/UIScene.hbscene` is still on disk and still listed
@@ -6504,7 +6850,16 @@ void Editor::DrawHierarchy(Engine& engine) {
             }
         }
         if (ImGui::MenuItem("Bake All Probes")) {
+            // PushUndo, because assigning rp.source IS an edit to the scene - the same
+            // failure the GI bake above documents, and probes shipped in exactly that
+            // state for longer: the bake wrote perfectly good `.hbprobe` files and left
+            // the only pointers to them in memory, so closing without Ctrl+S orphaned
+            // every one of them and the interiors reloaded sky-lit with nothing on
+            // screen to say why. (Found with 64 orphaned probes on disk against 0
+            // references in the scene.)
+            PushUndo(scene);
             const std::filesystem::path assets = Project::Active().AssetsDir();
+            u32 bakedCount = 0, failedCount = 0;
             for (const entt::entity e : reg.view<Transform, ReflectionProbe>()) {
                 ReflectionProbe& rp = reg.get<ReflectionProbe>(e);
                 if (rp.source.empty())
@@ -6518,8 +6873,22 @@ void Editor::DrawHierarchy(Engine& engine) {
                     rp.prefiltered = m.prefiltered;
                     rp.prefilteredMaxLod = m.prefilteredMaxLod;
                     rp.baked = true;
+                    ++bakedCount;
+                } else {
+                    ++failedCount;
                 }
             }
+            if (bakedCount > 0) {
+                buildResult_ = "Baked " + std::to_string(bakedCount) +
+                               " probe(s). SAVE THE SCENE (Ctrl+S) or the references are lost.";
+                HBE_WARN("Probes: baked {}. The scene now references them - SAVE THE SCENE, "
+                         "or the probes are orphaned and the level reloads without them.",
+                         bakedCount);
+            } else {
+                buildResult_ = "Probe bake produced nothing (no ReflectionProbe in this scene?).";
+            }
+            if (failedCount > 0)
+                HBE_WARN("Probes: {} probe(s) failed to bake.", failedCount);
         }
         if (ImGui::MenuItem("Camera Spline")) {
             PushUndo(scene);
@@ -7685,6 +8054,10 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             undoOnActivate();
             ImGui::Separator();
             if (ImGui::Button("Bake Probe##rp")) {
+                // PushUndo + the save warning, for the same reason the whole-level bake
+                // carries them: `source` is scene state, and a bake that only lives in
+                // memory orphans its own output on the next reload.
+                PushUndo(scene);
                 const std::filesystem::path assets = Project::Active().AssetsDir();
                 if (rp->source.empty())
                     rp->source = "Probes/probe_" +
@@ -7698,10 +8071,26 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     rp->prefiltered = m.prefiltered;
                     rp->prefilteredMaxLod = m.prefilteredMaxLod;
                     rp->baked = true;
+                    buildResult_ = "Baked " + rp->source +
+                                   ". SAVE THE SCENE (Ctrl+S) or the reference is lost.";
+                    HBE_WARN("Probes: baked '{}'. The scene now references it - SAVE THE SCENE, "
+                             "or the probe is orphaned and the level reloads without it.",
+                             rp->source);
+                } else {
+                    buildResult_ = "Probe bake failed (no geometry around the probe?).";
                 }
             }
             ImGui::SameLine();
             ImGui::TextDisabled(rp->baked ? "baked" : "not baked - press Bake");
+            // The bake is only half the operation. Say so where the author is looking,
+            // not just in the log - an unsaved `source` is indistinguishable from a
+            // successful bake until the level is reloaded.
+            if (rp->baked && !rp->source.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                   "Ctrl+S to keep this bake - the .hbprobe is on disk,");
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                   "but the scene's pointer to it is not saved yet.");
+            }
         }
         if (s.remove) {
             PushUndo(scene);
@@ -7865,7 +8254,19 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                     rb->collisionVertices.size());
                 if (rb->shape == RigidBody::Shape::Mesh &&
                     rb->motion == RigidBody::Motion::Dynamic) {
-                    ImGui::TextDisabled("Dynamic uses a convex hull (triangle mesh = static).");
+                    // Was TextDisabled - grey, easy to miss, and it did not say what
+                    // the author actually loses. Jolt cannot use a triangle mesh for a
+                    // dynamic body, so the shape SILENTLY becomes its convex envelope:
+                    // a chair collides as a wedge, a barrel with a rim as a cylinder,
+                    // a door frame as a slab. This changes gameplay, so it is amber.
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                       "Dynamic + Mesh -> CONVEX HULL (Jolt has no dynamic");
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                       "triangle mesh). Concave detail is filled in: holes,");
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                       "rims and cavities will not collide. Use Static for");
+                    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                                       "exact triangles, or split the prop into convex parts.");
                 }
                 if (ImGui::Button("Rebuild From Mesh")) {
                     if (const MeshData* md = GetCpuMesh(scene, sel)) {
@@ -8501,15 +8902,27 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 ImGui::SliderFloat("Radius", &terrainRadius_, 0.5f, 50.0f, "%.1f");
                 ImGui::SliderFloat("Strength", &terrainStrength_, 0.1f, 30.0f, "%.1f");
                 if (terrainBrush_ == 4 || terrainBrush_ == 5)
-                    ImGui::TextDisabled("Cuts transparent holes for cliff/cave models\n"
-                                        "(collision stays). 'Hole fill' restores terrain.");
+                    // "(collision stays)" was FALSE and gameplay-affecting: a hole
+                    // becomes Jolt's cNoCollisionValue in the heightfield collider
+                    // (PhysicsWorld.cpp), so the player falls through unless the
+                    // cave/cliff model brings its own collider.
+                    ImGui::TextDisabled("Cuts holes for cliff/cave models - COLLISION IS CUT\n"
+                                        "TOO (you fall through; give the model a collider).\n"
+                                        "'Hole fill' restores terrain.");
                 else if (terrainBrush_ == 6)
                     ImGui::TextDisabled("Paints the active splat layer (set it below).");
             }
 
             // --- Material (splat) ------------------------------------------------
             ImGui::SeparatorText("Material (splat)");
-            ImGui::Checkbox("Splat painting", &tr->splatEnabled);
+            // Local copy so the undo snapshot captures the value BEFORE the toggle -
+            // the same shape every other undoable checkbox in this inspector uses.
+            // (This was the one terrain widget with no undo at all.)
+            bool splatOn = tr->splatEnabled;
+            if (ImGui::Checkbox("Splat painting", &splatOn)) {
+                PushUndo(scene);
+                tr->splatEnabled = splatOn;
+            }
             if (tr->splatEnabled) {
                 ImGui::DragFloat("Tile (world units)", &tr->splatTile, 0.1f, 0.25f, 128.0f);
                 undoOnActivate();
@@ -10586,8 +10999,14 @@ void Editor::DrawTimeline(Engine& engine) {
         }
     }
     if (ImGui::IsItemActive() && selectedKey_ < 0) {
-        const f32 t = glm::clamp((ImGui::GetMousePos().x - p0.x) / pxPerSec, 0.0f,
-                                 track->duration);
+        // Same frame grid as the cutscene NLE - one definition, three timelines, so a
+        // playhead scrubbed here and one scrubbed there cannot disagree.
+        editor::FrameGrid grid;
+        grid.fps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+        grid.enabled = timelineSnap_;
+        grid.suspend = ImGui::GetIO().KeyCtrl;
+        const f32 t = editor::SnapClamped((ImGui::GetMousePos().x - p0.x) / pxPerSec,
+                                          track->duration, grid);
         track->time = t;
         if (!track->playing && transform && !track->keys.empty()) {
             anim::Sample(*track, *transform); // live preview while scrubbing
@@ -10781,7 +11200,7 @@ void Editor::DrawSchematicEditor(Engine& engine) {
     // collapsed-window return on purpose - see the note on Editor::ClaimSave and the
     // longer one in DrawUIEditor. Replaces the old focus-gated handler that used to
     // sit after DrawSchematicCanvas() and double-fired with the global one.
-    ClaimSave(editor::SaveSurface::Schematic);
+    ClaimFocus(editor::SaveSurface::Schematic);
     if (!schemVisible) {
         ImGui::End();
         return;
@@ -11750,6 +12169,9 @@ std::filesystem::path Editor::CreatePrefabFromSelection(Scene& scene,
     out.close();
     reg.emplace_or_replace<PrefabInstance>(selected_, PrefabInstance{AssetRelPath(p)});
     assetsDirty_ = true;
+    // Same reason as Prefab Apply: "create" over an existing name is a write, and a
+    // cached entry for that path would outlive it for the whole session.
+    spawn::ClearPrefabCache();
     return p;
 }
 
@@ -11807,6 +12229,12 @@ void Editor::ApplyPrefabInstance(Engine& engine, entt::entity root) {
     if (!out) { HBE_WARN("Prefab Apply: cannot write '{}'.", dst.string()); return; }
     out.write(frag.data(), static_cast<std::streamsize>(frag.size()));
     assetsDirty_ = true;
+    // The Spawner's prefab cache is keyed by path and never invalidated by a write.
+    // Its only other caller was the project switch, so editing a prefab and pressing
+    // Play kept instantiating the PRE-EDIT version for the rest of the session, with
+    // nothing on screen to say why. schematic::ClearCache() is called on schematic
+    // save for exactly this reason; this is the same contract.
+    spawn::ClearPrefabCache();
     HBE_INFO("Prefab Apply: updated '{}'.", source);
 }
 
@@ -12061,7 +12489,7 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     // Above the "no cutscene open" early return AND above the collapsed-window one:
     // an unconditional claim is what makes an empty (or collapsed-but-focused) panel
     // say so instead of writing the level. See the note in DrawUIEditor.
-    ClaimSave(editor::SaveSurface::Cutscene);
+    ClaimFocus(editor::SaveSurface::Cutscene);
     if (!csVisible) {
         // Collapsed (or clipped): the preview step below won't run, so end the
         // preview and restore the scene rather than freezing it mid-pose.
@@ -12162,12 +12590,28 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     ImGui::SameLine();
     if (ImGui::Button("|<")) cutsceneEditTime_ = 0.0f; // rewind
     ImGui::SameLine();
-    ImGui::Text("%.2f / %.2fs", cutsceneEditTime_, cs.duration);
+    // Time readout in BOTH units. A frame number is the thing an author matches
+    // against a reference video or a sound cue; seconds alone made "which frame is
+    // this?" unanswerable.
+    {
+        const f32 tlFps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+        ImGui::Text("%.2f / %.2fs  (f%d)", cutsceneEditTime_, cs.duration,
+                    editor::TimeToFrame(cutsceneEditTime_, tlFps));
+    }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(110.0f);
     if (ImGui::DragFloat("Duration", &cs.duration, 0.1f, 0.1f, 3600.0f, "%.1f")) markDirty();
     ImGui::SameLine();
     if (ImGui::SmallButton("Fit")) { csScroll_ = 0.0f; csZoom_ = 0.0f; /* refit once laneW known */ }
+    ImGui::SameLine();
+    ImGui::Checkbox("Snap", &timelineSnap_);
+    if (ImGui::IsItemHovered()) {
+        const f32 tlFps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+        ImGui::SetTooltip("Keys and the playhead land on 1/%g s frame boundaries.\n"
+                          "Hold Ctrl during a drag to place between frames.\n"
+                          "Rate is Project Settings > Timeline (currently %g fps).",
+                          static_cast<double>(tlFps), static_cast<double>(tlFps));
+    }
 
     // -- Toolbar: add ---------------------------------------------------------
     Camera& vcam = engine.GetRenderer().GetCamera();
@@ -12240,6 +12684,20 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     const auto timeToX = [&](float t) { return laneX0 + (t - csScroll_) * csZoom_; };
     const auto xToTime = [&](float x) { return csScroll_ + (x - laneX0) / csZoom_; };
     const auto laneCenterY = [&](int lane) { return lane0Y + (static_cast<float>(lane) + 0.5f) * kRowH; };
+
+    // THE FRAME GRID for this panel, resolved ONCE per frame. Reading io.KeyCtrl at
+    // each call site instead would let a Ctrl press landing mid-drag snap the key but
+    // not the playhead, leaving them half a frame apart.
+    //
+    // Ctrl SUSPENDS the grid (the UI editor's convention), it does not force it on
+    // like the gizmo's: a timeline defaults to snap ON, and with snap on a force-on
+    // modifier would do nothing at all - there would be no way to author an off-frame
+    // key. `snapT` is the one entry point every gesture below goes through.
+    editor::FrameGrid grid;
+    grid.fps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+    grid.enabled = timelineSnap_;
+    grid.suspend = io.KeyCtrl;
+    const auto snapT = [&](float t) { return editor::SnapClamped(t, dur, grid); };
 
     // Wheel zoom, keeping the time under the cursor fixed.
     if (canvasHovered && io.MouseWheel != 0.0f) {
@@ -12408,7 +12866,7 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
             csDragKey_ = true;
         } else if (mouse.y < lane0Y || std::fabs(mouse.x - timeToX(cutsceneEditTime_)) < 6.0f) {
             csDragPlayhead_ = true; // ruler or near the playhead line
-            cutsceneEditTime_ = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+            cutsceneEditTime_ = snapT(xToTime(mouse.x)); // frame grid: see snapT
         } else if (mouse.x < laneX0 && mouse.y >= lane0Y) {
             // Clicked a lane header: select that track (for anim lanes).
             const int lane = static_cast<int>((mouse.y - lane0Y) / kRowH);
@@ -12421,9 +12879,9 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     // -- Interaction: continuous drag -----------------------------------------
     const bool leftDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
     if (csDragPlayhead_ && leftDown) {
-        cutsceneEditTime_ = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+        cutsceneEditTime_ = snapT(xToTime(mouse.x)); // frame grid: see snapT
     } else if (csDragKey_ && leftDown && csSelKind_ >= 0) {
-        const float nt = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+        const float nt = snapT(xToTime(mouse.x)); // dragged keys land ON a frame
         if (csSelKind_ == 0 && csSelIndex_ < static_cast<int>(cs.camera.size())) {
             cs.camera[static_cast<usize>(csSelIndex_)].time = nt;
             csSelIndex_ = reorder(cs.camera, csSelIndex_);
@@ -12457,7 +12915,7 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     static int ctxLane = -1;
     static float ctxTime = 0.0f;
     if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
-        ctxTime = glm::clamp(xToTime(mouse.x), 0.0f, dur);
+        ctxTime = snapT(xToTime(mouse.x)); // a key created here is on a frame too
         ctxLane = (mouse.y < lane0Y) ? 0 : static_cast<int>((mouse.y - lane0Y) / kRowH);
         ImGui::OpenPopup("##csctx");
     }
@@ -12761,7 +13219,7 @@ void Editor::DrawMusicEditor(Engine& engine) {
     if (!panelOpen_[Panel_Music]) return;
     AudioSystem& audio = engine.GetAudio();
     ImGui::Begin("Music", &panelOpen_[Panel_Music]);
-    ClaimSave(editor::SaveSurface::Music);
+    ClaimFocus(editor::SaveSurface::Music);
     if (!Project::HasActive()) {
         ImGui::TextDisabled("No project open.");
         ImGui::End();
@@ -12957,10 +13415,15 @@ void Editor::DrawMusicEditor(Engine& engine) {
         const float laneX0 = p0.x + kHeaderW;
         const float laneX1 = p0.x + avail.x;
         const float lanesW = glm::max(laneX1 - laneX0, 10.0f);
-        const auto timeToX = [&](f32 t) { return laneX0 + (t - musicScroll_) * musicZoom_; };
-        const auto xToTime = [&](float x) {
-            return musicScroll_ + (x - laneX0) / glm::max(musicZoom_, 1.0f);
-        };
+        // ONE zoom expression in both directions. These used to disagree - timeToX
+        // multiplied by the raw musicZoom_ while xToTime divided by
+        // glm::max(musicZoom_, 1.0f) - so they were not inverses of each other for
+        // any zoom below 1. Unreachable today (musicZoom_ starts at 120 and the wheel
+        // clamps it to [8, 2000]), but a pair of conversions that are only accidentally
+        // inverse is a trap for the next person to touch the clamp.
+        const f32 mZoom = glm::max(musicZoom_, 1.0f);
+        const auto timeToX = [&](f32 t) { return laneX0 + (t - musicScroll_) * mZoom; };
+        const auto xToTime = [&](float x) { return musicScroll_ + (x - laneX0) / mZoom; };
 
         ImGuiIO& io = ImGui::GetIO();
         ImGui::SetCursorScreenPos(ImVec2(laneX0, p0.y));
@@ -12977,7 +13440,17 @@ void Editor::DrawMusicEditor(Engine& engine) {
         musicScroll_ = glm::max(musicScroll_, 0.0f);
         if (hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
             if (io.MousePos.y < p0.y + kRulerH) {
-                musicEditTime_ = glm::max(xToTime(io.MousePos.x), 0.0f);
+                // This panel DREW a bar/beat grid and then obeyed none of it. The
+                // playhead now lands on a frame like every other timeline; the musical
+                // grid stays a visual reference (a bar boundary is not generally a
+                // frame boundary, and quantising to bars would fight the frame rate a
+                // cutscene is authored against).
+                editor::FrameGrid grid;
+                grid.fps =
+                    Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+                grid.enabled = timelineSnap_;
+                grid.suspend = io.KeyCtrl;
+                musicEditTime_ = glm::max(editor::Snap(xToTime(io.MousePos.x), grid), 0.0f);
             } else {
                 const int lane = static_cast<int>((io.MousePos.y - (p0.y + kRulerH)) / kRowH);
                 if (lane >= 0 && lane < lanes) musicLayerSel_ = lane;
@@ -13573,6 +14046,23 @@ void Editor::RebuildObjectiveIndex(Scene& scene) {
         scanAction(tv.action, tv.flag, tv.text, e, "Trigger Volume");
     }
 
+    // Health: dying runs game::CompleteObjective(onDeathObjective) - see
+    // combat::Update's one-shot death dispatch. Without this, an objective that is
+    // completed by a KILL rendered the red "set but never completed in this scene"
+    // warning, and the id picker could not reach it. A diagnostic that asserts
+    // something false is worse than no diagnostic.
+    for (const entt::entity e : reg.view<Health>()) {
+        const Health& h = reg.get<Health>(e);
+        if (!h.onDeathObjective.empty()) addComplete(h.onDeathObjective, e, "Health (on death)");
+    }
+
+    // Encounter: clearing one runs its clearedAction, which mirrors the Interactable
+    // verb set (see spawn::Update). clearedFlag doubles as the objective id.
+    for (const entt::entity e : reg.view<Encounter>()) {
+        const Encounter& en = reg.get<Encounter>(e);
+        scanAction(en.clearedAction, en.clearedFlag, en.clearedText, e, "Encounter (cleared)");
+    }
+
     // Schematic graphs referenced by the scene: load each unique .hbschem once and
     // pull Set/Complete Objective node literals (pin 1 = Id, pin 2 = Text).
     if (Project::HasActive()) {
@@ -13738,7 +14228,7 @@ void Editor::DrawCharacterEditor(Engine& engine) {
     if (!panelOpen_[Panel_CharacterEditor]) return;
     const bool charVisible =
         ImGui::Begin("Character Editor", &panelOpen_[Panel_CharacterEditor]);
-    ClaimSave(editor::SaveSurface::Character); // above the return - see DrawUIEditor
+    ClaimFocus(editor::SaveSurface::Character); // above the return - see DrawUIEditor
     if (!charVisible) {
         ImGui::End();
         return;
@@ -14643,7 +15133,7 @@ void Editor::DrawUIDocumentPanel(Engine& engine) {
     const bool uiDocVisible = ImGui::Begin("UI Document", &panelOpen_[Panel_UIDocument]);
     // Same handle space as the UI Editor: Ctrl+S here saves the ACTIVE document.
     // Above the `Begin() == false` return - see the note in DrawUIEditor.
-    ClaimSave(editor::SaveSurface::UIDocument);
+    ClaimFocus(editor::SaveSurface::UIDocument);
     if (!uiDocVisible) {
         ImGui::End();
         return;
@@ -15105,7 +15595,7 @@ void Editor::DrawAssetViewer(Engine& engine) {
     // inline sub-editors (material / audio event / mesh slots) is live at dispatch
     // time. A texture or a read-only preview resolves to "nothing open to save" -
     // never to the scene.
-    ClaimSave(editor::SaveSurface::AssetViewer);
+    ClaimFocus(editor::SaveSurface::AssetViewer);
 
     std::error_code ec;
     if (!Project::HasActive() || viewedAsset_.empty() ||
@@ -16135,6 +16625,17 @@ bool Editor::BuildAssetPack(std::string& outMessage) {
     return true;
 }
 
+bool Editor::HasReleaseRuntime() {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    wchar_t buf[MAX_PATH] = {};
+    ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    // Same candidate BuildShipping prefers. Kept deliberately narrow: this answers
+    // "will the ship be the fast build?", nothing else.
+    return fs::exists(fs::path(buf).parent_path() / ".." / "Release" / "HeartbreakRuntime.exe",
+                      ec);
+}
+
 bool Editor::BuildShipping(std::string& outMessage) {
     if (!Project::HasActive()) {
         outMessage = "No project open.";
@@ -16174,6 +16675,8 @@ bool Editor::BuildShipping(std::string& outMessage) {
     wchar_t buf[MAX_PATH] = {};
     ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
     const fs::path editorDir = fs::path(buf).parent_path();
+    // Appended to outMessage so a slow-runtime ship cannot read as a clean success.
+    std::string shipPerfWarning;
 
     struct CfgCand { const char* rel; const char* name; };
     static constexpr CfgCand kCands[] = {
@@ -16206,6 +16709,15 @@ bool Editor::BuildShipping(std::string& outMessage) {
         HBE_WARN("BuildShipping: no Release runtime found - shipping the '{}' build, which "
                  "runs SLOWER. Build the Release config and re-ship for best performance.",
                  shipCfg);
+        // A log line is not enough. Debug costs ~23 ms of CPU per frame on this
+        // engine (measured), so the produced game is not shippable - but the panel
+        // printed "Shipping build (72.6 MB)" in green and the author had no reason
+        // to look at the log. Carry it into the RESULT, which is the text they read.
+        if (shipCfg == "Debug" || shipCfg == "unknown")
+            shipPerfWarning = "  ** " + shipCfg +
+                              " runtime - NOT shippable (much slower). Build Release. **";
+        else
+            shipPerfWarning = "  ** no Release runtime - shipped " + shipCfg + " (slower) **";
     } else if (!freshestPath.empty() && freshestCfg != "Release") {
         // Staleness is inferred from a SIBLING config's mtime, because the shipping
         // path has no source tree to compare against. That proxy has one false
@@ -16320,7 +16832,8 @@ bool Editor::BuildShipping(std::string& outMessage) {
     char size[64];
     std::snprintf(size, sizeof(size), "%.1f MB", totalBytes / (1024.0 * 1024.0));
     outMessage = ok ? "Shipping build (" + std::string(size) + ", " + shipCfg + " runtime) at " +
-                          dst.string() + (packed ? "  [" + PackSummary(*packed) + "]" : "")
+                          dst.string() + (packed ? "  [" + PackSummary(*packed) + "]" : "") +
+                          shipPerfWarning
                     : "Shipping build finished with errors (see log).";
     HBE_INFO("Shipping: {}", outMessage);
     return ok;
@@ -16377,23 +16890,38 @@ void Editor::DrawBuildSettings(Engine& engine) {
             return s == "vulkan" ? 1 : s == "opengl" ? 2 : 0;
         };
         int backend = backendIndex(build.backend);
-        if (ImGui::Combo("Graphics Backend", &backend, "Direct3D 12\0Vulkan\0OpenGL\0")) {
+        if (ImGui::Combo("Graphics Backend", &backend,
+                         "Direct3D 12\0Vulkan\0OpenGL (PREVIEW - not shippable)\0")) {
             build.backend = kBackendIds[backend];
             changed = true;
+        }
+        if (backend == 2) {
+            // Say what "preview" costs, where the choice is made. The GL device
+            // overrides 15 of the RHI's ~40 entry points; everything else inherits a
+            // no-op default, so the game still runs and still looks wrong.
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                               "OpenGL is a preview backend. Missing: shadows, the entire");
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                               "post stack, punctual lights, probes/GI, skinning (bind");
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s",
+                               "pose), particles, volumetrics, transparency and world UI.");
         }
 
         // Per-platform backend fallback (the "build profile"): the shipped game
         // tries these in order at boot and uses the first that initializes, so a
-        // player whose machine fails D3D12 falls through to Vulkan, then OpenGL.
+        // player whose machine fails D3D12 falls through to Vulkan.
         ImGui::TextDisabled("Boot fallback order (first that initializes wins):");
         // Derive the 3 slots from the windows profile, else from the primary backend.
         std::vector<std::string> order;
         for (const BuildProfile& p : build.profiles)
             if (p.platform == "windows") { order = p.backends; break; }
         if (order.empty()) {
+            // Mirror ResolveBackendOrder EXACTLY, which auto-appends D3D12/Vulkan and
+            // never OpenGL. Showing a default the engine would not actually use is the
+            // same class of bug as the objectives panel warning about nothing.
             order = {build.backend};
             for (const char* o : kBackendIds)
-                if (build.backend != o) order.emplace_back(o);
+                if (build.backend != o && std::string(o) != "opengl") order.emplace_back(o);
         }
         int slot[3] = {0, 0, 0}; // 0 = None
         for (int i = 0; i < 3 && i < static_cast<int>(order.size()); ++i)
@@ -16402,7 +16930,8 @@ void Editor::DrawBuildSettings(Engine& engine) {
         for (int i = 0; i < 3; ++i) {
             char label[24];
             std::snprintf(label, sizeof(label), "Try #%d", i + 1);
-            if (ImGui::Combo(label, &slot[i], "None\0Direct3D 12\0Vulkan\0OpenGL\0"))
+            if (ImGui::Combo(label, &slot[i],
+                             "None\0Direct3D 12\0Vulkan\0OpenGL (PREVIEW)\0"))
                 slotChanged = true;
         }
         if (slotChanged) {
@@ -16608,7 +17137,14 @@ void Editor::DrawBuildSettings(Engine& engine) {
 
     ImGui::Separator();
     // One Build: cooks (compressed) packs AND assembles the shipping folder.
-    if (ImGui::Button("Build", ImVec2(120, 0))) BuildShipping(buildResult_);
+    if (ImGui::Button("Build", ImVec2(120, 0))) {
+        if (HasReleaseRuntime()) BuildShipping(buildResult_);
+        else wantShipConfirm_ = true;
+    }
+    if (!HasReleaseRuntime()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.2f, 1.0f), "%s", "no Release runtime");
+    }
     if (!buildResult_.empty()) {
         ImGui::TextWrapped("%s", buildResult_.c_str());
     }
@@ -16949,11 +17485,18 @@ void Editor::OnProjectChanged() {
     }
 
     // Seed starter content so a brand-new project isn't empty.
-    const std::filesystem::path sphereUaf = Project::Active().AssetsDir() / "Sphere.uaf";
-    std::error_code ec;
-    if (!std::filesystem::exists(sphereUaf, ec)) {
-        Model model{mesh::GenerateSphere(0.5f, 32, 16)};
-        uaf::WriteMesh(sphereUaf, model);
+    //
+    // NEVER IN HUB MODE. A launcher must not write into a project just because the user
+    // clicked it in a list: merely LOOKING at a project would dirty someone else's
+    // working tree (and, with the collaboration layer, a shared one). The Hub hands the
+    // path to a real editor, which seeds it there if it is genuinely new.
+    if (!hubMode_) {
+        const std::filesystem::path sphereUaf = Project::Active().AssetsDir() / "Sphere.uaf";
+        std::error_code ec;
+        if (!std::filesystem::exists(sphereUaf, ec)) {
+            Model model{mesh::GenerateSphere(0.5f, 32, 16)};
+            uaf::WriteMesh(sphereUaf, model);
+        }
     }
 }
 
@@ -17004,6 +17547,103 @@ bool Editor::CreateProject(const std::filesystem::path& directory, const std::st
         if (engine_) engine_->Quit();
     }
     return true;
+}
+
+void Editor::DrawHubLauncher() {
+    // The Hub owns the ENGINE INSTALL; the Project Manager below owns projects. Kept
+    // separate because they fail independently: a broken install still needs a UI that
+    // can repair it, which is the whole reason the Hub is not part of the editor.
+    //
+    // State is function-local static rather than an Editor member: this panel exists
+    // only in hub mode, and threading four fields through the editor's header for one
+    // launcher screen would put update state into every editor build that never uses it.
+    static hub::Updater* s_updater = nullptr;
+    static std::string s_rollbackMsg;
+    if (!s_updater) {
+        wchar_t exe[MAX_PATH] = {};
+        ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        hub::UpdatePaths paths;
+        // installRoot is the PARENT of bin/ - the Hub swaps bin/ wholesale and must not
+        // be inside the directory it renames.
+        paths.installRoot = std::filesystem::path(exe).parent_path().parent_path();
+        s_updater = new hub::Updater(
+            "https://hollowdreamstudios.com/enginemanifest.json", paths);
+        s_updater->CleanWorkspace(); // discard a previous failed attempt, keep backups
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(430, 0), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Heartbreak Engine", nullptr,
+                 ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize);
+
+    const hub::UpdateProgress& pr = s_updater->Progress();
+    ImGui::Text("Installed engine: %s", hub::CurrentEngineVersion().ToString().c_str());
+    ImGui::TextDisabled("hollowdreamstudios.com");
+    ImGui::Separator();
+
+    switch (pr.state) {
+        case hub::UpdateState::Available:
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "Version %s is available.",
+                               pr.remoteVersion.ToString().c_str());
+            break;
+        case hub::UpdateState::UpToDate:
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s", pr.message.c_str());
+            break;
+        case hub::UpdateState::Failed:
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", pr.message.c_str());
+            break;
+        case hub::UpdateState::Done:
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s", pr.message.c_str());
+            break;
+        default:
+            if (!pr.message.empty()) ImGui::TextWrapped("%s", pr.message.c_str());
+            break;
+    }
+
+    if (pr.state == hub::UpdateState::Downloading && pr.bytesTotal > 0) {
+        const float f = static_cast<float>(static_cast<double>(pr.bytesDone) /
+                                           static_cast<double>(pr.bytesTotal));
+        char lbl[64];
+        std::snprintf(lbl, sizeof(lbl), "%.1f / %.1f MB", pr.bytesDone / 1048576.0,
+                      pr.bytesTotal / 1048576.0);
+        ImGui::ProgressBar(f, ImVec2(-1, 0), lbl);
+    }
+
+    const bool busy = pr.state == hub::UpdateState::Checking ||
+                      pr.state == hub::UpdateState::Downloading ||
+                      pr.state == hub::UpdateState::Verifying ||
+                      pr.state == hub::UpdateState::Installing;
+    ImGui::BeginDisabled(busy);
+    if (ImGui::Button("Check for updates")) s_updater->Check();
+    if (pr.state == hub::UpdateState::Available) {
+        ImGui::SameLine();
+        if (ImGui::Button("Download and install")) {
+            // The confirm hook is where consent lives. It returns true here because the
+            // click WAS the consent - but the hook exists so an unattended caller
+            // (a script, a future silent-update option) cannot install without one.
+            s_updater->Apply([](const hub::UpdateProgress&) { return true; });
+        }
+    }
+    ImGui::EndDisabled();
+
+    if (pr.state == hub::UpdateState::Done) {
+        ImGui::TextDisabled("Close and reopen the Hub to run the new build.");
+    }
+
+    if (ImGui::CollapsingHeader("Advanced")) {
+        ImGui::TextDisabled("Manifest: https://hollowdreamstudios.com/enginemanifest.json");
+        // Say plainly what protects the download, rather than implying more.
+        ImGui::TextWrapped("Updates are fetched over HTTPS with certificate validation. "
+                           "When the manifest publishes a sha256 it is enforced; this one "
+                           "does not yet, so integrity rests on HTTPS alone.");
+        if (ImGui::Button("Roll back to previous build")) {
+            std::string err;
+            s_rollbackMsg = s_updater->Rollback(err) ? "Rolled back. Restart the Hub."
+                                                     : err;
+        }
+        if (!s_rollbackMsg.empty()) ImGui::TextWrapped("%s", s_rollbackMsg.c_str());
+    }
+    ImGui::End();
 }
 
 void Editor::DrawProjectManager() {

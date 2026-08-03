@@ -143,7 +143,11 @@ void DoBurst(Scene& scene, Renderer& renderer, entt::entity spawnerEnt, Spawner&
                            &created);
         if (created.empty()) continue;
         const entt::entity root = created.front();
-        if (Transform* t = reg.try_get<Transform>(root)) t->position = base + DiscOffset(i, want, s.radius);
+        // `base` is the spawner's WORLD position, so the sum is a world point.
+        // Instantiate drops the prefab root at the scene root today (local == world),
+        // but writing it through the world setter keeps that from becoming a silent
+        // misplacement the day a prefab root arrives parented.
+        scene.SetWorldPosition(root, base + DiscOffset(i, want, s.radius));
         reg.emplace_or_replace<Spawned>(root, Spawned{s.encounterId, s.spawnerId});
         // A spawned NPC INHERITS its spawner's streaming-shard membership, so despawning
         // that shard takes it too. Without this the NPC is created long after the shard

@@ -893,7 +893,7 @@ void Editor::DrawUIEditorPanel(Engine& engine) {
     // Begin() pushes the focus scope unconditionally (imgui.cpp, "Add to focus scope
     // stack") and End() pops it, so claiming here is legal for a skipped window; a
     // docked-but-inactive tab is absent from NavFocusRoute and simply scores 0.
-    ClaimSave(editor::SaveSurface::UIDocument);
+    ClaimFocus(editor::SaveSurface::UIDocument);
 
     if (!uiEdVisible) {
         // Collapsed, OR the X was just clicked (Begin clears panelOpen_ and returns

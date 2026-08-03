@@ -1,5 +1,6 @@
 // Scene/PaintSystem.cpp - see PaintSystem.h.
 #include "Scene/PaintSystem.h"
+#include "Core/Log.h"
 
 #include "Assets/AssetLoader.h"
 #include "Assets/Mesh.h"
@@ -190,6 +191,10 @@ void SizeLayer(PaintLayer& l, u32 resolution) {
 
 int AddLayer(PaintComponent& p, const std::string& name) {
     PaintLayer l;
+    // Mint the id HERE, at the one place a layer is created, so no layer can ever exist
+    // without one. A layer with id 0 would make every stroke recorded against it
+    // ambiguous the moment the list is reordered.
+    l.id = p.nextLayerId++;
     l.name = name;
     SizeLayer(l, p.resolution < 16 ? 1024 : p.resolution);
     p.layers.push_back(std::move(l));
@@ -210,6 +215,7 @@ void EnsureCanvas(PaintComponent& p, u32 resolution) {
     // Guarantee at least one layer, and (re)size every layer to the resolution.
     if (p.layers.empty()) {
         PaintLayer base;
+        base.id = p.nextLayerId++;
         base.name = "Base";
         p.layers.push_back(std::move(base));
     }
@@ -712,10 +718,30 @@ bool SameTip(const BrushDef& a, const BrushDef& b) {
 // painting. Path strokes interpolate dabs between consecutive points at the brush
 // spacing, matching the editor's live stamping so a rebake is pixel-identical.
 // `mesh` is needed only for projection (mode-2) strokes; null skips them.
+// Resolves a stroke's target layer by STABLE ID, falling back to the legacy index for
+// strokes loaded from a pre-v5 file. Returns -1 when the layer is gone (deleted since
+// the stroke was recorded), which the caller must treat as "skip", never as layer 0 -
+// replaying an orphaned stroke into the first layer paints it somewhere the artist
+// never did.
+int ResolveStrokeLayer(const PaintComponent& p, const Stroke& s) {
+    if (s.layerId != 0) {
+        for (usize i = 0; i < p.layers.size(); ++i)
+            if (p.layers[i].id == s.layerId) return static_cast<int>(i);
+        return -1; // its layer was deleted
+    }
+    // v4 and older: the index IS the reference. Only correct because the migration on
+    // load pinned id == index at the one moment they still agreed.
+    if (s.layer < 0 || s.layer >= static_cast<int>(p.layers.size())) return -1;
+    return s.layer;
+}
+
 void ReplayStroke(PaintComponent& p, const Stroke& s, const BrushTip& tip,
                   const MeshData* mesh) {
-    if (s.layer < 0 || s.layer >= static_cast<int>(p.layers.size())) return;
-    PaintLayer& L = p.layers[s.layer];
+    // BY ID, NOT INDEX. Reordering or deleting a layer used to silently replay every
+    // stroke into the wrong one, because nothing recorded the reorder.
+    const int li = ResolveStrokeLayer(p, s);
+    if (li < 0) return;
+    PaintLayer& L = p.layers[static_cast<usize>(li)];
     if (s.type == StrokeType::Clear) {
         std::fill(L.color.begin(), L.color.end(), static_cast<u8>(0));
         std::fill(L.material.begin(), L.material.end(), static_cast<u8>(0));
@@ -735,7 +761,7 @@ void ReplayStroke(PaintComponent& p, const Stroke& s, const BrushTip& tip,
     dab.erase = s.erase;
     dab.mode = s.brush.mode;
 
-    if (s.type == StrokeType::Fill) { FillLayer(p, s.layer, dab, false); return; }
+    if (s.type == StrokeType::Fill) { FillLayer(p, li, dab, false); return; }
     if (!tip.Valid() || s.path.empty()) return;
 
     // 3D projection strokes interpolate dab centres along the LOCAL-space path and
@@ -746,7 +772,7 @@ void ReplayStroke(PaintComponent& p, const Stroke& s, const BrushTip& tip,
                                f32 pressure, f32 angle) {
             Dab d = dab;
             d.flow = s.flow * pressure;
-            StampProjected(p, s.layer, *mesh, c, nrm, radius, tip, angle, d);
+            StampProjected(p, li, *mesh, c, nrm, radius, tip, angle, d);
         };
         f32 ang0 = 0.0f;
         if (s.path.size() > 1)
@@ -777,7 +803,7 @@ void ReplayStroke(PaintComponent& p, const Stroke& s, const BrushTip& tip,
     const auto dabAt = [&](const glm::vec2& uv, f32 radius, f32 pressure, f32 angle) {
         Dab d = dab;
         d.flow = s.flow * pressure;
-        Stamp(p, s.layer, uv, radius, tip, angle, d);
+        Stamp(p, li, uv, radius, tip, angle, d);
     };
 
     // First point (angle toward the next point).
@@ -807,6 +833,23 @@ void ReplayStroke(PaintComponent& p, const Stroke& s, const BrushTip& tip,
 }
 
 void BakeFromStrokes(PaintComponent& p, const MeshData* mesh) {
+    // REFUSE on a canvas whose pixels this history cannot reproduce. This function
+    // zeroes every layer before replaying, so on a pre-v3 `.hbpaint` (baked pixels,
+    // no recorded strokes) it cleared the entire painting and replayed nothing - one
+    // undo destroyed the artwork, unrecoverably.
+    //
+    // Refusing costs a missing feature on legacy canvases (undo/redo does not rebake
+    // until the canvas is repainted from scratch); running cost the art itself. This
+    // is the same "a missing feature, never a wrong write" direction the save dispatch
+    // takes. The real fix is a stored baseline the ops replay ON TOP of - designed,
+    // not yet built.
+    if (!p.strokesComplete) {
+        HBE_WARN("Paint: skipped a rebake on a canvas with no recorded history (a "
+                 "pre-v3 .hbpaint). Its baked pixels are the only copy, so replaying "
+                 "{} stroke(s) over a cleared canvas would destroy them.",
+                 p.strokes.size());
+        return;
+    }
     for (PaintLayer& L : p.layers) {
         std::fill(L.color.begin(), L.color.end(), static_cast<u8>(0));
         std::fill(L.material.begin(), L.material.end(), static_cast<u8>(0));
@@ -995,11 +1038,16 @@ bool Save(const std::filesystem::path& absPath, const PaintComponent& p) {
     std::filesystem::create_directories(absPath.parent_path(), ec);
     BinaryWriter w;
     w.Bytes(kMagic, 4);
-    w.Pod<u32>(4); // v4: v3 + stroke projection mode + per-point local pos/normal/radius
+    // v5: stable PaintLayer::id + Stroke::layerId. Before it, a stroke named its layer
+    // by ARRAY INDEX, so reordering layers silently replayed every stroke into the wrong
+    // one - and a recorded history keyed on an index can never be migrated, because the
+    // reorder that changed its meaning was not itself recorded.
+    w.Pod<u32>(5);
     w.Pod<u32>(p.resolution);
     w.Pod<i32>(p.activeLayer);
     w.Pod<u32>(static_cast<u32>(p.layers.size()));
     for (const PaintLayer& L : p.layers) {
+        w.Pod<u32>(L.id); // v5
         w.Str(L.name);
         w.Pod<f32>(L.opacity);
         w.Pod<u8>(L.visible ? 1 : 0);
@@ -1011,7 +1059,8 @@ bool Save(const std::filesystem::path& absPath, const PaintComponent& p) {
     w.Pod<u32>(static_cast<u32>(p.strokes.size()));
     for (const Stroke& s : p.strokes) {
         w.Pod<i32>(static_cast<i32>(s.type));
-        w.Pod<i32>(s.layer);
+        w.Pod<i32>(s.layer);      // legacy index, still written so v4 readers survive
+        w.Pod<u32>(s.layerId);    // v5: the authoritative reference
         w.Pod<i32>(s.projection); // v4
         WriteBrushDef(w, s.brush);
         w.Pod<glm::vec4>(s.color);
@@ -1058,6 +1107,7 @@ bool Load(const std::filesystem::path& absPath, PaintComponent& p) {
         r.Pod(count);
         for (u32 i = 0; i < count; ++i) {
             PaintLayer L;
+            if (version >= 5) r.Pod(L.id);
             r.Str(L.name);
             r.Pod(L.opacity);
             u8 vis = 1; r.Pod(vis); L.visible = vis != 0;
@@ -1086,11 +1136,26 @@ bool Load(const std::filesystem::path& absPath, PaintComponent& p) {
     }
     if (p.layers.empty()) p.layers.emplace_back(PaintLayer{});
     p.activeLayer = std::clamp(p.activeLayer, 0, static_cast<int>(p.layers.size()) - 1);
+    // MIGRATION: a pre-v5 file has no layer ids, and its strokes reference layers by
+    // index. Assigning id == index+1 makes the old index meaning and the new id meaning
+    // agree EXACTLY at load time, which is the only moment they are still known to be
+    // the same thing. Ids start at 1 so 0 stays "unassigned".
+    {
+        u32 next = 1;
+        for (PaintLayer& L : p.layers)
+            if (L.id == 0) L.id = next++;
+            else next = std::max(next, L.id + 1);
+        p.nextLayerId = next;
+    }
 
     // v3+: the stroke database (editable history). Older files have none - the baked
     // layers above are still authoritative; the editor will re-record from there on.
     // v4 added stroke.projection + per-point local pos/normal/radius (3D projection).
     p.strokes.clear();
+    // A pre-v3 canvas has pixels but NO history, so the stroke list cannot rebuild it.
+    // BakeFromStrokes refuses to run against such a canvas rather than zeroing the art
+    // it cannot replay - see PaintComponent::strokesComplete.
+    p.strokesComplete = (version >= 3);
     if (version >= 3) {
         u32 sc = 0;
         r.Pod(sc);
@@ -1098,6 +1163,7 @@ bool Load(const std::filesystem::path& absPath, PaintComponent& p) {
             Stroke s;
             i32 ty = 0; r.Pod(ty); s.type = static_cast<StrokeType>(ty);
             r.Pod(s.layer);
+            if (version >= 5) r.Pod(s.layerId);
             if (version >= 4) r.Pod(s.projection);
             ReadBrushDef(r, s.brush);
             r.Pod(s.color);

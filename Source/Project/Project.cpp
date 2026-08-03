@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdio>
 #include <fstream>
 
 namespace hbe {
@@ -66,6 +67,10 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         s.uiDocument = s.uiDocuments.front();
     }
     s.musicGraph = j.value("musicGraph", "");
+    // Clamped on the way in, not trusted: a hand-edited 0 or a negative would make
+    // every Snap a divide-by-zero identity, i.e. snapping silently off. The fallback
+    // MUST equal the struct default - this file's own two-places-default rule.
+    s.timelineFps = glm::clamp(j.value("timelineFps", 30.0f), 1.0f, 240.0f);
     s.musicStartState = j.value("musicStartState", "");
     // Reset before reading so a re-parse REPLACES rather than appends (the same
     // settings_ member is reused across in-process project switches; the glyph vectors
@@ -101,6 +106,13 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         }
     } else {
         s.inputActions.push_back({"Interact", {Key::E, static_cast<u32>(Gamepad_X)}});
+        // Pause and Skip ship as defaults because the engine POLLS them by name: a
+        // project with no such action simply cannot be paused and its cutscenes
+        // cannot be skipped, which reads as a broken engine rather than an
+        // unconfigured project. Both are ordinary rebindable actions - nothing here
+        // is special-cased the way "Interact" is.
+        s.inputActions.push_back({"Pause", {Key::Escape, static_cast<u32>(Gamepad_Start)}});
+        s.inputActions.push_back({"Skip", {Key::Space, static_cast<u32>(Gamepad_B)}});
     }
     // Streaming tags. Cleared first for the same reason inputActions is (the
     // reused settings_ member), and NORMALIZED after the read rather than
@@ -254,6 +266,10 @@ bool Project::Open(const fs::path& projectFile) {
     }
 
     ParseSettings(j, settings_);
+    // Keep the file as read so Save() can put back whatever this build does not
+    // parse. See Project::rawJson_ - without it, opening a project written by a NEWER
+    // engine and saving it deletes every setting this build predates.
+    rawJson_ = j.dump();
     // The tag table is process-wide, so it MUST be rebuilt from the list we just
     // read - an in-process project switch would otherwise keep the previous
     // project's ids and silently mis-map every tag in the new one. Same bug class
@@ -287,6 +303,7 @@ bool Project::OpenPacked(const fs::path& mountDir) {
     }
 
     ParseSettings(j, settings_);
+    rawJson_ = j.dump(); // unknown-key preservation, same as Open()
     tags::SeedFromProject(settings_.tags); // see Open()
     root_ = fs::absolute(mountDir);
     projectFile_ = root_ / "__project.hbproj"; // synthetic (lives in the pack)
@@ -303,6 +320,9 @@ bool Project::Create(const fs::path& directory, const std::string& name) {
         return false;
     }
 
+    // A NEW project must not inherit the previously-open project's raw JSON, or its
+    // unrecognised keys would be written into a file that never had them.
+    rawJson_.clear();
     root_ = fs::absolute(directory);
     settings_.name = name;
     settings_.startupScene.clear();
@@ -323,7 +343,29 @@ bool Project::Create(const fs::path& directory, const std::string& name) {
 }
 
 bool Project::Save() const {
+    // START FROM THE FILE AS IT WAS READ, not from an empty object. Everything below
+    // overwrites the keys this build owns; anything it does not recognise survives.
+    //
+    // This used to begin `json j;` and emit only known keys, which silently DELETED
+    // every other key in the file on the first save. That made the format lossy in one
+    // direction across engine versions - open a project saved by a newer build, change
+    // one setting, and every option that build predates is gone with no warning and no
+    // undo. A parse failure here is not fatal: fall back to the old from-scratch
+    // behaviour rather than refusing to save.
     json j;
+    if (!rawJson_.empty()) {
+        json prev = json::parse(rawJson_, nullptr, /*allow_exceptions*/ false);
+        if (prev.is_object()) j = std::move(prev);
+        // ...EXCEPT the superseded keys, which this file drops ON PURPOSE - that drop
+        // IS the migration (ParseSettings reads each as a fallback for its replacement,
+        // so a project upgrades itself the first time it is saved). Preserving unknown
+        // keys must not resurrect the ones we deliberately retire, or a project would
+        // never finish migrating and an old key could later be read back as a fallback
+        // over the new one.
+        for (const char* dead : {"mainMenuScene", "hudScene", "loadingScene", "uiScene",
+                                 "studioLoadingScene"})
+            j.erase(dead);
+    }
     j["name"] = settings_.name;
     j["startupScene"] = settings_.startupScene;
     // New keys only - the legacy uiScene/studioLoadingScene are read on load and
@@ -339,6 +381,7 @@ bool Project::Save() const {
     j["uiDocument"] = settings_.uiDocuments.empty() ? settings_.uiDocument
                                                     : settings_.uiDocuments.front();
     j["musicGraph"] = settings_.musicGraph;
+    j["timelineFps"] = settings_.timelineFps;
     j["musicStartState"] = settings_.musicStartState;
     const auto writeGlyphs = [](const DeviceGlyphs& g) {
         json arr = json::array();
@@ -467,6 +510,106 @@ std::string Project::RelativeAssetPath(const fs::path& absolute) const {
     fs::path rel = fs::relative(absolute, AssetsDir(), ec);
     if (ec) return absolute.filename().string();
     return rel.generic_string();
+}
+
+// --- `--test-projectkeys` ----------------------------------------------------
+
+bool Project::ProjectKeysSelfTest() {
+    int fails = 0;
+    const auto check = [&fails](bool cond, const char* what) {
+        if (cond) return;
+        ++fails;
+        std::printf("projectkeys FAIL: %s\n", what);
+    };
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path() / "hbe_projectkeys_test";
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "Assets", ec);
+    const fs::path file = dir / "KeyTest.hbproj";
+
+    // A project file carrying: a key this build cannot possibly know (as a NEWER
+    // engine would write), a nested one, a legacy key that MUST be retired, and a
+    // known key whose value must survive untouched.
+    {
+        json seed;
+        seed["name"] = "KeyTest";
+        seed["engine"] = "HeartbreakEngine";
+        seed["startupScene"] = "Scenes/X.hbscene";
+        seed["futureOnlySetting"] = {{"a", 1}, {"b", json::array({2, 3})}};
+        seed["anotherFutureKey"] = "keep me";
+        seed["uiScene"] = "Legacy/Old.hbscene"; // retired: must NOT come back
+        std::ofstream out(file);
+        check(static_cast<bool>(out), "could not write the test project");
+        out << seed.dump(2);
+    }
+
+    Project p;
+    check(p.Open(file), "the test project did not open");
+    check(p.Save(), "the test project did not save");
+
+    json after;
+    {
+        std::ifstream in(file);
+        check(static_cast<bool>(in), "could not re-read the saved project");
+        try {
+            in >> after;
+        } catch (const std::exception&) {
+            check(false, "the saved project did not re-parse");
+        }
+    }
+
+    // THE HEADLINE: unknown keys survive a full open -> save round trip. Before the
+    // fix each of these was silently deleted.
+    check(after.contains("futureOnlySetting"), "an unknown key was DELETED by Save()");
+    check(after.contains("anotherFutureKey"), "a second unknown key was DELETED by Save()");
+    if (after.contains("futureOnlySetting")) {
+        check(after["futureOnlySetting"].value("a", 0) == 1,
+              "an unknown key's nested value was not preserved exactly");
+        check(after["futureOnlySetting"]["b"] == json::array({2, 3}),
+              "an unknown key's nested array was not preserved exactly");
+    }
+    check(after.value("anotherFutureKey", std::string()) == "keep me",
+          "an unknown key's value changed across the round trip");
+
+    // ...and the retired keys are still dropped. Preserving unknown keys must not
+    // resurrect the ones the migration deliberately retires - ParseSettings reads
+    // `uiScene` as a FALLBACK for `uiDocument`, so a resurrected one could later be
+    // read back over the new key.
+    check(!after.contains("uiScene"), "a RETIRED legacy key came back (migration broken)");
+
+    // A known key still round-trips, i.e. the preservation did not shadow the writer.
+    check(after.value("startupScene", std::string()) == "Scenes/X.hbscene",
+          "a known key did not survive the round trip");
+    check(after.value("name", std::string()) == "KeyTest", "the project name changed");
+    // And the writer's own keys are present, proving Save() really ran.
+    check(after.contains("version"), "Save() did not write its own keys");
+    check(after.contains("timelineFps"), "Save() did not write a current-build key");
+
+    // A project CREATED in-process must not inherit the previous file's unknown keys.
+    {
+        const fs::path dir2 = dir / "fresh";
+        Project q;
+        check(q.Create(dir2, "Fresh"), "could not create a fresh project");
+        check(q.Save(), "a fresh project did not save");
+        json fresh;
+        std::ifstream in(q.ProjectFile());
+        if (in) {
+            try {
+                in >> fresh;
+            } catch (const std::exception&) {
+            }
+        }
+        check(!fresh.contains("futureOnlySetting"),
+              "a NEW project inherited the previously-open project's unknown keys");
+    }
+
+    fs::remove_all(dir, ec);
+    if (fails == 0) {
+        std::printf("projectkeys: unknown keys survive open->save; retired legacy keys "
+                    "stay dropped; a new project inherits nothing\n");
+    }
+    return fails == 0;
 }
 
 } // namespace hbe

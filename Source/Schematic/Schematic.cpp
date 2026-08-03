@@ -290,13 +290,30 @@ bool Graph::Connect(u32 fromNode, u32 fromPin, u32 toNode, u32 toPin) {
     const PinType it = db.inputs[toPin].type;
     if (ot != it) return false; // strict type match (Exec only to Exec, etc.)
 
-    // An input pin takes one wire (data) - exec OUTPUTs also take one (one next
-    // node). Replace the conflicting end.
+    // WHICH END IS EXCLUSIVE DEPENDS ON THE PIN KIND:
+    //   * DATA: one wire per INPUT (a value pin reads exactly one source), but an
+    //     output may feed many inputs (fan-out).
+    //   * EXEC: one wire per OUTPUT (it names THE next node), but an input may be
+    //     reached from many places (fan-IN).
+    //
+    // This used to drop `sameIn` unconditionally, which applied the DATA rule to exec
+    // pins too: wiring a second branch into a node that already had an incoming exec
+    // wire SILENTLY DELETED the first. Reconvergence - several branches rejoining a
+    // shared tail - is the single most common graph shape in a visual scripting
+    // language, and it was unauthorable.
+    //
+    // Fan-in is safe for both consumers. The interpreter walks exec FORWARD (find the
+    // link out of a pin), so multiple in-edges are invisible to it. The transpiler
+    // inlines exec chains recursively and breaks cycles with an active-stack, so a
+    // reconverging tail is EMITTED ONCE PER BRANCH - larger generated code, identical
+    // behaviour. Data lookups use InLink(node, pin), which stays unique by the rule
+    // above.
     for (auto lit = links.begin(); lit != links.end();) {
-        const bool sameIn = (lit->toNode == toNode && lit->toPin == toPin);
-        const bool sameExecOut =
-            (ot == PinType::Exec && lit->fromNode == fromNode && lit->fromPin == fromPin);
-        lit = (sameIn || sameExecOut) ? links.erase(lit) : std::next(lit);
+        const bool exclusive =
+            ot == PinType::Exec
+                ? (lit->fromNode == fromNode && lit->fromPin == fromPin) // exec: output
+                : (lit->toNode == toNode && lit->toPin == toPin);        // data: input
+        lit = exclusive ? links.erase(lit) : std::next(lit);
     }
     links.push_back({fromNode, fromPin, toNode, toPin});
     return true;

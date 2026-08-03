@@ -75,7 +75,8 @@ struct Graph {
     void RemoveNode(u32 id);         // also drops the node's links
     void RemoveLink(u32 index);
     // Connect an output pin to an input pin. A given output pin drives at most one
-    // wire (replaces any existing), and an input accepts at most one wire.
+    // wire (connecting again REPLACES it, because Follow returns THE next node), but
+    // an input accepts MANY - branches are meant to reconverge on a shared line.
     bool Connect(u32 fromNode, u32 fromPin, u32 toNode, u32 toPin);
 
     // Exec output-pin count: Start 1, Line 1, Choice = choices.size(), Condition 2
@@ -91,6 +92,13 @@ struct Graph {
 const char* NodeTypeName(NodeType t);
 
 inline constexpr const char* kDialogueExtension = ".hbdialogue";
+
+// --test-graphfanin: pins RECONVERGENCE in both node graphs (dialogue and schematic) -
+// several branches rejoining a shared tail. Both used to enforce "one wire per input
+// pin", which silently deleted the first branch's wire, made the shape unauthorable and
+// ended conversations early at runtime. Every case also asserts the OLD behaviour fails
+// it. Headless. See Dialogue/GraphFanInTest.cpp.
+bool GraphFanInSelfTest();
 
 bool SaveGraph(const std::filesystem::path& path, const Graph& g);
 // Pack-aware (VFS). Accepts both the graph format (v2, "nodes"/"links") and the

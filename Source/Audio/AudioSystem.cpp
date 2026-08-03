@@ -67,7 +67,34 @@ struct AudioSystem::Impl {
 
     // One playing fire-and-forget sound. Addresses must be stable while the
     // voice plays (miniaudio keeps pointers into these), hence the std::list.
+    //
+    // PINNED IN MEMORY, ENFORCED BY THE COMPILER. `ma_sound` and `ma_audio_buffer`
+    // are self-referential: ma_sound_init_from_data_source links the sound's
+    // ma_node_base into the engine's node graph AT ITS ADDRESS (ma_node_base::
+    // pOutputBuses points at its own _outputBuses, the destination group's input bus
+    // keeps a linked-list pointer to that same storage, and pSound->pDataSource
+    // points at the sibling ma_audio_buffer). Relocating one copies the bytes and
+    // leaves the graph pointing at the ORIGINAL address; the device thread then
+    // walks a dangling ma_node_output_bus* every callback.
+    //
+    // That is not hypothetical - it shipped. Building a music layer in a local and
+    // then push_back-ing a MOVE of it left the node graph pointing into the dead
+    // stack frame, and the audio thread faulted inside
+    // ma_node_input_bus_read_pcm_frames reading 0xFFFF'FFFF'FFFF'FFFF (symbolized
+    // from HeartbreakEditor.exe+0xF7F32D). It was a use-after-free on the audio
+    // thread, so it presented as a random crash seconds after an unrelated action.
+    //
+    // Deleting the copy/move members turns that entire class of mistake into a
+    // COMPILE ERROR rather than a heisenbug. Every owner must therefore construct
+    // in place in a node-stable container (std::list / unordered_map, never vector)
+    // - see `voices`, `musicLayers` and `spatial`, all of which emplace.
     struct Voice {
+        Voice() = default;
+        Voice(const Voice&) = delete;
+        Voice& operator=(const Voice&) = delete;
+        Voice(Voice&&) = delete;
+        Voice& operator=(Voice&&) = delete;
+
         std::vector<u8> data;
         ma_audio_buffer buffer{};
         ma_sound sound{};
@@ -721,14 +748,28 @@ void AudioSystem::PlayMusicState(const std::string& state, f32 fadeSeconds) {
             HBE_WARN("Music: layer '{}' failed to load.", layer.asset);
             continue;
         }
-        Impl::MusicLayerVoice mv;
+        // CONSTRUCT IN THE LIST FIRST, THEN INITIALIZE. `ma_sound` and
+        // `ma_audio_buffer` are not relocatable: ma_sound_init_from_data_source
+        // links the sound's ma_node_base into the engine's node graph AT ITS
+        // ADDRESS (ma_node_base::pOutputBuses points at its own _outputBuses, and
+        // the "Music" group's input bus keeps a linked-list pointer to that same
+        // storage), and the device thread walks that list every callback. Building
+        // the voice in a local and then push_back-ing a *move* of it copies the
+        // bytes to the heap but leaves the graph pointing at the stack frame; the
+        // instant this function returns, that frame is reused and the audio thread
+        // dereferences a garbage ma_node_output_bus* (the observed crash: a read of
+        // 0xFFFF'FFFF'FFFF'FFFF inside ma_node_input_bus_read_pcm_frames).
+        // This is why `voices` is a std::list and StartVoice uses emplace_back too.
+        Impl::MusicLayerVoice& mv = impl_->musicLayers.emplace_back();
         mv.baseVolume = glm::max(layer.volume, 0.0f);
         mv.parameter = layer.parameter;
         mv.paramLo = layer.paramLo;
         mv.paramHi = layer.paramHi;
         mv.current = 0.0f;
-        if (!impl_->StartMusicVoice(mv.voice, *audio)) continue;
-        impl_->musicLayers.push_back(std::move(mv));
+        if (!impl_->StartMusicVoice(mv.voice, *audio)) {
+            impl_->musicLayers.pop_back(); // nothing was attached to the graph
+            continue;
+        }
     }
     impl_->musicState = state;
     impl_->musicClock = 0.0f; // the new state's bar grid starts now
@@ -738,6 +779,10 @@ void AudioSystem::PlayMusicState(const std::string& state, f32 fadeSeconds) {
 
 void AudioSystem::SetMusicDucking(bool active) {
     if (impl_) impl_->duckActive = active;
+}
+
+usize AudioSystem::MusicLayerCount() const {
+    return impl_ ? impl_->musicLayers.size() : 0;
 }
 
 bool AudioSystem::MusicTransitionPending(std::string& outState, f32& outSeconds) const {

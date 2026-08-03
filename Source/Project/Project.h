@@ -324,6 +324,15 @@ struct ProjectSettings {
     // installs it on boot and crossfades into `musicStartState` when the game runs.
     std::string musicGraph;
     std::string musicStartState; // state played on game start (empty = graph default)
+    // AUTHORED FRAME RATE for every timeline in the editor (the cutscene NLE, the
+    // AnimationTrack strip, the music arrangement view). Keys and the playhead snap
+    // to 1/timelineFps so a hand-placed key lands where playback actually samples it -
+    // before this, the mouse position went straight into a float-seconds field and two
+    // keys meant to line up landed on 1.3871429s and 1.3866667s.
+    //
+    // AUTHORING ONLY. The runtime is still float-seconds end to end; this changes
+    // where a key is PLACED, never how it is SAMPLED.
+    f32 timelineFps = 30.0f;
     InputIcons inputIcons;       // per-device prompt icon library (ships with the game)
     // Data-driven input actions: named actions + default key/gamepad binding. Players
     // rebind them at runtime (overrides in UserSettings); the interact prompt shows
@@ -339,6 +348,15 @@ public:
     // The active project (one at a time, like most editors).
     static Project& Active() { return s_active; }
     static bool HasActive() { return !s_active.root_.empty(); }
+
+    // --test-projectkeys: proves a `.hbproj` ROUND-TRIPS keys this build does not
+    // know. Save() rebuilds the file and used to start from an empty object, so every
+    // unrecognised key was deleted on the first save - which made the format lossy
+    // across engine versions in one direction, permanently and with no warning.
+    // Also asserts the deliberately-retired legacy keys are STILL dropped (that drop
+    // is the migration), and that a known key survives a round trip unchanged.
+    // Headless: writes only into the OS temp directory.
+    static bool ProjectKeysSelfTest();
 
     // Opens an existing `.hbproj`. Returns false on failure.
     bool Open(const std::filesystem::path& projectFile);
@@ -390,6 +408,20 @@ private:
     std::filesystem::path root_;
     std::filesystem::path projectFile_;
     ProjectSettings settings_;
+    // THE RAW `.hbproj` AS IT WAS READ, kept so Save() can re-emit keys this build
+    // does not understand.
+    //
+    // Save() rebuilds the file from a bare `json j;` and writes only the keys it knows.
+    // Every other key in the file is therefore DELETED on the next save - permanently,
+    // with no warning. That makes the format one-directional across versions: an older
+    // engine opening and saving a project written by a newer one silently strips every
+    // setting the older build predates, and a hand-added key never survives one round
+    // trip. `j["version"] = 1` is written but has no reader, so nothing even detects
+    // the mismatch.
+    //
+    // Stored as an opaque string rather than a json object to keep nlohmann out of this
+    // header (it is included very widely). Empty for a project created in-process.
+    std::string rawJson_;
 };
 
 } // namespace hbe

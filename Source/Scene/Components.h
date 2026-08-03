@@ -283,6 +283,17 @@ struct MeshInstance {
 // Layers composite with `opacity` + transparency into the component's flattened
 // output (paint::Flatten). A layer can paint colour, material, or both.
 struct PaintLayer {
+    // STABLE IDENTITY, not the array index.
+    //
+    // paint::Stroke used to reference its layer BY INDEX, and the layer add/remove/
+    // reorder controls record no stroke - so after any reorder the next
+    // BakeFromStrokes replayed every stroke into the WRONG layer. That is a live
+    // single-user bug, and it makes a durable stroke history impossible: an index
+    // recorded today means something different tomorrow, and no migration can recover
+    // it because the edit that changed its meaning was never written down.
+    //
+    // 0 = unassigned (a v4-or-older file, migrated on load to id == index).
+    u32 id = 0;
     std::string name = "Layer";
     std::vector<u8> color;
     std::vector<u8> material;
@@ -310,6 +321,28 @@ struct PaintComponent {
     // never needs the strokes. The editor records strokes while painting so they
     // stay editable (undo = pop a stroke + rebake). Persisted in `.hbpaint` v3.
     std::vector<paint::Stroke> strokes;
+
+    // TRUE when `strokes` can fully reproduce `layers` by itself.
+    //
+    // FALSE for a canvas loaded from a pre-v3 `.hbpaint`, which stores baked PIXELS
+    // and no history at all. That distinction is load-bearing because
+    // paint::BakeFromStrokes ZEROES every layer before replaying: on such a canvas a
+    // rebake (undo, redo, or any stroke edit) cleared the art to nothing and then
+    // replayed an empty list, destroying the whole painting in one click. The loader
+    // already knew this - its comment says the baked layers "are still authoritative"
+    // - but nothing carried that fact to the one function that had to honour it.
+    //
+    // Not serialized: it is derived from the file version on load, and a canvas saved
+    // at v3+ from a legacy base is still not self-describing (the baseline pixels are
+    // in `layers`, not in any stroke), so the flag must stay false for its lifetime
+    // rather than be re-derived as true from the new version number.
+    bool strokesComplete = true;
+
+    // Next PaintLayer::id to hand out. Monotonic and NEVER reused: recycling an id
+    // would let a stroke recorded against a deleted layer silently attach itself to
+    // whatever layer took that number next - the exact class of bug the id replaced.
+    // Not serialized; re-derived on load as max(existing id) + 1.
+    u32 nextLayerId = 1;
 
     // Flattened (composited) output, uploaded to the GPU (not serialized).
     std::vector<u8> flatColor;      // RGB albedo, A coverage

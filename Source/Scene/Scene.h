@@ -81,6 +81,11 @@ struct SceneEnvironment {
     // rendering state - it rides here because the environment is the one thing that
     // survives from the file into the live scene. See SceneData::packSlot.
     u32 packSlot = 0xFFFFFFFFu;
+    // Collaboration identity, carried file -> live scene -> file so a save never
+    // strips it. See SceneData::docId / SceneData::guidEpoch for what they are and
+    // why guidEpoch specifically must exist.
+    u64 docId = 0;
+    u64 guidEpoch = 0;
     // Why the volume above is (or is not) bound. Written ONLY by
     // scene::ApplyEnvironment, so "the scene says it has GI but it did not load"
     // is a state the editor can show and a test can assert instead of a look
@@ -265,6 +270,21 @@ public:
     // World-space matrix of an entity: composes Transform up the Parent chain.
     glm::mat4 WorldMatrix(entt::entity e) const;
 
+    // World matrix of an entity's PARENT (identity when it has none). This is the
+    // frame `Transform` is expressed in, so it is what converts between the two.
+    glm::mat4 ParentWorldMatrix(entt::entity e) const;
+
+    // Write a WORLD-space position/rotation into an entity's LOCAL Transform.
+    //
+    // These exist because gameplay code kept computing a world-space answer (a nav
+    // step, a look-at direction, a spawn point) and assigning it straight to
+    // `Transform::position` / `Transform::rotation`, which are PARENT-relative.
+    // For a root entity the two coincide, which is why it went unnoticed - and why
+    // it broke silently the moment an agent was parented to anything. No-ops on an
+    // entity with no Transform.
+    void SetWorldPosition(entt::entity e, const glm::vec3& worldPos);
+    void SetWorldRotation(entt::entity e, const glm::quat& worldRot);
+
     // Editor visibility mode: when on, entities carrying EditorHidden (or parented
     // under one) are skipped by CollectDrawItems / the UI build, so they stay
     // loaded but invisible. The runtime leaves this off (EditorHidden has no
@@ -416,6 +436,15 @@ void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh = 
 // (--gpu-particles), which is how the two expansion paths are A/B measured against
 // each other at an identical particle count.
 void SpawnParticleStress(Scene& scene, u32 count, bool gpuExpand = false, bool gpuSim = false);
+
+// --test-worldlocal: pins Scene::SetWorldPosition / SetWorldRotation - the
+// conversion gameplay code needs when it computes a WORLD answer for an entity
+// whose Transform is PARENT-RELATIVE. Covers a rotated + non-uniformly scaled
+// parent, a two-level chain, the root identity case, and a Transform-less entity;
+// every case also asserts that the old raw-assignment behaviour FAILS it, so the
+// test measures the fix rather than the status quo. Headless: no GPU, no window,
+// no project. See Scene/WorldLocalTest.cpp.
+bool WorldLocalSelfTest();
 
 } // namespace scene
 } // namespace hbe

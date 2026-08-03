@@ -61,6 +61,9 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/TagShard.cpp"
     "Source/Scene/TagStreaming.cpp"
     "Source/Scene/TagTable.cpp"
+    "Source/Scene/SceneJournal.cpp"
+    "Source/Scene/WorldLocalTest.cpp"
+    "Source/Dialogue/GraphFanInTest.cpp"
     "Source/Scene/WorldState.cpp")
 
 set(HBE_PHYSICS_SOURCES
@@ -130,10 +133,49 @@ set(HBE_VULKAN_SOURCES "Source/RHI/Vulkan/VulkanDevice.cpp")
 set(HBE_GL_SOURCES     "Source/RHI/GL/GLDevice.cpp"
                        "Source/RHI/GL/GLApi.cpp")
 
+# Collaboration layer. Depends on Core/ ONLY - no scene, no renderer, no editor, no
+# glm - so the same objects link into a headless server with no GPU and no shader
+# step. Enforced by inspection:
+#   grep -rE '#include "(Scene|Renderer|RHI|Editor|Engine|UI|Assets|Game)/' Source/Collab/
+# must stay empty.
+set(HBE_COLLAB_SOURCES
+    "Source/Collab/Protocol.cpp"
+    "Source/Collab/LoopbackTransport.cpp"
+    "Source/Collab/LockTable.cpp"
+    "Source/Collab/CollabServer.cpp"
+    "Source/Collab/CollabClient.cpp"
+    "Source/Collab/Journal.cpp"
+    "Source/Collab/JournalSelfTest.cpp"
+    "Source/Collab/TcpTransport.cpp"
+    "Source/Collab/Identity.cpp"
+    "Source/Collab/SecureChannel.cpp"
+    "Source/Collab/CollabSelfTest.cpp")
+
+# Peer-to-peer transport. EDITOR ONLY - see hbe_configure_engine_lib. Kept out of
+# HBE_COLLAB_SOURCES on purpose so the shipped runtime never links libdatachannel.
+set(HBE_COLLAB_P2P_SOURCES
+    "Source/Collab/Signaling.cpp"
+    "Source/Collab/ProjectSync.cpp"
+    "Source/Collab/WebRtcTransport.cpp"
+    "Source/Editor/CollabSession.cpp"
+    "Source/Editor/CollabPanels.cpp")
+
+# Hub / launcher: engine version, update manifest, HTTPS fetch, safe zip extraction
+# and the staged-swap installer. Core/ + Windows only - the Hub must be able to run in
+# order to REPAIR a broken engine install, so it must not need one to start.
+set(HBE_HUB_SOURCES
+    "Source/Hub/UpdateCheck.cpp"
+    "Source/Hub/ZipArchive.cpp"
+    "Source/Hub/Updater.cpp"
+    "Source/Hub/HubConfig.cpp"
+    "Source/Hub/ProjectCatalog.cpp"
+    "Source/Hub/HubSelfTest.cpp")
+
 # Editor-only sources (added only to hbe_editor).
 set(HBE_EDITOR_SOURCES
     "Source/Editor/Editor.cpp"
     "Source/Editor/SaveDispatch.cpp"
+    "Source/Editor/TimelineSnap.cpp"
     "Source/Editor/SceneSaveTest.cpp"
     "Source/Editor/EditorZoneTest.cpp"
     "Source/Editor/PasteParentTest.cpp"
@@ -161,6 +203,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_SCHEMATIC_SOURCES}
     ${HBE_DIALOGUE_SOURCES}
     ${HBE_UI_SOURCES}
+    ${HBE_COLLAB_SOURCES}
     ${HBE_RHI_SOURCES}
     ${HBE_RENDERER_SOURCES}
     ${HBE_ENGINE_SOURCES})
@@ -180,6 +223,30 @@ function(hbe_configure_engine_lib tgt is_editor)
     target_link_libraries(${tgt} PRIVATE shell32)
     # Windows Compression API (UAP pack compression). Ships with Windows 8+.
     target_link_libraries(${tgt} PRIVATE cabinet)
+    # WinSock2 (the collaboration TCP transport). Ships with Windows; no redist, and
+    # the same kind of in-box import lib as xinput9_1_0/cabinet above - so the
+    # collaboration layer adds no third-party dependency.
+    # THE ENGINE VERSION, and the only place it is defined.
+    #
+    # It must be an ORDERED triple that reaches C++, because the updater's entire job is
+    # answering "is the remote newer than me?". The boot log's __DATE__/__TIME__ stamp
+    # cannot answer that - it does not sort - and the outer project(VERSION) never
+    # reached a single translation unit. Bump these to publish a release.
+    target_compile_definitions(${tgt} PRIVATE
+        HBE_VERSION_MAJOR=1 HBE_VERSION_MINOR=0 HBE_VERSION_PATCH=0)
+    target_link_libraries(${tgt} PRIVATE ws2_32)
+    # Mbed TLS: transport security for collaboration over the open internet, and BCrypt
+    # for the per-install identity keypair. See Source/Collab/SecureChannel.h for why a
+    # library is the right call for the handshake specifically.
+    target_link_libraries(${tgt} PRIVATE mbedtls mbedx509 mbedcrypto bcrypt)
+    # The launcher core, for --test-hub. One-way: hbe_hubcore never links the engine.
+    target_link_libraries(${tgt} PRIVATE hbe_hubcore)
+    # zlib (raw inflate) for the Hub's release-archive reader. assimp already builds
+    # zlibstatic, so this adds no new download - only a link and an include path.
+    target_link_libraries(${tgt} PRIVATE zlibstatic)
+    target_include_directories(${tgt} PRIVATE
+        "${assimp_SOURCE_DIR}/contrib/zlib"
+        "${assimp_BINARY_DIR}/contrib/zlib")
     # stb single-header utilities: stb_easy_font for the in-game UI (runtime
     # too); the editor additionally uses stb_image for texture import.
     target_link_libraries(${tgt} PRIVATE stb)
@@ -229,6 +296,11 @@ function(hbe_configure_engine_lib tgt is_editor)
     # Only the editor library pulls in Dear ImGui + ImGuizmo.
     if(is_editor)
         target_link_libraries(${tgt} PUBLIC imgui)
+        # WebRTC (peer-to-peer collaboration) is an AUTHORING feature. Linking it into
+        # `hbe` would put an ICE/DTLS/SCTP stack, and its threads, into every shipped
+        # game that will never open a collaboration session.
+        target_sources(${tgt} PRIVATE ${HBE_COLLAB_P2P_SOURCES})
+        target_link_libraries(${tgt} PRIVATE LibDataChannel::LibDataChannelStatic)
         # comdlg32 = file dialogs, ole32 = IFileDialog folder picker (COM).
         # mf* = Media Foundation H.264 .mp4 encode/decode (offline movie render).
         target_link_libraries(${tgt} PRIVATE comdlg32 ole32 mfplat mfreadwrite mfuuid mf)
@@ -311,8 +383,43 @@ target_link_libraries(HeartbreakEditor PRIVATE hbe_editor)
 set_target_properties(HeartbreakEditor PROPERTIES VS_DPI_AWARE "PerMonitor")
 
 # The Hub: standalone project manager that launches the editor.
-add_executable(HeartbreakHub "Source/main_hub.cpp" "${HBE_SCHEMATIC_STUB}")
-target_link_libraries(HeartbreakHub PRIVATE hbe_editor)
+# ---------------------------------------------------------------------------
+# hbe_hubcore - the launcher's logic, with NO ENGINE DEPENDENCY.
+#
+# Deliberately its own library so HeartbreakHub can link this and nothing else. The
+# Hub must run when the engine is broken, half-installed or absent - that is exactly
+# when a person opens a launcher - and it must live OUTSIDE the bin/ directory it
+# swaps during an update, because a process cannot rename the directory it runs from.
+# The engine libs link it too (for --test-hub), which is a one-way dependency.
+# ---------------------------------------------------------------------------
+add_library(hbe_hubcore STATIC ${HBE_HUB_SOURCES})
+target_include_directories(hbe_hubcore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Source")
+target_compile_features(hbe_hubcore PUBLIC cxx_std_20)
+target_link_libraries(hbe_hubcore PRIVATE nlohmann_json::nlohmann_json zlibstatic)
+target_include_directories(hbe_hubcore PRIVATE
+    "${assimp_SOURCE_DIR}/contrib/zlib" "${assimp_BINARY_DIR}/contrib/zlib")
+# All in-box Windows libs: WinHTTP (https), BCrypt (SHA-256). No third-party runtime.
+target_link_libraries(hbe_hubcore PRIVATE winhttp bcrypt)
+target_compile_definitions(hbe_hubcore PUBLIC
+    HBE_VERSION_MAJOR=1 HBE_VERSION_MINOR=0 HBE_VERSION_PATCH=0)
+
+# imgui_hub - the SAME Dear ImGui sources, but only the Win32 + D3D11 backends. The
+# engine's `imgui` target bundles the D3D12 and Vulkan backends, and linking it would
+# drag vulkan-1.dll back into the launcher - the exact import that made the old hub
+# fail to start on a machine with no GPU driver.
+add_library(imgui_hub STATIC
+    "${imgui_SOURCE_DIR}/imgui.cpp"
+    "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+    "${imgui_SOURCE_DIR}/imgui_tables.cpp"
+    "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_win32.cpp"
+    "${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp")
+target_include_directories(imgui_hub PUBLIC
+    "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
+target_compile_features(imgui_hub PUBLIC cxx_std_20)
+
+add_executable(HeartbreakHub WIN32 "Source/HubApp/main_hubapp.cpp")
+target_link_libraries(HeartbreakHub PRIVATE hbe_hubcore imgui_hub d3d11 dxgi)
 set_target_properties(HeartbreakHub PROPERTIES VS_DPI_AWARE "PerMonitor")
 
 # The Art Editor: a focused painting tool for 2D artists (same editor lib).
@@ -324,6 +431,5 @@ set_target_properties(HeartbreakArtEditor PROPERTIES VS_DPI_AWARE "PerMonitor")
 include(ShaderCompile)
 hbe_compile_engine_shaders(HeartbreakEditor)
 hbe_compile_engine_shaders(HeartbreakRuntime)
-hbe_compile_engine_shaders(HeartbreakHub)
 hbe_compile_engine_shaders(HeartbreakArtEditor)
 

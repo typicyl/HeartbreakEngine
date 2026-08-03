@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <system_error>
 #include <type_traits>
 #include <vector>
 
@@ -37,12 +38,38 @@ public:
 
     const std::vector<u8>& Data() const { return data_; }
 
+    // WRITE-TO-TEMP-THEN-RENAME. This used to open the destination directly, which
+    // TRUNCATES it: from that instant until the write completed, the asset on disk was
+    // a partial file, and a crash, a full disk or a lost network drive left it that
+    // way. Every binary asset in the engine goes through here (.uaf meshes, textures,
+    // audio, animation), so the window was small but the loss was total and silent -
+    // the next load just reports a corrupt asset.
+    //
+    // std::filesystem::rename over an existing file is atomic on NTFS, so a reader
+    // either sees the whole old file or the whole new one, never a half-written mix.
     bool SaveToFile(const std::filesystem::path& path) const {
-        std::ofstream out(path, std::ios::binary);
-        if (!out) return false;
-        out.write(reinterpret_cast<const char*>(data_.data()),
-                  static_cast<std::streamsize>(data_.size()));
-        return out.good();
+        std::filesystem::path tmp = path;
+        tmp += ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (!out) return false;
+            out.write(reinterpret_cast<const char*>(data_.data()),
+                      static_cast<std::streamsize>(data_.size()));
+            if (!out.good()) {
+                out.close();
+                std::error_code rm;
+                std::filesystem::remove(tmp, rm); // never leave a stray .tmp behind
+                return false;
+            }
+        } // close before renaming - Windows will not rename an open file
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::error_code rm;
+            std::filesystem::remove(tmp, rm);
+            return false;
+        }
+        return true;
     }
 
 private:

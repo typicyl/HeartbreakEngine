@@ -2243,6 +2243,28 @@ bool DocumentInvariantsSelfTest(Scene& scene, Renderer* renderer, const fs::path
             const usize before = inst->entities.size();
             const entt::entity victim = inst->entities.back();
             const std::string firstName = captured.entities.front().name;
+
+            // DRAIN THE FREE LIST FIRST. This block used to assume entt had no freed
+            // handles to hand out, which is true only in a registry that has never
+            // destroyed anything - never the case after a real boot (the engine
+            // instantiates and replaces scenes before the test runs). With a
+            // non-empty free list `__brandnew` is itself a RECYCLED handle carrying
+            // version bits, its integral value lands above `__recycled`'s, and the
+            // premise assertion below failed on every real document - taking the
+            // whole test red while every actual invariant passed. So this gate has
+            // never gated anything.
+            //
+            // entt's free list is LIFO, so draining until a handle comes back with
+            // version 0 (a genuinely fresh index) leaves it empty and makes the
+            // scenario deterministic: victim -> free list -> recycled takes it back
+            // with a bumped version, brandnew then takes a fresh low index.
+            std::vector<entt::entity> drained;
+            for (u32 guard = 0; guard < 4096; ++guard) {
+                const entt::entity e = scene.CreateEntity("__drain");
+                drained.push_back(e);
+                if (entt::to_version(e) == 0) break; // fresh index -> list is empty
+            }
+
             reg.destroy(victim);
             inst->entities.pop_back();
             const entt::entity recycled = scene.CreateEntity("__recycled");
@@ -2253,6 +2275,7 @@ bool DocumentInvariantsSelfTest(Scene& scene, Renderer* renderer, const fs::path
             docs.Track(scene, h, brandnew);
             // The premise of the check: the recycled handle really is numerically
             // above the fresh one (otherwise the assertion below proves nothing).
+            // Now deterministic thanks to the drain above.
             expect(static_cast<u32>(recycled) > static_cast<u32>(brandnew),
                    "entt recycled a handle whose integral value is HIGHER (version bits)");
             DocData after;
@@ -2265,6 +2288,12 @@ bool DocumentInvariantsSelfTest(Scene& scene, Renderer* renderer, const fs::path
                    "capture keeps CREATION order across a handle recycle");
             expect(!after.entities.empty() && after.entities.front().name == firstName,
                    "the rest of the document keeps its order across a recycle");
+
+            // The drain entities were never tracked in the document, so they do not
+            // affect any assertion above; destroy them now so section 5's "Close
+            // destroys every document entity" runs against a clean registry.
+            for (const entt::entity e : drained)
+                if (reg.valid(e)) reg.destroy(e);
         }
     }
 

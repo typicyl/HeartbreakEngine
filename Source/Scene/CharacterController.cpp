@@ -68,22 +68,24 @@ void Update(Scene& scene, const Input& input, f32 dt, const glm::vec3& cameraFor
         const bool externallyFaced = cc.externalFacing;
         cc.externalFacing = false;
         //
-        // KNOWN DEFECT, deliberately left alone here (a separate change, because
-        // it alters how every existing third-person character faces): this yaw is
-        // MIRRORED IN X against the engine's forward convention. Every other
-        // system reads a facing as `world * vec4(0,0,-1,0)` (cam::Update's
-        // tgtFwd, AISystem's perception cone, the render camera). Rotating -Z by
-        // angleAxis(a, +Y) yields (-sin a, 0, -cos a), so with
-        // a = atan2(dir.x, -dir.z) the body's forward comes out as
-        // (-dir.x, 0, +dir.z): correct walking forward or back, backwards walking
-        // left or right. The fix is `atan2(-dir.x, -dir.z)`. Left as-is here so
-        // the first-person work below it is not carrying an unrelated,
-        // content-visible behaviour change; cam::YawQuat uses the CORRECT
-        // convention, which is why the first-person path does not route through
-        // this one.
+        // FIXED (was a signed, documented defect): this yaw used to be MIRRORED IN
+        // X against the engine's forward convention. Every other system reads a
+        // facing as `world * vec4(0,0,-1,0)` (cam::Update's tgtFwd, AISystem's
+        // perception cone, the render camera). Rotating -Z by angleAxis(a, +Y)
+        // yields (-sin a, 0, -cos a), so the old `atan2(dir.x, -dir.z)` produced a
+        // forward of (-dir.x, 0, +dir.z): correct walking forward or back,
+        // BACKWARDS walking left or right. It was left alone as "a separate
+        // change" and then stayed - and because ai::ForwardDir reads the same
+        // transform, a strafing AI's sight cone pointed wrong too.
+        //
+        // Content note: third-person characters authored against the old mirrored
+        // behaviour will now turn the other way when strafing. That is the
+        // correction, not a regression - the body now agrees with the camera, the
+        // perception cone and cam::YawQuat, which always used this convention
+        // (which is why the first-person path never routed through here).
         if (cc.faceMoveDir && !externallyFaced &&
             glm::length(glm::vec2(dir.x, dir.z)) > 1e-3f) {
-            const f32 yaw = std::atan2(dir.x, -dir.z); // 0 faces local -Z
+            const f32 yaw = std::atan2(-dir.x, -dir.z); // 0 faces local -Z
             const glm::quat target = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
             const f32 a = cc.turnSpeed <= 0.0f ? 1.0f : 1.0f - std::exp(-cc.turnSpeed * dt);
             t.rotation = glm::slerp(t.rotation, target, glm::clamp(a, 0.0f, 1.0f));

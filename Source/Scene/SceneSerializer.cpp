@@ -413,6 +413,8 @@ SceneData HeaderOf(const SceneEnvironment& env) {
     // the key off the file it overwrites, but that only covers saves over an
     // existing file - this is the path that covers the rest.
     h.packSlot = env.packSlot;
+    h.docId = env.docId;
+    h.guidEpoch = env.guidEpoch;
     h.post = env.post;
     h.hasDayNight = env.dayNightAuthored != 0;
     h.timeOfDay = env.timeOfDay;
@@ -545,6 +547,20 @@ json BuildSceneJson(const Scene& scene,
     // Slot identity survives the round trip (see SceneData::packSlot). Written only
     // when the source carried one, so a never-stamped scene stays byte-identical.
     if (hdr.packSlot != SceneData::kNoPackSlot) root["packSlot"] = hdr.packSlot;
+    // COLLABORATION IDENTITY - written ONLY when the document already has one.
+    //
+    // Minting here was wrong and --test-tagtable caught it immediately: saving is
+    // supposed to be DETERMINISTIC (two round trips of one scene are byte-identical,
+    // which is what makes a save diffable and a round-trip testable), and minting a
+    // random id per write made every save differ from the last.
+    //
+    // Identity is assigned ONCE, by an explicit act - enabling collaboration on a
+    // document, or the central guid migration - not as a side effect of pressing
+    // Ctrl+S. Until then these stay 0, which the collaboration layer already reads as
+    // "not identified, cannot be merged" rather than as a wildcard. A scene that never
+    // collaborates therefore never grows the keys, and its bytes never change.
+    if (hdr.docId != 0) root["docId"] = guid::ToHex(hdr.docId);
+    if (hdr.guidEpoch != 0) root["guidEpoch"] = guid::ToHex(hdr.guidEpoch);
     // Written only when the scene AUTHORED an override, so a level that inherits the
     // project's cycle stays byte-for-byte what it was before the keys existed.
     if (hdr.hasDayNight) {
@@ -1322,6 +1338,12 @@ void ParseSceneJson(const json& root, SceneData& out) {
     out.giSource = root.value("giSource", std::string());
     if (const auto ps = root.find("packSlot"); ps != root.end() && ps->is_number_unsigned())
         out.packSlot = ps->get<u32>();
+    // Absent = a file written before these existed; 0 means "unidentified", which the
+    // collaboration layer treats as "cannot be merged yet", never as a wildcard match.
+    if (const auto it = root.find("docId"); it != root.end() && it->is_string())
+        out.docId = guid::FromHex(it->get<std::string>());
+    if (const auto it = root.find("guidEpoch"); it != root.end() && it->is_string())
+        out.guidEpoch = guid::FromHex(it->get<std::string>());
     out.exposure = root.value("exposure", 1.0f);
     out.shadowDistance = root.value("shadowDistance", 150.0f);
     if (const auto it = root.find("post"); it != root.end() && it->is_object()) {
@@ -2045,6 +2067,10 @@ bool SaveScene(const Scene& scene, const fs::path& path,
             try {
                 json old;
                 prev >> old;
+                for (const char* k : {"docId", "guidEpoch"}) {
+                    if (const auto it2 = old.find(k); it2 != old.end() && !root.contains(k))
+                        root[k] = *it2;
+                }
                 if (const auto it = old.find("packSlot");
                     it != old.end() && it->is_number_unsigned())
                     root["packSlot"] = *it;
@@ -2596,6 +2622,8 @@ void ApplyEnvironment(Scene& scene, Renderer& renderer, const SceneData& data) {
     // below: putting it after that would skip it whenever the same volume is already
     // bound, which is the common case on undo/redo and Stop-Play.
     env.packSlot = data.packSlot;
+    env.docId = data.docId;
+    env.guidEpoch = data.guidEpoch;
     env.post = data.post;
     // The optional per-scene day/night override. Applied here so it lands through
     // the SAME one writer as the rest of the header - the clock is lighting, and a
@@ -4621,6 +4649,319 @@ bool PaintCanvasSelfTest() {
 
     fs::remove_all(root, ec);
     return ok;
+}
+
+// ===========================================================================
+// PER-COMPONENT DELTAS (see SceneSerializer.h)
+// ===========================================================================
+
+namespace {
+
+// One row per supported component: how to READ it back out of JSON and onto a live
+// entity, and how to REMOVE it. The write side needs no entry - it is EntityToJson.
+//
+// This table IS the coverage. A key absent from it is refused by ApplyComponentJson,
+// which is why adding a component is a visible, deliberate act rather than something
+// that half-works.
+struct DeltaApplier {
+    const char* key;
+    // `v` is the sub-object EntityToJson wrote for this key. Return false for a shape
+    // this build does not understand - never a partially applied component.
+    bool (*apply)(entt::registry& reg, entt::entity e, const json& v);
+    void (*remove)(entt::registry& reg, entt::entity e);
+};
+
+bool ApplyNameComp(entt::registry& reg, entt::entity e, const json& v) {
+    if (!v.is_string()) return false;
+    reg.emplace_or_replace<Name>(e, Name{v.get<std::string>()});
+    return true;
+}
+void RemoveNameComp(entt::registry& reg, entt::entity e) { reg.remove<Name>(e); }
+
+glm::vec3 DeltaVec3(const json& a, const glm::vec3& def) {
+    if (!a.is_array() || a.size() != 3) return def;
+    return glm::vec3(a[0].get<f32>(), a[1].get<f32>(), a[2].get<f32>());
+}
+
+bool ApplyTransformComp(entt::registry& reg, entt::entity e, const json& v) {
+    if (!v.is_object()) return false;
+    Transform t = reg.all_of<Transform>(e) ? reg.get<Transform>(e) : Transform{};
+    // Each field is optional so a sender may omit an unchanged one. A MISSING field
+    // keeps what is already there rather than snapping to a default - resetting it
+    // would teleport an object because the sender was being economical.
+    if (const auto it = v.find("p"); it != v.end()) t.position = DeltaVec3(*it, t.position);
+    if (const auto it = v.find("s"); it != v.end()) t.scale = DeltaVec3(*it, t.scale);
+    if (const auto it = v.find("r"); it != v.end() && it->is_array() && it->size() == 4) {
+        // THE ORDER IS w,x,y,z - matching ToJson(const glm::quat&), which writes
+        // {q.w, q.x, q.y, q.z}. It is NOT the x,y,z,w most formats use, and assuming
+        // the common convention here produced a rotation that looked almost right;
+        // nobody investigates "slightly off", so the round-trip test is what caught it.
+        // Read it through the SAME accessor order the writer used and it cannot drift.
+        t.rotation = glm::quat((*it)[0].get<f32>(), (*it)[1].get<f32>(),
+                               (*it)[2].get<f32>(), (*it)[3].get<f32>());
+    }
+    reg.emplace_or_replace<Transform>(e, t);
+    return true;
+}
+void RemoveTransformComp(entt::registry& reg, entt::entity e) { reg.remove<Transform>(e); }
+
+// Runs ONE component's json through THE SCENE FILE'S OWN READER.
+//
+// The obvious alternative - hand-writing a small parser per row, right here - was
+// rejected. It would be a SECOND reader for the same bytes, and the moment the two
+// drifted a value would mean one thing when saved and a different thing when sent to a
+// colleague. Nobody would think to look for that: both paths would work in isolation.
+// The cost is building a one-entity scene document per applied delta, which happens at
+// human editing rates, not per frame per entity.
+bool ParseOneComponent(const char* key, const json& v, EntityData& out) {
+    json ent = json::object();
+    ent[key] = v;
+    json root = json::object();
+    root["entities"] = json::array({ent});
+    SceneData sd;
+    ParseSceneJson(root, sd);
+    if (sd.entities.size() != 1) return false;
+    out = std::move(sd.entities[0]);
+    return true;
+}
+
+// A component that Instantiate applies as a single `reg.emplace<T>(e, d.field)` and
+// nothing else. That is the exact condition for being safe here: no renderer, no staged
+// assets, no post-load fix-up, nothing to intern on the main thread.
+//
+// Components that fail that test are deliberately ABSENT rather than approximated -
+// `rigidBody` rebuilds collider geometry and resets a physics body id, `mesh` and `paint`
+// need staged assets, `tag` interns into a shared table, `characterRig` spawns parts
+// after load. Applying those as a plain copy would produce an entity that looks right in
+// the inspector and behaves wrong, which is worse than not supporting them: an unknown
+// key is REFUSED by ApplyComponentJson and the caller is told.
+#define HBE_PLAIN_DELTA(FN, KEY, HAS, VAL, TYPE)                                         \
+    bool FN##Apply(entt::registry& reg, entt::entity e, const json& v) {                 \
+        EntityData d;                                                                    \
+        if (!ParseOneComponent(KEY, v, d) || !d.HAS) return false;                        \
+        reg.emplace_or_replace<TYPE>(e, d.VAL);                                          \
+        return true;                                                                     \
+    }                                                                                    \
+    void FN##Remove(entt::registry& reg, entt::entity e) { reg.remove<TYPE>(e); }
+
+HBE_PLAIN_DELTA(DirLight, "light", hasLight, light, DirectionalLightComponent)
+HBE_PLAIN_DELTA(PointLight, "pointLight", hasPointLight, pointLight, PointLightComponent)
+HBE_PLAIN_DELTA(SpotLight, "spotLight", hasSpotLight, spotLight, SpotLightComponent)
+HBE_PLAIN_DELTA(RectLight, "rectLight", hasRectLight, rectLight, RectLightComponent)
+HBE_PLAIN_DELTA(Cam, "camera", hasCamera, camera, CameraComponent)
+HBE_PLAIN_DELTA(CamZone, "cameraZone", hasCameraZone, cameraZone, CameraZone)
+HBE_PLAIN_DELTA(CamSpline, "cameraSpline", hasCameraSpline, cameraSpline, CameraSpline)
+HBE_PLAIN_DELTA(MusZone, "musicZone", hasMusicZone, musicZone, MusicZone)
+HBE_PLAIN_DELTA(PostVol, "postVolume", hasPostVolume, postVolume, PostVolume)
+HBE_PLAIN_DELTA(Interact, "interactable", hasInteractable, interactable, Interactable)
+HBE_PLAIN_DELTA(Trig, "trigger", hasTrigger, trigger, TriggerVolume)
+HBE_PLAIN_DELTA(DlgActor, "dialogueActor", hasDialogueActor, dialogueActor, DialogueActor)
+HBE_PLAIN_DELTA(Chk, "checkpoint", hasCheckpoint, checkpoint, Checkpoint)
+HBE_PLAIN_DELTA(Hp, "health", hasHealth, health, Health)
+HBE_PLAIN_DELTA(Wpn, "weapon", hasWeapon, weapon, Weapon)
+HBE_PLAIN_DELTA(AiPerc, "aiPerception", hasAIPerception, aiPerception, AIPerception)
+HBE_PLAIN_DELTA(AiBehav, "aiBehavior", hasAIBehavior, aiBehavior, AIBehavior)
+HBE_PLAIN_DELTA(Spwn, "spawner", hasSpawner, spawner, Spawner)
+HBE_PLAIN_DELTA(Enc, "encounter", hasEncounter, encounter, Encounter)
+HBE_PLAIN_DELTA(NavAg, "navAgent", hasNavAgent, navAgent, NavigationAgent)
+HBE_PLAIN_DELTA(NavObs, "navObstacle", hasNavObstacle, navObstacle, NavigationObstacle)
+HBE_PLAIN_DELTA(NavIn, "navmeshInput", hasNavmeshInput, navmeshInput, NavmeshInput)
+HBE_PLAIN_DELTA(Rot, "rotator", hasRotator, rotator, Rotator)
+HBE_PLAIN_DELTA(Cens, "censor", hasCensor, censor, CensorComponent)
+HBE_PLAIN_DELTA(CharCtl, "character", hasCharacter, character, CharacterController)
+HBE_PLAIN_DELTA(Ik, "ik", hasIK, ik, IKConstraint)
+HBE_PLAIN_DELTA(WText, "worldText", hasWorldText, worldText, WorldText)
+HBE_PLAIN_DELTA(MotMat, "motionMatching", hasMotionMatching, motionMatching, MotionMatching)
+HBE_PLAIN_DELTA(Parts, "particles", hasParticles, particles, ParticleEmitter)
+
+#undef HBE_PLAIN_DELTA
+
+const DeltaApplier kAppliers[] = {
+    {"name", &ApplyNameComp, &RemoveNameComp},
+    {"transform", &ApplyTransformComp, &RemoveTransformComp},
+    {"light", &DirLightApply, &DirLightRemove},
+    {"pointLight", &PointLightApply, &PointLightRemove},
+    {"spotLight", &SpotLightApply, &SpotLightRemove},
+    {"rectLight", &RectLightApply, &RectLightRemove},
+    {"camera", &CamApply, &CamRemove},
+    {"cameraZone", &CamZoneApply, &CamZoneRemove},
+    {"cameraSpline", &CamSplineApply, &CamSplineRemove},
+    {"musicZone", &MusZoneApply, &MusZoneRemove},
+    {"postVolume", &PostVolApply, &PostVolRemove},
+    {"interactable", &InteractApply, &InteractRemove},
+    {"trigger", &TrigApply, &TrigRemove},
+    {"dialogueActor", &DlgActorApply, &DlgActorRemove},
+    {"checkpoint", &ChkApply, &ChkRemove},
+    {"health", &HpApply, &HpRemove},
+    {"weapon", &WpnApply, &WpnRemove},
+    {"aiPerception", &AiPercApply, &AiPercRemove},
+    {"aiBehavior", &AiBehavApply, &AiBehavRemove},
+    {"spawner", &SpwnApply, &SpwnRemove},
+    {"encounter", &EncApply, &EncRemove},
+    {"navAgent", &NavAgApply, &NavAgRemove},
+    {"navObstacle", &NavObsApply, &NavObsRemove},
+    {"navmeshInput", &NavInApply, &NavInRemove},
+    {"rotator", &RotApply, &RotRemove},
+    {"censor", &CensApply, &CensRemove},
+    {"character", &CharCtlApply, &CharCtlRemove},
+    {"ik", &IkApply, &IkRemove},
+    {"worldText", &WTextApply, &WTextRemove},
+    {"motionMatching", &MotMatApply, &MotMatRemove},
+    {"particles", &PartsApply, &PartsRemove},
+};
+
+const DeltaApplier* FindApplier(const std::string& key) {
+    for (const DeltaApplier& a : kAppliers)
+        if (key == a.key) return &a;
+    return nullptr;
+}
+
+} // namespace
+
+const char* DeltaApplyName(DeltaApply r) {
+    switch (r) {
+        case DeltaApply::Applied: return "Applied";
+        case DeltaApply::Removed: return "Removed";
+        case DeltaApply::UnknownKey: return "UnknownKey";
+        case DeltaApply::BadJson: return "BadJson";
+        case DeltaApply::NoEntity: return "NoEntity";
+    }
+    return "?";
+}
+
+const std::vector<std::string>& DeltaComponentKeys() {
+    static const std::vector<std::string> keys = [] {
+        std::vector<std::string> k;
+        for (const DeltaApplier& a : kAppliers) k.emplace_back(a.key);
+        return k;
+    }();
+    return keys;
+}
+
+bool IsDeltaComponent(const std::string& key) { return FindApplier(key) != nullptr; }
+
+bool ComponentToJson(const Scene& scene, entt::entity e, const std::string& key,
+                     std::string& outJson) {
+    outJson.clear();
+    const entt::registry& reg = scene.Registry();
+    if (!reg.valid(e)) return false;
+    if (!IsDeltaComponent(key)) return false;
+    // REUSE THE SAVE WRITER. Extracting one key from EntityToJson's output is what
+    // guarantees a delta and a save can never disagree about a component's shape - a
+    // second hand-written writer would drift the first time either one changed.
+    static const std::unordered_map<u32, int> kNoParents;
+    const json je = EntityToJson(reg, e, kNoParents, false);
+    const auto it = je.find(key);
+    if (it == je.end()) return false; // the entity does not have this component
+    outJson = it->dump();
+    return true;
+}
+
+DeltaApply ApplyComponentJson(Scene& scene, entt::entity e, const std::string& key,
+                              const std::string& jsonText) {
+    entt::registry& reg = scene.Registry();
+    if (!reg.valid(e)) return DeltaApply::NoEntity;
+    const DeltaApplier* a = FindApplier(key);
+    // REFUSED, not ignored. A silent no-op is a divergence with no symptom: the sender
+    // believes the edit landed and every other machine never saw it.
+    if (!a) return DeltaApply::UnknownKey;
+
+    if (jsonText.empty()) {
+        a->remove(reg, e);
+        return DeltaApply::Removed;
+    }
+    const json v = json::parse(jsonText, nullptr, false);
+    if (v.is_discarded()) return DeltaApply::BadJson;
+    return a->apply(reg, e, v) ? DeltaApply::Applied : DeltaApply::BadJson;
+}
+
+bool ComponentDeltaSelfTest() {
+    int fails = 0;
+    const auto check = [&fails](bool c, const char* what) {
+        if (c) return;
+        ++fails;
+        std::printf("componentdelta FAIL: %s\n", what);
+    };
+
+    Scene s;
+    const entt::entity src = s.CreateEntity("Source");
+    const entt::entity dst = s.CreateEntity("Dest");
+    entt::registry& reg = s.Registry();
+
+    Transform t;
+    t.position = {1.5f, -2.25f, 3.75f};
+    t.scale = {2.0f, 0.5f, 1.25f};
+    t.rotation = glm::normalize(glm::quat(0.3f, 0.1f, -0.5f, 0.8f));
+    reg.emplace_or_replace<Transform>(src, t);
+
+    // Every registered key must round-trip onto a DIFFERENT entity and land identical.
+    // The second entity is the point - this is the cross-machine case, and a test that
+    // applied back onto the source would pass even if apply did nothing at all.
+    for (const std::string& key : DeltaComponentKeys()) {
+        std::string payload;
+        if (!ComponentToJson(s, src, key, payload)) continue; // src lacks it: fine
+        check(!payload.empty(), "a serialized component was empty");
+        const DeltaApply r = ApplyComponentJson(s, dst, key, payload);
+        check(r == DeltaApply::Applied, "a registered component did not apply");
+        std::string back;
+        check(ComponentToJson(s, dst, key, back), "the applied component did not read back");
+        check(back == payload, "a component did not survive the round trip byte-for-byte");
+    }
+
+    // The transform specifically - the thing an artist actually moves - must be
+    // numerically right, not merely byte-equal to something that is also wrong.
+    {
+        check(reg.all_of<Transform>(dst), "the transform did not reach the destination");
+        const Transform& g = reg.get<Transform>(dst);
+        check(glm::length(g.position - t.position) < 1e-4f, "position did not survive");
+        check(glm::length(g.scale - t.scale) < 1e-4f, "scale did not survive");
+        check(std::fabs(glm::dot(g.rotation, t.rotation)) > 0.999f, "rotation did not survive");
+    }
+
+    // A partial transform must MERGE, not reset the omitted fields to defaults.
+    {
+        const DeltaApply r = ApplyComponentJson(s, dst, "transform", "{\"p\":[9.0,9.0,9.0]}");
+        check(r == DeltaApply::Applied, "a partial transform should apply");
+        const Transform& g = reg.get<Transform>(dst);
+        check(glm::length(g.position - glm::vec3(9.0f)) < 1e-4f, "the partial position applied");
+        check(glm::length(g.scale - t.scale) < 1e-4f,
+              "an OMITTED field was reset instead of preserved - that teleports objects");
+    }
+
+    // Name round-trip, then removal.
+    {
+        check(ApplyComponentJson(s, dst, "name", "\"Renamed\"") == DeltaApply::Applied,
+              "a name delta should apply");
+        check(reg.get<Name>(dst).value == "Renamed", "the name did not change");
+        check(ApplyComponentJson(s, dst, "name", "") == DeltaApply::Removed,
+              "an empty payload should REMOVE the component");
+        check(!reg.all_of<Name>(dst), "the component was not actually removed");
+    }
+
+    // THE REFUSAL. An unsupported key must be reported, never silently dropped.
+    check(ApplyComponentJson(s, dst, "rigidBody", "{}") == DeltaApply::UnknownKey,
+          "an unregistered component key must be REFUSED, not ignored");
+    check(!IsDeltaComponent("rigidBody"), "rigidBody is not in the delta table yet");
+    check(IsDeltaComponent("transform"), "transform must be in the delta table");
+    check(ApplyComponentJson(s, dst, "transform", "{{{not json") == DeltaApply::BadJson,
+          "malformed JSON must be reported as BadJson");
+    check(ApplyComponentJson(s, dst, "transform", "[1,2,3]") == DeltaApply::BadJson,
+          "a wrong-SHAPE payload must be reported, not partially applied");
+    check(ApplyComponentJson(s, entt::null, "transform", "{}") == DeltaApply::NoEntity,
+          "an invalid entity must be reported");
+    {
+        std::string sink;
+        check(!ComponentToJson(s, src, "nosuchcomponent", sink),
+              "an unknown key must not serialize");
+    }
+
+    if (fails == 0) {
+        std::printf("componentdelta: %zu key(s) round-trip onto a DIFFERENT entity "
+                    "byte-for-byte; omitted fields merge rather than reset; removal "
+                    "works; unknown keys and bad payloads are REFUSED\n",
+                    DeltaComponentKeys().size());
+    }
+    return fails == 0;
 }
 
 } // namespace hbe::scene

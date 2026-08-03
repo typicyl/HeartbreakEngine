@@ -62,7 +62,12 @@ void WorldAabb(const glm::mat4& m, const glm::vec3& localC, const glm::vec3& loc
 // unpainted, non-splat "simple" materials only (everything per-instance except
 // the transforms must be identical - the run head's ObjectCB serves the group).
 bool Instanceable(const rhi::DrawItem& it) {
-    return it.boneCount == 0 && !it.paintColorTexture.IsValid() &&
+    // morphCount too: blendshape weights ride in the ObjectCB, and the run HEAD's
+    // ObjectCB serves the whole group. An UNSKINNED morphing mesh passes the
+    // boneCount test, so without this two blendshaped props with different
+    // expressions instanced together and every one of them silently wore the first
+    // one's face.
+    return it.boneCount == 0 && it.morphCount == 0 && !it.paintColorTexture.IsValid() &&
            !(it.materialFlags &
              (rhi::MaterialFlag_Transparent | rhi::MaterialFlag_TerrainSplat));
 }

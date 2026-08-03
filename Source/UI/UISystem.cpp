@@ -1006,6 +1006,18 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
                      &ctx.interactives);
 }
 
+bool PointerOverInteractive(Scene& scene, const UIContext& ctx) {
+    entt::registry& reg = scene.Registry();
+    for (const entt::entity e : ctx.interactives) {
+        if (!reg.valid(e) || !reg.all_of<UIElement>(e)) continue;
+        const UIElement& el = reg.get<UIElement>(e);
+        // `dragging` matters as much as `hovered`: a slider grabbed and dragged off
+        // its own rect still owns the pointer until the button comes up.
+        if (el.hovered || el.held || el.dragging) return true;
+    }
+    return false;
+}
+
 static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
                               const std::filesystem::path& assetsDir,
                               glm::vec2 targetSize, const CanvasConfig& config,

@@ -252,6 +252,16 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
 void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
                        const PointerState* pointers, UIContext& ctx);
 
+// True when the pointer is currently over (or holding) an interactive widget -
+// i.e. this click belongs to the UI, not to the world.
+//
+// Call AFTER UpdateInteraction, which is what fills `ctx.interactives` for the
+// frame. Cheap: walks only the elements the hit-test actually touched, not the
+// registry. Exists because gameplay's "player fires on left-mouse" branch had no
+// way to ask, so every dialogue-choice / pause / HUD click also discharged the
+// player's weapon.
+bool PointerOverInteractive(Scene& scene, const UIContext& ctx);
+
 // One world-space canvas's triangles for this frame, rendered into its texture
 // (the lit page quad in the scene samples it).
 struct WorldUIBatch {

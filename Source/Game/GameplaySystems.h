@@ -20,8 +20,11 @@ class Camera;
 
 namespace gameplay {
 
+// `uiCapturedPointer` = the pointer is over a UI widget this frame, so the click
+// belongs to the interface. Suppresses ONLY the player-fire branch (see
+// ui::PointerOverInteractive); AI, spawning and combat are unaffected.
 void Update(Scene& scene, PhysicsWorld& physics, Renderer& renderer, const Input& input,
-            const Camera& camera, f32 dt);
+            const Camera& camera, f32 dt, bool uiCapturedPointer = false);
 
 } // namespace gameplay
 } // namespace hbe

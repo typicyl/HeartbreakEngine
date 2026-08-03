@@ -334,8 +334,15 @@ public:
         const GLubyte* ver = glGetString(GL_VERSION);
 
         if (!LoadGLFunctions()) {
-            HBE_ERROR("[GL] Required GL entry points unavailable; staying clear-only.");
-            return true;
+            // FAIL, do not "stay clear-only". Returning true here reported success to
+            // Renderer::Initialize, which reports success to the boot loop, which
+            // `break`s on the first backend that works - so a machine with a stale GL
+            // ICD stopped the fallback chain HERE and the player stared at a blank
+            // window forever, with no attempt at the backend that would have worked.
+            // A device that cannot draw is not a device.
+            HBE_ERROR("[GL] Required GL entry points unavailable - failing so the boot "
+                      "chain can fall through to another backend.");
+            return false;
         }
 
         if (desc.enableValidation && glDebugMessageCallback) {
@@ -352,8 +359,12 @@ public:
         presentProg_ = LinkProgram(kPresentVS, kPresentFS, /*shared*/ false, "Present");
         uiProg_      = LinkProgram(kUiVS, kUiFS, /*shared*/ false, "UI");
         if (!meshProg_ || !skyProg_ || !presentProg_ || !uiProg_) {
-            HBE_ERROR("[GL] Core programs failed; staying clear-only.");
-            sceneOk_ = false;
+            // Same reasoning as the entry-point failure above: without these programs
+            // this device can clear the screen and nothing else, which is worse than
+            // no device at all because it ends the fallback chain.
+            HBE_ERROR("[GL] Core programs failed to link - failing so the boot chain can "
+                      "fall through to another backend.");
+            return false;
         } else {
             CacheUniforms();
             CreateSamplers();

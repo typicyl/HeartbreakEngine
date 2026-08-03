@@ -53,7 +53,12 @@ void FaceTarget(Scene& scene, entt::entity e, const glm::vec3& targetPos) {
     glm::vec3 d = targetPos - WorldPos(scene, e);
     d.y = 0.0f;
     if (glm::length(d) < 1e-3f) return;
-    t->rotation = glm::quatLookAt(glm::normalize(d), glm::vec3(0.0f, 1.0f, 0.0f));
+    // The direction is derived from WORLD positions, so the rotation it produces is
+    // a WORLD rotation - it used to be assigned straight to the parent-relative
+    // `t->rotation`, so an NPC parented to anything (a moving platform, a room root,
+    // a streamed shard root) aimed and looked wrong. ForwardDir reads the world
+    // matrix, so its perception cone inherited the same error.
+    scene.SetWorldRotation(e, glm::quatLookAt(glm::normalize(d), glm::vec3(0.0f, 1.0f, 0.0f)));
 }
 
 void AdvancePatrol(AIBehavior& beh) {

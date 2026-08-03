@@ -168,6 +168,63 @@ glm::mat4 Scene::WorldMatrix(entt::entity e) const {
     return m;
 }
 
+glm::mat4 Scene::ParentWorldMatrix(entt::entity e) const {
+    const Parent* p = registry_.try_get<Parent>(e);
+    if (!p || !registry_.valid(p->entity)) return glm::mat4(1.0f);
+    return WorldMatrix(p->entity);
+}
+
+void Scene::SetWorldPosition(entt::entity e, const glm::vec3& worldPos) {
+    Transform* t = registry_.try_get<Transform>(e);
+    if (!t) return;
+    const Parent* p = registry_.try_get<Parent>(e);
+    if (!p || !registry_.valid(p->entity)) { // root: local IS world
+        t->position = worldPos;
+        return;
+    }
+    t->position = glm::vec3(glm::inverse(WorldMatrix(p->entity)) * glm::vec4(worldPos, 1.0f));
+}
+
+void Scene::SetWorldRotation(entt::entity e, const glm::quat& worldRot) {
+    Transform* t = registry_.try_get<Transform>(e);
+    if (!t) return;
+    const Parent* p = registry_.try_get<Parent>(e);
+    if (!p || !registry_.valid(p->entity)) {
+        t->rotation = worldRot;
+        return;
+    }
+    // Solve for the local rotation that makes the child's WORLD BASIS come out as
+    // asked, by pulling the wanted axes back through the parent's full 3x3.
+    //
+    // The obvious `inverse(parentRotation) * worldRot` is WRONG whenever the parent
+    // has non-uniform scale: the child's world orientation is parentRot * parentScale
+    // * childLocalRot, and a non-uniform scale sitting in the middle SHEARS the
+    // child's axes. No local rotation can undo a shear, so full orientation is not
+    // recoverable in that case - but the FORWARD direction is, exactly, and forward
+    // (local -Z) is what every facing consumer in this engine reads: cam::Update's
+    // tgtFwd, ai::ForwardDir's sight cone, the render camera. So forward is solved
+    // exactly and roll about it is fitted; under uniform scale (the normal case)
+    // both are exact.
+    const glm::mat3 m(WorldMatrix(p->entity));
+    if (std::fabs(glm::determinant(m)) < 1e-8f) { // degenerate parent: best effort
+        t->rotation = worldRot;
+        return;
+    }
+    const glm::mat3 inv = glm::inverse(m);
+    glm::vec3 fwd = inv * (worldRot * glm::vec3(0.0f, 0.0f, -1.0f));
+    if (glm::length(fwd) < 1e-8f) {
+        t->rotation = worldRot;
+        return;
+    }
+    fwd = glm::normalize(fwd);
+    glm::vec3 up = inv * (worldRot * glm::vec3(0.0f, 1.0f, 0.0f));
+    up = glm::length(up) < 1e-8f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::normalize(up);
+    // quatLookAt degenerates when up is parallel to the direction.
+    if (std::fabs(glm::dot(fwd, up)) > 0.999f)
+        up = std::fabs(fwd.y) < 0.9f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(0.0f, 0.0f, 1.0f);
+    t->rotation = glm::normalize(glm::quatLookAt(fwd, up));
+}
+
 bool Scene::IsEditorHidden(entt::entity e) const {
     // Walk self -> ancestors; hidden if any of them carries EditorHidden.
     int depth = 0;

@@ -11,7 +11,9 @@
 #include "Assets/SeamWeld.h"
 #include "Assets/UAF.h"
 #include "Editor/MovieRender.h"
+#include "Editor/CollabSession.h" // peer-to-peer sessions + this scene's history
 #include "Editor/SaveDispatch.h" // Ctrl+S: which focused surface owns the chord
+#include "Editor/TimelineSnap.h" // the shared per-frame grid for every timeline
 #include "Core/Types.h"
 #include "Navigation/GridNav.h"
 #include "Renderer/CameraController.h"
@@ -77,6 +79,11 @@ public:
     // (newest config found) + shaders + .hbproj + packs (+ loose Assets only
     // when packAssets is off).
     static bool BuildShipping(std::string& outMessage);
+    // True when a Release runtime exists next to the editor - i.e. BuildShipping
+    // will ship the FAST build. False means the ship falls back to a slower config
+    // (Debug costs ~23 ms CPU/frame here), so the interactive Build paths confirm
+    // first instead of producing an unshippable build that reports success.
+    static bool HasReleaseRuntime();
     // The TRANSITIVE closure of every asset reachable from the active project's
     // roots (its scenes / UI documents / prefabs, plus the non-scene roots in
     // ProjectSettings: startupScene, bootDocument, every uiDocuments[] entry,
@@ -323,6 +330,17 @@ private:
     // DrawAssetBrowser applies it). Keeps the extension; folders rename whole.
     std::filesystem::path renameAsset_;
     char renameAssetBuf_[128] = {};
+    // Pending asset DELETE (a modal in DrawAssetBrowser confirms it). Delete used
+    // to be a one-click unrecoverable `remove()` whose error code was consulted
+    // only to decide whether to refresh the grid - so a failed delete (locked
+    // file, non-empty folder) was completely silent, and deleting something the
+    // game still references produced a broken build with no diagnostic. The
+    // reference set is computed ONCE when the modal opens, not per frame.
+    std::filesystem::path deleteAsset_;
+    bool deleteAssetIsFolder_ = false;
+    bool deleteAssetRefsKnown_ = false; // false = closure could not be proven total
+    std::vector<std::string> deleteAssetRefs_; // referenced keys under the target
+    std::string deleteAssetError_;            // surfaced remove() failure
     // Pending "create asset" name prompt (a modal in DrawAssetBrowser confirms
     // it). kind: 1 = material, 2 = script, 3 = audio event.
     int pendingCreateKind_ = 0;
@@ -353,6 +371,10 @@ private:
     int  gizmoMode_ = 0;       // 0 = translate, 1 = rotate, 2 = scale
     // Grid snapping for the transform gizmo: round translation to gizmoSnapStep_
     // metres, rotation to gizmoSnapAngle_ degrees, scale to gizmoSnapScale_.
+    // Timeline frame-grid snapping. Defaults ON, unlike gizmoSnap_: a timeline whose
+    // keys land on arbitrary floats is the broken state, not the useful one. Ctrl
+    // SUSPENDS it for a gesture (see the grid setup in DrawCutsceneTimeline).
+    bool timelineSnap_ = true;
     bool gizmoSnap_ = false;
     f32  gizmoSnapStep_ = 1.0f;
     f32  gizmoSnapAngle_ = 15.0f;
@@ -470,6 +492,9 @@ private:
     // Modal for creating/opening projects; auto-opens while no project is
     // active and is reachable from the Project menu afterwards.
     void DrawProjectManager();
+    // The launcher panel: which engine build this is, whether a newer one is published,
+    // and the controls to fetch it. Hub mode only.
+    void DrawHubLauncher();
     bool OpenProject(const std::filesystem::path& hbproj);
     bool CreateProject(const std::filesystem::path& directory, const std::string& name);
     void OnProjectChanged(); // resets browser state, seeds starter content
@@ -1042,7 +1067,69 @@ private:
     // KNOWN, ACCEPTED: imgui settles route arbitration with a one-frame delay (a
     // route registered this frame is scored against last frame's table). Focus is
     // gained by a click, which is itself a prior frame, so a human cannot reach it.
+    // A per-DOCUMENT undo stack for the asset editors.
+    //
+    // The scene's PushUndo cannot serve these, and not merely because it is coarse:
+    // CaptureSnapshot records the registry plus every open `.hbui`, and the four asset
+    // documents (dlg::Graph, schematic::Graph, CutsceneAsset, MusicGraph,
+    // CharacterAsset) live in plain Editor members that are in NEITHER. So Ctrl+Z in
+    // the Dialogue Editor could never undo the edit just made, and always reverted an
+    // unrelated scene edit instead - a no-op that also destroyed other work.
+    //
+    // Every one of those documents is a plain copyable value, so a snapshot is just a
+    // copy: no serializer, no GPU touch, no allocation beyond the vectors themselves.
+    template <class T>
+    struct AssetHistory {
+        std::vector<T> undo, redo;
+        // Call with the document's CURRENT state BEFORE applying an edit - the same
+        // ordering the inspector's undoOnActivate idiom uses (snapshot on
+        // IsItemActivated, i.e. when the widget is grabbed, not after it changes).
+        void Push(const T& before) {
+            undo.push_back(before);
+            if (undo.size() > 64) undo.erase(undo.begin());
+            redo.clear(); // a new edit invalidates the redo branch
+        }
+        bool Undo(T& live) {
+            if (undo.empty()) return false;
+            redo.push_back(live);
+            live = std::move(undo.back());
+            undo.pop_back();
+            return true;
+        }
+        bool Redo(T& live) {
+            if (redo.empty()) return false;
+            undo.push_back(live);
+            live = std::move(redo.back());
+            redo.pop_back();
+            return true;
+        }
+        // Opening a DIFFERENT document must drop the history, or Ctrl+Z would paste
+        // the previous file's contents over the current one.
+        void Clear() {
+            undo.clear();
+            redo.clear();
+        }
+    };
+    AssetHistory<dlg::Graph> dlgHistory_;
+
     bool ClaimSave(editor::SaveSurface surface);
+    // Registers EVERY focus-routed chord this panel owns - Ctrl+S plus the six edit
+    // chords - in one call. Panels call THIS instead of ClaimSave, in the same
+    // position (immediately after Begin(), ABOVE every early return) and for the same
+    // reason: Begin() pushes the focus scope unconditionally, so a collapsed-but-
+    // focused window must still claim or the global fallback writes/edits the scene
+    // while the focused, titled window says "Dialogue Editor".
+    void ClaimFocus(editor::SaveSurface surface);
+    void ProcessEditRequest(Engine& engine);
+    // Per-verb, because two chords can be granted to two different owners in the same
+    // frame (an active InputText owns Ctrl+Z at route score 300 while the panel owns
+    // Ctrl+D at 199). One byte each; a single shared claim would mis-attribute.
+    editor::SaveSurface editVerbSurface_[static_cast<usize>(editor::EditVerb::Count)]{};
+    u8 editVerbs_ = 0; // bitmask of verbs claimed this frame
+    // The three facts DecideEdit needs that SurfaceHasContent does not cover.
+    bool SurfaceHasSelection(editor::SaveSurface s) const;
+    bool SurfaceClipboardEmpty(editor::SaveSurface s) const;
+    bool SurfaceHistoryEmpty(editor::SaveSurface s, editor::EditVerb v) const;
     // Ctrl+S fallback + Ctrl+Shift+S. Called from the global keyboard block.
     void RegisterSaveShortcuts(Engine& engine);
     // End of frame, after every panel has had its chance to claim: turn the claim
@@ -1396,6 +1483,9 @@ private:
         // identities in both (stage 1 documented that hazard).
         Panel_Tags,
         Panel_UIEditor,
+        Panel_Collaborate,
+        Panel_People,
+        Panel_Review,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
@@ -1541,6 +1631,10 @@ private:
     u64 sceneWorldToken_ = 0;
     SceneStreamer streamer_;                 // additive async scene loads
     bool wantSaveSceneAs_ = false;
+    // Set by the interactive Build entry points when no Release runtime exists;
+    // BuildUI turns it into a confirm modal (popups cannot open inside a menu, and
+    // the Build Settings panel draws after the modal block - both defer a frame).
+    bool wantShipConfirm_ = false;
     char sceneSaveName_[128] = "MainScene";
 
     // -- Shipping ----------------------------------------------------------------
@@ -1614,6 +1708,29 @@ private:
     // An objective-id field: free-typing InputText + a "Pick" popup of existing ids
     // (searchable). Returns true when `value` changed. Used by the narrative inspectors.
     bool ObjectiveIdPicker(const char* label, std::string& value, Scene& scene);
+
+    // -- Collaborate (peer-to-peer sessions + scene history) ---------------------
+    // The whole state machine lives in editor::CollabSession; these are just its front
+    // door. Defined in CollabPanels.cpp, following the UIEditor.cpp precedent - Editor.cpp
+    // is already on /bigobj.
+    editor::CollabSession collab_;
+    char collabLabelBuf_[64] = {};   // name to file a newly admitted person under
+    char collabImportPath_[512] = {};
+    char collabDownloadPath_[512] = {}; // where a joiner copies the project to // path of a collaborator's .hbjournal to compare
+    bool wantCollabImport_ = false; // deferred: a popup cannot be opened from a button
+                                    // inside another panel's draw in every case, and this
+                                    // matches the editor's existing want* modal idiom
+    void DrawCollaborate(Engine& engine);
+    void DrawCollabPeople(Engine& engine);
+    void DrawCollabReview(Engine& engine);
+    void CollabTick(Engine& engine);
+    // Seals a commit for a scene that has just been written. Called from the two success
+    // paths of SaveSceneToDisk, never from a wrapper - Save As bypasses those.
+    void CollabNoteSaved(Scene& scene, const std::filesystem::path& writtenPath);
+    // Re-baselines because a DIFFERENT document is now open. Deliberately not called from
+    // AdoptWorld: that also fires on undo/redo and Play->Stop, where re-baselining would
+    // erase the uncommitted delta.
+    void CollabNoteOpened(Scene& scene, const std::filesystem::path& path);
 
     bool hubMode_ = false;
     bool artMode_ = false;     // painting-focused layout (HeartbreakArtEditor.exe)

@@ -10,9 +10,24 @@
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
 #include "Assets/SeamWeld.h"
 #include "Assets/SlotIds.h"      // --test-slotids / --migrate-slots (pack slot identity)
+#include "Assets/MusicGraph.h"   // --test-musicvoice (music director lifecycle)
 #include "Assets/UAP.h"          // uap::PackIndexOf (the migration plan prints pack numbers)
+#include "Audio/AudioSystem.h"   // --test-musicvoice
+#include "Collab/CollabSelfTest.h"  // --test-collab
+#include "Collab/Journal.h"          // --test-journal
+#include "Collab/Identity.h"         // --test-identity
+#include "Collab/SecureChannel.h"    // --test-securechannel
+#include "Collab/ProjectSync.h"      // --test-projectsync
+#include "Collab/WebRtcTransport.h"  // --test-webrtc
+#include "Editor/CollabSession.h"   // --test-collabsession
+#include "Scene/SceneJournal.h"       // --test-p2p
+#include "Hub/HubConfig.h"           // --hub-install
+#include "Hub/HubSelfTest.h"          // --test-hub
+#include "Hub/Updater.h"              // --hub-check (live manifest fetch)
+#include "Collab/TcpTransport.h"     // --test-tcp
 #include "Core/JobSystem.h"
 #include "Core/Window.h"
+#include "Dialogue/DialogueGraph.h" // --test-graphfanin (node-graph reconvergence)
 #include "Editor/Editor.h"
 #include "Editor/Importer.h"
 #include "Editor/MovieRender.h"
@@ -49,6 +64,7 @@
 #  include <crtdbg.h> // route Debug asserts to stderr - see the top of main()
 #endif
 #include <filesystem>
+#include <fstream> // --test-readback raw frame dump / --test-readback-compare
 #include <string>
 #include <unordered_map> // legacy-.hbsave duplicate-guid check in --test-uiflow
 #include <vector>
@@ -64,6 +80,20 @@
 
 // Forward-declared per ImGui's documented pattern (declared inside `#if 0`).
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+
+namespace {
+// Short, path-safe backend tag for the --test-readback frame dumps. NOT
+// rhi::ToString, which returns "Direct3D 12" - a space in a filename that a
+// sibling flag has to reconstruct exactly is a trap.
+const char* ReadbackTag(hbe::rhi::GraphicsAPI api) {
+    switch (api) {
+        case hbe::rhi::GraphicsAPI::D3D12: return "d3d12";
+        case hbe::rhi::GraphicsAPI::Vulkan: return "vulkan";
+        case hbe::rhi::GraphicsAPI::OpenGL: return "opengl";
+    }
+    return "unknown";
+}
+} // namespace
 
 int main(int argc, char** argv) {
 #ifdef _DEBUG
@@ -267,6 +297,238 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-strokezones") == 0) {
             const bool ok = hbe::strokezone::SelfTest();
             std::printf("strokezones %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-worldlocal: prove the WORLD-vs-LOCAL transform contract. Nav
+        // steering, AI look-at and spawner placement each computed a WORLD-space
+        // answer and assigned it to `Transform`, which is PARENT-RELATIVE - correct
+        // for a root entity (which is why it survived), silently wrong for anything
+        // parented to a moving platform, a room root or a streamed shard root. Pins
+        // Scene::SetWorldPosition / SetWorldRotation against a rotated and
+        // NON-UNIFORMLY SCALED parent, a two-level chain, the root identity case and
+        // a Transform-less entity, and asserts in each case that the old raw
+        // assignment FAILS - so the fixture is provably adversarial rather than
+        // trivially satisfiable. Headless: no GPU, no window, no project.
+        if (std::strcmp(argv[i], "--test-worldlocal") == 0) {
+            const bool ok = hbe::scene::WorldLocalSelfTest();
+            std::printf("worldlocal %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-graphfanin: prove RECONVERGENCE works in both node graphs. A choice
+        // fanning out to several branches which then REJOIN a shared tail is the most
+        // common shape in a visual scripting language, and both graphs made it
+        // unauthorable: Connect enforced "one wire per INPUT pin" (correct for DATA
+        // pins, wrong for EXEC), so wiring the second branch SILENTLY DELETED the
+        // first and at runtime that branch hit Follow()==0 and ended early. Pins the
+        // corrected rule - exec: output exclusive, input fan-in; data: input exclusive,
+        // output fan-out - plus removal of a fan-in node, and a save/load round trip.
+        // Every case asserts the OLD behaviour fails it. Headless.
+        // --test-timelinesnap: prove the FRAME GRID every editor timeline now snaps
+        // to. Before it, all three timelines wrote the raw mouse position into a
+        // float-seconds key, so two keys meant to line up landed on 1.3871429s and
+        // 1.3866667s and the music editor drew a bar grid it did not obey. Asserts
+        // idempotence across eight frame rates over 0-3600s (a key is re-snapped on
+        // every drag frame, on inspector release and again on save, so a Snap that
+        // moved an already-snapped value would drift it every gesture), the
+        // round-half-away-from-zero rule, the off-grid-duration clamp trap, and that
+        // a disabled or Ctrl-suspended grid is EXACTLY the identity. Headless.
+        // --test-projectkeys: prove a `.hbproj` survives a round trip through a build
+        // that does not understand all of its keys. Project::Save() rebuilds the whole
+        // file and used to start from an empty json object, emitting only the keys this
+        // build knows - so every other key was silently DELETED on the first save. That
+        // made the format lossy across engine versions in one direction, permanently:
+        // open a project written by a newer build, change one setting, and every option
+        // that build predates is gone. `j["version"] = 1` was written but never read, so
+        // nothing detected the mismatch either. Also asserts the retired legacy keys
+        // stay dropped (that drop IS the migration) and that a NEW project does not
+        // inherit a previous one's unknown keys. Headless; writes only to temp.
+        // --test-collab: drive the SHIPPING collaboration server and client over the
+        // in-process loopback transport - no sockets, no ports, no threads, so a
+        // two-client lock RACE is deterministic instead of flaky. Asserts: a contested
+        // lock resolves to exactly one owner (never both, never neither); a lease
+        // expires when its owner stops heartbeating and does NOT expire while it does;
+        // a non-owner's edit is refused and never reaches authoritative state; a
+        // stale-revision edit is detected; paint ops commit to the history in server
+        // order with attribution while PREVIEWS never enter it; a reconnecting user
+        // keeps their identity and reclaims their locks; and the framing survives
+        // arbitrary stream splits, unknown message kinds and a hostile 4 GiB length.
+        // Headless: no GPU, no window, no project.
+        // --test-tcp: the same collaboration session over REAL localhost TCP, which is
+        // the only way to exercise what the in-process loopback structurally cannot -
+        // a partial send, a 64 KiB frame split across several recv() calls, and 200
+        // small frames coalesced into one read. Binds an EPHEMERAL port (0) so it
+        // cannot fail on a machine where something already owns a fixed one.
+        // --test-hub: the launcher's update path, everything provable without a
+        // network. Version ORDERING (a string compare puts 1.0.10 below 1.0.9 and
+        // silently stops offering updates at the tenth patch), the real published
+        // manifest shape, the https-only URL policy, the zip-slip containment guard,
+        // the installer's refusals, and SHA-256 against its published test vectors.
+        // --hub-check: a LIVE update check against the configured manifest URL, through
+        // the real WinHTTP/TLS path. Separate from --test-hub on purpose: --test-hub must
+        // never depend on a network, or a dropped wifi teaches people to ignore a red
+        // test. This one is a diagnostic you run when you want to know about the server.
+        // --hub-install <dir>: run a REAL install into <dir> through the shipping
+        // installer - fetch the manifest, download, verify the hash, extract, swap, and
+        // stamp. Exists because everything up to the swap was only ever exercised
+        // against synthetic data; this is the one path that has to work on a stranger's
+        // machine, and it deserves to be runnable without clicking through a GUI.
+        if (std::strcmp(argv[i], "--hub-install") == 0 && i + 1 < argc) {
+            hbe::hub::UpdatePaths ip;
+            ip.installRoot = argv[i + 1];
+            hbe::hub::Updater up("https://hollowdreamstudios.com/enginemanifest.json", ip);
+            up.SetInstalledVersion(hbe::hub::ReadInstalledVersion(ip.installRoot));
+            up.Check();
+            std::printf("check: %s | %s\n", hbe::hub::UpdateStateName(up.Progress().state),
+                        up.Progress().message.c_str());
+            if (up.Progress().state != hbe::hub::UpdateState::Available) return 1;
+            up.Apply([](const hbe::hub::UpdateProgress&) { return true; });
+            const hbe::hub::UpdateProgress& p2 = up.Progress();
+            std::printf("apply: %s | %s\n", hbe::hub::UpdateStateName(p2.state),
+                        p2.message.c_str());
+            const auto stamp = hbe::hub::ReadInstalledVersion(ip.installRoot);
+            std::printf("stamp: %s | looksInstalled=%d\n",
+                        stamp ? stamp->ToString().c_str() : "(none)",
+                        hbe::hub::LooksInstalled(ip.installRoot) ? 1 : 0);
+            return p2.state == hbe::hub::UpdateState::Done ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--hub-check") == 0) {
+            wchar_t exe[MAX_PATH] = {};
+            ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            hbe::hub::UpdatePaths paths;
+            paths.installRoot = std::filesystem::path(exe).parent_path().parent_path();
+            hbe::hub::Updater up("https://hollowdreamstudios.com/enginemanifest.json", paths);
+            up.Check();
+            const hbe::hub::UpdateProgress& pr = up.Progress();
+            std::printf("hub-check: state=%s local=%s remote=%s\n  %s\n",
+                        hbe::hub::UpdateStateName(pr.state),
+                        pr.localVersion.ToString().c_str(),
+                        pr.remoteVersion.ToString().c_str(), pr.message.c_str());
+            if (!pr.releaseUrl.empty())
+                std::printf("  release: %s\n", pr.releaseUrl.c_str());
+            return pr.state == hbe::hub::UpdateState::Failed ? 1 : 0;
+        }
+        // --test-componentdelta: the seam collaborative scene editing needs. Saving is
+        // monolithic (EntityToJson writes a whole entity; Instantiate applies one while
+        // CREATING it), and neither shape lets a client say "component C of an entity
+        // that already exists becomes this". Proves every registered key round-trips
+        // onto a DIFFERENT entity byte-for-byte, that omitted fields MERGE rather than
+        // reset (resetting teleports objects), that an empty payload removes, and that
+        // an unsupported key is REFUSED rather than silently ignored - a silent no-op
+        // would be a divergence with no symptom until someone saved. Headless.
+        if (std::strcmp(argv[i], "--test-componentdelta") == 0) {
+            const bool ok = hbe::scene::ComponentDeltaSelfTest();
+            std::printf("componentdelta %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-hub") == 0) {
+            const bool ok = hbe::hub::HubSelfTest();
+            std::printf("hub %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-tcp") == 0) {
+            const bool ok = hbe::collab::TcpTransportSelfTest();
+            std::printf("tcp %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-journal: the OFFLINE half of collaboration. A save seals a commit
+        // (before/after bytes per entity+component against a named parent); going
+        // offline is a fork and reconnecting is a fast-forward, a clean merge, or a
+        // question for a human. Asserts the two properties that matter: a crash costs
+        // only the LAST commit and never surfaces a partial one, and a merge between
+        // two INDEPENDENTLY MIGRATED copies is refused - scene::MigrateSceneGuids
+        // derives guids as a pure function of path and row index, so divergent copies
+        // assign the same guid to different objects and a silent merge would move the
+        // wrong things. Headless.
+        // --test-p2p: THE WHOLE COLLABORATION STACK, end to end, against real scenes.
+        // An elected-host session over a real transport (lock enforced, a non-owner
+        // refused, an owner edit reaching the OTHER peer scene), then a peer going
+        // offline, sealing its work as a commit, and reconciling - disjoint work
+        // merging and landing without reverting local edits, an overlap held for
+        // review with NOTHING applied, and independently-migrated copies refused.
+        if (std::strcmp(argv[i], "--test-p2p") == 0) {
+            const bool ok = hbe::scene::P2PEndToEndSelfTest();
+            std::printf("p2p %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-identity: WHO a peer is, once the session is reachable from the open
+        // internet. A per-install ECDSA P-256 keypair persists and stays stable, the
+        // challenge never repeats, a genuine signature verifies - and impersonation,
+        // replay, a tampered signature and tampered data all FAIL. Also asserts the
+        // allowlist is default-DENY: an empty one admits nobody. Headless.
+        if (std::strcmp(argv[i], "--test-identity") == 0) {
+            const bool ok = hbe::collab::IdentitySelfTest();
+            std::printf("identity %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-securechannel: the CHANNEL, over an untrusted network. A full TLS 1.3
+        // handshake with no sockets, then every way it must fail - an unlisted peer
+        // whose crypto is perfectly valid, a single flipped ciphertext byte, and an
+        // intercepted / reflected / replayed identity proof. Headless.
+        if (std::strcmp(argv[i], "--test-securechannel") == 0) {
+            const bool ok = hbe::collab::SecureChannelSelfTest();
+            std::printf("securechannel %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-webrtc: the PEER-TO-PEER path, over real ICE and a real data channel.
+        // Invitation and reply exchanged as text, a direct link, mutual proof of
+        // identity, then a whole collaboration session through it including a 200 KiB
+        // blob that must survive chunking. Also asserts an uninvited peer holding a
+        // genuine invitation never becomes a session. Hermetic: no ICE servers, so it
+        // needs no internet.
+        // --net-check: the DIAGNOSTIC for "it won't connect". Talks to real STUN servers
+        // and reports what this machine looks like from outside. Needs the internet,
+        // which is exactly why it is not part of --test-webrtc.
+        if (std::strcmp(argv[i], "--net-check") == 0) {
+            const bool ok = hbe::collab::NetCheck();
+            return ok ? 0 : 1;
+        }
+        // --test-collabsession: the editor's FRONT DOOR, headlessly. What a save records
+        // (and what it must leave out), a conflict held until a person answers it, and
+        // the whole invite flow over a real peer-to-peer link - uninvited guest refused
+        // but shown to the host, admitted, then connected. Hermetic: no ICE servers.
+        if (std::strcmp(argv[i], "--test-collabsession") == 0) {
+            const bool ok = hbe::editor::CollabSessionSelfTest();
+            std::printf("collabsession %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-projectsync: handing a WHOLE project to a peer that has nothing.
+        // What stays out (build output, caches, the host's own access list), that the
+        // manifest is deterministic and content-addressed, that a transfer lands through
+        // staging, and that an escaping path, an unoffered file, an oversized file and
+        // wrong contents are each refused. Headless.
+        if (std::strcmp(argv[i], "--test-projectsync") == 0) {
+            const bool ok = hbe::collab::ProjectSyncSelfTest();
+            std::printf("projectsync %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-webrtc") == 0) {
+            const bool ok = hbe::collab::WebRtcSelfTest();
+            std::printf("webrtc %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-journal") == 0) {
+            const bool ok = hbe::collab::JournalSelfTest();
+            std::printf("journal %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-collab") == 0) {
+            const bool ok = hbe::collab::CollabSelfTest();
+            std::printf("collab %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-projectkeys") == 0) {
+            const bool ok = hbe::Project::ProjectKeysSelfTest();
+            std::printf("projectkeys %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-timelinesnap") == 0) {
+            const bool ok = hbe::editor::TimelineSnapSelfTest();
+            std::printf("timelinesnap %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-graphfanin") == 0) {
+            const bool ok = hbe::dlg::GraphFanInSelfTest();
+            std::printf("graphfanin %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-shardstate: prove SHARD PERSISTENCE + manual spawn/despawn. A shard
@@ -491,8 +753,13 @@ int main(int argc, char** argv) {
         // chord instead of dropping it, and Play refuses the two surfaces it mutates.
         // The decision is a pure function of a focused-surface id, so this needs no
         // ImGui context: headless, no GPU/window. Same contract as --test-seamweld.
+        // Also covers the EDIT chords (Ctrl+Z/Y/X/C/V/D), which were an ungated
+        // global poll until they were routed through the same claim model. `&` not
+        // `&&` so both halves always run and both print their summary.
         if (std::strcmp(argv[i], "--test-savedispatch") == 0) {
-            const bool ok = hbe::editor::SaveDispatchSelfTest();
+            const bool saveOk = hbe::editor::SaveDispatchSelfTest();
+            const bool editOk = hbe::editor::EditDispatchSelfTest();
+            const bool ok = saveOk && editOk;
             std::printf("savedispatch %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
@@ -506,6 +773,94 @@ int main(int argc, char** argv) {
     // --project flag opens one directly (automation / file association).
     if (!config.projectPath.empty()) {
         hbe::Project::Active().Open(std::filesystem::path(config.projectPath));
+    }
+
+    // Placed AFTER the project open so `--project` has taken effect (the music
+    // graph and its audio assets resolve against Assets/).
+    {
+        for (int i = 1; i < argc; ++i) {
+        // --test-musicvoice: drive the music director's full lifecycle - install a
+        // graph, start every state, crossfade between them, stop, repeat - and assert
+        // the layer list drains to zero.
+        //
+        // Context: a music layer's `ma_sound` used to be initialised in a STACK LOCAL
+        // and then push_back-ed as a MOVE. ma_sound is self-referential (the node
+        // graph holds pointers into it), so the graph kept pointing at the dead stack
+        // frame and the miniaudio device thread faulted inside
+        // ma_node_input_bus_read_pcm_frames. The DETERMINISTIC guard against that is
+        // now a compile error - Voice has its copy/move members deleted - so this
+        // test's job is the part a type cannot express: that the reap path actually
+        // uninits and erases every layer instead of leaking them into the node graph,
+        // and that repeated state changes stay stable. A leak here means the old
+        // crash's sibling (an ever-growing node list) is back.
+        if (std::strcmp(argv[i], "--test-musicvoice") == 0) {
+            if (!hbe::Project::HasActive()) {
+                std::printf("--test-musicvoice requires --project\n");
+                return 1;
+            }
+            hbe::AudioSystem audio;
+            if (!audio.IsAvailable()) {
+                // Honest SKIP, not a green PASS: with no playback device this proves
+                // nothing, and a vacuous pass is worse than no test.
+                std::printf("musicvoice SKIP (no audio playback device)\n");
+                return 0;
+            }
+            const auto& ms = hbe::Project::Active().Settings();
+            if (ms.musicGraph.empty()) {
+                std::printf("musicvoice SKIP (project has no musicGraph)\n");
+                return 0;
+            }
+            const auto assetsDir = hbe::Project::Active().AssetsDir();
+            const auto graph = hbe::assets::LoadMusicGraph(assetsDir / ms.musicGraph);
+            if (!graph) {
+                std::printf("musicvoice FAILED: could not load '%s'\n", ms.musicGraph.c_str());
+                return 1;
+            }
+            audio.SetMusicGraph(*graph, assetsDir);
+            const std::vector<std::string> states = audio.MusicStateNames();
+            if (states.empty()) {
+                std::printf("musicvoice SKIP (graph declares no states)\n");
+                return 0;
+            }
+            // Pump ~1.2s of simulated frames; long enough for a short crossfade to
+            // finish and the reaper to run.
+            const auto pump = [&audio](int frames) {
+                for (int f = 0; f < frames; ++f) {
+                    audio.UpdateMusic(1.0f / 60.0f);
+                    audio.Update();
+                }
+            };
+            bool ok = true;
+            for (int cycle = 0; cycle < 3; ++cycle) {
+                for (const std::string& st : states) {
+                    // A short explicit fade: the project's own default is 5.3s, which
+                    // would outlast the pump and make the drain assertion meaningless.
+                    audio.PlayMusicState(st, 0.05f);
+                    pump(30);
+                    if (audio.MusicLayerCount() == 0) {
+                        std::printf("musicvoice FAILED: state '%s' started no layers\n",
+                                    st.c_str());
+                        ok = false;
+                    }
+                }
+                audio.StopMusic(0.05f);
+                pump(90);
+                if (audio.MusicLayerCount() != 0) {
+                    std::printf("musicvoice FAILED: %zu layer(s) survived the stop on "
+                                "cycle %d (leaked into the node graph)\n",
+                                audio.MusicLayerCount(), cycle);
+                    ok = false;
+                }
+            }
+            if (!audio.IsAvailable()) {
+                std::printf("musicvoice FAILED: the audio engine died during the run\n");
+                ok = false;
+            }
+            std::printf("musicvoice %s (%zu state(s), 3 cycles)\n", ok ? "PASS" : "FAILED",
+                        states.size());
+            return ok ? 0 : 1;
+        }
+        }
     }
 
     // --test-scenesave <scene.hbscene> [--project <proj>]: the SCENE-SAVE
@@ -881,6 +1236,11 @@ int main(int argc, char** argv) {
         }
         static hbe::Editor rbEditor;
         static int rbFrame = 0;
+        // The verdict has to escape the frame lambda. This test used to `return
+        // rbEngine.Run(config)` and only PRINT its own result, so it exited 0 no
+        // matter what - a permanently green gate, and the only automated check
+        // standing under --render-movie.
+        static bool rbOk = false;
         hbe::Engine rbEngine;
         rbEngine.SetOnInit([](hbe::Engine& e) {
             e.GetPhysics().SetRunning(false);
@@ -891,19 +1251,129 @@ int main(int argc, char** argv) {
         });
         rbEngine.SetOnFrame([](hbe::Engine& e) {
             rbEditor.BuildUI(e);
-            e.GetRenderer().SetViewportSize(641, 361); // odd -> exercises 256B row pitch
+            constexpr hbe::u32 kW = 641, kH = 361; // odd -> exercises 256B row pitch
+            e.GetRenderer().SetViewportSize(kW, kH);
             if (++rbFrame >= 30) {
                 std::vector<hbe::u8> px;
                 hbe::u32 w = 0, h = 0;
-                const bool ok = e.GetRenderer().ReadbackViewportColor(px, w, h);
-                const auto out = std::filesystem::temp_directory_path() / "hbe_readback.png";
-                if (ok) hbe::movie::WritePng(out, w, h, px);
-                std::printf("readback %s %ux%u -> %s\n", ok ? "OK" : "FAIL", w, h,
-                            out.string().c_str());
+                const bool got = e.GetRenderer().ReadbackViewportColor(px, w, h);
+
+                // ASSERT THE PIXELS, not just the bool. The three failures this test
+                // exists to catch - a black frame, a channel swap, a row-pitch offset
+                // - all return `true` from ReadbackViewportColor, so checking only
+                // the bool could never have caught any of them.
+                bool ok = got;
+                const auto fail = [&ok](const char* why) {
+                    std::printf("readback FAIL: %s\n", why);
+                    ok = false;
+                };
+                if (!got) std::printf("readback FAIL: ReadbackViewportColor returned false\n");
+                if (ok && (w != kW || h != kH)) fail("dimensions differ from the requested size");
+                if (ok && px.size() != static_cast<hbe::usize>(w) * h * 4)
+                    fail("buffer is not w*h*4 (row pitch not de-padded?)");
+                if (ok) {
+                    // Non-degenerate: a de-padded frame of a rendered scene is neither
+                    // all zero nor one flat colour. A row-pitch bug that shifts rows
+                    // still varies, so this is the weakest of the three checks - the
+                    // strong one is the cross-backend compare below.
+                    bool allZero = true, uniform = true;
+                    for (hbe::usize i = 0; i < px.size(); ++i) {
+                        if (px[i] != 0) allZero = false;
+                        if (px[i] != px[i % 4]) uniform = false;
+                        if (!allZero && !uniform) break;
+                    }
+                    if (allZero) fail("every byte is zero (black frame)");
+                    else if (uniform) fail("every pixel is identical (nothing rendered?)");
+                }
+
+                // Per-backend filenames. Both backends used to write the SAME
+                // hbe_readback.png, so running one after the other silently discarded
+                // the first and no comparison was possible. A short tag, not
+                // rhi::ToString - that yields "Direct3D 12", and a space in a path a
+                // sibling tool has to reconstruct is a trap.
+                const std::string api = ReadbackTag(e.GetRenderer().API());
+                const auto dir = std::filesystem::temp_directory_path();
+                const auto png = dir / ("hbe_readback_" + api + ".png");
+                const auto raw = dir / ("hbe_readback_" + api + ".raw");
+                if (got) {
+                    hbe::movie::WritePng(png, w, h, px);
+                    // Raw RGBA for --test-readback-compare (the D3D12<->Vulkan parity
+                    // gate): PNG round-trips through an encoder, raw bytes do not.
+                    std::ofstream rf(raw, std::ios::binary);
+                    const hbe::u32 hdr[2] = {w, h};
+                    rf.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+                    rf.write(reinterpret_cast<const char*>(px.data()),
+                             static_cast<std::streamsize>(px.size()));
+                }
+                rbOk = ok;
+                std::printf("readback %s %ux%u (%s) -> %s\n", ok ? "PASS" : "FAILED", w, h,
+                            api.c_str(), png.string().c_str());
                 e.Quit();
             }
         });
-        return rbEngine.Run(config);
+        const int runRc = rbEngine.Run(config);
+        return (runRc == 0 && rbOk) ? 0 : 1;
+    }
+
+    // --test-readback-compare: the D3D12 <-> Vulkan parity gate. Reads the raw
+    // frames --test-readback left in temp for each backend and compares them.
+    //
+    // "One-backend-only is a bug" is the stated rule of this engine's RHI seam, and
+    // nothing mechanically enforced it - the two backends were only ever compared by
+    // a human looking at two screenshots. Usage:
+    //   HeartbreakEditor --project P --d3d12  --test-readback
+    //   HeartbreakEditor --project P --vulkan --test-readback
+    //   HeartbreakEditor --test-readback-compare
+    bool testRbCompare = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-readback-compare") == 0) testRbCompare = true;
+    if (testRbCompare) {
+        const auto load = [](const char* api, hbe::u32& w, hbe::u32& h,
+                             std::vector<hbe::u8>& px) -> bool {
+            const auto p =
+                std::filesystem::temp_directory_path() / ("hbe_readback_" + std::string(api) +
+                                                          ".raw");
+            std::ifstream f(p, std::ios::binary);
+            if (!f) {
+                std::printf("readback-compare: missing %s (run --test-readback --%s first)\n",
+                            p.string().c_str(), api);
+                return false;
+            }
+            hbe::u32 hdr[2] = {0, 0};
+            f.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+            w = hdr[0];
+            h = hdr[1];
+            px.assign(static_cast<hbe::usize>(w) * h * 4, 0);
+            f.read(reinterpret_cast<char*>(px.data()),
+                   static_cast<std::streamsize>(px.size()));
+            return static_cast<hbe::usize>(f.gcount()) == px.size();
+        };
+        hbe::u32 aw = 0, ah = 0, bw = 0, bh = 0;
+        std::vector<hbe::u8> a, b;
+        if (!load("d3d12", aw, ah, a) || !load("vulkan", bw, bh, b)) return 1;
+        if (aw != bw || ah != bh) {
+            std::printf("readback-compare FAILED: %ux%u vs %ux%u\n", aw, ah, bw, bh);
+            return 1;
+        }
+        // Not memcmp: two correct backends differ by rasterisation and filtering
+        // rounding. A CHANNEL SWAP or a row-pitch shift moves the mean by far more
+        // than that, which is what this is sized to catch.
+        hbe::u64 diffSum = 0;
+        hbe::u32 maxDiff = 0, badPixels = 0;
+        for (hbe::usize i = 0; i < a.size(); ++i) {
+            const hbe::u32 d = static_cast<hbe::u32>(std::abs(int(a[i]) - int(b[i])));
+            diffSum += d;
+            maxDiff = d > maxDiff ? d : maxDiff;
+            if (d > 24) ++badPixels;
+        }
+        const double mean = a.empty() ? 0.0 : double(diffSum) / double(a.size());
+        const double badPct = a.empty() ? 0.0 : 100.0 * double(badPixels) / double(a.size());
+        // A swapped R/B channel on a sky gradient moves the mean by tens of levels;
+        // legitimate backend rounding sits well under 1.
+        const bool ok = mean < 4.0 && badPct < 2.0;
+        std::printf("readback-compare %s: mean=%.3f max=%u over-threshold=%.2f%% (%ux%u)\n",
+                    ok ? "PASS" : "FAILED", mean, maxDiff, badPct, aw, ah);
+        return ok ? 0 : 1;
     }
 
     // --test-gpucompute: prove the general GPU-compute + GPU-writable-structured-
@@ -1035,9 +1505,19 @@ int main(int argc, char** argv) {
     // preload resolves paths against the project's Assets/.
     {
         const char* docPath = nullptr;
+        bool docFlagSeen = false;
         for (int i = 1; i < argc; ++i)
-            if (std::strcmp(argv[i], "--test-uidoc-invariants") == 0 && i + 1 < argc)
-                docPath = argv[i + 1];
+            if (std::strcmp(argv[i], "--test-uidoc-invariants") == 0) {
+                docFlagSeen = true;
+                if (i + 1 < argc) docPath = argv[i + 1];
+            }
+        // The flag WITHOUT its argument used to fall straight through into the
+        // interactive editor - so a scripted test sweep opened a window and hung
+        // instead of reporting a usage error. Fail loudly like every other flag.
+        if (docFlagSeen && !docPath) {
+            std::printf("--test-uidoc-invariants requires a .hbui path\n");
+            return 1;
+        }
         if (docPath) {
             if (!hbe::Project::HasActive()) {
                 std::printf("--test-uidoc-invariants requires --project\n");
@@ -1082,9 +1562,17 @@ int main(int argc, char** argv) {
     // uploads UI textures, so `--project` is required.
     {
         const char* canvasPath = nullptr;
+        bool canvasFlagSeen = false;
         for (int i = 1; i < argc; ++i)
-            if (std::strcmp(argv[i], "--test-uicanvas") == 0 && i + 1 < argc)
-                canvasPath = argv[i + 1];
+            if (std::strcmp(argv[i], "--test-uicanvas") == 0) {
+                canvasFlagSeen = true;
+                if (i + 1 < argc) canvasPath = argv[i + 1];
+            }
+        // Same fall-through-into-the-GUI hazard as --test-uidoc-invariants above.
+        if (canvasFlagSeen && !canvasPath) {
+            std::printf("--test-uicanvas requires a .hbui path\n");
+            return 1;
+        }
         if (canvasPath) {
             if (!hbe::Project::HasActive()) {
                 std::printf("--test-uicanvas requires --project\n");

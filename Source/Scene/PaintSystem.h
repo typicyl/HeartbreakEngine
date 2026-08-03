@@ -198,7 +198,11 @@ enum class StrokeType : int { Path = 0, Fill = 1, Clear = 2 };
 // alters existing strokes.
 struct Stroke {
     StrokeType type = StrokeType::Path;
-    int       layer = 0;         // index of the PaintLayer this stroke belongs to
+    int       layer = 0;         // LEGACY index; kept only to migrate v4 files
+    // The layer this stroke belongs to, by STABLE ID (PaintLayer::id). An index could
+    // not survive a layer reorder - and reorder is not recorded as an operation, so a
+    // history keyed on the index is unmigratable. 0 = fall back to `layer` (v4 files).
+    u32       layerId = 0;
     int       projection = 0;    // 0 mesh-uv / 1 box (both UV-disc) | 2 = 3D projection
     BrushDef  brush;             // snapshot -> deterministic tip via MakeBrushTip
     glm::vec4 color{1.0f};       // RGB albedo + max coverage

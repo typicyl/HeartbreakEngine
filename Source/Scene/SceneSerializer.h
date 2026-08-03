@@ -245,6 +245,33 @@ struct SceneData {
     // dropping it renumbers the asset at the next cook.
     static constexpr u32 kNoPackSlot = 0xFFFFFFFFu;
     u32 packSlot = kNoPackSlot;
+
+    // --- COLLABORATION IDENTITY (top-level "docId" / "guidEpoch") ---------------
+    //
+    // docId names THIS DOCUMENT across machines and across renames. Minted once and
+    // stored IN the file, never derived from its path - this engine already wrote the
+    // post-mortem of path-keying into Assets/SlotIds.h, where a path-derived pack slot
+    // made shipped pack stability exactly zero because a rename is indistinguishable
+    // from delete + create. Written as 16-char hex for the same reason `guid` is: a
+    // 64-bit JSON number is the one thing tooling reliably mangles.
+    //
+    // guidEpoch is the guard against the nastiest failure this format has.
+    // scene::MigrateSceneGuids derives every entity guid as Derive(SeedFromPath(path),
+    // rowIndex) - a PURE FUNCTION of the path and the row, with no randomness and no
+    // machine identity. That determinism is exactly right for a single project (anyone
+    // migrating the same file lands on the same ids), and it becomes a data-corruption
+    // hazard the moment two DIVERGENT copies of a pre-guid scene exist: a 100-entity
+    // copy and an 80-entity copy both compute Derive(seed, 5) and get the SAME guid for
+    // DIFFERENT objects. Nothing detects it - each file is internally unique, so the
+    // duplicate-claim guard sees nothing - and a merge would land one person's tent
+    // transform onto another's rock and report it clean.
+    //
+    // guidEpoch is a RANDOM u64 minted once per document at the same moment as docId.
+    // Same docId with a DIFFERENT guidEpoch means the two sides migrated independently,
+    // so their guids are not comparable and any merge between them must be refused BY
+    // NAME rather than silently aliasing entities. 0 = a file that predates the field.
+    u64 docId = 0;
+    u64 guidEpoch = 0;
     rhi::PostSettings post; // HDR post-process stack (defaults = effects on)
     // PER-SCENE DAY/NIGHT OVERRIDE (header keys "timeOfDay"/"dayLengthSeconds"/
     // "dynamicSky"). Optional, and `hasDayNight` is the whole point of it being
@@ -564,6 +591,52 @@ bool LightingParitySelfTest();
 // not, which loses the painting), name collisions get distinct files, an
 // already-assigned source is never reassigned, and the result reloads. No GPU.
 bool PaintCanvasSelfTest();
+
+// ---------------------------------------------------------------------------
+// PER-COMPONENT DELTAS - the seam collaborative editing needs.
+// ---------------------------------------------------------------------------
+//
+// Saving is monolithic: EntityToJson writes an entity's whole component set, and
+// Instantiate applies one inline while CREATING the entity. Neither shape works for
+// a collaboration client, which has to say "component C of an entity that already
+// exists becomes this" and nothing else - sending a whole entity would make every
+// nudge of one object overwrite every other field a second artist was editing.
+//
+// These three functions are that seam. The WRITE side reuses EntityToJson verbatim
+// and extracts one key, so a delta can never disagree with what a save would have
+// produced. The APPLY side is an explicit per-key table.
+//
+// COVERAGE IS DELIBERATELY PARTIAL, AND AN UNSUPPORTED KEY IS REFUSED, NEVER
+// IGNORED. A silent no-op would let a client believe an edit landed when the other
+// machines never saw it - a divergence with no symptom until someone saves. Adding a
+// component is one entry in kAppliers plus one test row.
+enum class DeltaApply : u8 {
+    Applied,     // the component was written onto the entity
+    Removed,     // an empty payload removed it
+    UnknownKey,  // not in the delta table - the caller MUST surface this
+    BadJson,     // the payload did not parse or had the wrong shape
+    NoEntity,    // that entity does not exist in this registry
+};
+const char* DeltaApplyName(DeltaApply r);
+
+// Component keys this build can send and apply, in a stable order.
+const std::vector<std::string>& DeltaComponentKeys();
+bool IsDeltaComponent(const std::string& key);
+
+// Serializes ONE component to JSON. False when the entity does not have it (which is
+// how a caller distinguishes "unchanged" from "removed"). The text is exactly the
+// sub-object a full save would write for that key.
+bool ComponentToJson(const Scene& scene, entt::entity e, const std::string& key,
+                     std::string& outJson);
+
+// Applies one component to an EXISTING entity. An empty `json` removes it.
+DeltaApply ApplyComponentJson(Scene& scene, entt::entity e, const std::string& key,
+                              const std::string& json);
+
+// --test-componentdelta: proves every registered key round-trips through
+// ComponentToJson -> ApplyComponentJson onto a DIFFERENT entity and lands identical,
+// that removal works, and that an unknown key is refused rather than ignored.
+bool ComponentDeltaSelfTest();
 
 } // namespace scene
 } // namespace hbe

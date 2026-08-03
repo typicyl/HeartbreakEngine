@@ -44,6 +44,9 @@ SaveAction DecideSave(const SaveContext& ctx) {
         // A focused Asset Viewer with no live sub-editor. Never falls through to the
         // scene: the author is looking at an asset, not at the level.
         case SaveSurface::AssetViewer:
+        // The collaboration panels own no file. Ctrl+S with one focused must not write
+        // the level - the author is looking at a connection, not at the world.
+        case SaveSurface::Collaborate:
             return SaveAction::NothingOpen;
 
         case SaveSurface::UIDocument:
@@ -97,6 +100,7 @@ const char* SaveSurfaceName(SaveSurface s) {
         case SaveSurface::AudioEvent:  return "Asset Viewer (audio event)";
         case SaveSurface::MeshSlots:   return "Asset Viewer (mesh slots)";
         case SaveSurface::AssetViewer: return "Asset Viewer";
+        case SaveSurface::Collaborate: return "Collaborate";
         case SaveSurface::Count:       break;
     }
     return "?";
@@ -173,7 +177,15 @@ constexpr Row kRows[] = {
     {SaveSurface::MeshSlots,   SaveAction::MeshSlots},
     // The Asset Viewer with no live sub-editor writes nothing at all.
     {SaveSurface::AssetViewer, SaveAction::NothingOpen},
+    // The collaboration panels own no file either.
+    {SaveSurface::Collaborate, SaveAction::NothingOpen},
 };
+// kRows is HAND-MAINTAINED, and a surface simply missing from it is not a failure - the
+// sweeps below just never exercise it, and the suite still says PASS. That is how a new
+// surface gets added with no test at all, so make the omission a build error instead.
+static_assert(sizeof(kRows) / sizeof(kRows[0]) == static_cast<usize>(SaveSurface::Count),
+              "kRows must cover every SaveSurface - a missing row is a silently untested "
+              "surface, not a smaller test");
 
 SaveContext Ctx(SaveSurface s, bool content = true) {
     SaveContext c;
@@ -325,6 +337,289 @@ bool SaveDispatchSelfTest() {
                     "scene can write the scene; empty surfaces write nothing; text "
                     "fields defer; Play refuses scene + .hbui\n",
                     static_cast<int>(sizeof(kRows) / sizeof(kRows[0])));
+    }
+    return g_fails == 0;
+}
+
+// ============================================================================
+// The EDIT chord decision (Ctrl+Z / Y / X / C / V / D)
+// ============================================================================
+
+namespace {
+constexpr u8 kU = 1u << static_cast<u8>(EditVerb::Undo);
+constexpr u8 kR = 1u << static_cast<u8>(EditVerb::Redo);
+constexpr u8 kX = 1u << static_cast<u8>(EditVerb::Cut);
+constexpr u8 kC = 1u << static_cast<u8>(EditVerb::Copy);
+constexpr u8 kV = 1u << static_cast<u8>(EditVerb::Paste);
+constexpr u8 kD = 1u << static_cast<u8>(EditVerb::Duplicate);
+
+// ONE ENTRY PER SaveSurface, IN ENUM ORDER. This table is the entire policy: a 0
+// means "swallow every edit chord in this panel", which is always safe because a
+// swallowed chord does nothing, whereas a forwarded one edits the LEVEL.
+//
+// The asset editors currently grant only Undo/Redo. Cut/Copy/Paste/Duplicate stay
+// off until each editor has a node/key clipboard of its own - granting them earlier
+// would mean the executor either no-ops (a lie) or falls back to the scene (the very
+// bug this replaces). See the phase note on AssetHistory in Editor.h.
+constexpr u8 kCaps[static_cast<usize>(SaveSurface::Count)] = {
+    /* None        */ kU | kR | kX | kC | kV | kD, // the scene fallback: today's behaviour
+    /* Scene       */ kU | kR | kX | kC | kV | kD,
+    /* UIDocument  */ kU | kR | kX | kC | kV | kD, // entities: the SCENE history/clipboard
+    /* Schematic   */ kU | kR,
+    /* Dialogue    */ kU | kR,
+    /* Cutscene    */ kU | kR,
+    /* Music       */ kU | kR,
+    /* Character   */ kU | kR,
+    /* Material    */ kU | kR,
+    /* AudioEvent  */ kU | kR,
+    /* MeshSlots   */ kU | kR,
+    /* AssetViewer */ 0, // a texture / read-only preview: swallow everything
+    // 0 IS THE WHOLE POINT HERE. These panels are text boxes an invitation gets pasted
+    // into; ImGui routes Ctrl+Z/Y/X/C/V to the ACTIVE InputText at score 300, so typing
+    // behaves normally, and every chord that reaches this table instead is swallowed
+    // rather than cutting the level's selection.
+    /* Collaborate */ 0,
+};
+static_assert(sizeof(kCaps) / sizeof(kCaps[0]) == static_cast<usize>(SaveSurface::Count),
+              "kCaps must have one entry per SaveSurface, in the same order");
+
+// Verbs that require something selected, and verbs that pop a history stack.
+constexpr u8 kNeedsSelection = kX | kC | kD;
+constexpr u8 kNeedsHistory = kU | kR;
+
+bool IsSceneDomain(SaveSurface s) {
+    return s == SaveSurface::None || s == SaveSurface::Scene || s == SaveSurface::UIDocument;
+}
+
+constexpr EditAction kSceneAction[static_cast<usize>(EditVerb::Count)] = {
+    EditAction::SceneUndo,  EditAction::SceneRedo,  EditAction::SceneCut,
+    EditAction::SceneCopy,  EditAction::ScenePaste, EditAction::SceneDuplicate,
+};
+constexpr EditAction kAssetAction[static_cast<usize>(EditVerb::Count)] = {
+    EditAction::AssetUndo,  EditAction::AssetRedo,  EditAction::AssetCut,
+    EditAction::AssetCopy,  EditAction::AssetPaste, EditAction::AssetDuplicate,
+};
+} // namespace
+
+bool SurfaceHandlesVerb(SaveSurface s, EditVerb v) {
+    if (s >= SaveSurface::Count || v >= EditVerb::Count) return false;
+    return (kCaps[static_cast<usize>(s)] & (1u << static_cast<u8>(v))) != 0;
+}
+
+EditAction DecideEdit(const EditContext& ctx) {
+    const u8 verbBit = 1u << static_cast<u8>(ctx.verb);
+
+    // 1. A TEXT FIELD KEEPS THE DESTRUCTIVE VERBS. Undo/Redo/Copy are deliberately
+    //    NOT suppressed: ImGui's active InputText already owns those chords at a
+    //    higher route score, so they never arrive here while typing. Ctrl+D has no
+    //    ImGui route, hence this narrow gate rather than the old global blanking.
+    if (ctx.textFieldActive &&
+        (ctx.verb == EditVerb::Cut || ctx.verb == EditVerb::Paste ||
+         ctx.verb == EditVerb::Duplicate))
+        return EditAction::Ignored;
+
+    // 2. WHICH HISTORY. Resolved from the surface alone.
+    if (!IsSceneDomain(ctx.focused)) {
+        // A FOCUSED ASSET EDITOR NEVER TOUCHES THE SCENE. This branch IS the bug:
+        // Ctrl+X in the Dialogue Editor used to run DestroyRecursive on the level.
+        if (!SurfaceHandlesVerb(ctx.focused, ctx.verb)) return EditAction::Ignored;
+        if (!ctx.surfaceHasContent) return EditAction::NothingOpen;
+        if ((verbBit & kNeedsSelection) && !ctx.hasSelection) return EditAction::Ignored;
+        if (ctx.verb == EditVerb::Paste && ctx.clipboardEmpty) return EditAction::Ignored;
+        if ((verbBit & kNeedsHistory) && ctx.historyEmpty) return EditAction::Ignored;
+        return kAssetAction[static_cast<usize>(ctx.verb)];
+    }
+
+    // A scene-domain surface that does not implement the verb still swallows it.
+    if (!SurfaceHandlesVerb(ctx.focused, ctx.verb)) return EditAction::Ignored;
+
+    // 3. PAINT FIRST, SCENE AS ITS ELSE - the order the old global poll had, but now
+    //    only while a SCENE-domain surface is focused.
+    if (ctx.paintHistoryActive &&
+        (ctx.verb == EditVerb::Undo || ctx.verb == EditVerb::Redo))
+        return ctx.verb == EditVerb::Undo ? EditAction::PaintUndo : EditAction::PaintRedo;
+
+    if ((verbBit & kNeedsSelection) && !ctx.hasSelection) return EditAction::Ignored;
+    if (ctx.verb == EditVerb::Paste && ctx.clipboardEmpty) return EditAction::Ignored;
+    if ((verbBit & kNeedsHistory) && ctx.historyEmpty) return EditAction::Ignored;
+    return kSceneAction[static_cast<usize>(ctx.verb)];
+}
+
+const char* EditVerbName(EditVerb v) {
+    switch (v) {
+        case EditVerb::Undo: return "undo";
+        case EditVerb::Redo: return "redo";
+        case EditVerb::Cut: return "cut";
+        case EditVerb::Copy: return "copy";
+        case EditVerb::Paste: return "paste";
+        case EditVerb::Duplicate: return "duplicate";
+        case EditVerb::Count: break;
+    }
+    return "?";
+}
+
+const char* EditActionName(EditAction a) {
+    switch (a) {
+        case EditAction::Ignored: return "Ignored";
+        case EditAction::NothingOpen: return "NothingOpen";
+        case EditAction::RefusedPlayMode: return "RefusedPlayMode";
+        case EditAction::SceneUndo: return "SceneUndo";
+        case EditAction::SceneRedo: return "SceneRedo";
+        case EditAction::SceneCut: return "SceneCut";
+        case EditAction::SceneCopy: return "SceneCopy";
+        case EditAction::ScenePaste: return "ScenePaste";
+        case EditAction::SceneDuplicate: return "SceneDuplicate";
+        case EditAction::PaintUndo: return "PaintUndo";
+        case EditAction::PaintRedo: return "PaintRedo";
+        case EditAction::AssetUndo: return "AssetUndo";
+        case EditAction::AssetRedo: return "AssetRedo";
+        case EditAction::AssetCut: return "AssetCut";
+        case EditAction::AssetCopy: return "AssetCopy";
+        case EditAction::AssetPaste: return "AssetPaste";
+        case EditAction::AssetDuplicate: return "AssetDuplicate";
+        case EditAction::Count: break;
+    }
+    return "?";
+}
+
+bool EditDispatchSelfTest() {
+    g_fails = 0;
+
+    const auto isSceneWrite = [](EditAction a) {
+        return a == EditAction::SceneUndo || a == EditAction::SceneRedo ||
+               a == EditAction::SceneCut || a == EditAction::SceneCopy ||
+               a == EditAction::ScenePaste || a == EditAction::SceneDuplicate;
+    };
+    const auto isAssetWrite = [](EditAction a) {
+        return a == EditAction::AssetUndo || a == EditAction::AssetRedo ||
+               a == EditAction::AssetCut || a == EditAction::AssetCopy ||
+               a == EditAction::AssetPaste || a == EditAction::AssetDuplicate;
+    };
+
+    // THE TEST'S OWN ORACLE, deliberately INDEPENDENT of the implementation's
+    // IsSceneDomain(). Sharing that helper would make the headline invariant below
+    // tautological: an injected fault in IsSceneDomain would silently change what the
+    // check MEANS as well as what the code DOES, and the property would keep passing
+    // for the wrong reason. (Verified by fault injection - the shared-helper version
+    // did exactly that.) This list is written out by hand so a change to the
+    // implementation's domain rule has to disagree with it.
+    const auto expectedSceneDomain = [](SaveSurface s) {
+        return s == SaveSurface::None || s == SaveSurface::Scene ||
+               s == SaveSurface::UIDocument;
+    };
+
+    const usize nSurf = static_cast<usize>(SaveSurface::Count);
+    const usize nVerb = static_cast<usize>(EditVerb::Count);
+    u32 reached[static_cast<usize>(EditAction::Count)] = {};
+
+    // The FULL cross product: 12 surfaces x 6 verbs x 2^6 boolean combinations.
+    for (usize s = 0; s < nSurf; ++s) {
+        for (usize v = 0; v < nVerb; ++v) {
+            for (u32 bits = 0; bits < 64; ++bits) {
+                EditContext c;
+                c.focused = static_cast<SaveSurface>(s);
+                c.verb = static_cast<EditVerb>(v);
+                c.playMode = (bits & 1) != 0;
+                c.textFieldActive = (bits & 2) != 0;
+                c.surfaceHasContent = (bits & 4) != 0;
+                c.paintHistoryActive = (bits & 8) != 0;
+                c.hasSelection = (bits & 16) != 0;
+                c.clipboardEmpty = (bits & 32) != 0;
+                c.historyEmpty = (bits & 32) == 0; // exercise both stacks
+                const EditAction a = DecideEdit(c);
+
+                Check(a < EditAction::Count, "DecideEdit returned an out-of-range action");
+                Check(IsSceneDomain(c.focused) == expectedSceneDomain(c.focused),
+                      "the implementation's scene-domain rule diverged from the test's");
+                reached[static_cast<usize>(a)]++;
+                // DETERMINISM: the same facts must give the same answer.
+                Check(DecideEdit(c) == a, "DecideEdit is not deterministic");
+
+                // THE HEADLINE INVARIANT - the reported bug, as a property. A focused
+                // ASSET editor can never produce a scene edit, under ANY combination
+                // of facts. This is what makes Ctrl+X in the Dialogue Editor provably
+                // unable to run DestroyRecursive on the level.
+                if (!expectedSceneDomain(c.focused))
+                    Check(!isSceneWrite(a),
+                          "a non-scene surface produced a SCENE edit (the destructive bug)");
+
+                // SWALLOW, NEVER FALL THROUGH: a verb the surface does not implement
+                // is Ignored - never a scene action, never an asset action.
+                if (!SurfaceHandlesVerb(c.focused, c.verb))
+                    Check(a == EditAction::Ignored,
+                          "an unimplemented verb did not resolve to Ignored");
+
+                // DESTRUCTIVE VERBS ARE GATED: a cut/duplicate with nothing selected,
+                // or a paste from an empty clipboard, must be unrepresentable.
+                if (!c.hasSelection)
+                    Check(a != EditAction::SceneCut && a != EditAction::AssetCut &&
+                              a != EditAction::SceneDuplicate && a != EditAction::AssetDuplicate,
+                          "a cut/duplicate was allowed with no selection");
+                if (c.clipboardEmpty)
+                    Check(a != EditAction::ScenePaste && a != EditAction::AssetPaste,
+                          "a paste was allowed from an empty clipboard");
+
+                // PAINT ARBITRATION IS BOUNDED: it may only ever affect Undo/Redo,
+                // and only inside the scene domain. It used to divert Ctrl+Z from any
+                // focused panel.
+                if (a == EditAction::PaintUndo || a == EditAction::PaintRedo) {
+                    Check(expectedSceneDomain(c.focused),
+                          "paint history captured a chord outside the scene domain");
+                    Check(c.verb == EditVerb::Undo || c.verb == EditVerb::Redo,
+                          "paint history captured a non-undo verb");
+                    Check(c.paintHistoryActive, "a paint action fired with no paint history");
+                }
+
+                // THE TEXT-FIELD GATE IS MINIMAL: it suppresses exactly Cut/Paste/
+                // Duplicate. Undo/Redo/Copy are left to ImGui's higher-scoring active
+                // item, which is the whole point of routing them.
+                if (c.textFieldActive &&
+                    (c.verb == EditVerb::Cut || c.verb == EditVerb::Paste ||
+                     c.verb == EditVerb::Duplicate))
+                    Check(a == EditAction::Ignored, "a destructive verb survived a text field");
+            }
+        }
+    }
+
+    // UNDO AND REDO ALWAYS PAIR TO THE SAME DOMAIN - Ctrl+Z and Ctrl+Y can never pop
+    // from two different stacks for one surface.
+    for (usize s = 0; s < nSurf; ++s) {
+        EditContext u;
+        u.focused = static_cast<SaveSurface>(s);
+        u.surfaceHasContent = true;
+        u.hasSelection = true;
+        u.clipboardEmpty = false;
+        u.historyEmpty = false;
+        EditContext r = u;
+        u.verb = EditVerb::Undo;
+        r.verb = EditVerb::Redo;
+        const EditAction au = DecideEdit(u), ar = DecideEdit(r);
+        Check(isSceneWrite(au) == isSceneWrite(ar) && isAssetWrite(au) == isAssetWrite(ar),
+              "undo and redo resolved to different histories for one surface");
+    }
+
+    // NO DEAD ENUMERATOR except the two deliberately reserved ones.
+    for (usize i = 0; i < static_cast<usize>(EditAction::Count); ++i) {
+        const EditAction a = static_cast<EditAction>(i);
+        if (a == EditAction::RefusedPlayMode) continue; // reserved; see Editor.h note
+        if (a == EditAction::AssetCut || a == EditAction::AssetCopy ||
+            a == EditAction::AssetPaste || a == EditAction::AssetDuplicate)
+            continue; // granted once each asset editor has its own clipboard
+        Check(reached[i] > 0, "an EditAction is unreachable from every surface");
+        const char* n = EditActionName(a);
+        Check(n[0] != '?', "an EditAction has no name");
+        for (usize j = 0; j < i; ++j)
+            Check(std::strcmp(n, EditActionName(static_cast<EditAction>(j))) != 0,
+                  "two EditActions share a name");
+    }
+    for (usize v = 0; v < nVerb; ++v)
+        Check(EditVerbName(static_cast<EditVerb>(v))[0] != '?', "an EditVerb has no name");
+
+    if (g_fails == 0) {
+        std::printf("editdispatch: %zu surfaces x %zu verbs x 64 fact combinations; no "
+                    "asset editor can ever edit the scene; unimplemented verbs are "
+                    "swallowed; cut/paste/duplicate are gated\n",
+                    nSurf, nVerb);
     }
     return g_fails == 0;
 }

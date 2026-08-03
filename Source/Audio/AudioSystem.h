@@ -132,6 +132,10 @@ public:
     std::string CurrentMusicState() const; // "" when stopped
     std::vector<std::string> MusicStateNames() const; // states in the installed graph
     bool HasMusicGraph() const;
+    // Live music layer voices, including ones still fading out. Reaches zero once a
+    // stop's crossfade completes - if it does not, layers are leaking into the
+    // miniaudio node graph. Used by --test-musicvoice and the dev overlay.
+    usize MusicLayerCount() const;
     // Dialogue ducking: while true, the music layers are pulled down by the
     // graph's duckDecibels (attack/release smoothed) so speech stays intelligible.
     // The engine sets this from "is a conversation or voiceline playing"; the

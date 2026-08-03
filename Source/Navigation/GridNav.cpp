@@ -1082,7 +1082,8 @@ void UpdateAgents(Scene& scene, const GridNav& grid, f32 dt) {
     struct AgentP { glm::vec2 xz; f32 radius; entt::entity e; };
     std::vector<AgentP> nearby;
     for (const entt::entity e : reg.view<Transform, NavigationAgent>())
-        nearby.push_back({horiz(reg.get<Transform>(e).position),
+        // World, like every other position in this function (see the steering loop).
+        nearby.push_back({horiz(glm::vec3(scene.WorldMatrix(e)[3])),
                           reg.get<NavigationAgent>(e).radius, e});
     // Uniform hash grid over the agents. Cell = the largest separation distance any
     // pair can care about, so one 3x3 neighbourhood covers every possible interaction.
@@ -1101,7 +1102,11 @@ void UpdateAgents(Scene& scene, const GridNav& grid, f32 dt) {
     for (const entt::entity e : reg.view<Transform, NavigationAgent>()) {
         NavigationAgent& ag = reg.get<NavigationAgent>(e);
         Transform& tf = reg.get<Transform>(e);
-        const glm::vec3 pos = tf.position;
+        // WORLD position. `tf.position` is PARENT-RELATIVE, and every other quantity
+        // in this loop (the grid, obstacles, the target, other agents) is world - so
+        // an agent under any non-identity parent used to path from the wrong place
+        // to the wrong place, silently and only when parented.
+        const glm::vec3 pos = glm::vec3(scene.WorldMatrix(e)[3]);
 
         if (!ag.hasTarget) {
             ag.velocity *= std::max(0.0f, 1.0f - dt * 6.0f);
@@ -1199,13 +1204,32 @@ void UpdateAgents(Scene& scene, const GridNav& grid, f32 dt) {
         glm::vec3 newPos = pos + ag.velocity * dt;
         if (const std::optional<f32> g = grid.GroundAt(newPos.x, newPos.z, pos.y))
             newPos.y = *g; // follow the ground
-        tf.position = newPos;
+        // newPos is WORLD; Transform::position is parent-relative. Converting is the
+        // other half of the fix above - writing it raw put a parented agent's world
+        // answer into its local slot, compounding the error every frame.
+        scene.SetWorldPosition(e, newPos);
 
         if (ag.turnSpeed > 0.0f && glm::length(horiz(ag.velocity)) > 0.05f) {
-            const f32 yaw = std::atan2(ag.velocity.x, ag.velocity.z);
+            // ONE facing convention engine-wide: forward is local -Z, so a heading
+            // yaw is atan2(-x, -z). This line used to use atan2(+x, +z) - a THIRD
+            // convention, disagreeing with both cam::YawQuat and the character
+            // controller, which is why a nav-driven NPC and a player character
+            // walking the same direction faced differently.
+            const f32 yaw = std::atan2(-ag.velocity.x, -ag.velocity.z);
             const glm::quat want = glm::angleAxis(yaw, glm::vec3(0.0f, 1.0f, 0.0f));
-            tf.rotation =
-                glm::normalize(glm::slerp(tf.rotation, want, std::min(1.0f, ag.turnSpeed * dt)));
+            // Slerp in WORLD space, then store as local (the parent frame may rotate).
+            // Normalise the basis first: quat_cast on a scaled (non-orthogonal) 3x3
+            // does not return that matrix's rotation.
+            const glm::mat4 wm = scene.WorldMatrix(e);
+            glm::vec3 b0(wm[0]), b1(wm[1]), b2(wm[2]);
+            const f32 n0 = glm::length(b0), n1 = glm::length(b1), n2 = glm::length(b2);
+            const glm::quat curWorld =
+                (n0 > 1e-8f && n1 > 1e-8f && n2 > 1e-8f)
+                    ? glm::quat_cast(glm::mat3(b0 / n0, b1 / n1, b2 / n2))
+                    : tf.rotation;
+            scene.SetWorldRotation(
+                e, glm::normalize(glm::slerp(glm::normalize(curWorld), want,
+                                             std::min(1.0f, ag.turnSpeed * dt))));
         }
     }
 }

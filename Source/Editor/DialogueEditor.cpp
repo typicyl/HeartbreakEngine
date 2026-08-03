@@ -68,6 +68,9 @@ void Editor::OpenDialogue(const std::filesystem::path& path) {
         g.Connect(s, 0, l, 0);
     }
     dlgGraph_ = std::move(g);
+    // A different document: the old history would otherwise let Ctrl+Z paste the
+    // PREVIOUS file's contents over this one.
+    dlgHistory_.Clear();
     editedDialoguePath_ = path;
     dlgDirty_ = false;
     dlgFocus_ = true;
@@ -112,11 +115,24 @@ void Editor::DrawDialogueEditor(Engine& engine) {
     // the focus (the collapse arrow focuses first, then collapses), so a claim below
     // that return would be skipped and the global route would write the LEVEL while
     // the focused window is titled "Dialogue Editor".
-    ClaimSave(editor::SaveSurface::Dialogue);
+    ClaimFocus(editor::SaveSurface::Dialogue);
     if (!dlgVisible) {
         ImGui::End();
         return;
     }
+
+    // UNDO SNAPSHOTS for this document. `dlgSnap` records the graph as it is RIGHT NOW,
+    // so it must be called BEFORE the edit lands.
+    //
+    // `dlgSnapOnActivate` is the codebase's undoOnActivate idiom (Editor.cpp's
+    // inspector): snapshot when the widget is GRABBED, not when its value changes. That
+    // is what makes a drag or a typed name cost exactly one undo entry instead of one
+    // per frame or one per keystroke - and it captures the pre-edit value, which is the
+    // whole point of an undo entry.
+    const auto dlgSnap = [&] { dlgHistory_.Push(dlgGraph_); };
+    const auto dlgSnapOnActivate = [&] {
+        if (ImGui::IsItemActivated()) dlgSnap();
+    };
 
     // Toolbar: New / Open / Save + open file name.
     if (ImGui::Button("New")) {
@@ -192,19 +208,23 @@ void Editor::DrawDialogueEditor(Engine& engine) {
         if (n->type == dlg::NodeType::Line) {
             std::snprintf(buf, sizeof(buf), "%s", n->speaker.c_str());
             if (ImGui::InputText("Speaker", buf, 96)) { n->speaker = buf; dlgDirty_ = true; }
+            dlgSnapOnActivate();
             std::snprintf(buf, sizeof(buf), "%s", n->text.c_str());
             if (ImGui::InputTextMultiline("Text", buf, sizeof(buf), ImVec2(-1.0f, 80.0f))) {
                 n->text = buf;
                 dlgDirty_ = true;
             }
+            dlgSnapOnActivate();
             {
                 std::string cpick; // searchable voice-clip picker
                 if (AssetPicker("Clip", n->clip, ".uaf", uaf::AssetType::Audio, cpick)) {
+                    dlgSnap(); // discrete pick - one entry, before the write
                     n->clip = cpick;
                     dlgDirty_ = true;
                 }
             }
             if (ImGui::DragFloat("Hold (s, 0=auto)", &n->hold, 0.05f, 0.0f, 60.0f)) dlgDirty_ = true;
+            dlgSnapOnActivate();
         } else if (n->type == dlg::NodeType::Choice) {
             ImGui::TextDisabled("Each option is a branch taken when the player picks it.");
             int removeIdx = -1;
@@ -213,8 +233,10 @@ void Editor::DrawDialogueEditor(Engine& engine) {
                 dlg::ChoiceOption& c = n->choices[i];
                 std::snprintf(buf, sizeof(buf), "%s", c.text.c_str());
                 if (ImGui::InputText("Option", buf, 256)) { c.text = buf; dlgDirty_ = true; }
+                dlgSnapOnActivate();
                 std::snprintf(buf, sizeof(buf), "%s", c.showIf.c_str());
                 if (ImGui::InputText("Show if flag", buf, 96)) { c.showIf = buf; dlgDirty_ = true; }
+                dlgSnapOnActivate();
                 if (ImGui::SmallButton("Remove option")) removeIdx = static_cast<int>(i);
                 ImGui::Separator();
                 ImGui::PopID();
@@ -232,30 +254,37 @@ void Editor::DrawDialogueEditor(Engine& engine) {
                         ++li;
                     }
                 }
+                dlgSnap(); // destructive: removing an option drops its branch wire too
                 n->choices.erase(n->choices.begin() + removeIdx);
                 dlgDirty_ = true;
             }
             if (ImGui::Button("+ Add option")) {
+                dlgSnap();
                 n->choices.push_back({"New option", ""});
                 dlgDirty_ = true;
             }
         } else if (n->type == dlg::NodeType::Condition) {
             std::snprintf(buf, sizeof(buf), "%s", n->flag.c_str());
             if (ImGui::InputText("Flag", buf, 96)) { n->flag = buf; dlgDirty_ = true; }
+            dlgSnapOnActivate();
             const char* kOps = "!= 0\0==\0!=\0>\0<\0>=\0<=\0";
             int op = static_cast<int>(n->op);
             if (ImGui::Combo("Test", &op, kOps)) {
+                dlgSnap();
                 n->op = static_cast<dlg::CmpOp>(op);
                 dlgDirty_ = true;
             }
             if (n->op != dlg::CmpOp::NotZero) {
                 if (ImGui::DragFloat("Value", &n->value, 0.1f)) dlgDirty_ = true;
+                dlgSnapOnActivate();
             }
             ImGui::TextDisabled("Pin 0 = True, Pin 1 = False.");
         } else if (n->type == dlg::NodeType::SetFlag) {
             std::snprintf(buf, sizeof(buf), "%s", n->setFlag.c_str());
             if (ImGui::InputText("Flag", buf, 96)) { n->setFlag = buf; dlgDirty_ = true; }
+            dlgSnapOnActivate();
             if (ImGui::DragFloat("Set to", &n->setValue, 0.1f)) dlgDirty_ = true;
+            dlgSnapOnActivate();
         } else {
             ImGui::TextDisabled("%s node has no fields.", dlg::NodeTypeName(n->type));
         }
@@ -433,6 +462,7 @@ void Editor::DrawDialogueCanvas(float width) {
                     dlgDragNode_ = l.fromNode;
                     dlgDragPin_ = l.fromPin;
                     dlgDragFromOutput_ = true;
+                    dlgHistory_.Push(dlgGraph_); // picking a wire up REMOVES it
                     dlgGraph_.RemoveLink(i);
                     dlgDirty_ = true;
                     started = true;
@@ -453,7 +483,15 @@ void Editor::DrawDialogueCanvas(float width) {
             u32 fn, fp, tn, tp;
             if (dlgDragFromOutput_) { fn = dlgDragNode_; fp = dlgDragPin_; tn = hov.node; tp = hov.pin; }
             else { fn = hov.node; fp = hov.pin; tn = dlgDragNode_; tp = dlgDragPin_; }
-            if (dlgGraph_.Connect(fn, fp, tn, tp)) dlgDirty_ = true;
+            {
+                // Snapshot BEFORE Connect: it can also REPLACE an existing wire on the
+                // source output pin, so the undo has to capture that wire too.
+                dlg::Graph before = dlgGraph_;
+                if (dlgGraph_.Connect(fn, fp, tn, tp)) {
+                    dlgHistory_.Push(before);
+                    dlgDirty_ = true;
+                }
+            }
         }
         dlgDragging_ = false;
     }
@@ -475,6 +513,7 @@ void Editor::DrawDialogueCanvas(float width) {
     // Delete the selected node.
     if (dlgSelected_ && ImGui::IsWindowFocused() && !ImGui::IsAnyItemActive() &&
         ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        dlgHistory_.Push(dlgGraph_); // takes the node AND every wire touching it
         dlgGraph_.RemoveNode(dlgSelected_);
         dlgSelected_ = 0;
         dlgDirty_ = true;
@@ -483,6 +522,7 @@ void Editor::DrawDialogueCanvas(float width) {
     // Right-click: delete a hovered link, else open the add-node menu.
     if (canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
         if (hoveredLink >= 0) {
+            dlgHistory_.Push(dlgGraph_);
             dlgGraph_.RemoveLink(static_cast<u32>(hoveredLink));
             dlgDirty_ = true;
         } else if (!hov.valid) {
@@ -494,6 +534,7 @@ void Editor::DrawDialogueCanvas(float width) {
         for (int i = 0; i < static_cast<int>(NodeType::Count); ++i) {
             const NodeType t = static_cast<NodeType>(i);
             if (ImGui::MenuItem(dlg::NodeTypeName(t))) {
+                dlgHistory_.Push(dlgGraph_);
                 dlgSelected_ = dlgGraph_.AddNode(t, dlgAddPos_);
                 dlgDirty_ = true;
             }

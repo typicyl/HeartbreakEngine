@@ -46,6 +46,13 @@ enum class SaveSurface : u8 {
     // "fall through to the scene", and a focused Asset Viewer must never write the
     // level. Always resolves to NothingOpen.
     AssetViewer,
+    // The collaboration panels (Collaborate / People / Review changes). Same reasoning
+    // as AssetViewer and, if anything, sharper: these panels are mostly TEXT BOXES that
+    // an invitation gets pasted into. Left as None, a Ctrl+V aimed at the paste field
+    // would fall through and paste the scene CLIPBOARD - entities - into the level, and
+    // Ctrl+X would cut the current selection out of it. They own no savable document, so
+    // every chord here resolves to "swallowed", never to the scene.
+    Collaborate,
     Count
 };
 
@@ -111,5 +118,92 @@ const char* SaveActionNoun(SaveAction a);
 // Scene/None can ever produce a scene write, the fallback rules hold, a text field
 // defers rather than being dropped, and Play refuses the two mutated surfaces.
 bool SaveDispatchSelfTest();
+
+// ============================================================================
+// THE EDIT CHORDS - Ctrl+Z / Y / X / C / V / D
+// ============================================================================
+//
+// Same rule, same shape, same reason. Ctrl+S was routed to the focused surface
+// years before these were, and they stayed a single global poll gated only on
+// `io.KeyCtrl && !io.WantTextInput`. That meant Ctrl+X with the Dialogue Editor
+// focused ran CopySelection + PushUndo + DestroyRecursive on the SCENE selection -
+// a destructive edit to the level, from a keypress aimed at a dialogue node.
+//
+// Three further defects fall out of the same fix:
+//   * `io.KeyCtrl` is a modifier-DOWN test, not an exact chord match, so Ctrl+Alt+D
+//     duplicated and Ctrl+Shift+Y redid. ImGui::Shortcut matches modifiers exactly -
+//     the same property that already makes Ctrl+Shift+S its own registration.
+//   * `!io.WantTextInput` was a blunt global gate: while ANY text field anywhere was
+//     active, Ctrl+Z in the viewport did nothing. Under routing an active InputText
+//     registers Ctrl+Z/Y/X/C/V against its own item id and scores 300 (vs a focused
+//     window's 199), so it wins and undoes THE FIELD - which is what the author means.
+//   * The paint-vs-scene arbitration was global: with the Art Editor painting, Ctrl+Z
+//     popped a paint stroke even when the Dialogue Editor was focused.
+
+// One enumerator per CHORD, not per key: Ctrl+Z and Ctrl+Shift+Z are two chords.
+enum class EditVerb : u8 { Undo = 0, Redo, Cut, Copy, Paste, Duplicate, Count };
+
+// What the caller must do. Exactly one per chord per frame. The PREFIX names the
+// history/clipboard the verb lands in - the edit analogue of "which file does
+// Ctrl+S write".
+enum class EditAction : u8 {
+    // --- non-acting outcomes ---
+    // The focused surface owns the chord and has nothing to do with it. SWALLOWED:
+    // no status line, and above all NOT forwarded to the scene. This enumerator is
+    // the fix for the destructive bug above.
+    Ignored = 0,
+    NothingOpen,      // a focused asset editor with no asset open (status line)
+    RefusedPlayMode,  // reserved: a structural scene edit during Play (see below)
+    // --- the SCENE history (undoStack_/redoStack_) + the SCENE clipboard ---
+    // Viewport / Hierarchy / Inspector / Timeline, AND the UI Editor: `.hbui`
+    // elements ARE entities, PushUndo(Engine&) already captures every open document,
+    // and CopySelection already carries clipboardFromDoc_. Giving the UI editor a
+    // second history would be exactly the reinvention this dispatch exists to avoid.
+    SceneUndo, SceneRedo, SceneCut, SceneCopy, ScenePaste, SceneDuplicate,
+    // --- the surface-PAINT stroke history (paintStrokeOrder_/paintStrokeRedo_) ---
+    // Only Undo/Redo exist: strokes have no clipboard.
+    PaintUndo, PaintRedo,
+    // --- the FOCUSED asset editor's OWN working copy ---
+    // WHICH asset is ctx.focused; the executor switches on it the same way
+    // ProcessSaveRequest's per-surface cases already do.
+    AssetUndo, AssetRedo, AssetCut, AssetCopy, AssetPaste, AssetDuplicate,
+    Count
+};
+
+// The facts, all observable without touching a file. Mirrors SaveContext.
+struct EditContext {
+    SaveSurface focused = SaveSurface::None; // REUSED verbatim - same claim ids
+    EditVerb verb = EditVerb::Undo;
+    bool playMode = false;
+    // ImGui routes Ctrl+Z/Y/X/C/V to an ACTIVE InputText at score 300 (beating a
+    // panel's 199), so those never reach here while typing. Ctrl+D is the exception -
+    // ImGui registers no route for it - so this gate survives, but NARROWED to the
+    // destructive verbs instead of blanking the whole block.
+    bool textFieldActive = false;
+    bool surfaceHasContent = false;
+    // paintActive_ && !paintStrokeMode_ && (strokes || redo). Only ever diverts
+    // Undo/Redo, and only inside the Scene domain - it used to divert them from ANY
+    // focused panel.
+    bool paintHistoryActive = false;
+    bool hasSelection = false;   // scene: selected_ valid; asset: a node/key selected
+    bool clipboardEmpty = true;  // the clipboard the RESOLVED domain pastes from
+    bool historyEmpty = true;    // that domain's undo (Undo) or redo (Redo) stack
+};
+
+// THE dispatch rule. Total: every (SaveSurface, EditVerb) pair yields exactly one
+// EditAction.
+EditAction DecideEdit(const EditContext& ctx);
+
+// Does `s` implement `v` AT ALL. The capability table in the .cpp is the whole
+// policy: granting a verb to a panel is one bit there plus one executor case. A verb
+// a surface does not implement resolves to Ignored - NEVER to the scene.
+bool SurfaceHandlesVerb(SaveSurface s, EditVerb v);
+
+const char* EditVerbName(EditVerb v);
+const char* EditActionName(EditAction a);
+
+// Folded into `--test-savedispatch`. Same contract: pure, headless, no ImGui.
+// Sweeps the full cross product of surfaces x verbs x every boolean combination.
+bool EditDispatchSelfTest();
 
 } // namespace hbe::editor

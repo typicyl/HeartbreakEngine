@@ -233,6 +233,40 @@ public:
     void FlowMainMenu();  // back to the main menu, unlock cursor
     void FlowReload();    // respawn/restart: game loading screen -> reload gameplay
 
+    // --- Player pause -------------------------------------------------------
+    // PAUSE IS NOT A GameState. It is a modal overlay on Playing: Loading and
+    // MainMenu cannot be paused, and making it a fifth enumerator would have meant
+    // auditing every `gameState_ == Playing` test in the engine (the gameplay band,
+    // the character band, the streaming gate, the cursor policy) for a case none of
+    // them wanted.
+    //
+    // Paused means the SIMULATION delta is zero - physics, animation, AI, gameplay
+    // and nav all stand still - while the PRESENTATION clock (dt_) keeps running, so
+    // the pause menu still fades and animates and the caption crawl does not freeze
+    // mid-word. That is the same split the dev menu's devTimeScale_ already relies
+    // on; this reuses the mechanism rather than adding a second one.
+    //
+    // Pushes a UI panel named "Pause" when the project has one. It still pauses
+    // (and frees the cursor) when it does not, so pause works before the menu is
+    // authored instead of silently doing nothing.
+    bool Paused() const { return paused_; }
+    void SetPaused(bool on);
+    void TogglePause();
+
+    // --- Cutscene skip ------------------------------------------------------
+    bool CutsceneActive() const { return cutsceneTime_ >= 0.0f; }
+    // Abandon the running cutscene at the player's request. Restores the game
+    // camera and drops whatever the cutscene put on screen.
+    //
+    // Deliberately does NOT fast-forward the remaining markers. A cutscene's markers
+    // are camera keys, animation clips, shakes, subtitles and dialogue - all purely
+    // presentational. Story state (flags, objectives, the next beat) is written by
+    // the SCHEMATIC that launched the cutscene, and PlayCutscene is fire-and-forget,
+    // so that schematic has already moved on. Firing the remaining markers would
+    // therefore dump every skipped line onto the screen at once - the exact thing
+    // the player asked not to see.
+    void SkipCutscene();
+
     // Checkpoint save/load: writes/reads <projectRoot>/Saves/<slot>.hbsave (a full
     // scene snapshot + game::SerializeState). SaveGame is what a reached checkpoint
     // triggers; LoadGame restores the world + objectives + checkpoints and resumes
@@ -418,6 +452,7 @@ private:
     f32 cutsceneTime_ = -1.0f;      // -1 = no cutscene; else seconds along the timeline
     bool cutsceneRestoreCam_ = true; // gameCameraEnabled_ to restore when it ends
     bool cutsceneCamOwned_ = false;  // true while a cutscene has taken over the camera
+    bool paused_ = false;            // player pause (see Paused/SetPaused above)
     void SeedSettingsWidgets();  // fill "setting:*" widgets from userSettings_ (on Settings shown)
     void ApplyChangedSettings(); // read changed "setting:*" widgets -> apply live + mark dirty
     // BOOT-TIME DUPLICATE SCAN over the resident screen set. Every consumer of

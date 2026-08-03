@@ -177,7 +177,13 @@ std::vector<rhi::GraphicsAPI> ResolveBackendOrder(const BuildSettings& b) {
     }
     const A primary = ApiFromString(b.backend);
     std::vector<A> order{primary};
-    for (A a : {A::D3D12, A::Vulkan, A::OpenGL})
+    // AUTO-FALLBACK IS D3D12/VULKAN ONLY. OpenGL is a preview backend - no shadows,
+    // no post stack, no punctual lights/probes/GI, bind-pose skinning, no particles,
+    // no material flags (glass renders opaque) - so a player whose D3D12 AND Vulkan
+    // both failed would silently get a visibly different product rather than an
+    // error. It stays reachable when it is CHOSEN (--opengl, or a build profile
+    // that names it), which is the only way a preview backend should ever ship.
+    for (A a : {A::D3D12, A::Vulkan})
         if (a != primary) order.push_back(a);
     return order;
 }
@@ -1800,7 +1806,9 @@ int Engine::Run(const EngineConfig& configIn) {
     } else {
         using A = rhi::GraphicsAPI;
         backendOrder = {config.api};
-        for (A a : {A::D3D12, A::Vulkan, A::OpenGL})
+        // Auto-fallback is D3D12/Vulkan only - see ResolveBackendOrder for why
+        // OpenGL is never appended to a chain the user did not ask for.
+        for (A a : {A::D3D12, A::Vulkan})
             if (a != config.api) backendOrder.push_back(a);
     }
     // The editor is built on Dear ImGui; OpenGL has no editor UI backend yet, so
@@ -2357,7 +2365,14 @@ int Engine::Run(const EngineConfig& configIn) {
         // The offline MOVIE RENDER overrides the SIMULATION delta with a fixed dt=1/fps
         // (deterministic frame-stepping) - but ONLY dt, never dt_, so caption/loading
         // clocks (which use dt_) are not time-warped.
-        const f32 dt = (renderFixedDt_ > 0.0f) ? renderFixedDt_ : (dtSmooth * devTimeScale_);
+        // Player pause multiplies in here rather than gating each system: one place,
+        // and every consumer of the simulation delta (physics, animation, AI, nav,
+        // gameplay, the cutscene clock) stops together by construction. dt_ - the
+        // PRESENTATION clock used by the flow fades and the caption crawl - is
+        // deliberately untouched, so the pause menu still animates.
+        const f32 pauseScale = paused_ ? 0.0f : 1.0f;
+        const f32 dt =
+            (renderFixedDt_ > 0.0f) ? renderFixedDt_ : (dtSmooth * devTimeScale_ * pauseScale);
 
         // Benchmark sampling + termination. Uses the RAW delta, before clamping
         // and smoothing, so a spike is recorded as a spike.
@@ -2702,8 +2717,17 @@ int Engine::Run(const EngineConfig& configIn) {
         if (flowActive_) UpdateGameFlow(dt_);
         if (!onInit_) {             // runtime only (not the editor preview)
             ApplyChangedSettings(); // live-apply any Settings widget the user just changed
-            UpdateCaptions(dt_);    // drain audio captions -> drive the caption element
         }
+        // Captions run in the RUNTIME always, and in the editor while PLAYING.
+        //
+        // They used to share the `!onInit_` gate above, which meant they never ran in
+        // the editor at all - so dialogue played, pushed lines that could never
+        // expire (subtitles_.Update was the only thing that ages them, and this is
+        // its only call site), nothing rendered, and `SetMusicDucking` below - which
+        // reads `!subtitles_.Empty()` and is NOT gated - latched the score ducked for
+        // the rest of the session after the first line. That is the primary narrative
+        // authoring loop, broken in the tool it is authored in.
+        if (!onInit_ || physics.IsRunning()) UpdateCaptions(dt_);
 
         // Visual-script "Schematics" tick while the simulation runs (the editor's
         // play mode gates physics; the runtime always plays). On Start / On Update.
@@ -2744,8 +2768,15 @@ int Engine::Run(const EngineConfig& configIn) {
         // same frame (no one-frame lag).
         {
             const auto _pt = clock::now();
-            if (physics.IsRunning())
-                gameplay::Update(scene, physics, renderer, input, renderer.GetCamera(), dt);
+            // Same gate character::Update carries 28 lines up, and for the same
+            // reason: a 3D main menu binds a world whose Player/AI/Spawner entities
+            // are resident and physics runs. Without it the whole gameplay band ran
+            // behind the menu - AI patrolled and shot, encounters cleared, and
+            // checkpoints wrote `.hbsave` while the player was still on the title
+            // screen. The editor keeps its old behaviour (flowActive_ is false).
+            if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing))
+                gameplay::Update(scene, physics, renderer, input, renderer.GetCamera(), dt,
+                                 ui::PointerOverInteractive(scene, uiCtx_));
             accGpMs += std::chrono::duration<f64, std::milli>(clock::now() - _pt).count();
         }
         // NavigationAgents steer along real-time grid A* paths while the
@@ -5324,6 +5355,35 @@ void Engine::UpdateCutscene(f32 dt) {
     }
 }
 
+void Engine::SetPaused(bool on) {
+    // Only Playing can be paused. Guarding here rather than at each call site means a
+    // stray Pause press during a load or on the menu is a no-op instead of freezing a
+    // state machine that has no way to resume itself.
+    if (on && gameState_ != GameState::Playing) return;
+    if (paused_ == on) return;
+    paused_ = on;
+    if (!scene_) return;
+    // Push/pop the project's "Pause" panel when it has one. Has() rather than an
+    // assumption: pause must work in a project that has not authored the menu yet
+    // (it still freezes and frees the cursor), otherwise the feature looks broken
+    // rather than un-authored.
+    if (uiManagerMode_ && uiManager_.Has(*scene_, "Pause")) {
+        if (on) uiManager_.Push(*scene_, "Pause");
+        else if (uiManager_.Top() == "Pause") uiManager_.Pop(*scene_);
+    }
+    HBE_INFO("Flow: {}", on ? "paused" : "resumed");
+}
+
+void Engine::TogglePause() { SetPaused(!paused_); }
+
+void Engine::SkipCutscene() {
+    if (cutsceneTime_ < 0.0f) return;
+    HBE_INFO("Cutscene: skipped by the player at {:.2f}s / {:.2f}s.", cutsceneTime_,
+             cutscene_.duration);
+    ClearCutscene();          // restores the game camera
+    ResetDialogueRuntime();   // drops the conversation/subtitles the cutscene put up
+}
+
 void Engine::ClearCutscene() {
     if (cutsceneCamOwned_) {
         SetGameCameraEnabled(cutsceneRestoreCam_);
@@ -5447,6 +5507,23 @@ void Engine::UpdateGameFlow(f32 dt) {
         // Refresh live HUD tokens each frame so {objective}, {item:<id>} and {equipped}
         // reflect current game state (they were previously resolved only on load).
         SubstituteUITokens(1.0f);
+
+        // PAUSE + CUTSCENE SKIP. Both are polled here, in the Playing branch, because
+        // both are only meaningful while the game is actually running.
+        //
+        // Skip takes priority over pause while a cutscene is up: one button press
+        // during a cinematic should get out of the cinematic, not open a menu behind
+        // it. `devMenuOpen_` suppresses both so the dev overlay's own key handling
+        // does not double-fire (the same guard the rebind poll uses).
+        if (!devMenuOpen_ && input_) {
+            if (actionMap_.Pressed(*input_, "Skip") && CutsceneActive()) {
+                SkipCutscene();
+            } else if (actionMap_.Pressed(*input_, "Pause")) {
+                if (CutsceneActive()) SkipCutscene();
+                else TogglePause();
+            }
+        }
+
         // Free-cursor policy: any menu panel over the HUD (Settings/Pause - pushed
         // by a button OR a schematic UI node) frees the cursor for point-and-click
         // (including world-space pages); back on the HUD relocks mouse-look.
@@ -5454,7 +5531,10 @@ void Engine::UpdateGameFlow(f32 dt) {
         const bool menuOpen =
             uiManagerMode_ && !uiManager_.Empty() && uiManager_.Top() != "HUD";
         // Dialogue choices need point-and-click too, so free the cursor for them.
-        const bool wantFreeCursor = menuOpen || dialogueChoiceActive_;
+        // `paused_` is listed explicitly rather than relying on the Pause panel being
+        // up: pause works in a project that has not authored one yet, and a paused
+        // game holding the cursor captive for mouse-look would be unescapable.
+        const bool wantFreeCursor = menuOpen || dialogueChoiceActive_ || paused_;
         if (IsCursorLocked() == wantFreeCursor) SetCursorLocked(!wantFreeCursor);
         const std::string act = PollClickedAction(*scene_);
         // A "rebind:<Action>" button starts listening for the next key/button; the
@@ -5464,6 +5544,8 @@ void Engine::UpdateGameFlow(f32 dt) {
             FlowMainMenu();
         else if (act == "restart")
             FlowReload();
+        else if (act == "resume")
+            SetPaused(false); // a Pause panel's Resume button
         else if (act == "settings" && uiManager_.Has(*scene_, "Settings")) {
             uiManager_.Push(*scene_, "Settings"); // pause-menu style overlay; "back" pops
             SeedSettingsWidgets();
