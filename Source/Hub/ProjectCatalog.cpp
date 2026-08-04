@@ -9,6 +9,10 @@
 
 #include "Hub/ProjectCatalog.h"
 
+#include "Core/Platform.h"
+
+#include "Hub/HubConfig.h"
+
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
@@ -24,12 +28,9 @@ constexpr usize kMaxRecent = 24;
 }
 
 fs::path RecentProjectsFile() {
-    wchar_t buf[MAX_PATH] = {};
-    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
     // Per-user, not next to the executable: an update REPLACES the install directory,
     // and a project list stored there would be wiped by every update.
-    const fs::path base = (n > 0 && n < MAX_PATH) ? fs::path(buf) : fs::temp_directory_path();
-    return base / "HeartbreakEngine" / "recent_projects.json";
+    return platform::UserDataDir() / "recent_projects.json";
 }
 
 std::string ReadProjectName(const fs::path& hbproj) {
@@ -125,18 +126,36 @@ void RemoveProject(std::vector<ProjectEntry>& list, const fs::path& file) {
 
 fs::path ResolveEditorExe(std::string& outError) {
     outError.clear();
-    wchar_t self[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, self, MAX_PATH);
-    const fs::path editor = fs::path(self).parent_path() / L"HeartbreakEditor.exe";
     std::error_code ec;
-    if (!fs::exists(editor, ec)) {
-        // The engine is not installed, or an update is mid-flight. Name the missing
-        // file - "nothing happened" is the worst possible response to a click.
-        outError = "HeartbreakEditor.exe was not found next to the Hub (" +
-                   editor.string() + "). Install or repair the engine first.";
-        return {};
+
+    // THE RECORDED INSTALL ROOT COMES FIRST. The Hub already remembers where it put the
+    // engine - LoadHubConfig().installRoot, written to hub.json the moment it is chosen -
+    // and the updater and LooksInstalled both work in terms of <installRoot>/bin. This
+    // function did not: it looked only NEXT TO THE HUB. The Hub is REQUIRED to live
+    // outside the tree it swaps (that is what makes renaming bin/ legal), so in a real
+    // install "next to the Hub" is precisely where the editor is not. It only ever worked
+    // in the dev build, where both happen to land in the same output directory - which is
+    // exactly the configuration that hides the bug.
+    const fs::path root = LoadHubConfig().installRoot;
+    if (!root.empty()) {
+        const fs::path installed = root / "bin" / "HeartbreakEditor.exe";
+        if (fs::exists(installed, ec)) return installed;
     }
-    return editor;
+
+    // Fallback: beside the Hub. Keeps the development layout working, where the Hub and
+    // the editor are built into one directory.
+    const fs::path adjacent = platform::ExecutableDir() / L"HeartbreakEditor.exe";
+    if (fs::exists(adjacent, ec)) return adjacent;
+
+    // Name BOTH places that were tried. "Not found" without saying where is unanswerable,
+    // and the two locations mean two different problems: a broken install versus a Hub
+    // pointed at the wrong folder.
+    outError = "HeartbreakEditor.exe was not found. Looked in " +
+               (root.empty() ? std::string("<no engine folder set>")
+                             : (root / "bin").string()) +
+               " and beside the Hub (" + adjacent.parent_path().string() +
+               "). Install the engine, or set the engine folder in the Hub.";
+    return {};
 }
 
 bool LaunchEditor(const fs::path& hbproj, std::string& outError) {

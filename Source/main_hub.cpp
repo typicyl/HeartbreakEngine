@@ -24,7 +24,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 
 int main(int argc, char** argv) {
     hbe::EngineConfig config = hbe::ParseCommandLine(argc, argv);
-    config.title = L"Heartbreak Hub";
+    config.title = "Heartbreak Hub";
     config.width = 960;
     config.height = 600;
 

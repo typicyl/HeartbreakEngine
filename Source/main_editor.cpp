@@ -9,6 +9,11 @@
 #include "Assets/AssetFormats.h" // --test-assetformats (the registry's own invariants)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
 #include "Assets/SeamWeld.h"
+#include "Scene/BodyShape.h"
+#include "Assets/MeshDerive.h"
+#include "Assets/MeshSimplify.h"
+#include "Assets/MeshFaceSelect.h"
+#include "Core/Platform.h"
 #include "Assets/SlotIds.h"      // --test-slotids / --migrate-slots (pack slot identity)
 #include "Assets/MusicGraph.h"   // --test-musicvoice (music director lifecycle)
 #include "Assets/UAP.h"          // uap::PackIndexOf (the migration plan prints pack numbers)
@@ -119,6 +124,49 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-seamweld") == 0) {
             const bool ok = hbe::weld::SelfTest();
             std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-bodyshape: the character sliders resolve from joint NAMES alone, and
+        // length/girth split on a bone axis derived from the rig. Headless - it proves the
+        // slider maths, not how the character looks, which only a person can judge.
+        // --test-meshderive: normals/tangents for geometry nobody authored, plus the
+        // deterministic RNG both the generator and its bake keys stand on. Headless.
+        // --test-platform: the OS layer that replaces 12 hand-rolled copies of "where is
+        // my exe" and 6 of "where does user data go". Headless.
+        if (std::strcmp(argv[i], "--test-platform") == 0) {
+            const bool ok = hbe::platform::SelfTest();
+            std::printf("platform %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-input: the portable half of Input, which became testable when it was
+        // split out of Input_Win32.cpp - press edges, the ordered text stream, mouse
+        // deltas, and the stick deadzone curve, none of which need a window.
+        if (std::strcmp(argv[i], "--test-input") == 0) {
+            const bool ok = hbe::InputSelfTest();
+            std::printf("input %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-faceselect: picking triangles and splitting them into their own submesh,
+        // which is how a second material is assigned to part of a mesh.
+        if (std::strcmp(argv[i], "--test-faceselect") == 0) {
+            const bool ok = hbe::mesh::FaceSelectSelfTest();
+            std::printf("faceselect %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-simplify: the quadric decimator used to build streaming LODs at import.
+        if (std::strcmp(argv[i], "--test-simplify") == 0) {
+            const bool ok = hbe::mesh::SimplifySelfTest();
+            std::printf("simplify %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-meshderive") == 0) {
+            const bool ok = hbe::mesh::SelfTest();
+            std::printf("meshderive %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-bodyshape") == 0) {
+            const bool ok = hbe::bodyshape::SelfTest();
+            std::printf("bodyshape %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-assetformats: the ASSET REGISTRY's own invariants. Assets/
@@ -396,10 +444,8 @@ int main(int argc, char** argv) {
             return p2.state == hbe::hub::UpdateState::Done ? 0 : 1;
         }
         if (std::strcmp(argv[i], "--hub-check") == 0) {
-            wchar_t exe[MAX_PATH] = {};
-            ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
             hbe::hub::UpdatePaths paths;
-            paths.installRoot = std::filesystem::path(exe).parent_path().parent_path();
+            paths.installRoot = hbe::platform::ExecutableDir().parent_path();
             hbe::hub::Updater up("https://hollowdreamstudios.com/enginemanifest.json", paths);
             up.Check();
             const hbe::hub::UpdateProgress& pr = up.Progress();
@@ -779,7 +825,7 @@ int main(int argc, char** argv) {
     }
 
     hbe::EngineConfig config = hbe::ParseCommandLine(argc, argv);
-    config.title = L"Heartbreak Editor";
+    config.title = "Heartbreak Editor";
 
     // Normally no project is opened here - the editor's Project Manager modal
     // handles creating/opening projects (and remembers recent ones). The

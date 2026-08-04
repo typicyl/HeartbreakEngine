@@ -31,7 +31,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 
 int main(int argc, char** argv) {
     hbe::EngineConfig config = hbe::ParseCommandLine(argc, argv);
-    config.title = L"Heartbreak Art Editor";
+    config.title = "Heartbreak Art Editor";
 
     // --project opens a project directly; otherwise the Project Manager modal
     // lets the artist pick one (recents remembered).

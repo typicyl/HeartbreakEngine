@@ -803,10 +803,26 @@ public:
     // Uploads a CPU mesh to the GPU. Returns an invalid handle if unsupported.
     virtual MeshHandle CreateMesh(const hbe::MeshData&) { return {}; }
 
-    // Re-uploads vertex/index data into an EXISTING mesh's GPU buffers (in place,
-    // no reallocation when the data still fits - true for editing where the
-    // topology is fixed, e.g. terrain sculpting). Synchronous, like CreateMesh.
-    virtual void UpdateMesh(MeshHandle, const hbe::MeshData&) {}
+    // Re-uploads vertex/index data into an EXISTING mesh's GPU buffers, IN PLACE.
+    // NEVER GROWS: an upload larger than the original allocation is REFUSED, on
+    // every backend, and reported by returning false. Reserve the headroom up
+    // front with CreateMeshReserved if the geometry is going to change size.
+    //
+    // The return value is not advisory. A refused upload leaves the GPU holding
+    // the PREVIOUS geometry, so a caller that has already updated its own CPU
+    // copy - bounds, colliders, anything derived - is now describing something
+    // that is not on the screen. Check it.
+    virtual bool UpdateMesh(MeshHandle, const hbe::MeshData&) { return false; }
+
+    // Like CreateMesh, but ALLOCATES for the stated capacity while uploading only
+    // `initial`. This is the front door for geometry that is generated rather than
+    // loaded: a procedural mesh whose vertex count moves with its parameters needs
+    // room to grow, and UpdateMesh deliberately will not resize for it.
+    // A capacity below the initial contents is raised to fit rather than refused.
+    virtual MeshHandle CreateMeshReserved(const hbe::MeshData& initial, u32 /*vertexCapacity*/,
+                                          u32 /*indexCapacity*/) {
+        return CreateMesh(initial);
+    }
 
     // Uploads a 2D texture into the bindless array; returns its index handle.
     virtual TextureHandle CreateTexture(const TextureDesc&) { return {}; }

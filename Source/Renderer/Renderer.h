@@ -30,7 +30,14 @@ public:
 
     // Re-uploads geometry into an existing mesh's GPU buffers in place (fixed
     // topology, e.g. terrain sculpting). Avoids leaking a buffer per edit.
-    void UpdateMesh(rhi::MeshHandle handle, const MeshData& mesh);
+    // False when the device refused the upload (it never grows a mesh - reserve the
+    // headroom with UploadMeshReserved). On false the GPU still holds the OLD geometry
+    // and the cull bounds are deliberately left describing it.
+    bool UpdateMesh(rhi::MeshHandle handle, const MeshData& mesh);
+
+    // For geometry that is generated rather than loaded and whose size moves.
+    rhi::MeshHandle UploadMeshReserved(const MeshData& mesh, u32 vertexCapacity,
+                                       u32 indexCapacity);
 
     // Uploads a 2D texture into the bindless array; returns its index handle.
     rhi::TextureHandle UploadTexture(const rhi::TextureDesc& desc);

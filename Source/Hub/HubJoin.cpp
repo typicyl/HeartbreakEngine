@@ -9,6 +9,8 @@
 
 #include "Hub/HubJoin.h"
 
+#include "Core/Platform.h"
+
 #include "Collab/Signaling.h"
 
 #include <chrono>
@@ -23,10 +25,10 @@ fs::path IdentityFileForHub() {
     // shared: the Hub links no engine, and pulling in an editor header to agree on a path
     // would be the wrong dependency in the wrong direction. The PATH is the contract, and
     // --test-hub asserts the Hub and the editor produce the same fingerprint from it.
-    wchar_t buf[MAX_PATH] = {};
-    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    const fs::path base = (n > 0 && n < MAX_PATH) ? fs::path(buf) : fs::temp_directory_path();
-    return base / "HeartbreakEngine" / "identity.hbkey";
+    // The PATH is the contract, and it now comes from one implementation - the editor's
+    // copy of this derivation and this one used to be able to disagree about truncation
+    // and about the fallback when LOCALAPPDATA is unset.
+    return platform::UserDataDir() / "identity.hbkey";
 }
 
 JoinSession::JoinSession() = default;

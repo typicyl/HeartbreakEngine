@@ -11,6 +11,7 @@
 #include "Hub/ProjectCatalog.h"
 #include "Hub/HubJoin.h"
 #include "Hub/UpdateCheck.h"
+#include "Hub/HubSelfUpdate.h"
 #include "Hub/Updater.h"
 #include "Hub/ZipArchive.h"
 
@@ -29,7 +30,8 @@ bool HubSelfTest() {
     const bool b = ZipSelfTest();
     const bool c = UpdaterSelfTest();
     const bool d = ProjectCatalogSelfTest();
-    const bool ok = a && b && c && d;
+    const bool e = SelfUpdateSelfTest();
+    const bool ok = a && b && c && d && e;
     if (ok) {
         std::printf("hub: version ordering (1.0.9 < 1.0.10), the published manifest shape "
                     "parses, http/@-authority/CRLF URLs refused, zip traversal + device "

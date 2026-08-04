@@ -15,9 +15,25 @@
 
 namespace hbe {
 
+// Defined below; the window class registration needs it before then.
+i64 __stdcall WndProcThunk(void* hwnd, u32 msg, u64 wparam, i64 lparam);
+
 namespace {
 constexpr const wchar_t* kWindowClassName = L"HeartbreakEngineWindowClass";
+
+// UTF-8 -> UTF-16 for the title bar. The interface carries UTF-8 because a window title is
+// user-facing text; this is the one place that has to speak the OS's encoding.
+std::wstring Widen(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    const int need = ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(),
+                                           static_cast<int>(utf8.size()), nullptr, 0);
+    if (need <= 0) return {};
+    std::wstring out(static_cast<usize>(need), 0);
+    ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()),
+                          out.data(), need);
+    return out;
 }
+} // namespace
 
 Window::Window(const WindowDesc& desc) {
     HINSTANCE hinstance = ::GetModuleHandleW(nullptr);
@@ -25,7 +41,7 @@ Window::Window(const WindowDesc& desc) {
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);
     wc.style         = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
-    wc.lpfnWndProc   = reinterpret_cast<WNDPROC>(&Window::WndProcThunk);
+    wc.lpfnWndProc   = reinterpret_cast<WNDPROC>(&WndProcThunk);
     wc.hInstance     = hinstance;
     wc.hCursor       = ::LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = kWindowClassName;
@@ -59,7 +75,8 @@ Window::Window(const WindowDesc& desc) {
         height_ = desc.height;
     }
 
-    HWND hwnd = ::CreateWindowExW(0, kWindowClassName, desc.title.c_str(), style, x, y, w, h,
+    const std::wstring wideTitle = Widen(desc.title);
+    HWND hwnd = ::CreateWindowExW(0, kWindowClassName, wideTitle.c_str(), style, x, y, w, h,
                                   nullptr, nullptr, hinstance, this);
 
     if (!hwnd) {
@@ -98,7 +115,15 @@ bool Window::PumpMessages() {
     return !closing_;
 }
 
-i64 __stdcall Window::WndProcThunk(void* hwnd, u32 msg, u64 wparam, i64 lparam) {
+// Grants the free-function window procedure access to Window::HandleMessage without
+// putting an MSVC calling convention in the shared header.
+struct WindowPlatformAccess {
+    static i64 Handle(Window& w, void* hwnd, u32 msg, u64 wparam, i64 lparam) {
+        return w.HandleMessage(hwnd, msg, wparam, lparam);
+    }
+};
+
+i64 __stdcall WndProcThunk(void* hwnd, u32 msg, u64 wparam, i64 lparam) {
     HWND h = static_cast<HWND>(hwnd);
 
     if (msg == WM_NCCREATE) {
@@ -110,7 +135,7 @@ i64 __stdcall Window::WndProcThunk(void* hwnd, u32 msg, u64 wparam, i64 lparam) 
 
     auto* self = reinterpret_cast<Window*>(::GetWindowLongPtrW(h, GWLP_USERDATA));
     if (self) {
-        return self->HandleMessage(hwnd, msg, wparam, lparam);
+        return WindowPlatformAccess::Handle(*self, hwnd, msg, wparam, lparam);
     }
     return ::DefWindowProcW(h, msg, static_cast<WPARAM>(wparam), static_cast<LPARAM>(lparam));
 }

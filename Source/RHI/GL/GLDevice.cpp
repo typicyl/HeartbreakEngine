@@ -59,6 +59,11 @@ struct FrameUBO {
 struct GlMesh {
     GLuint vao = 0, vbo = 0, ibo = 0;
     GLsizei indexCount = 0;
+    // ALLOCATED bytes, tracked so this backend refuses an oversize UpdateMesh exactly
+    // like D3D12 and Vulkan. glBufferData would happily reallocate, which is precisely
+    // the divergence: geometry that updated fine on --opengl was silently dropped on
+    // the other two backends.
+    GLsizeiptr vbCapacity = 0, ibCapacity = 0;
     bool alive = false;
 };
 
@@ -416,19 +421,32 @@ public:
 
     bool SupportsSceneRendering() const override { return sceneOk_; }
 
-    MeshHandle CreateMesh(const hbe::MeshData& data) override {
+    MeshHandle CreateMesh(const hbe::MeshData& data) override { return CreateMeshImpl(data, 0, 0); }
+
+    MeshHandle CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
+                                  u32 indexCapacity) override {
+        return CreateMeshImpl(initial, vertexCapacity, indexCapacity);
+    }
+
+    MeshHandle CreateMeshImpl(const hbe::MeshData& data, u32 vertexCapacity, u32 indexCapacity) {
         if (!sceneOk_ || data.Empty()) return {};
         GlMesh m{};
         glGenVertexArrays(1, &m.vao);
         glGenBuffers(1, &m.vbo);
         glGenBuffers(1, &m.ibo);
         glBindVertexArray(m.vao);
+        const GLsizeiptr vbBytes = GLsizeiptr(data.vertices.size() * sizeof(hbe::Vertex));
+        const GLsizeiptr ibBytes = GLsizeiptr(data.indices.size() * sizeof(u32));
+        m.vbCapacity = std::max<GLsizeiptr>(vbBytes, GLsizeiptr(vertexCapacity) * sizeof(hbe::Vertex));
+        m.ibCapacity = std::max<GLsizeiptr>(ibBytes, GLsizeiptr(indexCapacity) * sizeof(u32));
         glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
-        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(data.vertices.size() * sizeof(hbe::Vertex)),
-                     data.vertices.data(), GL_STATIC_DRAW);
+        // Allocate the RESERVATION, then upload only the contents - the same split the
+        // other two backends make between allocation size and view size.
+        glBufferData(GL_ARRAY_BUFFER, m.vbCapacity, nullptr, GL_STATIC_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vbBytes, data.vertices.data());
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(data.indices.size() * sizeof(u32)),
-                     data.indices.data(), GL_STATIC_DRAW);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, m.ibCapacity, nullptr, GL_STATIC_DRAW);
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, ibBytes, data.indices.data());
         SetupVertexLayout();
         glBindVertexArray(0);
         m.indexCount = GLsizei(data.indices.size());
@@ -441,17 +459,26 @@ public:
         return MeshHandle{id};
     }
 
-    void UpdateMesh(MeshHandle h, const hbe::MeshData& data) override {
-        if (!sceneOk_ || !h.IsValid() || h.id >= meshes_.size() || data.Empty()) return;
+    bool UpdateMesh(MeshHandle h, const hbe::MeshData& data) override {
+        if (!sceneOk_ || !h.IsValid() || h.id >= meshes_.size() || data.Empty()) return false;
         GlMesh& m = meshes_[h.id];
-        if (!m.alive) return;
+        if (!m.alive) return false;
+        const GLsizeiptr vbBytes = GLsizeiptr(data.vertices.size() * sizeof(hbe::Vertex));
+        const GLsizeiptr ibBytes = GLsizeiptr(data.indices.size() * sizeof(u32));
+        if (vbBytes > m.vbCapacity || ibBytes > m.ibCapacity) {
+            HBE_WARN("[GL] UpdateMesh refused: {} vertex + {} index bytes exceed the {}/{} "
+                     "reserved for mesh {}. Use CreateMeshReserved.",
+                     vbBytes, ibBytes, m.vbCapacity, m.ibCapacity, h.id);
+            return false;
+        }
+        // glBufferSubData, NOT glBufferData: writing into the existing allocation is what
+        // makes "never grows" true here rather than merely documented.
         glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
-        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(data.vertices.size() * sizeof(hbe::Vertex)),
-                     data.vertices.data(), GL_STATIC_DRAW);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, vbBytes, data.vertices.data());
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ibo);
-        glBufferData(GL_ELEMENT_ARRAY_BUFFER, GLsizeiptr(data.indices.size() * sizeof(u32)),
-                     data.indices.data(), GL_STATIC_DRAW);
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, ibBytes, data.indices.data());
         m.indexCount = GLsizei(data.indices.size());
+        return true;
     }
 
     TextureHandle CreateTexture(const TextureDesc& desc) override {

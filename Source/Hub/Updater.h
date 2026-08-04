@@ -49,6 +49,13 @@ struct UpdateProgress {
     Version localVersion;
     Version remoteVersion;
     std::string releaseUrl;
+    // Set when the engine payload carried a NEWER Hub and it has been staged beside the
+    // running launcher. The swap itself needs the process to exit, so the UI offers a
+    // restart rather than doing it mid-update.
+    bool hubUpdateStaged = false;
+    // Why the payload's Hub could NOT be staged, when that happened. Empty otherwise. The
+    // engine update still succeeded in that case, so this is a note, not a failure.
+    std::string hubUpdateNote;
 };
 
 // Where an install lives and where its scratch space goes.

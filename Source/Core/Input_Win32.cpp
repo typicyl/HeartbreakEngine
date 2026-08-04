@@ -1,4 +1,9 @@
-// Core/Input_Win32.cpp - Win32 virtual-key translation + XInput gamepad poll.
+// Core/Input_Win32.cpp - the Windows half of Input: virtual-key translation and gamepads.
+//
+// Everything that is not OS-shaped lives in Core/Input.cpp. What remains here is the part a
+// second platform genuinely has to reimplement: turning native key codes into hbe::Key, and
+// asking XInput / Raw Input about controllers. The frame logic, edge detection, text stream
+// and deadzone curve are shared and tested independently.
 #include "Core/Input.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -11,7 +16,6 @@
 #include <xinput.h>
 
 #include <cmath>
-#include <cstring>
 #include <vector>
 
 namespace hbe {
@@ -46,106 +50,12 @@ Key TranslateVK(u32 vk) {
     }
 }
 
-// Applies a radial deadzone and normalizes a raw thumbstick axis pair.
-void NormalizeStick(i16 rawX, i16 rawY, i32 deadzone, f32& outX, f32& outY) {
-    const f32 x = static_cast<f32>(rawX);
-    const f32 y = static_cast<f32>(rawY);
-    const f32 mag = std::sqrt(x * x + y * y);
-    if (mag <= static_cast<f32>(deadzone)) {
-        outX = outY = 0.0f;
-        return;
-    }
-    const f32 norm = (mag - deadzone) / (32767.0f - deadzone);
-    const f32 scale = (norm > 1.0f ? 1.0f : norm) / mag;
-    outX = x * scale;
-    outY = y * scale;
-}
-
 } // namespace
 
-void Input::NewFrame() {
-    std::memcpy(prevKeys_, keys_, sizeof(keys_));
-    std::memcpy(prevMouse_, mouse_, sizeof(mouse_));
-    std::memset(pressedEdge_, 0, sizeof(pressedEdge_));
-    mouseDeltaX_ = mouseDeltaY_ = 0.0f;
-    wheel_ = 0.0f;
-    textEventCount_ = 0;
-    PollGamepads();
-}
-
-void Input::PushEditKey(Key k) {
-    TextEditEvent::Kind kind;
-    switch (k) {
-        case Key::Backspace: kind = TextEditEvent::Backspace; break;
-        case Key::Delete:    kind = TextEditEvent::Delete; break;
-        case Key::Left:      kind = TextEditEvent::CaretLeft; break;
-        case Key::Right:     kind = TextEditEvent::CaretRight; break;
-        case Key::Home:      kind = TextEditEvent::CaretHome; break;
-        case Key::End:       kind = TextEditEvent::CaretEnd; break;
-        default: return; // not an editing key
-    }
-    if (textEventCount_ < kMaxTextEvents)
-        textEvents_[textEventCount_++] = TextEditEvent{kind, 0};
-}
-
+// Translate, then hand to the shared logic. This function is the ONLY thing standing between
+// a Win32 message pump and platform-independent input state.
 void Input::OnKeyVK(u32 nativeKey, bool down) {
-    const Key k = TranslateVK(nativeKey);
-    if (k == Key::Unknown) return;
-    if (down) lastGamepad_ = false; // deliberate keyboard input -> keyboard/mouse prompts
-    if (down) {
-        // Down-transition = a fresh press edge (survives a same-frame release).
-        if (!keys_[Index(k)]) pressedEdge_[Index(k)] = true;
-        // Editing keys feed the ordered text-event stream, one per WM_KEYDOWN -
-        // so OS auto-repeat yields repeated edits and message order relative to
-        // WM_CHAR insertions is preserved. Cleared each frame; only drained by
-        // an active text-field edit session.
-        PushEditKey(k);
-    }
-    keys_[Index(k)] = down;
-}
-
-void Input::OnChar(u32 codepoint) {
-    if (textEventCount_ < kMaxTextEvents)
-        textEvents_[textEventCount_++] = TextEditEvent{TextEditEvent::InsertChar, codepoint};
-}
-
-void Input::OnMouseButton(MouseButton b, bool down) {
-    if (down) lastGamepad_ = false;
-    mouse_[Index(b)] = down;
-}
-
-void Input::OnMouseMove(f32 x, f32 y) {
-    if (hasMousePos_) {
-        mouseDeltaX_ += x - mouseX_;
-        mouseDeltaY_ += y - mouseY_;
-        // Notable mouse movement -> the player is on mouse (not a resting cursor
-        // while playing on a pad); flip prompts back to keyboard/mouse.
-        if (std::fabs(x - mouseX_) + std::fabs(y - mouseY_) > 2.0f) lastGamepad_ = false;
-    }
-    mouseX_ = x;
-    mouseY_ = y;
-    hasMousePos_ = true;
-}
-
-void Input::OnMouseLockedDelta(f32 dx, f32 dy) {
-    mouseDeltaX_ += dx;
-    mouseDeltaY_ += dy;
-}
-
-void Input::ResetMousePos() {
-    hasMousePos_ = false; // the next OnMouseMove seeds position without a delta
-}
-
-void Input::OnMouseWheel(f32 delta) {
-    wheel_ += delta;
-}
-
-void Input::OnFocusLost() {
-    std::memset(keys_, 0, sizeof(keys_));
-    std::memset(mouse_, 0, sizeof(mouse_));
-    std::memset(pressedEdge_, 0, sizeof(pressedEdge_));
-    textEventCount_ = 0;
-    hasMousePos_ = false;
+    OnKey(TranslateVK(nativeKey), down);
 }
 
 void Input::PollGamepads() {
@@ -168,10 +78,10 @@ void Input::PollGamepads() {
 
         pad.connected = true;
         const XINPUT_GAMEPAD& g = state.Gamepad;
-        NormalizeStick(g.sThumbLX, g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
-                       pad.leftX, pad.leftY);
-        NormalizeStick(g.sThumbRX, g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE,
-                       pad.rightX, pad.rightY);
+        input_detail::NormalizeStick(g.sThumbLX, g.sThumbLY, XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE,
+                                     pad.leftX, pad.leftY);
+        input_detail::NormalizeStick(g.sThumbRX, g.sThumbRY, XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE,
+                                     pad.rightX, pad.rightY);
         pad.leftTrigger = g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD
                               ? (g.bLeftTrigger - XINPUT_GAMEPAD_TRIGGER_THRESHOLD) /
                                     (255.0f - XINPUT_GAMEPAD_TRIGGER_THRESHOLD)

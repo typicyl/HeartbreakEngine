@@ -575,6 +575,33 @@ private:
     f32 previewYaw_ = 0.8f, previewPitch_ = 0.35f, previewZoom_ = 2.4f;
     bool previewMeshDirty_ = false;         // unsaved material-slot edits
 
+    // -- Face select: give PART of a mesh its own material ------------------------
+    // A submesh IS a MeshData with one Material, so "these faces get a different
+    // material" is a mesh operation: split the chosen triangles into a new submesh.
+    // The split APPENDS rather than reorders, because scenes reference submeshes
+    // positionally as "uaf:<path>#<index>" and renumbering would silently repoint
+    // every entity in every scene at different geometry.
+    void DrawFaceSelectTools(Engine& engine);
+    // glm rather than ImVec2 so this header stays free of imgui.h, which it does not
+    // otherwise include.
+    void PickPreviewFace(Engine& engine, glm::vec2 mouse, glm::vec2 imgMin, glm::vec2 imgSize,
+                         bool add, bool remove);
+    void RebuildPreviewGpu(Engine& engine);   // re-upload after the model changed
+    void RefreshFaceHighlight(Engine& engine);
+    bool faceSelectMode_ = false;
+    usize faceSelectSubmesh_ = 0;             // selection belongs to ONE submesh
+    std::vector<u32> faceSelection_;          // triangle indices, sorted, unique
+    int faceSelectTool_ = 1;                  // 0 single, 1 linked, 2 similar facing
+    f32 faceSelectAngle_ = 30.0f;             // degrees, for linked / similar
+    // The highlight is ONE mesh, allocated once at full submesh capacity and then
+    // updated in place - the RHI has no DestroyMesh, so creating one per selection
+    // change would leak a handle on every click.
+    glm::mat4 previewViewProj_{1.0f};         // the matrix actually submitted last frame
+    glm::vec3 previewEye_{0.0f};
+    rhi::MeshHandle faceHighlightMesh_;
+    u32 faceHighlightCapacity_ = 0;
+    u32 faceHighlightTris_ = 0;
+
     // -- Audio (mixer + event assets) --------------------------------------------
     // FMOD-style: the "Audio Mixer" panel edits the project's bus tree live;
     // .hbevent assets edit in the Asset Viewer and post through the mixer.
@@ -628,6 +655,15 @@ private:
     // Selected item: kind 0=camera key, 1=transform key, 2=clip marker,
     // 3=dialogue marker; track = anim-track index (kinds 1/2); index = slot.
     int csSelKind_ = -1, csSelTrack_ = -1, csSelIndex_ = -1;
+    // Which key the cursor is over, carried one frame (the hit test runs while drawing, so
+    // the highlight lands on the next frame - imperceptible, and it means a user can SEE
+    // what they are about to grab instead of guessing).
+    int csHoverKind_ = -1, csHoverTrack_ = -1, csHoverIndex_ = -1;
+    // Grab offset: the key's time MINUS the cursor's time at the moment of the press.
+    // Without it a drag snaps the key to the cursor, so grabbing a key 10 px off-centre
+    // teleported it by 10 px worth of time before the mouse had moved at all.
+    f32 csDragGrabDt_ = 0.0f;
+    bool csDragArmed_ = false;                   // pressed on a key, not yet past threshold
     bool csDragKey_ = false;                     // a key drag is in progress
     bool csDragPlayhead_ = false;                // playhead scrub in progress
     // Live preview: previewing owns the viewport; playing advances the playhead.
@@ -1111,6 +1147,20 @@ private:
         }
     };
     AssetHistory<dlg::Graph> dlgHistory_;
+    // Cutscene undo. Snapshots the WHOLE asset: a cutscene is a few hundred keys at most,
+    // so a full copy per edit is far cheaper than tracking per-field deltas, and it cannot
+    // desynchronise the way an incremental log can.
+    AssetHistory<CutsceneAsset> csHistory_;
+    // Set while a drag is in flight so the snapshot is taken ONCE, at the grab, rather
+    // than every frame the mouse moves - otherwise one drag fills the whole 64-entry
+    // history with intermediate positions and Ctrl+Z walks back a pixel at a time.
+    // The asset as it was at the START of this frame, held so an edit can be undone
+    // without every one of the ~29 mutation sites in the panel having to remember to
+    // snapshot. Wiring them individually is precisely how one gets missed - and a missing
+    // snapshot is invisible until someone needs the undo.
+    CutsceneAsset csFrameSnapshot_;
+    bool csSnapshotValid_ = false;
+    bool csEditedThisFrame_ = false;
 
     bool ClaimSave(editor::SaveSurface surface);
     // Registers EVERY focus-routed chord this panel owns - Ctrl+S plus the six edit

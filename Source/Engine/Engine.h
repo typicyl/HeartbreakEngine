@@ -37,7 +37,7 @@ class PhysicsWorld;
 class AudioSystem;
 
 struct EngineConfig {
-    std::wstring title = L"Heartbreak Engine";
+    std::string title = "Heartbreak Engine"; // UTF-8; see WindowDesc::title
     u32 width  = 1280;
     u32 height = 720;
     i32 posX = -1; // window position; -1 = OS default (see --winpos)

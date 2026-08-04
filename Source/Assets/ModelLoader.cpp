@@ -159,11 +159,26 @@ MeshData ConvertMesh(const aiMesh* src, const aiScene* scene, bool flipV) {
     }
 
     mesh.indices.reserve(static_cast<usize>(src->mNumFaces) * 3);
+    u32 skippedFaces = 0;
     for (u32 f = 0; f < src->mNumFaces; ++f) {
         const aiFace& face = src->mFaces[f];
-        for (u32 j = 0; j < face.mNumIndices; ++j) {
-            mesh.indices.push_back(face.mIndices[j]);
+        // TRIANGLES ONLY. aiProcess_Triangulate splits polygons, but it does NOT remove
+        // points and lines - a source file with stray edge or vertex geometry (common in
+        // CAD exports and in meshes with construction curves left in) still yields faces
+        // with 1 or 2 indices. Appending those to a triangle index buffer does not just
+        // add a degenerate: it SHIFTS every subsequent index by one or two, so the entire
+        // rest of the mesh is rebuilt from the wrong vertices. The result is a shredded
+        // model that looks like a bad export rather than an importer bug.
+        if (face.mNumIndices != 3) {
+            ++skippedFaces;
+            continue;
         }
+        for (u32 j = 0; j < 3; ++j) mesh.indices.push_back(face.mIndices[j]);
+    }
+    if (skippedFaces > 0) {
+        HBE_WARN("[import] '{}': skipped {} non-triangle face(s) (points/lines). They "
+                 "would have shifted every following triangle.",
+                 mesh.name.empty() ? std::string("(unnamed)") : mesh.name, skippedFaces);
     }
 
     if (scene->mMaterials && src->mMaterialIndex < scene->mNumMaterials) {

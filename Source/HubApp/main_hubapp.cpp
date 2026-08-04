@@ -29,6 +29,7 @@
 #include <shobjidl.h>
 
 #include "Hub/HubConfig.h"
+#include "Hub/HubSelfUpdate.h"
 #include "Hub/HubJoin.h"
 #include "Hub/ProjectCatalog.h"
 #include "Hub/UpdateCheck.h"
@@ -188,6 +189,12 @@ std::string Utf8(const std::wstring& w) {
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+    // If the PREVIOUS Hub replaced itself, its old binary is sitting beside this one under
+    // a different name. This is the first moment it is no longer running and can actually
+    // be deleted - a self-update cannot tidy up after itself from inside the process it is
+    // replacing.
+    hbe::hub::CleanupAfterSelfUpdate();
+
     WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, WndProc, 0, 0, ::GetModuleHandleW(nullptr),
                    nullptr, ::LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)), nullptr, nullptr,
                    L"HeartbreakHubWnd", nullptr};
@@ -245,6 +252,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     updater.SetInstalledVersion(hbe::hub::ReadInstalledVersion(cfg.installRoot));
     updater.CleanWorkspace();
     bool installed = hbe::hub::LooksInstalled(cfg.installRoot);
+    // Hub self-update state. Deliberately plain locals: it is a three-state flow (nothing /
+    // staged / failed) that lives entirely inside this loop.
+    bool hubSelfStaged = hbe::hub::SelfUpdateStaged();
+    std::string hubSelfStatus, hubSelfError;
 
     std::string status, rollbackMsg;
     // Joining a colleague's session to fetch a project - see HubJoin.h.
@@ -472,6 +483,72 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
             updater.SetInstalledVersion(cfg.installedVersion);
         }
         if (pr.state != hbe::hub::UpdateState::Done) persistedDone = false;
+
+        // --- The Hub updating ITSELF -----------------------------------------
+        // Separate from the engine update on purpose: they are different downloads with
+        // different versions, and the Hub is deliberately NOT part of the payload it swaps.
+        ImGui::Spacing();
+        ImGui::SeparatorText("The Hub itself");
+        // THE HUB'S VERSION IS THE ENGINE'S VERSION. It ships inside the engine payload,
+        // so reporting its own compile-time constant was reporting the version of whatever
+        // build someone happened to compile it from - permanently 1.0.0 no matter what
+        // engine it was actually delivered with. Prefer the INSTALLED engine's stamp, which
+        // is what the payload that carried this Hub wrote; fall back to the build constant
+        // only when nothing is installed yet, where it is the honest answer.
+        {
+            const auto stamped = hbe::hub::ReadInstalledVersion(cfg.installRoot);
+            const std::string shown = stamped ? stamped->ToString()
+                                              : hbe::hub::CurrentEngineVersion().ToString();
+            ImGui::TextDisabled("Hub %s%s  -  %s", shown.c_str(),
+                                stamped ? "" : " (no engine installed)",
+                                hbe::hub::HubExePath().parent_path().string().c_str());
+        }
+        // The engine update may have brought a newer Hub with it - every engine archive
+        // ships the matching launcher, so this is the normal way the Hub updates now.
+        if (pr.hubUpdateStaged && !hubSelfStaged) {
+            hubSelfStaged = true;
+            hubSelfStatus = "A newer Hub came with the engine and is ready.";
+        }
+        if (!pr.hubUpdateNote.empty() && hubSelfError.empty())
+            hubSelfError = pr.hubUpdateNote;
+        if (hubSelfError.empty() && !hubSelfStaged) {
+            ImGui::TextDisabled("The Hub updates with the engine.");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Every engine archive carries the matching Hub, so installing or "
+                    "updating the engine updates this launcher too.\n\n"
+                    "There is deliberately no separate Hub download: the manifest publishes "
+                    "ONE release URL - the engine archive - and a button that fetched it as "
+                    "though it were a Hub executable renamed a .zip over this program.");
+        }
+        if (hubSelfStaged) {
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", hubSelfStatus.c_str());
+            ImGui::TextDisabled("The Hub will restart to finish.");
+            if (ImGui::Button("Restart and update the Hub")) {
+                std::string err;
+                if (!hbe::hub::ApplySelfUpdate(err)) {
+                    hubSelfError = err;
+                    hubSelfStaged = false;
+                } else if (!hbe::hub::RelaunchHub(err)) {
+                    // The swap SUCCEEDED, so the new Hub is in place - only the restart
+                    // failed. Say exactly that; telling the user the update failed would
+                    // send them re-downloading something they already have.
+                    hubSelfError = "The Hub was updated but could not restart itself. "
+                                   "Close and reopen it. (" + err + ")";
+                    hubSelfStaged = false;
+                } else {
+                    running = false; // the replacement is already starting
+                }
+            }
+        } else if (!hubSelfStatus.empty()) {
+            ImGui::TextDisabled("%s", hubSelfStatus.c_str());
+        }
+        if (!hubSelfError.empty()) {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", hubSelfError.c_str());
+            ImGui::PopTextWrapPos();
+            if (ImGui::SmallButton("Dismiss")) hubSelfError.clear();
+        }
 
         ImGui::Spacing();
         if (ImGui::CollapsingHeader("Advanced")) {

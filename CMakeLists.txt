@@ -14,8 +14,16 @@ set(HBE_CORE_SOURCES
     "Source/Core/JobSystem.cpp"
     "Source/Core/UserSettings.cpp"
     "Source/Core/InputActions.cpp"
+    # PLATFORM LAYER. Selected by OS exactly the way the RHI backends are selected by
+    # graphics API - a second platform adds Platform_Linux.cpp beside this and changes
+    # nothing else. The conditional is worth writing now, with one backend, because it is
+    # what makes the file's role obvious to the next reader.
+    $<$<BOOL:${WIN32}>:Source/Core/Platform_Win32.cpp>
     "Source/Core/Window_Win32.cpp"
-    "Source/Core/Input_Win32.cpp")
+    # Input is SPLIT: the frame logic, press edges, text stream and deadzone curve are
+    # portable and unconditional; only key translation and the gamepad poll are per-OS.
+    "Source/Core/Input.cpp"
+    $<$<BOOL:${WIN32}>:Source/Core/Input_Win32.cpp>)
 
 set(HBE_ASSET_SOURCES
     "Source/Assets/AssetFormats.cpp"
@@ -44,6 +52,10 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/Scene.cpp"
     "Source/Scene/EntityGuid.cpp"
     "Source/Scene/AnimationSystem.cpp"
+    "Source/Scene/BodyShape.cpp"
+    "Source/Assets/MeshDerive.cpp"
+    "Source/Assets/MeshSimplify.cpp"
+    "Source/Assets/MeshFaceSelect.cpp"
     "Source/Scene/CameraRig.cpp"
     "Source/Scene/CameraSystem.cpp"
     "Source/Scene/CharacterController.cpp"
@@ -188,6 +200,7 @@ set(HBE_HUB_SOURCES
     "Source/Hub/UpdateCheck.cpp"
     "Source/Hub/ZipArchive.cpp"
     "Source/Hub/Updater.cpp"
+    "Source/Hub/HubSelfUpdate.cpp"
     "Source/Hub/HubConfig.cpp"
     "Source/Hub/ProjectCatalog.cpp"
     "Source/Hub/HubSelfTest.cpp"
@@ -255,7 +268,9 @@ function(hbe_configure_engine_lib tgt is_editor)
     # cannot answer that - it does not sort - and the outer project(VERSION) never
     # reached a single translation unit. Bump these to publish a release.
     target_compile_definitions(${tgt} PRIVATE
-        HBE_VERSION_MAJOR=1 HBE_VERSION_MINOR=0 HBE_VERSION_PATCH=0)
+        HBE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+        HBE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+        HBE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
     target_link_libraries(${tgt} PRIVATE ws2_32)
     # Mbed TLS: transport security for collaboration over the open internet, and BCrypt
     # for the per-install identity keypair. See Source/Collab/SecureChannel.h for why a
@@ -414,7 +429,12 @@ set_target_properties(HeartbreakEditor PROPERTIES VS_DPI_AWARE "PerMonitor")
 # swaps during an update, because a process cannot rename the directory it runs from.
 # The engine libs link it too (for --test-hub), which is a one-way dependency.
 # ---------------------------------------------------------------------------
-add_library(hbe_hubcore STATIC ${HBE_HUB_SOURCES})
+# The platform layer is shared with the engine. It pulls in nothing but <windows.h> and
+# Core/Types.h, so it does not violate the Hub's "links no engine code" rule - and THREE of
+# the six duplicated %LOCALAPPDATA% lookups lived in Hub/ , which is precisely the
+# duplication this layer exists to delete.
+add_library(hbe_hubcore STATIC ${HBE_HUB_SOURCES}
+    $<$<BOOL:${WIN32}>:Source/Core/Platform_Win32.cpp>)
 target_include_directories(hbe_hubcore PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/Source")
 target_compile_features(hbe_hubcore PUBLIC cxx_std_20)
 target_link_libraries(hbe_hubcore PRIVATE nlohmann_json::nlohmann_json zlibstatic)
@@ -426,8 +446,12 @@ target_link_libraries(hbe_hubcore PRIVATE winhttp bcrypt ws2_32)
 # The same peer-to-peer stack the editor uses - see HBE_HUB_COLLAB_SOURCES.
 target_link_libraries(hbe_hubcore PRIVATE mbedtls mbedx509 mbedcrypto)
 target_link_libraries(hbe_hubcore PRIVATE LibDataChannel::LibDataChannelStatic)
+# The Hub SHIPS INSIDE the engine payload, so its version is the engine's version by
+# definition - taking it from anywhere else is how the two drift apart.
 target_compile_definitions(hbe_hubcore PUBLIC
-    HBE_VERSION_MAJOR=1 HBE_VERSION_MINOR=0 HBE_VERSION_PATCH=0)
+    HBE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    HBE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    HBE_VERSION_PATCH=${PROJECT_VERSION_PATCH})
 
 # imgui_hub - the SAME Dear ImGui sources, but only the Win32 + D3D11 backends. The
 # engine's `imgui` target bundles the D3D12 and Vulkan backends, and linking it would
@@ -447,6 +471,27 @@ target_compile_features(imgui_hub PUBLIC cxx_std_20)
 add_executable(HeartbreakHub WIN32 "Source/HubApp/main_hubapp.cpp")
 target_link_libraries(HeartbreakHub PRIVATE hbe_hubcore imgui_hub d3d11 dxgi)
 set_target_properties(HeartbreakHub PROPERTIES VS_DPI_AWARE "PerMonitor")
+
+# HeartbreakHuman: the procedural human authoring application.
+#
+# Links the human library plus D3D11/ImGui and NOTHING ELSE - no engine renderer, no scene,
+# no editor. Same discipline as the Hub: a tool that can only run when the whole engine links
+# is a tool that cannot be used when the engine is broken, and this one has no need of it.
+# MeshDerive is compiled in directly rather than pulled from hbe.lib for the same reason.
+add_library(hbe_humancore STATIC
+    "Source/Human/HumanParameters.cpp"
+    "Source/Human/Anatomy.cpp"
+    "Source/Human/BodyField.cpp"
+    "Source/Human/SurfaceGen.cpp"
+    "Source/Human/HumanGenerator.cpp"
+    "Source/Assets/MeshDerive.cpp")
+target_include_directories(hbe_humancore PUBLIC "Source")
+target_link_libraries(hbe_humancore PUBLIC glm::glm)
+target_compile_features(hbe_humancore PUBLIC cxx_std_20)
+
+add_executable(HeartbreakHuman WIN32 "Source/HumanApp/main_humanapp.cpp")
+target_link_libraries(HeartbreakHuman PRIVATE hbe_humancore imgui_hub d3d11 d3dcompiler dxgi)
+set_target_properties(HeartbreakHuman PROPERTIES VS_DPI_AWARE "PerMonitor")
 
 # The Art Editor: a focused painting tool for 2D artists (same editor lib).
 add_executable(HeartbreakArtEditor "Source/main_arteditor.cpp" "${HBE_SCHEMATIC_STUB}")

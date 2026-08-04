@@ -1,5 +1,8 @@
 // Editor/Editor.cpp
 #include "Editor/Editor.h"
+#include "Core/Platform.h"
+
+#include "Assets/MeshFaceSelect.h"
 #include "Hub/Updater.h" // hub launcher: engine version + auto-update
 
 #include "Assets/AssetFormats.h"
@@ -159,12 +162,7 @@ std::optional<std::filesystem::path> BrowseForFolderDialog() {
 
 // Where the recent-projects list persists (per user).
 std::filesystem::path RecentProjectsFile() {
-    wchar_t buf[MAX_PATH] = {};
-    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    const std::filesystem::path base =
-        (n > 0 && n < MAX_PATH) ? std::filesystem::path(buf)
-                                : std::filesystem::temp_directory_path();
-    return base / "HeartbreakEngine" / "recent_projects.json";
+    return platform::UserDataDir() / "recent_projects.json";
 }
 
 // Classic folder with a tab.
@@ -1096,6 +1094,12 @@ void Editor::ProcessEditRequest(Engine& engine) {
                     dlgHistory_.Undo(dlgGraph_)) {
                     dlgSelected_ = 0; // the restored graph may not contain it
                     dlgDirty_ = true;
+                } else if (ctx.focused == editor::SaveSurface::Cutscene &&
+                           csHistory_.Undo(editedCutscene_)) {
+                    // The restored cutscene may have fewer keys than the selection index
+                    // points at, so drop the selection rather than leave it dangling.
+                    csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
+                    editedCutsceneDirty_ = true;
                 }
                 break;
             case editor::EditAction::AssetRedo:
@@ -1103,6 +1107,10 @@ void Editor::ProcessEditRequest(Engine& engine) {
                     dlgHistory_.Redo(dlgGraph_)) {
                     dlgSelected_ = 0;
                     dlgDirty_ = true;
+                } else if (ctx.focused == editor::SaveSurface::Cutscene &&
+                           csHistory_.Redo(editedCutscene_)) {
+                    csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
+                    editedCutsceneDirty_ = true;
                 }
                 break;
             case editor::EditAction::AssetCut:
@@ -1154,6 +1162,8 @@ bool Editor::SurfaceHistoryEmpty(editor::SaveSurface s, editor::EditVerb v) cons
             return redo ? redoStack_.empty() : undoStack_.empty();
         case editor::SaveSurface::Dialogue:
             return redo ? dlgHistory_.redo.empty() : dlgHistory_.undo.empty();
+        case editor::SaveSurface::Cutscene:
+            return redo ? csHistory_.redo.empty() : csHistory_.undo.empty();
         default:
             // The remaining asset editors have no history yet, so their Undo/Redo
             // resolves to Ignored - a silent no-op. That is deliberate and is the SAFE
@@ -12469,7 +12479,15 @@ void Editor::OpenCutscene(Engine& engine, const std::filesystem::path& path) {
     cutsceneEditTime_ = 0.0f;
     csScroll_ = 0.0f;
     csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
-    csDragKey_ = csDragPlayhead_ = false;
+    csDragKey_ = csDragPlayhead_ = csDragArmed_ = false;
+    // DROP THE HISTORY WITH THE DOCUMENT. AssetHistory::Clear exists and documents exactly
+    // this requirement - "Ctrl+Z would paste the previous file's contents over the current
+    // one" - but nothing in the editor was calling it, for this surface or for dialogue.
+    // Undo across a document switch does not restore an earlier state, it OVERWRITES the
+    // open file with a different asset entirely.
+    csHistory_.Clear();
+    csSnapshotValid_ = false;
+    csEditedThisFrame_ = false;
     cutsceneFocus_ = true;
     panelOpen_[Panel_CutsceneTimeline] = true;
 }
@@ -12568,7 +12586,27 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         }
         return idx;
     };
-    const auto markDirty = [&]() { editedCutsceneDirty_ = true; };
+    // UNDO BY FRAME SNAPSHOT, not by per-site bookkeeping. Every mutation in this panel
+    // calls markDirty, but markDirty runs AFTER the edit, so it cannot capture the "before"
+    // state that AssetHistory::Push needs. Instead the asset is copied at the top of each
+    // frame while nothing is being dragged or held, and that copy is committed to the
+    // history at the bottom of the frame if anything changed.
+    //
+    // This is what makes a DRAG one undo step rather than sixty: while a gesture is in
+    // flight the snapshot is not refreshed and nothing is committed, so the entry that
+    // lands is the state from before the drag began. The same holds for a held slider.
+    const auto markDirty = [&]() {
+        editedCutsceneDirty_ = true;
+        csEditedThisFrame_ = true;
+    };
+    // Refresh the "before" copy only while idle. Mid-drag or mid-slider it must stay put,
+    // or the undo entry would be the state one frame ago instead of before the gesture.
+    const bool csGestureIdle = !csDragKey_ && !csDragArmed_ && !csDragPlayhead_ &&
+                               !ImGui::IsAnyItemActive();
+    if (csGestureIdle && !csEditedThisFrame_) {
+        csFrameSnapshot_ = editedCutscene_;
+        csSnapshotValid_ = true;
+    }
 
     // -- Toolbar: file ops ----------------------------------------------------
     if (ImGui::Button("New")) {
@@ -12620,6 +12658,40 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     ImGui::SameLine();
     if (ImGui::Button("|<")) cutsceneEditTime_ = 0.0f; // rewind
     ImGui::SameLine();
+    // FRAME STEPPING. At a 60 s fit one pixel of drag is 2.7 frames, so the playhead
+    // simply cannot be placed on a chosen frame by dragging - no amount of snapping fixes
+    // that, because snapping only decides which of the frames under the cursor you get.
+    // These two buttons and the typed field are the only exact controls on the panel.
+    {
+        const f32 tlFps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+        const f32 step = 1.0f / glm::max(tlFps, 1.0f);
+        if (ImGui::Button("<|")) cutsceneEditTime_ = glm::max(0.0f, cutsceneEditTime_ - step);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Previous frame (Left arrow)");
+        ImGui::SameLine();
+        if (ImGui::Button("|>"))
+            cutsceneEditTime_ = glm::min(cs.duration, cutsceneEditTime_ + step);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Next frame (Right arrow)");
+        ImGui::SameLine();
+        // Arrow keys nudge by a frame, Shift by ten. Only when the panel is focused and no
+        // text field has the keyboard, so typing a name never scrubs the timeline.
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+            !ImGui::GetIO().WantTextInput) {
+            const f32 mult = ImGui::GetIO().KeyShift ? 10.0f : 1.0f;
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))
+                cutsceneEditTime_ = glm::max(0.0f, cutsceneEditTime_ - step * mult);
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true))
+                cutsceneEditTime_ = glm::min(cs.duration, cutsceneEditTime_ + step * mult);
+        }
+        ImGui::SetNextItemWidth(78.0f);
+        f32 typed = cutsceneEditTime_;
+        if (ImGui::InputFloat("##cstime", &typed, 0.0f, 0.0f, "%.3f",
+                              ImGuiInputTextFlags_EnterReturnsTrue)) {
+            cutsceneEditTime_ = glm::clamp(typed, 0.0f, cs.duration);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Type an exact time in seconds and press Enter.");
+        ImGui::SameLine();
+    }
     // Time readout in BOTH units. A frame number is the thing an author matches
     // against a reference video or a sound cue; seconds alone made "which frame is
     // this?" unanswerable.
@@ -12709,7 +12781,13 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
 
     // Refit (or first use): size zoom so the whole cutscene spans the lane. laneW
     // is >= 1 and dur >= 0.001, so this is always positive (no divide-by-zero).
-    if (csZoom_ <= 0.0f) csZoom_ = laneW / dur;
+    if (csZoom_ <= 0.0f) {
+        // Clamped to the SAME range the wheel uses. Fit used to be unclamped, so a long
+        // cutscene could land below the wheel's 4 px/s floor - and since the wheel clamps,
+        // the view could not be zoomed back in afterwards. A one-hour asset fit at
+        // 0.19 px/s: 5.4 seconds per pixel, and stuck there.
+        csZoom_ = glm::clamp(laneW / dur, 4.0f, 4000.0f);
+    }
 
     const auto timeToX = [&](float t) { return laneX0 + (t - csScroll_) * csZoom_; };
     const auto xToTime = [&](float x) { return csScroll_ + (x - laneX0) / csZoom_; };
@@ -12795,22 +12873,33 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     // Key rendering + hit-testing. Collect the nearest key under the cursor on a
     // left press so we can select/drag it.
     dl->PushClipRect(ImVec2(laneX0, lane0Y), ImVec2(laneX1, p0.y + sz.y), true);
-    const auto drawDiamond = [&](float cx, float cy, ImU32 col, bool sel) {
-        const float r = sel ? kDiaR + 1.5f : kDiaR;
+    const auto drawDiamond = [&](float cx, float cy, ImU32 col, bool sel, bool hov = false) {
+        const float r = (sel || hov) ? kDiaR + 1.5f : kDiaR;
         dl->AddQuadFilled(ImVec2(cx, cy - r), ImVec2(cx + r, cy), ImVec2(cx, cy + r), ImVec2(cx - r, cy), col);
         if (sel)
             dl->AddQuad(ImVec2(cx, cy - r), ImVec2(cx + r, cy), ImVec2(cx, cy + r), ImVec2(cx - r, cy),
                         IM_COL32(255, 255, 255, 255), 1.5f);
+        else if (hov) // a softer ring: "you would grab this", not "this is selected"
+            dl->AddQuad(ImVec2(cx, cy - r), ImVec2(cx + r, cy), ImVec2(cx, cy + r), ImVec2(cx - r, cy),
+                        IM_COL32(255, 255, 255, 150), 1.0f);
+    };
+    const auto isHovered = [&](int kind, int track, int index) {
+        return csHoverKind_ == kind && csHoverTrack_ == track && csHoverIndex_ == index;
     };
 
-    struct Hit { int kind = -1, track = -1, index = -1; float d2 = 1e9f; };
+    // `x` is kept so a press can compute the GRAB OFFSET - see csDragGrabDt_.
+    struct Hit { int kind = -1, track = -1, index = -1; float d2 = 1e9f; float x = 0.0f; };
     Hit hit;
     const bool leftPressed = canvasHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    // Runs on EVERY frame the canvas is hovered, not only on a press: that is what makes a
+    // hover highlight possible at all. It previously early-returned unless the button had
+    // just gone down, so there was no way to tell which key you were about to hit.
     const auto consider = [&](int kind, int track, int index, float x, float y) {
-        if (!leftPressed) return;
+        if (!canvasHovered) return;
         const float dx = mouse.x - x, dy = mouse.y - y;
         const float d2 = dx * dx + dy * dy;
-        if (d2 < hit.d2 && d2 < (kDiaR + 5.0f) * (kDiaR + 5.0f)) hit = {kind, track, index, d2};
+        if (d2 < hit.d2 && d2 < (kDiaR + 5.0f) * (kDiaR + 5.0f))
+            hit = {kind, track, index, d2, x};
     };
 
     // Camera keys.
@@ -12893,7 +12982,14 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     if (leftPressed) {
         if (hit.kind >= 0) {
             csSelKind_ = hit.kind; csSelTrack_ = hit.track; csSelIndex_ = hit.index;
-            csDragKey_ = true;
+            // ARMED, NOT DRAGGING. Selecting a key must not move it. This used to set the
+            // drag flag directly, and because IsMouseDown() is already true on the press
+            // frame the drag branch ran immediately and wrote the key's time to the
+            // CURSOR's time - so a click meant to inspect a key silently retimed it by up
+            // to the hit radius (~15 frames on a zoomed-out cutscene), with no undo.
+            csDragArmed_ = true;
+            csDragKey_ = false;
+            csDragGrabDt_ = (hit.x - mouse.x) / csZoom_; // key time - cursor time
         } else if (mouse.y < lane0Y || std::fabs(mouse.x - timeToX(cutsceneEditTime_)) < 6.0f) {
             csDragPlayhead_ = true; // ruler or near the playhead line
             cutsceneEditTime_ = snapT(xToTime(mouse.x)); // frame grid: see snapT
@@ -12910,8 +13006,12 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
     const bool leftDown = ImGui::IsMouseDown(ImGuiMouseButton_Left);
     if (csDragPlayhead_ && leftDown) {
         cutsceneEditTime_ = snapT(xToTime(mouse.x)); // frame grid: see snapT
-    } else if (csDragKey_ && leftDown && csSelKind_ >= 0) {
-        const float nt = snapT(xToTime(mouse.x)); // dragged keys land ON a frame
+    } else if (csDragArmed_ && leftDown && csSelKind_ >= 0 &&
+               (csDragKey_ || ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4.0f))) {
+        // Past the threshold, so this is a real drag. The grab offset keeps the key where
+        // it was relative to the cursor, so it does not jump on the first moved pixel.
+        csDragKey_ = true;
+        const float nt = snapT(xToTime(mouse.x) + csDragGrabDt_); // keys land ON a frame
         if (csSelKind_ == 0 && csSelIndex_ < static_cast<int>(cs.camera.size())) {
             cs.camera[static_cast<usize>(csSelIndex_)].time = nt;
             csSelIndex_ = reorder(cs.camera, csSelIndex_);
@@ -12939,7 +13039,10 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         }
         markDirty();
     }
-    if (!leftDown) { csDragPlayhead_ = false; csDragKey_ = false; }
+    if (!leftDown) { csDragPlayhead_ = false; csDragKey_ = false; csDragArmed_ = false; }
+    // Carry the hover for next frame's highlight.
+    csHoverKind_ = hit.kind; csHoverTrack_ = hit.track; csHoverIndex_ = hit.index;
+    if (hit.kind >= 0 && !csDragKey_) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
     // -- Right-click context menu: add items at the clicked time/lane ---------
     static int ctxLane = -1;
@@ -13242,6 +13345,16 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
                        glm::degrees(cam.FovY()), cam.Aspect());
             cam.LookAt(pose.position, pose.position + pose.forward, pose.up);
         }
+    }
+
+    // COMMIT the frame's snapshot. Deferred to here so that a drag or a held slider - which
+    // marks dirty on every frame it is active - produces ONE history entry, taken from
+    // before the gesture started, instead of one per frame.
+    if (csEditedThisFrame_ && csSnapshotValid_ && !csDragKey_ && !csDragArmed_ &&
+        !csDragPlayhead_ && !ImGui::IsAnyItemActive()) {
+        csHistory_.Push(csFrameSnapshot_);
+        csFrameSnapshot_ = editedCutscene_; // the new baseline
+        csEditedThisFrame_ = false;
     }
 }
 
@@ -15559,6 +15672,256 @@ std::vector<u32> DownsamplePixels(const u8* src, u32 sw, u32 sh, u32 maxDim,
 }
 } // namespace
 
+// --- Face select -------------------------------------------------------------
+//
+// The whole feature rests on one fact about this engine: a submesh IS a MeshData with
+// exactly one Material. So giving part of a mesh a different material is not a
+// rendering problem at all - it is a mesh operation. Split the chosen triangles into
+// their own submesh and point it at another .hbmat, and draw submission, .hbmat
+// editing, packing and the asset viewer all work unchanged.
+
+void Editor::RebuildPreviewGpu(Engine& engine) {
+    // Re-upload after previewModel_ changed shape (a split adds a submesh). This does
+    // NOT reload from disk - the edits live only in previewModel_ until Save Mesh.
+    Renderer& renderer = engine.GetRenderer();
+    const std::filesystem::path assetsDir = Project::Active().AssetsDir();
+    const auto loadTex = [&](const std::string& name) -> rhi::TextureHandle {
+        if (name.empty()) return {};
+        if (auto it = textureCache_.find(name); it != textureCache_.end()) return it->second;
+        const rhi::TextureHandle h = assets::LoadTexture(renderer, assetsDir / name);
+        textureCache_[name] = h;
+        return h;
+    };
+    // The old handles are abandoned rather than freed: the RHI has no DestroyMesh (see
+    // TagStreaming.h). A split is a deliberate, occasional authoring action, so a handful
+    // of leaked handles per session is acceptable where a per-frame leak would not be.
+    previewMeshes_.clear();
+    previewInstances_.clear();
+    for (MeshData& md : previewModel_) {
+        previewMeshes_.push_back(renderer.UploadMesh(md));
+        MeshInstance mi;
+        if (!md.material.materialAsset.empty()) {
+            if (const auto mat = assets::LoadMaterial(assetsDir / md.material.materialAsset)) {
+                assets::ApplyMaterial(renderer, assetsDir, *mat, mi, textureCache_);
+            }
+        } else {
+            mi.baseColor = md.material.baseColor;
+            mi.metallic = md.material.metallic;
+            mi.roughness = md.material.roughness;
+            mi.emissiveColor = md.material.emissive;
+            mi.albedoTexture = loadTex(md.material.baseColorTex);
+            mi.normalTexture = loadTex(md.material.normalTex);
+            mi.mrTexture = loadTex(md.material.mrTex);
+            mi.aoTexture = loadTex(md.material.aoTex);
+            mi.emissiveTexture = loadTex(md.material.emissiveTex);
+        }
+        previewInstances_.push_back(mi);
+    }
+}
+
+void Editor::RefreshFaceHighlight(Engine& engine) {
+    Renderer& renderer = engine.GetRenderer();
+    faceHighlightTris_ = 0;
+    if (faceSelectSubmesh_ >= previewModel_.size()) return;
+    const MeshData& src = previewModel_[faceSelectSubmesh_];
+    const u32 srcTris = static_cast<u32>(src.indices.size() / 3);
+
+    MeshData hl;
+    hl.name = "face-highlight";
+    hl.vertices.reserve(faceSelection_.size() * 3);
+    hl.indices.reserve(faceSelection_.size() * 3);
+    for (const u32 t : faceSelection_) {
+        if (t >= srcTris) continue;
+        for (u32 k = 0; k < 3; ++k) {
+            Vertex v = src.vertices[src.indices[t * 3 + k]];
+            // Nudge along the normal so the overlay wins the depth test against the face
+            // it is highlighting. A depth-bias state would be cleaner, but this preview
+            // path submits plain DrawItems and has no per-item raster state.
+            v.position += v.normal * (previewRadius_ * 0.0015f);
+            hl.indices.push_back(static_cast<u32>(hl.vertices.size()));
+            hl.vertices.push_back(v);
+        }
+    }
+    faceHighlightTris_ = static_cast<u32>(hl.indices.size() / 3);
+    if (hl.vertices.empty()) return;
+
+    // ONE mesh, allocated once at the whole submesh's capacity and updated in place.
+    // The RHI cannot grow a mesh and cannot destroy one, so creating a highlight per
+    // click would leak a handle every time - reserving the maximum the selection could
+    // ever reach means UpdateMesh always fits.
+    if (!faceHighlightMesh_.IsValid() || faceHighlightCapacity_ < srcTris * 3) {
+        faceHighlightCapacity_ = srcTris * 3;
+        faceHighlightMesh_ = renderer.UploadMeshReserved(hl, faceHighlightCapacity_,
+                                                         faceHighlightCapacity_);
+    } else if (!renderer.UpdateMesh(faceHighlightMesh_, hl)) {
+        // Refused = it did not fit. Say so rather than showing a stale highlight that
+        // silently disagrees with what is actually selected.
+        SetSaveStatus("Could not update the face highlight (too many faces).", true);
+        faceHighlightTris_ = 0;
+    }
+}
+
+void Editor::PickPreviewFace(Engine& engine, glm::vec2 mouse, glm::vec2 imgMin,
+                             glm::vec2 imgSize, bool add, bool remove) {
+    if (previewModel_.empty() || imgSize.x <= 0.0f || imgSize.y <= 0.0f) return;
+    const f32 mx = (mouse.x - imgMin.x) / imgSize.x;
+    const f32 my = (mouse.y - imgMin.y) / imgSize.y;
+    if (mx < 0.0f || mx > 1.0f || my < 0.0f || my > 1.0f) return;
+
+    // Same ray construction the scene picker uses, against the matrix the preview
+    // actually submitted last frame.
+    const glm::mat4 invVP = glm::inverse(previewViewProj_);
+    const glm::vec2 ndc(mx * 2.0f - 1.0f, 1.0f - my * 2.0f);
+    glm::vec4 pNear = invVP * glm::vec4(ndc, 0.0f, 1.0f);
+    glm::vec4 pFar = invVP * glm::vec4(ndc, 1.0f, 1.0f);
+    pNear /= pNear.w;
+    pFar /= pFar.w;
+    const glm::vec3 ro(pNear);
+    const glm::vec3 rd = glm::normalize(glm::vec3(pFar) - glm::vec3(pNear));
+
+    // The preview submits every submesh with an IDENTITY transform, so mesh space and
+    // preview space are the same and the ray needs no further transform. Test them all
+    // and keep the nearest - the user is pointing at a pixel, not at a submesh.
+    i32 bestTri = -1;
+    usize bestSub = 0;
+    f32 bestT = 1e30f;
+    for (usize i = 0; i < previewModel_.size(); ++i) {
+        f32 t = 0.0f;
+        const i32 tri = mesh::RaycastTriangle(previewModel_[i], ro, rd, &t);
+        if (tri >= 0 && t < bestT) { bestT = t; bestTri = tri; bestSub = i; }
+    }
+    if (bestTri < 0) {
+        if (!add && !remove) { faceSelection_.clear(); RefreshFaceHighlight(engine); }
+        return;
+    }
+
+    // A selection belongs to ONE submesh, because the split it feeds operates on one.
+    // Clicking into a different submesh starts a new selection rather than silently
+    // mixing triangle indices from two different index buffers.
+    if (bestSub != faceSelectSubmesh_) {
+        faceSelectSubmesh_ = bestSub;
+        faceSelection_.clear();
+    }
+
+    std::vector<u32> hit;
+    switch (faceSelectTool_) {
+    case 1: hit = mesh::SelectConnected(previewModel_[bestSub], static_cast<u32>(bestTri),
+                                        faceSelectAngle_); break;
+    case 2: hit = mesh::SelectSimilarFacing(previewModel_[bestSub], static_cast<u32>(bestTri),
+                                            faceSelectAngle_); break;
+    default: hit.push_back(static_cast<u32>(bestTri)); break;
+    }
+
+    if (remove) {
+        for (const u32 t : hit)
+            faceSelection_.erase(std::remove(faceSelection_.begin(), faceSelection_.end(), t),
+                                 faceSelection_.end());
+    } else {
+        if (!add) faceSelection_.clear();
+        faceSelection_.insert(faceSelection_.end(), hit.begin(), hit.end());
+        std::sort(faceSelection_.begin(), faceSelection_.end());
+        faceSelection_.erase(std::unique(faceSelection_.begin(), faceSelection_.end()),
+                             faceSelection_.end());
+    }
+    RefreshFaceHighlight(engine);
+}
+
+void Editor::DrawFaceSelectTools(Engine& engine) {
+    ImGui::SeparatorText("Face select");
+    if (ImGui::Checkbox("Select faces", &faceSelectMode_)) {
+        if (!faceSelectMode_) {
+            faceSelection_.clear();
+            faceHighlightTris_ = 0;
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Click faces in the preview to select them, then give them their "
+                          "own material. Dragging still orbits the camera.");
+    if (!faceSelectMode_) return;
+
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::Combo("Tool", &faceSelectTool_, "Single face\0Linked (by angle)\0Similar facing\0");
+    if (faceSelectTool_ != 0) {
+        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SliderFloat("Angle", &faceSelectAngle_, 1.0f, 179.0f, "%.0f deg");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Linked: how sharp an edge stops the flood - 30 degrees keeps "
+                              "to one flat panel, 120 flows around a whole box.\n"
+                              "Similar facing: how far a face may point from the one clicked.");
+    }
+    ImGui::TextDisabled("Shift-click adds, Ctrl-click removes.");
+
+    const usize subTris = faceSelectSubmesh_ < previewModel_.size()
+                              ? previewModel_[faceSelectSubmesh_].indices.size() / 3
+                              : 0;
+    ImGui::Text("%d of %d faces selected (submesh #%d)", static_cast<int>(faceSelection_.size()),
+                static_cast<int>(subTris), static_cast<int>(faceSelectSubmesh_));
+
+    if (ImGui::Button("Select all")) {
+        faceSelection_.resize(subTris);
+        for (usize i = 0; i < subTris; ++i) faceSelection_[i] = static_cast<u32>(i);
+        RefreshFaceHighlight(engine);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        faceSelection_.clear();
+        RefreshFaceHighlight(engine);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Invert")) {
+        std::vector<u32> inv;
+        for (usize i = 0; i < subTris; ++i) {
+            const u32 t = static_cast<u32>(i);
+            if (!std::binary_search(faceSelection_.begin(), faceSelection_.end(), t))
+                inv.push_back(t);
+        }
+        faceSelection_.swap(inv);
+        RefreshFaceHighlight(engine);
+    }
+
+    ImGui::BeginDisabled(faceSelection_.empty());
+    static std::vector<std::string> assignChoices;
+    static bool assignScanned = false;
+    if (!assignScanned) { assignChoices = ListAssetsByExt(".hbmat"); assignScanned = true; }
+    if (ImGui::IsWindowAppearing()) assignScanned = false;
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.6f);
+    if (ImGui::BeginCombo("Assign material", "Choose a .hbmat...")) {
+        for (const std::string& choice : assignChoices) {
+            if (!ImGui::Selectable(choice.c_str())) continue;
+            if (faceSelectSubmesh_ >= previewModel_.size()) break;
+
+            const mesh::SplitResult r =
+                mesh::SplitByFaces(previewModel_[faceSelectSubmesh_], faceSelection_);
+            if (r.tookEverything) {
+                // Every face selected - splitting would leave an empty submesh behind
+                // forever. Changing this submesh's material IS the operation.
+                previewModel_[faceSelectSubmesh_].material.materialAsset = choice;
+            } else {
+                // APPEND, never reorder: scenes reference submeshes as "...#<index>", so
+                // the original must keep its index and the new group goes on the end.
+                previewModel_[faceSelectSubmesh_] = r.remainder;
+                MeshData added = r.extracted;
+                added.material.materialAsset = choice;
+                previewModel_.push_back(std::move(added));
+            }
+            previewMeshDirty_ = true;
+            faceSelection_.clear();
+            faceHighlightTris_ = 0;
+            RebuildPreviewGpu(engine);
+            SetSaveStatus(r.tookEverything
+                              ? "Material changed on submesh (all faces selected)."
+                              : "Split faces into a new submesh - press Save Mesh to keep it.",
+                          false);
+            break;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::EndDisabled();
+    if (previewMeshDirty_)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                           "Unsaved - Save Mesh writes the new submesh into the .uaf.");
+}
+
 void Editor::EnsureMeshPreview(Engine& engine) {
     if (previewPath_ == viewedAsset_) return;
     previewPath_ = viewedAsset_;
@@ -15567,6 +15930,10 @@ void Editor::EnsureMeshPreview(Engine& engine) {
     previewModel_.clear();
     previewDraw_.clear();
     previewMeshDirty_ = false;
+    // The selection indexes THIS model's triangles; it means nothing against another.
+    faceSelection_.clear();
+    faceSelectSubmesh_ = 0;
+    faceHighlightTris_ = 0;
 
     const std::optional<Model> model = assets::LoadMesh(viewedAsset_);
     if (!model) return;
@@ -16074,8 +16441,22 @@ void Editor::DrawAssetViewer(Engine& engine) {
                                     static_cast<u32>(imgSize.y));
             if (const u64 texId = renderer.PreviewTextureId()) {
                 ImGui::Image(static_cast<ImTextureID>(texId), imgSize);
+                const ImVec2 imgMin = ImGui::GetItemRectMin();
                 if (ImGui::IsItemHovered()) {
                     const ImGuiIO& io = ImGui::GetIO();
+                    // In face-select mode a CLICK picks and a DRAG still orbits, so the
+                    // camera never becomes unusable while selecting. The click is taken on
+                    // release, and only when the mouse did not travel - otherwise every
+                    // orbit would also reselect whatever ended up under the cursor.
+                    if (faceSelectMode_ && ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                        ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f).x == 0.0f &&
+                        ImGui::GetMouseDragDelta(ImGuiMouseButton_Left, 0.0f).y == 0.0f) {
+                        PickPreviewFace(engine, glm::vec2(ImGui::GetMousePos().x,
+                                                          ImGui::GetMousePos().y),
+                                        glm::vec2(imgMin.x, imgMin.y),
+                                        glm::vec2(imgSize.x, imgSize.y),
+                                        io.KeyShift, io.KeyCtrl);
+                    }
                     if (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
                         previewYaw_ -= io.MouseDelta.x * 0.012f;
                         previewPitch_ = glm::clamp(
@@ -16143,9 +16524,28 @@ void Editor::DrawAssetViewer(Engine& engine) {
                     item.materialFlags = mi.materialFlags;
                     previewDraw_.push_back(item);
                 }
+                // The picker has to reconstruct EXACTLY this ray, so it reads the matrix
+                // that was actually submitted rather than recomputing one from the orbit
+                // angles and risking a one-frame or one-convention disagreement.
+                previewViewProj_ = pv.viewProj;
+                previewEye_ = eye;
+
+                // Selected faces, drawn as an unlit emissive overlay on top of the mesh.
+                if (faceSelectMode_ && faceHighlightMesh_.IsValid() && faceHighlightTris_ > 0) {
+                    rhi::DrawItem hl;
+                    hl.mesh = faceHighlightMesh_;
+                    hl.baseColor = glm::vec4(1.0f, 0.45f, 0.05f, 1.0f);
+                    hl.emissiveColor = glm::vec3(1.0f, 0.45f, 0.05f);
+                    hl.emissiveIntensity = 3.0f;
+                    hl.roughness = 1.0f;
+                    hl.metallic = 0.0f;
+                    previewDraw_.push_back(hl);
+                }
                 renderer.SetPreviewScene(pv, previewDraw_);
                 previewSubmitted_ = true; // the mesh preview owns the slot this frame
             }
+
+            DrawFaceSelectTools(engine);
 
             // Material slots: one .hbmat picker per submesh; Save writes the
             // refs back into the .uaf (like Unreal's static-mesh editor).
@@ -16658,11 +17058,9 @@ bool Editor::BuildAssetPack(std::string& outMessage) {
 bool Editor::HasReleaseRuntime() {
     namespace fs = std::filesystem;
     std::error_code ec;
-    wchar_t buf[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
     // Same candidate BuildShipping prefers. Kept deliberately narrow: this answers
     // "will the ship be the fast build?", nothing else.
-    return fs::exists(fs::path(buf).parent_path() / ".." / "Release" / "HeartbreakRuntime.exe",
+    return fs::exists(platform::ExecutableDir() / ".." / "Release" / "HeartbreakRuntime.exe",
                       ec);
 }
 
@@ -16702,9 +17100,7 @@ bool Editor::BuildShipping(std::string& outMessage) {
     // warning, since a Debug/RelWithDebInfo runtime runs markedly slower (it was the
     // cause of a shipped build stuck well below the editor's frame rate). This used to
     // pick the "freshest" config, which silently shipped whatever was rebuilt last.
-    wchar_t buf[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    const fs::path editorDir = fs::path(buf).parent_path();
+    const fs::path editorDir = platform::ExecutableDir();
     // Appended to outMessage so a slow-runtime ship cannot read as a clean success.
     std::string shipPerfWarning;
 
@@ -17533,10 +17929,8 @@ void Editor::OnProjectChanged() {
 namespace {
 // Hub hand-off: spawn the full editor on the chosen project.
 void LaunchEditorDetached(const std::filesystem::path& hbproj) {
-    wchar_t buf[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
     const std::filesystem::path editorExe =
-        std::filesystem::path(buf).parent_path() / "HeartbreakEditor.exe";
+        platform::ExecutableDir() / "HeartbreakEditor.exe";
 
     std::wstring cmd = L"\"" + editorExe.wstring() + L"\" --project \"" +
                        hbproj.wstring() + L"\"";
@@ -17590,12 +17984,10 @@ void Editor::DrawHubLauncher() {
     static hub::Updater* s_updater = nullptr;
     static std::string s_rollbackMsg;
     if (!s_updater) {
-        wchar_t exe[MAX_PATH] = {};
-        ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
         hub::UpdatePaths paths;
         // installRoot is the PARENT of bin/ - the Hub swaps bin/ wholesale and must not
         // be inside the directory it renames.
-        paths.installRoot = std::filesystem::path(exe).parent_path().parent_path();
+        paths.installRoot = platform::ExecutableDir().parent_path();
         s_updater = new hub::Updater(
             "https://hollowdreamstudios.com/enginemanifest.json", paths);
         s_updater->CleanWorkspace(); // discard a previous failed attempt, keep backups

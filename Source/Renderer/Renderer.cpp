@@ -140,14 +140,30 @@ rhi::MeshHandle Renderer::UploadMesh(const MeshData& mesh) {
     return handle;
 }
 
-void Renderer::UpdateMesh(rhi::MeshHandle handle, const MeshData& mesh) {
-    if (!device_) return;
-    device_->UpdateMesh(handle, mesh);
+bool Renderer::UpdateMesh(rhi::MeshHandle handle, const MeshData& mesh) {
+    if (!device_) return false;
+    // GATED ON SUCCESS. This used to refresh unconditionally, so an upload the device
+    // refused left the frustum culler holding bounds for geometry that was never on the
+    // GPU - the mesh would cull against its new shape while drawing its old one.
+    if (!device_->UpdateMesh(handle, mesh)) return false;
     if (handle.IsValid()) { // geometry changed (sculpting) -> refresh the cull bounds
         glm::vec3 bmin, bmax;
         ComputeBounds(mesh, bmin, bmax);
         meshBounds_[handle.id] = {(bmin + bmax) * 0.5f, (bmax - bmin) * 0.5f};
     }
+    return true;
+}
+
+rhi::MeshHandle Renderer::UploadMeshReserved(const MeshData& mesh, u32 vertexCapacity,
+                                             u32 indexCapacity) {
+    if (!device_) return {};
+    const rhi::MeshHandle h = device_->CreateMeshReserved(mesh, vertexCapacity, indexCapacity);
+    if (h.IsValid()) {
+        glm::vec3 bmin, bmax;
+        ComputeBounds(mesh, bmin, bmax);
+        meshBounds_[h.id] = {(bmin + bmax) * 0.5f, (bmax - bmin) * 0.5f};
+    }
+    return h;
 }
 
 rhi::TextureHandle Renderer::UploadTexture(const rhi::TextureDesc& desc) {

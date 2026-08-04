@@ -1,5 +1,6 @@
 // Engine/Engine.cpp
 #include "Engine/Engine.h"
+#include "Core/Platform.h"
 #include "Engine/CutscenePlayer.h"
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
@@ -90,6 +91,10 @@ LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
                                      GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                  reinterpret_cast<LPCSTR>(addr), &mod) &&
             mod) {
+            // DELIBERATELY NOT platform::ExecutablePath(). This asks a different question:
+            // "which MODULE does this faulting address live in?" - the answer is a DLL as
+            // often as it is the exe, which is the entire point of printing it. The platform
+            // helper only ever answers for the running process. Leave this one alone.
             char full[MAX_PATH] = {};
             if (::GetModuleFileNameA(mod, full, MAX_PATH) > 0) {
                 const char* leaf = std::strrchr(full, '\\');
@@ -222,10 +227,9 @@ int Engine::Run(const EngineConfig& configIn) {
     schematic::RegisterBakedSchematics();
 #if !HBE_EDITOR
     {
-        wchar_t exePath[MAX_PATH] = {};
-        ::GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        const std::filesystem::path exeDir =
-            std::filesystem::path(exePath).parent_path();
+        // A SHIPPED build finds its packs beside the executable, never via the working
+        // directory - a game launched from a shortcut starts somewhere else entirely.
+        const std::filesystem::path exeDir = platform::ExecutableDir();
         std::error_code ec;
         bool packedProject = false;
 
@@ -287,7 +291,10 @@ int Engine::Run(const EngineConfig& configIn) {
             const std::string& gameName = build.gameName.empty()
                                               ? Project::Active().Settings().name
                                               : build.gameName;
-            config.title.assign(gameName.begin(), gameName.end());
+            // Straight assignment now that both sides are UTF-8. This line used to widen
+            // bytes one-for-one into a wstring, which silently produced MOJIBAKE in the
+            // title bar for any project whose name was not pure ASCII.
+            config.title = gameName;
             if (!config.widthExplicit && build.width > 0) config.width = build.width;
             if (!config.heightExplicit && build.height > 0) config.height = build.height;
             if (!config.fullscreenExplicit) config.fullscreen = build.fullscreen;

@@ -1,5 +1,6 @@
 // Core/UserSettings.cpp
 #include "Core/UserSettings.h"
+#include "Core/Platform.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,12 +16,17 @@
 namespace hbe {
 
 std::filesystem::path UserSettings::ResolveDir(const std::string& gameName) {
-    std::filesystem::path base(".");
-#if defined(_WIN32)
-    char buf[MAX_PATH] = {};
-    const DWORD n = ::GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
-    if (n > 0 && n < MAX_PATH) base = buf;
-#endif
+    // A SHIPPED GAME'S settings live under its OWN name, so this wants the profile root
+    // rather than UserDataDir() - routing it through the engine's folder would orphan every
+    // settings file already written.
+    //
+    // ONE DELIBERATE BEHAVIOUR CHANGE: the old fallback when LOCALAPPDATA is unset was ".",
+    // i.e. beside the executable, which on a shipped install is routinely read-only - the
+    // settings silently failed to save. The shared implementation falls back to the temp
+    // directory instead: settings that do not survive a reboot beat settings that never
+    // write at all, and it now matches what the other five copies always did.
+    std::filesystem::path base = platform::UserDataRoot();
+    if (base.empty()) base = ".";
     std::string safe = gameName.empty() ? std::string("HeartbreakGame") : gameName;
     for (char& c : safe)
         if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' || c == '"' ||

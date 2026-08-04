@@ -1,5 +1,6 @@
 // Core/Log.cpp
 #include "Core/Log.h"
+#include "Core/Platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -44,9 +45,11 @@ std::FILE* LogFile() {
     if (g_logFileTried) return g_logFile;
     g_logFileTried = true;
 #if defined(_WIN32)
-    char exePath[MAX_PATH] = {};
-    const DWORD n = ::GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-    std::string path = (n > 0 && n < MAX_PATH) ? std::string(exePath) + ".log" : "HeartbreakEngine.log";
+    // The only narrow-char copy of this in the tree, and the one that silently produced a
+    // log named after a TRUNCATED path when the executable sat deep enough.
+    const std::filesystem::path exe = platform::ExecutablePath();
+    std::string path = exe.empty() ? std::string("HeartbreakEngine.log")
+                                   : (exe.string() + ".log");
     if (::fopen_s(&g_logFile, path.c_str(), "w") != 0) g_logFile = nullptr;
 #else
     g_logFile = std::fopen("HeartbreakEngine.log", "w");

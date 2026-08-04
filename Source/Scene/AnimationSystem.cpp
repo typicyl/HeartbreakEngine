@@ -586,6 +586,24 @@ void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt
                                  : local;
             }
         };
+        // BODY PROPORTIONS. Applied to the LOCAL transforms, immediately before they are
+        // composed - which is the only correct place. Composition multiplies a child's local
+        // by its parent's global, so scaling a joint here carries every descendant with it:
+        // a wider clavicle takes the whole arm outward, meshes included. Writing into
+        // `globals` after compose() instead would scale one bone's flesh and strand
+        // everything below it - a torn limb.
+        //
+        // This changes the PALETTE and nothing else. It never touches a rest position or a
+        // skin binding, and every part of a character still reads this one palette, so the
+        // seam weld's guarantee is untouched: welded vertices evaluate the same sum over the
+        // same bytes and stay bit-identical. weld::SelfTest already asserts exactly that,
+        // with a scaled and sheared palette.
+        if (const BodyShape* body = reg.try_get<BodyShape>(e)) {
+            for (const bodyshape::JointShape& js : body->joints) {
+                if (js.joint < jointCount) locals[js.joint].s *= js.scale;
+            }
+        }
+
         compose();
 
         // Inverse kinematics: solve each two-bone chain on the posed skeleton,

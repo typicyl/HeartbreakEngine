@@ -11,6 +11,14 @@
 
 namespace hbe {
 
+// Shared input math that is not the operating system's business. Lives here so a second
+// backend reuses the exact curve rather than re-deriving it - the deadzone shape is felt
+// directly by the player, and two backends disagreeing on it is a bug nobody would think
+// to look for. Implemented in Core/Input.cpp; see there for why it is radial.
+namespace input_detail {
+void NormalizeStick(i16 rawX, i16 rawY, i32 deadzone, f32& outX, f32& outY);
+} // namespace input_detail
+
 // Keyboard keys (a practical subset; extend as needed).
 enum class Key : u8 {
     Unknown = 0,
@@ -97,6 +105,10 @@ public:
 
     // -- Platform event sink (called by the platform window) -----------------
     void OnKeyVK(u32 nativeKey, bool down); // native = Win32 virtual-key code
+    // The platform-independent entry point the above translates INTO. A backend that
+    // already speaks hbe::Key calls this directly; Key::Unknown is ignored rather than
+    // used as an index.
+    void OnKey(Key k, bool down);
     void OnChar(u32 codepoint);    // translated text input (WM_CHAR), printable only
     void OnMouseButton(MouseButton b, bool down);
     void OnMouseMove(f32 x, f32 y);
@@ -213,5 +225,7 @@ private:
     PadBrand padBrand_ = PadBrand::Xbox;      // detected controller family (default Xbox)
     u32 padBrandCooldown_ = 0;                // frames until the next brand rescan
 };
+
+bool InputSelfTest(); // --test-input
 
 } // namespace hbe

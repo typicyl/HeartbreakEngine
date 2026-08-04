@@ -16,7 +16,7 @@
 
 int main(int argc, char** argv) {
     hbe::EngineConfig config = hbe::ParseCommandLine(argc, argv);
-    config.title = L"Heartbreak Engine (Runtime)";
+    config.title = "Heartbreak Engine (Runtime)";
     hbe::Engine engine;
     return engine.Run(config);
 }

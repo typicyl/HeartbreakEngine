@@ -10,6 +10,9 @@
 #include <bcrypt.h>
 
 #include "Hub/Updater.h"
+#include "Core/Platform.h"
+
+#include "Hub/HubSelfUpdate.h"
 
 #include "Hub/HubConfig.h"
 #include "Hub/ZipArchive.h"
@@ -454,9 +457,7 @@ void Updater::Apply(const std::function<bool(const UpdateProgress&)>& confirm) {
     // cannot be moved) and we would land in the rollback path for a reason the user
     // cannot act on. Say it plainly instead.
     {
-        wchar_t selfExe[MAX_PATH] = {};
-        ::GetModuleFileNameW(nullptr, selfExe, MAX_PATH);
-        const fs::path selfDir = fs::path(selfExe).parent_path().lexically_normal();
+        const fs::path selfDir = platform::ExecutableDir().lexically_normal();
         const fs::path live = (paths_.installRoot / "bin").lexically_normal();
         const std::string rel = selfDir.lexically_relative(live).generic_string();
         if (!rel.empty() && rel.rfind("..", 0) != 0) {
@@ -485,6 +486,23 @@ void Updater::Apply(const std::function<bool(const UpdateProgress&)>& confirm) {
         if (fs::exists(backup, ec2)) fs::rename(backup, liveBin, ec2);
         Fail("Could not put the new build in place; the previous install was restored.");
         return;
+    }
+
+    // THE HUB TRAVELS WITH THE ENGINE. The payload that just went live carries the
+    // matching launcher, so take it from there instead of downloading a second file. This
+    // runs AFTER the bin/ swap: if the engine install had failed we would have rolled back,
+    // and staging a Hub for a build that is not installed would guarantee a mismatch.
+    {
+        std::string hubErr;
+        if (StageSelfUpdateFromPayload(liveBin / "HeartbreakHub.exe", hubErr)) {
+            progress_.hubUpdateStaged = true;
+        } else if (!hubErr.empty()) {
+            // Never fail the ENGINE update over the launcher - the engine is installed and
+            // working at this point. Surface it through the progress note, which is the
+            // Hub's own reporting channel: this target deliberately links no engine code,
+            // so the engine's logger is not available here.
+            progress_.hubUpdateNote = hubErr;
+        }
     }
 
     fs::remove(paths_.Download(), ec);

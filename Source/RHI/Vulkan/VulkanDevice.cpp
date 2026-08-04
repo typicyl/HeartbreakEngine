@@ -5,6 +5,7 @@
 // use a uniform buffer; per-draw constants use a dynamic uniform buffer arena
 // addressed with dynamic offsets.
 #include "RHI/Vulkan/VulkanDevice.h"
+#include "Core/Platform.h"
 #include "Assets/Mesh.h"
 #include "Assets/StrokeGen.h"
 #include "Core/Log.h"
@@ -113,11 +114,10 @@ std::vector<u8> ReadBinaryFile(const std::wstring& path) {
 }
 
 std::wstring ExecutableDir() {
-    wchar_t buf[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring path(buf);
-    const auto slash = path.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? L"" : path.substr(0, slash + 1);
+    const std::filesystem::path dir = hbe::platform::ExecutableDir();
+    // The trailing separator is part of this function's contract - callers concatenate a
+    // shader filename straight onto it.
+    return dir.empty() ? std::wstring() : (dir.wstring() + L"\\");
 }
 
 constexpr u64 AlignUp(u64 value, u64 alignment) {
@@ -262,7 +262,11 @@ public:
 
     bool SupportsSceneRendering() const override { return meshPipelineReady_; }
     MeshHandle CreateMesh(const hbe::MeshData& mesh) override;
-    void UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
+    MeshHandle CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
+                                  u32 indexCapacity) override;
+    VkDeviceSize reserveVertices_ = 0; // set only during CreateMeshReserved; 0 = exact
+    VkDeviceSize reserveIndices_ = 0;
+    bool UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
     void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
@@ -678,6 +682,17 @@ private:
     // Per-bindless-slot view so editor thumbnails can re-bind a texture.
     std::unordered_map<u32, VkImageView> slotViews_;
     std::unordered_map<u32, VkImage> slotImages_; // slot -> image (in-place UpdateTexture)
+    // What each slot's image was actually CREATED as. UpdateTexture must validate the
+    // caller's desc against this: without it, the staging buffer is sized from the DESC and
+    // memcpy'd from the caller's pointer, so a mismatched desc both copies out of bounds
+    // into the image AND reads out of bounds from caller memory. D3D12 already rejects a
+    // mismatch outright (it can ask the resource via GetDesc); Vulkan has no such query, so
+    // the dimensions have to be remembered here.
+    struct SlotImageInfo {
+        u32 width = 0, height = 0, mipCount = 1;
+        Format format = Format::R8G8B8A8_UNORM;
+    };
+    std::unordered_map<u32, SlotImageInfo> slotImageInfo_;
     // Volume textures (CreateVolumeTexture): SRV slot -> STORAGE_IMAGE view the
     // compute splat binds for writing (VV2). Kept in GENERAL layout so the same
     // image serves both the storage write and the sampled raymarch read.
@@ -844,6 +859,14 @@ bool VulkanDevice::Initialize(const RenderDeviceDesc& desc) {
     vsync_ = desc.vsync;
     desiredImageCount_ = std::clamp<u32>(desc.backBufferCount, 2, kMaxFramesInFlight);
     framesInFlight_ = desiredImageCount_;
+    // SAY SO WHEN THE REQUEST IS REDUCED. The two backends cap at different numbers
+    // (D3D12 at 4, Vulkan at kMaxFramesInFlight), so the same RenderDeviceDesc can produce
+    // a different amount of CPU/GPU overlap on each - which shows up as a frame-pacing
+    // difference nobody can account for. Clamping is fine; clamping silently is not.
+    if (desc.backBufferCount != desiredImageCount_) {
+        HBE_WARN("[Vulkan] backBufferCount {} clamped to {} (this backend allows 2..{}).",
+                 desc.backBufferCount, desiredImageCount_, kMaxFramesInFlight);
+    }
     swapFormat_ = ToVkFormat(desc.backBufferFormat);
 
     if (!CreateInstance(validation_)) return false;
@@ -1655,15 +1678,37 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
     ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    vkCreateImage(device_, &ici, nullptr, &tex.image);
+    // CHECK THE RETURN CODES. None of these three calls was checked, so an out-of-memory
+    // device handed back a VALID bindless handle pointing at a null image: every draw that
+    // sampled it read garbage or tripped validation, and nothing anywhere reported a
+    // failure. D3D12 already checks, rolls the bindless slot back and returns an invalid
+    // handle - which is the documented failure signal callers test for.
+    const auto abandon = [&](const char* what) -> TextureHandle {
+        HBE_ERROR("[Vulkan] CreateTexture failed at {} ({}x{} mip{})", what, desc.width,
+                  desc.height, mipCount);
+        if (tex.image) vkDestroyImage(device_, tex.image, nullptr);
+        if (tex.memory) vkFreeMemory(device_, tex.memory, nullptr);
+        vkDestroyBuffer(device_, staging, nullptr);
+        vkFreeMemory(device_, stagingMem, nullptr);
+        --bindlessNextSlot_; // give the slot back, exactly as D3D12 does
+        return {};
+    };
+    if (vkCreateImage(device_, &ici, nullptr, &tex.image) != VK_SUCCESS) {
+        tex.image = VK_NULL_HANDLE;
+        return abandon("vkCreateImage");
+    }
 
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(device_, tex.image, &req);
     VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    vkAllocateMemory(device_, &mai, nullptr, &tex.memory);
-    vkBindImageMemory(device_, tex.image, tex.memory, 0);
+    if (vkAllocateMemory(device_, &mai, nullptr, &tex.memory) != VK_SUCCESS) {
+        tex.memory = VK_NULL_HANDLE;
+        return abandon("vkAllocateMemory");
+    }
+    if (vkBindImageMemory(device_, tex.image, tex.memory, 0) != VK_SUCCESS)
+        return abandon("vkBindImageMemory");
 
     VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     cbai.commandPool = commandPool_;
@@ -1741,6 +1786,8 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
 
     slotViews_[slot] = tex.view;
     slotImages_[slot] = tex.image;
+    slotImageInfo_[slot] = SlotImageInfo{desc.width, desc.height,
+                                         desc.mipCount < 1 ? 1u : desc.mipCount, desc.format};
     textures_.push_back(tex);
     return TextureHandle{slot};
 }
@@ -1854,6 +1901,24 @@ void VulkanDevice::UpdateTexture(TextureHandle handle, const TextureDesc& desc) 
     VkImage image = imgIt->second;
     const u32 bpp = BytesPerPixel(desc.format);
     const u32 mipCount = desc.mipCount < 1 ? 1 : desc.mipCount;
+
+    // VALIDATE AGAINST WHAT THE IMAGE ACTUALLY IS - this is the D3D12 behaviour, and its
+    // absence here was not merely a missing check. Everything below sizes the staging
+    // buffer from the DESC and then memcpy's that many bytes out of desc.pixels, so a
+    // caller passing a bigger desc than the image reads PAST THE END of its own buffer and
+    // then copies past the end of the image. D3D12 returns early on exactly this mismatch;
+    // matching it turns a memory-corrupting call into a no-op on both backends.
+    const auto infoIt = slotImageInfo_.find(handle.index);
+    if (infoIt == slotImageInfo_.end()) return; // not an UpdateTexture-capable slot
+    const SlotImageInfo& info = infoIt->second;
+    if (info.width != desc.width || info.height != desc.height ||
+        info.mipCount != mipCount || info.format != desc.format) {
+        HBE_WARN("[Vulkan] UpdateTexture refused: {}x{} mip{} fmt{} does not match the "
+                 "{}x{} mip{} fmt{} this texture was created as.",
+                 desc.width, desc.height, mipCount, static_cast<int>(desc.format),
+                 info.width, info.height, info.mipCount, static_cast<int>(info.format));
+        return;
+    }
 
     VkDeviceSize total = 0;
     for (u32 mip = 0; mip < mipCount; ++mip) {
@@ -3947,20 +4012,33 @@ VkShaderModule VulkanDevice::LoadShaderModule(const std::wstring& path) {
     return mod;
 }
 
+MeshHandle VulkanDevice::CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
+                                            u32 indexCapacity) {
+    // Widen the ALLOCATION only; the upload and gm.indexCount still describe `initial`.
+    // gm.vbSize/ibSize mean ALLOCATED, which is exactly what UpdateMesh tests against.
+    reserveVertices_ = std::max<VkDeviceSize>(vertexCapacity, initial.vertices.size());
+    reserveIndices_ = std::max<VkDeviceSize>(indexCapacity, initial.indices.size());
+    const MeshHandle h = CreateMesh(initial);
+    reserveVertices_ = reserveIndices_ = 0;
+    return h;
+}
+
 MeshHandle VulkanDevice::CreateMesh(const hbe::MeshData& mesh) {
     if (mesh.Empty()) return {};
 
     GpuMeshVk gm;
     const VkDeviceSize vbSize = static_cast<VkDeviceSize>(mesh.vertices.size()) * sizeof(hbe::Vertex);
     const VkDeviceSize ibSize = static_cast<VkDeviceSize>(mesh.indices.size()) * sizeof(u32);
+    const VkDeviceSize vbAlloc = std::max(vbSize, reserveVertices_ * sizeof(hbe::Vertex));
+    const VkDeviceSize ibAlloc = std::max(ibSize, reserveIndices_ * sizeof(u32));
     const VkMemoryPropertyFlags hostVisible =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
     // Device-local (VRAM) vertex/index buffers; data staged through host memory
     // once at load. Keeps per-frame vertex fetch in VRAM instead of over PCIe.
-    if (!CreateBuffer(vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+    if (!CreateBuffer(vbAlloc, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, gm.vertexBuffer, gm.vertexMemory) ||
-        !CreateBuffer(ibSize, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        !CreateBuffer(ibAlloc, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, gm.indexBuffer, gm.indexMemory)) {
         HBE_ERROR("[Vulkan] Failed to allocate buffers for mesh '{}'", mesh.name);
         return {};
@@ -4006,19 +4084,24 @@ MeshHandle VulkanDevice::CreateMesh(const hbe::MeshData& mesh) {
     vkFreeMemory(device_, iStageMem, nullptr);
 
     gm.indexCount = mesh.IndexCount();
-    gm.vbSize = vbSize;
-    gm.ibSize = ibSize;
+    gm.vbSize = vbAlloc; // ALLOCATED, not uploaded - UpdateMesh tests against this
+    gm.ibSize = ibAlloc;
 
     meshes_.push_back(gm);
     return MeshHandle{static_cast<u32>(meshes_.size())};
 }
 
-void VulkanDevice::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
-    if (!handle.IsValid() || handle.id > meshes_.size() || mesh.Empty()) return;
+bool VulkanDevice::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
+    if (!handle.IsValid() || handle.id > meshes_.size() || mesh.Empty()) return false;
     GpuMeshVk& gm = meshes_[handle.id - 1];
     const VkDeviceSize vbSize = static_cast<VkDeviceSize>(mesh.vertices.size()) * sizeof(hbe::Vertex);
     const VkDeviceSize ibSize = static_cast<VkDeviceSize>(mesh.indices.size()) * sizeof(u32);
-    if (vbSize > gm.vbSize || ibSize > gm.ibSize) return; // must fit (fixed topology)
+    if (vbSize > gm.vbSize || ibSize > gm.ibSize) { // must fit; never grows
+        HBE_WARN("[Vulkan] UpdateMesh refused: {} vertex + {} index bytes exceed the "
+                 "{}/{} reserved for mesh {}. Use CreateMeshReserved.",
+                 vbSize, ibSize, gm.vbSize, gm.ibSize, handle.id);
+        return false;
+    }
 
     const VkMemoryPropertyFlags hostVisible =
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
@@ -4026,7 +4109,7 @@ void VulkanDevice::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
     VkDeviceMemory vStageMem = VK_NULL_HANDLE, iStageMem = VK_NULL_HANDLE;
     if (!CreateBuffer(vbSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, hostVisible, vStage, vStageMem) ||
         !CreateBuffer(ibSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, hostVisible, iStage, iStageMem)) {
-        return;
+        return false;
     }
     void* p = nullptr;
     vkMapMemory(device_, vStageMem, 0, vbSize, 0, &p);
@@ -4062,6 +4145,7 @@ void VulkanDevice::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
     vkFreeMemory(device_, iStageMem, nullptr);
 
     gm.indexCount = mesh.IndexCount();
+    return true;
 }
 
 void VulkanDevice::BeginFrame() {
@@ -5630,6 +5714,12 @@ bool VulkanDevice::RecreateSwapchain() {
 
 void VulkanDevice::Resize(u32 width, u32 height) {
     if (width == 0 || height == 0) return;
+    // A RESIZE TO THE SAME SIZE HAS NOTHING TO RECREATE. This used to rebuild the whole
+    // swapchain unconditionally, and RecreateSwapchain begins with a full device idle - so
+    // any caller that pumps Resize on every WM_SIZE, or on a window move, stalled the GPU
+    // once per event. D3D12 already returns early on an unchanged size; this is the same
+    // cheap guard, and it makes the two backends cost the same for the same call.
+    if (width == width_ && height == height_) return;
     width_ = width;
     height_ = height;
     RecreateSwapchain();

@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include "Hub/HubConfig.h"
+#include "Core/Platform.h"
 
 #include <nlohmann/json.hpp>
 
@@ -20,17 +21,13 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace {
-fs::path LocalAppData() {
-    wchar_t buf[MAX_PATH] = {};
-    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    return (n > 0 && n < MAX_PATH) ? fs::path(buf) : fs::temp_directory_path();
-}
+
 constexpr const char* kStampName = "engine_version.txt";
 } // namespace
 
-fs::path HubConfigFile() { return LocalAppData() / "HeartbreakEngine" / "hub.json"; }
+fs::path HubConfigFile() { return platform::UserDataDir() / "hub.json"; }
 
-fs::path DefaultInstallRoot() { return LocalAppData() / "HeartbreakEngine" / "Engine"; }
+fs::path DefaultInstallRoot() { return platform::UserDataDir() / "Engine"; }
 
 HubConfig LoadHubConfig() {
     HubConfig c;

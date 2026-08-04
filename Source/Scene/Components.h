@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "Scene/BodyShape.h"
 #include "RHI/RHI.h"
 #include "Scene/CameraRig.h"   // cam::CinematicSettings (CameraComponent cinematic rig)
 #include "Scene/PaintSystem.h" // paint::Stroke (PaintComponent stroke database)
@@ -1293,6 +1294,22 @@ struct IKChain {
 // Inverse kinematics applied AFTER skeletal animation poses the entity: each
 // chain solves a two-bone IK so its end joint reaches its target (analytic,
 // blended by weight). Requires an Animator + a skinned mesh on the entity.
+// Slider-driven body proportions. Lives on the CHARACTER ROOT - the entity that owns the
+// Animator and therefore the one skinning palette every part borrows. Putting it on a part
+// would shape that part alone and tear the seams open.
+//
+// `values` is authored and serialized BY NAME so a scene saved today still loads after more
+// sliders exist; `joints` is the resolved form the pose pass reads. The pose runs inside a
+// parallel job, so resolving happens once, before the job, whenever `dirty` is set - never
+// inside it.
+struct BodyShape {
+    std::unordered_map<std::string, f32> values; // slider name -> [-1, 1], 0 = as imported
+
+    // Runtime, not serialized.
+    std::vector<bodyshape::JointShape> joints;
+    bool dirty = true;
+};
+
 struct IKConstraint {
     std::vector<IKChain> chains;
 };

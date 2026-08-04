@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include "Editor/CollabSession.h"
+#include "Core/Platform.h"
 
 #include "Scene/Scene.h"
 
@@ -46,12 +47,6 @@ u64 RandomU64() {
     return v;
 }
 
-fs::path LocalAppData() {
-    wchar_t buf[MAX_PATH] = {};
-    const DWORD n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-    return (n > 0 && n < MAX_PATH) ? fs::path(buf) : fs::temp_directory_path();
-}
-
 } // namespace
 
 const char* SessionRoleName(SessionRole r) {
@@ -65,7 +60,10 @@ const char* SessionRoleName(SessionRole r) {
     return "?";
 }
 
-fs::path IdentityFile() { return LocalAppData() / "HeartbreakEngine" / "identity.hbkey"; }
+// The identity key must land in the SAME place the Hub writes it - the two share one
+// identity deliberately. Both now ask the platform layer rather than each re-deriving
+// %LOCALAPPDATA% with its own truncation and fallback behaviour.
+fs::path IdentityFile() { return platform::UserDataDir() / "identity.hbkey"; }
 
 fs::path AllowlistFile(const fs::path& projectRoot) {
     return projectRoot / "collab_authorized.txt";

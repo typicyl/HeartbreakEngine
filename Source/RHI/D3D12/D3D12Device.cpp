@@ -3,6 +3,7 @@
 // Implements a complete, fenced, triple-buffered present loop: adapter
 // selection, swapchain, RTV heap, per-frame command allocators, and a clear.
 #include "RHI/D3D12/D3D12Device.h"
+#include "Core/Platform.h"
 #include "Assets/Mesh.h"
 #include "Assets/StrokeGen.h"
 #include "Core/Log.h"
@@ -209,11 +210,10 @@ std::vector<u8> ReadBinaryFile(const std::wstring& path) {
 
 // Directory containing the running executable, with a trailing backslash.
 std::wstring ExecutableDir() {
-    wchar_t buf[MAX_PATH] = {};
-    ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring path(buf);
-    const auto slash = path.find_last_of(L"\\/");
-    return slash == std::wstring::npos ? L"" : path.substr(0, slash + 1);
+    const std::filesystem::path dir = hbe::platform::ExecutableDir();
+    // The trailing separator is part of this function's contract - callers concatenate a
+    // shader filename straight onto it.
+    return dir.empty() ? std::wstring() : (dir.wstring() + L"\\");
 }
 
 // Constant buffers mirror the cbuffer layouts in Shaders/Common.hlsli. - TODO figure out what's causing the spike
@@ -300,6 +300,49 @@ inline void FillMorphCB(ObjectCB& ocb, const DrawItem& it) {
     }
 }
 
+// The one place a DrawItem becomes object constants. See the declaration above for why
+// this must not be duplicated.
+inline void FillObjectMaterial(ObjectCB& ocb, const DrawItem& it) {
+    ocb.model = it.transform;
+    ocb.normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(it.transform))));
+    ocb.baseColor = it.baseColor;
+    ocb.metallic = it.metallic;
+    ocb.roughness = it.roughness;
+    ocb.albedoIndex = it.albedoTexture.index;
+    ocb.normalIndex = it.normalTexture.index;
+    ocb.mrIndex = it.mrTexture.index;
+    FillMorphCB(ocb, it); // facial blendshapes (bindless delta atlas)
+    ocb.aoIndex = it.aoTexture.index;
+    ocb.flags = it.materialFlags;
+    ocb.subsurfaceColor = it.subsurfaceColor;
+    ocb.subsurfaceRadius = it.subsurfaceRadius;
+    ocb.thicknessIndex = it.thicknessTexture.index;
+    ocb.emissiveColor = it.emissiveColor;
+    ocb.emissiveIntensity = it.emissiveIntensity;
+    ocb.emissiveIndex = it.emissiveTexture.index;
+    ocb.paintColorIndex = it.paintColorTexture.index;
+    ocb.paintHeightIndex = it.paintHeightTexture.index;
+    ocb.paintOpacity = it.paintOpacity;
+    ocb.paintHeightScale = it.paintHeightScale;
+    ocb.paintLodBias = it.paintLodBias;
+    ocb.paintTexel = it.paintTexel;
+    ocb.paintProjMode = it.paintProjMode;
+    ocb.paintBoxInvM = it.paintBoxInvM;
+    ocb.paintBoxCenter = it.paintBoxCenter;
+    ocb.paintBoxScale = it.paintBoxScale;
+    ocb.splatAlbedo = {it.splatAlbedo[0].index, it.splatAlbedo[1].index,
+                       it.splatAlbedo[2].index, it.splatAlbedo[3].index};
+    ocb.splatNormal = {it.splatNormal[0].index, it.splatNormal[1].index,
+                       it.splatNormal[2].index, it.splatNormal[3].index};
+    ocb.splatMR     = {it.splatMR[0].index, it.splatMR[1].index,
+                       it.splatMR[2].index, it.splatMR[3].index};
+    ocb.splatRough  = {it.splatRough[0], it.splatRough[1],
+                       it.splatRough[2], it.splatRough[3]};
+    // Motion vectors: the previous-frame world matrix. Filled here rather than in the
+    // scene pass so the shadow pass's constants are COMPLETE and reusable.
+    ocb.prevModel = it.prevTransform;
+}
+
 u32 BytesPerPixel(Format f) {
     switch (f) {
         case Format::R8G8B8A8_UNORM:
@@ -346,7 +389,9 @@ public:
 
     bool SupportsSceneRendering() const override { return meshPipelineReady_; }
     MeshHandle CreateMesh(const hbe::MeshData& mesh) override;
-    void UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
+    MeshHandle CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
+                                  u32 indexCapacity) override;
+    bool UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
     void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
@@ -415,12 +460,21 @@ private:
     // Scene-rendering setup.
     bool CreateDepthResources(u32 width, u32 height);
     bool CreateMeshPipeline();
+
+    // Set only for the duration of one CreateMeshReserved call; 0 = allocate exactly.
+    u64 reserveVertices_ = 0;
+    u64 reserveIndices_ = 0;
     bool CreateConstantArenas();
     bool CreateBindlessResources();
     bool CreateShadowResources();
     // Bump-allocates `size` bytes from the current frame's CB arena (256-aligned).
     // Returns a CPU pointer and sets `outGpuAddr`; nullptr if the arena is full.
     void* AllocConstants(u64 size, D3D12_GPU_VIRTUAL_ADDRESS& outGpuAddr);
+    // Passes and draws dropped this frame because the constant arena ran out. Reported
+    // once per frame rather than per item: an exhausted arena starves hundreds of draws in
+    // a row, and a per-item log would bury the one line that matters.
+    u32 constantStarvedPasses_ = 0;
+    u32 constantStarvedLastReported_ = 0;
 
     static constexpr u32 kMaxBackBuffers = 4;
 
@@ -1115,6 +1169,15 @@ void D3D12Device::BeginFrame() {
 
     allocators_[frameIndex_]->Reset();
     cmdList_->Reset(allocators_[frameIndex_].Get(), nullptr);
+    // SAY IT ONCE, WITH A NUMBER. Silent starvation is how a frame quietly loses its post
+    // stack or a shadow cascade and nobody can explain the picture.
+    if (constantStarvedPasses_ > 0 && constantStarvedPasses_ != constantStarvedLastReported_) {
+        HBE_WARN("[D3D12] The per-frame constant arena ran out: {} pass(es)/draw(s) were "
+                 "skipped last frame rather than rendered with the wrong constants.",
+                 constantStarvedPasses_);
+        constantStarvedLastReported_ = constantStarvedPasses_;
+    }
+    constantStarvedPasses_ = 0;
     constantHead_ = 0;
     boneHead_ = 0;
     instanceHead_ = 0;
@@ -2763,6 +2826,12 @@ void D3D12Device::DrawPostPass(ID3D12PipelineState* pso, ID3D12Resource* target,
     if (void* dst = AllocConstants(sizeof(PostCB), addr)) {
         std::memcpy(dst, &cb, sizeof(cb));
         cmdList_->SetGraphicsRootConstantBufferView(1, addr);
+    } else {
+        // No constants -> the root CBV still points at the PREVIOUS pass's PostCB, so this
+        // pass would run with another effect's parameters. Skip it: a missing effect is a
+        // visible, explicable result; a pass running on the wrong constants is not.
+        ++constantStarvedPasses_;
+        return;
     }
     cmdList_->SetPipelineState(pso);
     cmdList_->DrawInstanced(3, 1, 0, 0);
@@ -3015,8 +3084,10 @@ void D3D12Device::RunPostStack(const SceneView& view) {
                 if (void* dst = AllocConstants(sizeof(PostCB), addr)) {
                     std::memcpy(dst, &cb2, sizeof(cb2));
                     cmdList_->SetGraphicsRootConstantBufferView(1, addr);
+                    cmdList_->DrawInstanced(6, cols * rows, 0, 0);
+                } else {
+                    ++constantStarvedPasses_;
                 }
-                cmdList_->DrawInstanced(6, cols * rows, 0, 0);
             };
             drawLayer(baseLen * 1.8f, 0.55f, 0.62f, 11.0f + boilPhase); // coarse block-in
             drawLayer(baseLen, 0.42f, 0.46f, 37.0f + boilPhase);        // finer detail
@@ -3223,10 +3294,15 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.inTexel = sceneTexel;
         cb.params0 = {ps.fxaaEnabled ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f};
         D3D12_GPU_VIRTUAL_ADDRESS addr = 0;
+        bool fxaaConstantsOk = false;
         if (void* dst = AllocConstants(sizeof(PostCB), addr)) {
             std::memcpy(dst, &cb, sizeof(cb));
             cmdList_->SetGraphicsRootConstantBufferView(1, addr);
+            fxaaConstantsOk = true;
+        } else {
+            ++constantStarvedPasses_;
         }
+        if (!fxaaConstantsOk) return;
         cmdList_->SetPipelineState(fxaaPSO_.Get());
         cmdList_->DrawInstanced(3, 1, 0, 0);
         // The final target stays bound: the UI overlay and (in viewport mode)
@@ -3273,9 +3349,18 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
         if (!it.mesh.IsValid() || it.mesh.id > meshes_.size()) continue;
         if (it.materialFlags & MaterialFlag_NoShadow) continue; // doesn't cast a shadow
         D3D12_GPU_VIRTUAL_ADDRESS objAddr = 0;
-        if (void* dst = AllocConstants(sizeof(ObjectCB), objAddr)) {
+        void* shadowDst = AllocConstants(sizeof(ObjectCB), objAddr);
+        // A shadow caster that cannot get constants must be DROPPED, not drawn with the
+        // previous caster's transform - that projects a shadow from the wrong place.
+        if (!shadowDst) continue;
+        {
+            void* dst = shadowDst;
+            // COMPLETE constants, not just the transform. The depth-only pass reads almost
+            // none of this - but filling it here lets DrawScene REUSE this allocation
+            // instead of making a second one, which is what removes the 2:1 arena cost on
+            // every object that both casts a shadow and is visible.
             ObjectCB ocb{};
-            ocb.model = it.transform;
+            FillObjectMaterial(ocb, it);
             if (it.bones && it.boneCount > 0) {
                 bool ok = false;
                 const u32 offset = AllocBones(it.bones, it.boneCount, ok);
@@ -3286,10 +3371,19 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
                     shadowBoneOffsets_[i] = offset;
                 }
             }
-            // Instanced run head: upload the whole run's transforms once; the
-            // cascade loops then draw the group with one call each. Depth-only
-            // pass: the normal/prev matrices are never read, so skip the
-            // inverse-transpose (write model into all three slots).
+            // Previous pose, for skinned motion vectors. The shadow pass does not need it,
+            // but the scene pass reading these same constants does - and uploading it here
+            // is what lets that reuse happen at all.
+            ocb.prevBoneOffset = ocb.boneOffset;
+            if (ocb.skinned && it.prevBones) {
+                bool pok = false;
+                const u32 prevOff = AllocBones(it.prevBones, it.boneCount, pok);
+                if (pok) ocb.prevBoneOffset = prevOff;
+            }
+            // Instanced run head: upload the whole run once, with the REAL normal and
+            // previous matrices. The depth pass ignores both, but writing model into all
+            // three slots (as this used to) would have made the run unusable by the scene
+            // pass - and it costs exactly the same three matrices either way.
             if (it.instanceRun > 1) {
                 bool iok = false;
                 u32 base = 0;
@@ -3297,8 +3391,9 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
                     for (u32 k = 0; k < it.instanceRun; ++k) {
                         const DrawItem& run = items[i + k];
                         inst[k * 3 + 0] = run.transform;
-                        inst[k * 3 + 1] = run.transform;
-                        inst[k * 3 + 2] = run.transform;
+                        inst[k * 3 + 1] = glm::mat4(
+                            glm::transpose(glm::inverse(glm::mat3(run.transform))));
+                        inst[k * 3 + 2] = run.prevTransform;
                     }
                     ocb.instanced = 1;
                     ocb.instanceBase = base;
@@ -3325,7 +3420,16 @@ void D3D12Device::DrawShadowPass(const SceneView& view, const DrawItem* items, u
         cmdList_->RSSetScissorRects(1, &scissor);
 
         D3D12_GPU_VIRTUAL_ADDRESS frameAddr = 0;
-        if (void* dst = AllocConstants(sizeof(FrameCB), frameAddr)) {
+        void* cascadeDst = AllocConstants(sizeof(FrameCB), frameAddr);
+        if (!cascadeDst) {
+            // Without this cascade's light matrix the pass would render it from the
+            // PREVIOUS cascade's viewpoint, writing a plausible-looking but wrong shadow
+            // map. An absent cascade is recoverable; a wrong one is not.
+            ++constantStarvedPasses_;
+            continue;
+        }
+        {
+            void* dst = cascadeDst;
             FrameCB fcb{};
             fcb.viewProj = view.cascadeViewProj[c];
             std::memcpy(dst, &fcb, sizeof(fcb));
@@ -3393,12 +3497,16 @@ MeshHandle D3D12Device::CreateMesh(const hbe::MeshData& mesh) {
     GpuMesh gm;
     const u64 vbSize = static_cast<u64>(mesh.vertices.size()) * sizeof(hbe::Vertex);
     const u64 ibSize = static_cast<u64>(mesh.indices.size()) * sizeof(u32);
+    // A pending CreateMeshReserved widens the ALLOCATION without changing what is
+    // uploaded or what the views describe.
+    const u64 vbAlloc = std::max(vbSize, reserveVertices_ * sizeof(hbe::Vertex));
+    const u64 ibAlloc = std::max(ibSize, reserveIndices_ * sizeof(u32));
 
     // Device-local (VRAM) vertex/index buffers so the GPU fetches geometry from
     // VRAM (~450 GB/s) instead of host memory over PCIe. Data is uploaded via a
     // temporary staging buffer + a copy.
-    gm.vertexBuffer = CreateDefaultBuffer(device_.Get(), vbSize, D3D12_RESOURCE_STATE_COPY_DEST);
-    gm.indexBuffer  = CreateDefaultBuffer(device_.Get(), ibSize, D3D12_RESOURCE_STATE_COPY_DEST);
+    gm.vertexBuffer = CreateDefaultBuffer(device_.Get(), vbAlloc, D3D12_RESOURCE_STATE_COPY_DEST);
+    gm.indexBuffer  = CreateDefaultBuffer(device_.Get(), ibAlloc, D3D12_RESOURCE_STATE_COPY_DEST);
     ComPtr<ID3D12Resource> vStage = CreateUploadBuffer(device_.Get(), vbSize);
     ComPtr<ID3D12Resource> iStage = CreateUploadBuffer(device_.Get(), ibSize);
     if (!gm.vertexBuffer || !gm.indexBuffer || !vStage || !iStage) {
@@ -3444,25 +3552,35 @@ MeshHandle D3D12Device::CreateMesh(const hbe::MeshData& mesh) {
     gm.ibv.Format = DXGI_FORMAT_R32_UINT;
     // Record the true allocation size once, at creation. UpdateMesh checks
     // against THIS, never the view size (which tracks the live contents).
-    gm.vbCapacity = vbSize;
-    gm.ibCapacity = ibSize;
+    // ALLOCATED, not uploaded. Recording the upload size here made CreateMeshReserved's
+    // headroom unreachable: the buffers really were allocated larger, but UpdateMesh tests
+    // against these fields, so every growth was refused on the default backend while the
+    // same call succeeded on Vulkan (which records the allocation). A reserved mesh that
+    // cannot grow is worse than no reservation at all - it looks like it worked.
+    gm.vbCapacity = vbAlloc;
+    gm.ibCapacity = ibAlloc;
     gm.indexCount = mesh.IndexCount();
     meshes_.push_back(std::move(gm));
     return MeshHandle{static_cast<u32>(meshes_.size())}; // 1-based id
 }
 
-void D3D12Device::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
-    if (!handle.IsValid() || handle.id > meshes_.size() || mesh.Empty()) return;
+bool D3D12Device::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
+    if (!handle.IsValid() || handle.id > meshes_.size() || mesh.Empty()) return false;
     GpuMesh& gm = meshes_[handle.id - 1];
     const u64 vbSize = static_cast<u64>(mesh.vertices.size()) * sizeof(hbe::Vertex);
     const u64 ibSize = static_cast<u64>(mesh.indices.size()) * sizeof(u32);
     // In-place path needs the new data to fit the ALLOCATION - not the current
     // view size, which shrinks with the contents (see GpuMesh::vbCapacity).
-    if (vbSize > gm.vbCapacity || ibSize > gm.ibCapacity) return;
+    if (vbSize > gm.vbCapacity || ibSize > gm.ibCapacity) {
+        HBE_WARN("[D3D12] UpdateMesh refused: {} vertex + {} index bytes exceed the "
+                 "{}/{} reserved for mesh {}. Use CreateMeshReserved.",
+                 vbSize, ibSize, gm.vbCapacity, gm.ibCapacity, handle.id);
+        return false;
+    }
 
     ComPtr<ID3D12Resource> vStage = CreateUploadBuffer(device_.Get(), vbSize);
     ComPtr<ID3D12Resource> iStage = CreateUploadBuffer(device_.Get(), ibSize);
-    if (!vStage || !iStage) return;
+    if (!vStage || !iStage) return false;
     D3D12_RANGE noRead{0, 0};
     void* p = nullptr;
     vStage->Map(0, &noRead, &p);
@@ -3503,6 +3621,19 @@ void D3D12Device::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
     gm.vbv.SizeInBytes = static_cast<UINT>(vbSize);
     gm.ibv.SizeInBytes = static_cast<UINT>(ibSize);
     gm.indexCount = mesh.IndexCount();
+    return true;
+}
+
+MeshHandle D3D12Device::CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
+                                           u32 indexCapacity) {
+    // Allocate for the larger of "what we were handed" and "what was asked for", then
+    // record THAT as the capacity. CreateMesh already stores capacity separately from
+    // the view size, so nothing in UpdateMesh has to change for this to work.
+    reserveVertices_ = std::max<u64>(vertexCapacity, initial.vertices.size());
+    reserveIndices_ = std::max<u64>(indexCapacity, initial.indices.size());
+    const MeshHandle h = CreateMesh(initial);
+    reserveVertices_ = reserveIndices_ = 0;
+    return h;
 }
 
 bool D3D12Device::EnsureVolumeResources() {
@@ -4082,7 +4213,24 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         u32 instances = 1; // >1 when this is an instanced run head
 
         D3D12_GPU_VIRTUAL_ADDRESS objAddr = 0;
-        if (void* dst = AllocConstants(sizeof(ObjectCB), objAddr)) {
+        // REUSE THE SHADOW PASS'S CONSTANTS. They are byte-identical to what this pass
+        // would write - both come from FillObjectMaterial plus the same bone and instance
+        // offsets - and the shadow pass has already paid for the arena slot. Allocating a
+        // second one halved the draw ceiling for every object that both casts a shadow and
+        // is visible: 768 bytes, twice, for one object.
+        //
+        // Index alignment is what makes this legal. The renderer hands DrawShadowPass the
+        // FULL item list and DrawScene a PREFIX of the same array (Renderer.cpp), so item i
+        // is the same object in both. A zero address means the shadow pass skipped it -
+        // NoShadow, a run follower, or its own arena failure - and this pass allocates
+        // normally, so correctness never depends on the shadow pass having succeeded.
+        const bool reuseShadowCb = shadowPassRun_ && i < shadowObjAddrs_.size() &&
+                                   shadowObjAddrs_[i] != 0;
+        if (reuseShadowCb) {
+            objAddr = shadowObjAddrs_[i];
+            cmdList_->SetGraphicsRootConstantBufferView(1, objAddr);
+            if (i < shadowInstanceCounts_.size()) instances = shadowInstanceCounts_[i];
+        } else if (void* dst = AllocConstants(sizeof(ObjectCB), objAddr)) {
             // Zero-init: the skinning fields (skinned/boneOffset/boneCount) are
             // only written for skinned items; uninitialized garbage here made a
             // non-skinned mesh skin against a wild bone offset -> GPU hang.
@@ -4172,6 +4320,14 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
 
             std::memcpy(dst, &ocb, sizeof(ocb));
             cmdList_->SetGraphicsRootConstantBufferView(1, objAddr);
+        } else {
+            // THE ARENA IS FULL. Falling through here left the ROOT CBV pointing at the
+            // PREVIOUS item's constants, so this mesh drew with another object's transform
+            // and material - geometry teleported and took the wrong textures with it, with
+            // nothing logged. Vulkan already bounds its loop and drops the item; do the
+            // same rather than render something that is definitely wrong. (This is the
+            // per-item draw LAMBDA, so the early out is a return, not a continue.)
+            return;
         }
 
         if (it.mesh.id != lastSceneMesh) {
@@ -5059,6 +5215,13 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
             ocb.prevModel = it.transform; // preview needs no motion vectors
             std::memcpy(dst, &ocb, sizeof(ocb));
             cmdList_->SetGraphicsRootConstantBufferView(1, objAddr);
+        } else {
+            // THE THIRD COPY of the same defect. The scene and shadow paths were fixed to
+            // drop an item whose constants could not be allocated; this one still fell
+            // through with the root CBV pointing at the PREVIOUS item, so an asset preview
+            // would draw one submesh wearing another's transform and material. Same rule
+            // everywhere: never draw with constants that belong to a different object.
+            continue;
         }
         cmdList_->IASetVertexBuffers(0, 1, &gm.vbv);
         cmdList_->IASetIndexBuffer(&gm.ibv);
