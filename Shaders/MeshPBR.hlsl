@@ -3,6 +3,7 @@
 // Material maps (base color / normal / metallic-roughness / AO) are sampled from
 // the bindless texture array by per-object index (0 = use the constant factor).
 #include "Common.hlsli"
+#include "Construction.hlsli"
 #include "BRDF.hlsli"
 
 struct VSInput
@@ -313,6 +314,21 @@ PSOutput PSMain(VSOutput input)
         metallic  *= mr.b;
         roughness *= mr.g;
     }
+    // --- PROCEDURAL CONSTRUCTION SURFACE ------------------------------------
+    // Applied AFTER the MR sample so an authored map still wins, and BEFORE lighting so the
+    // varied albedo/roughness feed the BRDF like any other material. Driven by WORLD position, so
+    // a pattern runs continuously across two walls meeting at a corner and tiles at any wall size
+    // without a UV unwrap. Costs no texture memory and no ObjectCB space - the material id rides
+    // in the spare high bits of gMaterialFlags.
+    {
+        const uint procKind = (gMaterialFlags >> HBE_PROC_SHIFT) & HBE_PROC_MASK;
+        if (procKind != HBE_PROC_NONE) {
+            albedo = HbConstructionSurface(procKind, albedo, input.positionWS,
+                                           normalize(input.normalWS), input.tangentWS.xyz,
+                                           input.uv, roughness, metallic);
+        }
+    }
+
     // Splat roughness = the blended layer-material roughness, but FLOORED by the terrain's
     // own roughness factor (gRoughnessFactor = the terrain Roughness slider). So cranking
     // the terrain Roughness forces the whole surface matte no matter how glossy a layer's

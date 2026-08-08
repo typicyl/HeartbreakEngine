@@ -131,6 +131,8 @@ struct EntityData {
     TerrainComponent terrain;
     bool hasMotionMatching = false;
     MotionMatching motionMatching;
+    bool hasBuilding = false;
+    ProceduralBuilding building;
     bool hasRotator = false;
     Rotator rotator;
     bool hasCensor = false;

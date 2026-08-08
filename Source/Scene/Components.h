@@ -1316,6 +1316,76 @@ struct IKConstraint {
 
 // Constant rotation applied to the entity's Transform while the simulation runs
 // (local axis, degrees per second). A simple gameplay helper component.
+// A procedurally generated structure. THE SOURCE IS THE ASSET, NOT THE GEOMETRY.
+//
+// Everything visible is regenerated from the `.hbbuild` by construction::Sync, so the meshes are
+// never serialized and never round-trip. That is not a preference - an entity carrying a
+// MeshInstance with no resolvable MeshRef saves an empty mesh source and reloads with nothing, and
+// undo restores through LoadMode::Replace which destroys the world. A building survives both only
+// because it is reconstructible from this one string.
+struct ProceduralBuilding {
+    // Footprint control points, in the building's local space. Walls are generated along the
+    // segments between consecutive points, so dragging a point reshapes the plan.
+    std::vector<glm::vec3> path;
+    f32 pathWallHeight = 3.0f;
+    f32 pathWallThickness = 0.25f;
+    bool pathClosed = true;
+
+    std::string source;      // .hbbuild path relative to Assets/ (persisted)
+    f32 chunkSize = 4.0f;    // spatial chunk edge, metres (persisted)
+    // Bumped by anything that invalidates the generated children. NOT serialized: a freshly loaded
+    // building has no children yet, so it must always regenerate once.
+    u32 revision = 1;
+    u32 builtRevision = 0;   // runtime only
+};
+
+// Marker on the entities construction::Sync generates. One per (chunk, material).
+//
+// EXCLUDED from .hbscene by kExclusions, with Sync as the named regenerator. Without that row
+// these would serialize as authored content with an empty mesh source and paste back as junk -
+// the exact failure SkinnedPartRef already had.
+struct BuildChunkTag {
+    entt::entity owner = entt::null;
+    i32 cx = 0, cy = 0, cz = 0;
+};
+
+// A DIRECTLY MANIPULABLE construction component.
+//
+// WHY THIS EXISTS. A parameter list is not control. "Window Count = 3, evenly spaced" cannot make
+// the building the artist actually wants - it makes the building the preset author imagined. So
+// every component of a ProceduralBuilding can be spawned as a real entity whose Transform IS its
+// definition: position and rotation map straight across, and SCALE IS THE HALF-EXTENT, so the
+// existing translate/rotate/scale gizmo edits the construction directly with no new tooling.
+//
+// These are editor-only scaffolding: excluded from the scene file, destroyed when edit mode ends.
+struct BuildComponentProxy {
+    entt::entity owner = entt::null; // the ProceduralBuilding entity
+    u32 componentId = 0;             // construction::ComponentId
+};
+
+// ONE DRAGGABLE FACE OF A CONSTRUCTION PART - the Unreal-style box brush handle.
+//
+// A transform gizmo can only move, rotate or uniformly grab a whole object. Pulling ONE FACE is
+// what actually makes box modelling feel like modelling: you push a wall longer from its end
+// rather than scaling it about its middle and then re-centring it.
+//
+// Each handle is a small entity sitting at the centre of one face. Dragging it along its axis
+// moves that face's plane; the opposite face stays exactly where it was.
+struct BuildFaceHandle {
+    entt::entity owner = entt::null; // the ProceduralBuilding
+    u32 componentId = 0;
+    u8 axis = 0;  // 0 = X, 1 = Y, 2 = Z
+    i8 sign = 1;  // +1 = the max face, -1 = the min face
+};
+
+// A control point of a WALL PATH: draw a footprint by dragging points, and walls generate along
+// the segments between them. This is the "visual adjustment like splines" half - laying out a
+// building by its plan rather than by typing dimensions.
+struct BuildPathPoint {
+    entt::entity owner = entt::null;
+    u32 index = 0;
+};
+
 struct Rotator {
     glm::vec3 axis{0.0f, 1.0f, 0.0f};
     f32 speed = 45.0f; // degrees per second

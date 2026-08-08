@@ -21,13 +21,18 @@
 // SCOPE. This is deliberately NOT a windowing or input abstraction - those live in
 // Core/Window.h and Core/Input.h and are a much larger job (Window.h currently leaks the
 // Win32 message signature into its public API). This is the small, boring, duplicated
-// filesystem-and-process layer, which is the part that pays for itself immediately.
+// filesystem-and-process layer - executable/user paths, machine identity, the process
+// crash handler, and system-font lookup - which is the part that pays for itself
+// immediately. The heavier native GUI services (file/folder pickers, desktop colour
+// sampling) that only the editor needs, and that drag in COM/comdlg/GDI, live in the
+// sibling Core/NativeDialogs.h so the shipped runtime never links them.
 #pragma once
 
 #include "Core/Types.h"
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace hbe::platform {
 
@@ -70,6 +75,38 @@ bool IsElevated();
 // A stable identifier for this machine, derived from OS-provided identity rather than from
 // anything the user typed. Not a secret and not a licence key: it distinguishes installs.
 std::string MachineId();
+
+// Start `exe` as a NEW, fully detached process with `args`, and return at once WITHOUT
+// waiting for it - this is a hand-off (the Hub launching the full editor on a project), not a
+// child we manage, so its handles are dropped immediately. Returns false if the process could
+// not be started; the caller decides how to report that (this stays log-free so the launcher
+// core can link it). No shell is involved: `exe` is run directly, so nothing in `args` is
+// interpreted by a command processor. Args are paths - flags are valid path tokens too - so
+// each survives to the child in the OS-native encoding with no lossy narrow round-trip.
+bool LaunchDetached(const std::filesystem::path& exe,
+                    const std::vector<std::filesystem::path>& args);
+
+// Install the process-wide "the program is dying" handler. On Windows this is the
+// Structured-Exception filter that turns a silent access-violation death during boot (a
+// graphics-driver fault on another machine, our own null deref) into ONE actionable log
+// line naming the faulting module + offset, then flushes every sink before the OS finishes
+// the process. It lived inline in Engine.cpp behind #if _WIN32, which is exactly the kind of
+// OS branch this layer exists to absorb: a POSIX backend installs signal handlers here
+// instead, and Engine.cpp calls this once, unconditionally, knowing nothing about either.
+//
+// Idempotent and safe to call before the window or renderer exists - that is the whole
+// point, since the faults it catches happen during device creation.
+void InstallCrashHandler();
+
+// The system UI fonts to try, in preference order, for rendering text (the in-game UI atlas
+// and the editor's ImGui theme). Absolute paths; a caller reads the first that loads. Empty
+// only on a system with none of them, in which case UI text is disabled rather than crashing.
+//
+// This replaces two copies of a hardcoded "C:\\Windows\\Fonts\\segoeui.ttf" literal. Beyond
+// being a portability leak, that literal was WRONG on any machine whose Windows is not on C:
+// (an SSD-swap or enterprise image routinely puts it on D:); the Win32 backend now asks the
+// OS for its actual Windows/Fonts directory. A second platform returns its own faces here.
+std::vector<std::filesystem::path> SystemUiFontCandidates();
 
 bool SelfTest(); // --test-platform
 

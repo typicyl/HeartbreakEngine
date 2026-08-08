@@ -19,11 +19,33 @@ set(HBE_CORE_SOURCES
     # nothing else. The conditional is worth writing now, with one backend, because it is
     # what makes the file's role obvious to the next reader.
     $<$<BOOL:${WIN32}>:Source/Core/Platform_Win32.cpp>
+    # The process crash handler is a SEPARATE backend TU from Platform_Win32.cpp on purpose:
+    # it depends on Core/Log, whereas Platform_Win32.cpp is ALSO linked (explicitly, below)
+    # into the engine-free hbe_hubcore, which has no Log.cpp. Living in HBE_CORE_SOURCES - which
+    # only the engine libraries pull in, never hbe_hubcore - keeps its Log dependency out of the
+    # Hub's link. A second platform adds CrashHandler_Posix.cpp beside it.
+    $<$<BOOL:${WIN32}>:Source/Core/CrashHandler_Win32.cpp>
     "Source/Core/Window_Win32.cpp"
     # Input is SPLIT: the frame logic, press edges, text stream and deadzone curve are
     # portable and unconditional; only key translation and the gamepad poll are per-OS.
     "Source/Core/Input.cpp"
     $<$<BOOL:${WIN32}>:Source/Core/Input_Win32.cpp>)
+
+# PROCEDURAL CONSTRUCTION. The definition + structural graph; geometry generation arrives in
+# later phases. Pure CPU, no RHI and no scene dependency - which is what lets --test-construction
+# run headless and what will let generation move onto a job worker later.
+set(HBE_CONSTRUCTION_SOURCES
+    "Source/Construction/ConstructionDef.cpp"
+    "Source/Construction/ConstructionGraph.cpp"
+    "Source/Construction/ConstructionGeometry.cpp"
+    "Source/Construction/ConstructionMasonry.cpp"
+    "Source/Construction/ConstructionWood.cpp"
+    "Source/Construction/ConstructionOpenings.cpp"
+    "Source/Construction/ConstructionParams.cpp"
+    "Source/Construction/ConstructionPreset.cpp"
+    "Source/Construction/ConstructionIO.cpp"
+    "Source/Construction/ConstructionSystem.cpp"
+    "Source/Construction/ConstructionTest.cpp")
 
 set(HBE_ASSET_SOURCES
     "Source/Assets/AssetFormats.cpp"
@@ -208,6 +230,11 @@ set(HBE_HUB_SOURCES
 
 # Editor-only sources (added only to hbe_editor).
 set(HBE_EDITOR_SOURCES
+    # Native GUI services (file/folder pickers, desktop colour sampling) - the editor-only
+    # slice of the platform layer, selected by OS the same way the RHI backends are. It drags
+    # in COM/comdlg/GDI, which is exactly why it is here and not in the runtime's Platform
+    # backend: a shipped game exe never links it. A second platform adds NativeDialogs_*.cpp.
+    $<$<BOOL:${WIN32}>:Source/Core/NativeDialogs_Win32.cpp>
     "Source/Editor/Editor.cpp"
     "Source/Editor/SaveDispatch.cpp"
     "Source/Editor/TimelineSnap.cpp"
@@ -226,6 +253,7 @@ set(HBE_EDITOR_SOURCES
 # Core sources common to both the runtime and editor libraries.
 set(HBE_RUNTIME_SOURCES
     ${HBE_CORE_SOURCES}
+    ${HBE_CONSTRUCTION_SOURCES}
     ${HBE_ASSET_SOURCES}
     ${HBE_SCENE_SOURCES}
     ${HBE_PHYSICS_SOURCES}
@@ -472,31 +500,11 @@ add_executable(HeartbreakHub WIN32 "Source/HubApp/main_hubapp.cpp")
 target_link_libraries(HeartbreakHub PRIVATE hbe_hubcore imgui_hub d3d11 dxgi)
 set_target_properties(HeartbreakHub PROPERTIES VS_DPI_AWARE "PerMonitor")
 
-# HeartbreakHuman: the procedural human authoring application.
-#
-# Links the human library plus D3D11/ImGui and NOTHING ELSE - no engine renderer, no scene,
-# no editor. Same discipline as the Hub: a tool that can only run when the whole engine links
-# is a tool that cannot be used when the engine is broken, and this one has no need of it.
-# MeshDerive is compiled in directly rather than pulled from hbe.lib for the same reason.
-add_library(hbe_humancore STATIC
-    "Source/Human/HumanParameters.cpp"
-    "Source/Human/Anatomy.cpp"
-    "Source/Human/BodyField.cpp"
-    "Source/Human/SurfaceGen.cpp"
-    "Source/Human/HumanGenerator.cpp"
-    "Source/Assets/MeshDerive.cpp")
-target_include_directories(hbe_humancore PUBLIC "Source")
-target_link_libraries(hbe_humancore PUBLIC glm::glm)
-target_compile_features(hbe_humancore PUBLIC cxx_std_20)
-
-add_executable(HeartbreakHuman WIN32 "Source/HumanApp/main_humanapp.cpp")
-target_link_libraries(HeartbreakHuman PRIVATE hbe_humancore imgui_hub d3d11 d3dcompiler dxgi)
-set_target_properties(HeartbreakHuman PROPERTIES VS_DPI_AWARE "PerMonitor")
-
 # The Art Editor: a focused painting tool for 2D artists (same editor lib).
 add_executable(HeartbreakArtEditor "Source/main_arteditor.cpp" "${HBE_SCHEMATIC_STUB}")
 target_link_libraries(HeartbreakArtEditor PRIVATE hbe_editor)
 set_target_properties(HeartbreakArtEditor PROPERTIES VS_DPI_AWARE "PerMonitor")
+
 
 # Compile HLSL -> DXIL + SPIR-V and stage next to each executable.
 include(ShaderCompile)

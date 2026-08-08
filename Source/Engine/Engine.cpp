@@ -1,5 +1,7 @@
 // Engine/Engine.cpp
 #include "Engine/Engine.h"
+
+#include "Construction/ConstructionSystem.h"
 #include "Core/Platform.h"
 #include "Engine/CutscenePlayer.h"
 #include "Assets/CutsceneAsset.h"
@@ -55,77 +57,18 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#  define NOMINMAX
-#endif
-#include <windows.h>
 
 namespace hbe {
 
 namespace {
-#if defined(_WIN32)
-// Last-resort SEH handler. An access violation during init (e.g. a graphics driver /
-// device-creation fault on another machine) would otherwise terminate the process
-// SILENTLY, leaving only the pre-crash log - exactly the "it logged 'starting' and
-// quit" report. Log the code + address, flush every sink (incl. the on-disk log),
-// then let the OS finish. Turns a silent death into an actionable crash line.
-LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
-    const EXCEPTION_RECORD* rec = ep ? ep->ExceptionRecord : nullptr;
-    const u32 code = rec ? rec->ExceptionCode : 0u;
-    const void* addr = rec ? rec->ExceptionAddress : nullptr;
-
-    // Resolve the faulting *instruction* to the module (DLL/exe) it lives in. This is
-    // what turns "0x7FFB.. in some DLL" into an actual name - e.g. our own exe (a real
-    // bug), a GPU driver (nvwgf2umx/atidxx), or kernel32 (a null handle we handed it).
-    char modName[MAX_PATH] = "<unknown module>";
-    uintptr_t modOffset = 0;
-    if (addr) {
-        HMODULE mod = nullptr;
-        if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                 reinterpret_cast<LPCSTR>(addr), &mod) &&
-            mod) {
-            // DELIBERATELY NOT platform::ExecutablePath(). This asks a different question:
-            // "which MODULE does this faulting address live in?" - the answer is a DLL as
-            // often as it is the exe, which is the entire point of printing it. The platform
-            // helper only ever answers for the running process. Leave this one alone.
-            char full[MAX_PATH] = {};
-            if (::GetModuleFileNameA(mod, full, MAX_PATH) > 0) {
-                const char* leaf = std::strrchr(full, '\\');
-                std::snprintf(modName, sizeof(modName), "%s", leaf ? leaf + 1 : full);
-            }
-            modOffset = reinterpret_cast<uintptr_t>(addr) - reinterpret_cast<uintptr_t>(mod);
-        }
-    }
-
-    // For an access violation, ExceptionInformation says read vs write and the exact
-    // address touched. A tiny address = a NULL/near-null deref (our own bad pointer,
-    // NOT a graphics driver) - which points the finger squarely at engine code.
-    if (code == 0xC0000005u /*EXCEPTION_ACCESS_VIOLATION*/ && rec && rec->NumberParameters >= 2) {
-        const unsigned long long rw = rec->ExceptionInformation[0]; // 0 read,1 write,8 DEP
-        const unsigned long long bad = rec->ExceptionInformation[1];
-        const char* op = rw == 1 ? "write to" : (rw == 8 ? "execute at" : "read from");
-        HBE_ERROR("FATAL: access violation in {}+0x{:X} - tried to {} 0x{:016X}{}",
-                  modName, modOffset, op, bad,
-                  bad < 0x10000ull ? " (NULL/near-null pointer - an engine bug, not the GPU)."
-                                   : " - engine terminating.");
-    } else {
-        HBE_ERROR("FATAL: unhandled exception 0x{:08X} in {}+0x{:X} at 0x{:016X} - terminating.",
-                  code, modName, modOffset, reinterpret_cast<uintptr_t>(addr));
-    }
-    HBE_ERROR("Send the <exe>.log file next to the executable. If this is graphics-side, try "
-              "--d3d12 / --vulkan / --opengl and update the GPU driver.");
-    FlushLog();
-    return EXCEPTION_EXECUTE_HANDLER; // stop searching; the process ends
-}
-#endif
-
+// The last-resort crash handler that used to live here (a Win32 SEH filter resolving the
+// faulting module) is now platform::InstallCrashHandler(), implemented in its own backend TU
+// Core/CrashHandler_Win32.cpp (kept out of Platform_Win32.cpp so its Core/Log dependency does
+// not reach the engine-free Hub). Moving it is what let this file stop including <windows.h>
+// for a single function. See Run().
 
 // Maps a build-settings backend string to the RHI enum.
 rhi::GraphicsAPI ApiFromString(const std::string& s) {
@@ -199,10 +142,10 @@ void Engine::Quit() {
 }
 
 int Engine::Run(const EngineConfig& configIn) {
-#if defined(_WIN32)
-    // Install first so a crash ANYWHERE in boot gets logged before the process dies.
-    ::SetUnhandledExceptionFilter(&CrashHandler);
-#endif
+    // Install first so a crash ANYWHERE in boot gets logged before the process dies. The
+    // handler is per-OS and lives in the platform layer; a non-Windows backend installs its
+    // own (signal handlers) behind this same call, and Run() stays free of any of it.
+    platform::InstallCrashHandler();
     // Build stamp = the first line ALWAYS printed. If a deployed copy doesn't show the
     // date/time of the build you just made, that machine is running a STALE exe (the
     // usual cause of "I fixed it but it still crashes the same way").
@@ -2478,7 +2421,7 @@ int Engine::Run(const EngineConfig& configIn) {
         }
 
         if (window.IsMinimized()) {
-            ::Sleep(10); // nothing to draw; yield the CPU
+            std::this_thread::sleep_for(std::chrono::milliseconds(10)); // nothing to draw; yield
             continue;
         }
 
@@ -2825,6 +2768,9 @@ int Engine::Run(const EngineConfig& configIn) {
             UpdateInteractions(scene, dt);
         }
         if (physics.IsRunning()) anim::UpdateRotators(scene, dt);
+        // Regenerates any ProceduralBuilding whose revision moved. Cheap when nothing changed
+        // (one view iteration), and revision-gated because the RHI cannot free a mesh.
+        construction::Sync(scene, GetRenderer());
         // Spatial-audio occlusion: push the project's tuning + a physics segment
         // test so 3D sources are attenuated/muffled by geometry (multi-ray leaks
         // through gaps). Only fed while the game runs (colliders live then).

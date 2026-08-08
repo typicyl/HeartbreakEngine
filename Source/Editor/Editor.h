@@ -10,6 +10,10 @@
 #include "Assets/MaterialAsset.h"
 #include "Assets/SeamWeld.h"
 #include "Assets/UAF.h"
+#include "Construction/ConstructionChunk.h"
+#include "Construction/ConstructionIO.h"
+#include "Construction/ConstructionGraph.h"
+#include "Construction/ConstructionPreset.h"
 #include "Editor/MovieRender.h"
 #include "Editor/CollabSession.h" // peer-to-peer sessions + this scene's history
 #include "Editor/SaveDispatch.h" // Ctrl+S: which focused surface owns the chord
@@ -1019,6 +1023,51 @@ private:
     // -- Schematic (visual scripting) editor -----------------------------------------
     // Node-graph editor for the project's .hbschem assets.
     void DrawSchematicEditor(Engine& engine);
+
+    // PROCEDURAL CONSTRUCTION ("Construction" panel). The whole inspector is driven by the
+    // parameter DESCRIPTOR TABLE rather than by hardcoded widgets - which is the entire reason
+    // that table exists. Adding a parameter to a generator makes it appear here with no edit to
+    // this file, and adding a preset makes it appear in the picker with no edit either.
+    void DrawConstructionPanel(Engine& engine);
+    void ConstructionRegenerate();
+    // Saves the .hbbuild and bumps every ProceduralBuilding referencing it, so an edit in the
+    // panel actually reaches the geometry in the viewport.
+    void ConstructionPushToScene(Scene& scene);
+    void ConstructionSpawnProxies(Scene& scene, entt::entity owner);
+    void ConstructionClearProxies(Scene& scene);
+    // Reads gizmo-edited proxy transforms back into the definition. Returns true if anything moved.
+    bool ConstructionPullProxies(Scene& scene);
+
+    // BOX BRUSH: six draggable face handles on one part. Dragging one moves that face's plane and
+    // leaves the opposite face where it is - which is what makes box modelling feel direct.
+    void ConstructionSpawnFaceHandles(Scene& scene, u32 componentId);
+    bool ConstructionPullFaceHandles(Scene& scene);
+    void ConstructionClearHandles(Scene& scene);
+
+    // PATH: drag the footprint points; walls regenerate along the segments.
+    void ConstructionSpawnPathPoints(Scene& scene, entt::entity owner);
+    bool ConstructionPullPathPoints(Scene& scene);
+    // Rebuilds the wall components that follow a building's path.
+    void ConstructionRebuildFromPath(const ProceduralBuilding& pb);
+
+    u32 conHandleComponent_ = 0; // which part currently shows face handles
+
+    std::string conPresetId_ = "wall";
+    construction::PresetParams conParams_{};
+    construction::ConstructionDef conDef_{};
+    construction::ChunkedSection conChunks_{};
+    std::vector<std::string> conErrors_;
+    f32 conChunkSize_ = 4.0f;
+    bool conAutoRegen_ = true;   // regenerate on every parameter edit
+    bool conDirty_ = true;
+    f64 conGenMs_ = 0.0;
+    char conFileName_[128] = "Buildings/untitled.hbbuild";
+    std::string conStatus_;
+    construction::ConstructionGraph conGraph_{};
+    int conTestRemove_ = -1;   // index into conDef_.components; -1 = nothing selected
+    bool conShowStructure_ = false;
+    entt::entity conEditTarget_ = entt::null; // the building whose components are manipulable
+    bool conLiveScene_ = true;                // push panel edits through to the spawned building
     void DrawSchematicCanvas();        // the node canvas (links/nodes/interaction)
     void OpenSchematic(const std::filesystem::path& path);
     // Returns whether a file was WRITTEN. A failed write must not be reported as a
@@ -1536,6 +1585,7 @@ private:
         Panel_Collaborate,
         Panel_People,
         Panel_Review,
+        Panel_Construction,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

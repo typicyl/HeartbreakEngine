@@ -14,6 +14,10 @@
 #include "Assets/MeshSimplify.h"
 #include "Assets/MeshFaceSelect.h"
 #include "Core/Platform.h"
+#include "Construction/ConstructionGraph.h"  // --test-construction
+#include "Construction/ConstructionPreset.h"  // --test-preset
+#include "Construction/ConstructionChunk.h"
+#include "Construction/ConstructionIO.h"
 #include "Assets/SlotIds.h"      // --test-slotids / --migrate-slots (pack slot identity)
 #include "Assets/MusicGraph.h"   // --test-musicvoice (music director lifecycle)
 #include "Assets/UAP.h"          // uap::PackIndexOf (the migration plan prints pack numbers)
@@ -141,6 +145,26 @@ int main(int argc, char** argv) {
         // --test-input: the portable half of Input, which became testable when it was
         // split out of Input_Win32.cpp - press edges, the ordered text stream, mouse
         // deltas, and the stick deadzone curve, none of which need a window.
+        // --test-construction: the procedural construction FOUNDATION - deterministic
+        // hierarchical seeds and the structural relationship graph. Headless; no project,
+        // no window, no GPU, because the definition layer deliberately depends on neither
+        // the scene nor the RHI.
+        // --test-preset: the PRESET + PARAMETER layer - the reflection table that makes an
+        // inspector possible without hardcoding a widget per field, and the presets that turn
+        // parameters into a construction graph.
+        if (std::strcmp(argv[i], "--test-preset") == 0) {
+            const bool ok = hbe::construction::ParamsSelfTest() &&
+                            hbe::construction::PresetSelfTest() &&
+                            hbe::construction::ChunkSelfTest() &&
+                            hbe::construction::IoSelfTest();
+            std::printf("preset %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-construction") == 0) {
+            const bool ok = hbe::construction::SelfTest();
+            std::printf("construction %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
         if (std::strcmp(argv[i], "--test-input") == 0) {
             const bool ok = hbe::InputSelfTest();
             std::printf("input %s\n", ok ? "PASS" : "FAIL");

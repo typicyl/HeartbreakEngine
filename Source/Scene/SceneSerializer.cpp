@@ -300,6 +300,20 @@ struct Exclusion {
 };
 
 constexpr Exclusion kExclusions[] = {
+    {[](const entt::registry& r, entt::entity e) {
+         return r.any_of<BuildFaceHandle, BuildPathPoint>(e);
+     },
+     "BuildFaceHandle/BuildPathPoint",
+     "editor-only box-brush and path handles; the Construction panel respawns them whenever a "
+     "part is selected and destroys them when edit mode ends"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<BuildComponentProxy>(e); },
+     "BuildComponentProxy",
+     "editor-only handles for direct manipulation of a ProceduralBuilding's components; the "
+     "Construction panel respawns them when edit mode is entered and destroys them when it ends"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<BuildChunkTag>(e); },
+     "BuildChunkTag",
+     "construction::Sync regenerates every chunk entity from ProceduralBuilding::source, which "
+     "IS serialized; a loaded building has builtRevision 0 so it always rebuilds once"},
     {[](const entt::registry& r, entt::entity e) { return r.all_of<TerrainChunk>(e); },
      "TerrainChunk",
      "terrain::Update destroys and rebuilds every chunk from TerrainComponent::heights, "
@@ -461,6 +475,7 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const CameraSpline>()) add(e);
     for (const entt::entity e : reg.view<const TerrainComponent>()) add(e);
     for (const entt::entity e : reg.view<const MotionMatching>()) add(e);
+    for (const entt::entity e : reg.view<const ProceduralBuilding>()) add(e);
     for (const entt::entity e : reg.view<const Rotator>()) add(e);
     for (const entt::entity e : reg.view<const CensorComponent>()) add(e);
     for (const entt::entity e : reg.view<const IKConstraint>()) add(e);
@@ -972,6 +987,18 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                     {"speedScale", mm->speedScale},
                                     {"useNavVelocity", mm->useNavVelocity},
                                     {"enabled", mm->enabled}};
+        }
+        if (const ProceduralBuilding* pb = reg.try_get<ProceduralBuilding>(e)) {
+            // Source and chunk size only. The geometry is derived and the revision counters are
+            // runtime bookkeeping - writing either would make the file lie about what it contains.
+            json path = json::array();
+            for (const glm::vec3& p : pb->path) path.push_back(ToJson(p));
+            je["building"] = {{"source", pb->source},
+                              {"chunkSize", pb->chunkSize},
+                              {"path", path},
+                              {"pathHeight", pb->pathWallHeight},
+                              {"pathThickness", pb->pathWallThickness},
+                              {"pathClosed", pb->pathClosed}};
         }
         if (const Rotator* ro = reg.try_get<Rotator>(e)) {
             je["rotator"] = {{"axis", ToJson(ro->axis)},
@@ -1759,6 +1786,18 @@ void ParseSceneJson(const json& root, SceneData& out) {
             mm.speedScale = it->value("speedScale", mm.speedScale);
             mm.useNavVelocity = it->value("useNavVelocity", mm.useNavVelocity);
             mm.enabled = it->value("enabled", mm.enabled);
+        }
+        if (auto it = je.find("building"); it != je.end()) {
+            d.hasBuilding = true;
+            d.building.source = it->value("source", std::string());
+            d.building.chunkSize = it->value("chunkSize", d.building.chunkSize);
+            d.building.pathWallHeight = it->value("pathHeight", d.building.pathWallHeight);
+            d.building.pathWallThickness =
+                it->value("pathThickness", d.building.pathWallThickness);
+            d.building.pathClosed = it->value("pathClosed", d.building.pathClosed);
+            if (auto pit = it->find("path"); pit != it->end() && pit->is_array())
+                for (const json& jp : *pit)
+                    d.building.path.push_back(Vec3(jp, glm::vec3(0.0f)));
         }
         if (auto it = je.find("rotator"); it != je.end()) {
             d.hasRotator = true;
@@ -3043,6 +3082,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             }
         }
         if (d.hasMotionMatching) reg.emplace<MotionMatching>(e, d.motionMatching);
+        if (d.hasBuilding) reg.emplace<ProceduralBuilding>(e, d.building);
         if (d.hasRotator) reg.emplace<Rotator>(e, d.rotator);
         if (d.hasCensor) reg.emplace<CensorComponent>(e, d.censor);
         if (d.hasCharacter) reg.emplace<CharacterController>(e, d.character);

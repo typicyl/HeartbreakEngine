@@ -3,6 +3,7 @@
 
 #include "Assets/UAF.h"
 #include "Core/Log.h"
+#include "Core/Platform.h" // SystemUiFontCandidates (no more hardcoded C:\Windows\Fonts)
 #include "Renderer/Renderer.h"
 #include "RHI/RHI.h"
 
@@ -30,9 +31,9 @@ constexpr int kFirstChar = 32;  // space
 constexpr int kCharCount = 95;  // ASCII 32..126
 
 std::vector<u8> ReadFontFile() {
-    for (const char* path : {"C:\\Windows\\Fonts\\segoeui.ttf",
-                             "C:\\Windows\\Fonts\\arial.ttf",
-                             "C:\\Windows\\Fonts\\tahoma.ttf"}) {
+    // The OS-provided UI faces, in preference order, resolved from the actual Windows/Fonts
+    // directory rather than a hardcoded C: path (which was wrong on non-C: system drives).
+    for (const std::filesystem::path& path : platform::SystemUiFontCandidates()) {
         std::ifstream in(path, std::ios::binary | std::ios::ate);
         if (!in) continue;
         const std::streamsize size = in.tellg();

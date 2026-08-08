@@ -174,7 +174,11 @@ cbuffer ObjectConstants : register(b1)
 #define HBE_MAT_PAINTERLY_EXEMPT 128u // dynamic-layer object: write the painterly mask
 #define HBE_MAT_TERRAIN_HOLE 256u     // clip terrain pixels where the hole mask (thickness slot) is set
 #define HBE_MAT_TERRAIN_SPLAT 512u    // blend 4 tiling layer albedos (albedo/normal/mr/ao slots) by the emissive-slot weight mask
-#define HBE_MAT_CENSORED 1024u        // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
+#define HBE_MAT_CENSORED 1024u
+// Bits 16-23 carry a PROCEDURAL CONSTRUCTION MATERIAL id (see Construction.hlsli). Packed into the
+// spare high bits of this existing word rather than added as a new ObjectCB field: ObjectCB is
+// 528 B aligned to 768 against a 4 MB per-frame arena, so growing it would directly cut how many
+// objects this renderer can draw in a frame.        // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
 
 // ---------------------------------------------------------------------------
 // Bindless texture table.

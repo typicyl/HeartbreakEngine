@@ -629,6 +629,12 @@ bool Editor::SceneSaveSelfTest(const fs::path& sceneFile) {
         reg.emplace<DebrisChunk>(plain("Debris"), DebrisChunk{});
         reg.emplace<Persistent>(plain("ResidentUI"));
         reg.emplace<UIDocMember>(plain("MenuButton"), UIDocMember{});
+        reg.emplace<BuildChunkTag>(plain("BuildChunk_0_0_0"),
+                                   BuildChunkTag{terrainRoot, 0, 0, 0});
+        reg.emplace<BuildComponentProxy>(plain("BuildProxy_1"),
+                                         BuildComponentProxy{terrainRoot, 1});
+        reg.emplace<BuildFaceHandle>(plain("FaceHandle_X"),
+                                     BuildFaceHandle{terrainRoot, 1, 0, 1});
         expect(scene::SaveScene(s, ex), "save a scene holding one entity per exclusion row");
 
         scene::SceneData d;

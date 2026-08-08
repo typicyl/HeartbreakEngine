@@ -19,6 +19,7 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "Core/FileFilter.h" // platform::FileFilter (the import dialog's type filter)
 
 #include <filesystem>
 #include <string>
@@ -108,9 +109,12 @@ CollectRefsFn CollectorOf(const std::string& ext);
 // an extension is duplicated / malformed. Headless; no project needed.
 bool RegistrySelfTest();
 
-// Win32 OPENFILENAME filter for the editor's Import dialog, built from
-// SourceFormats() so the dialog and the importer can never disagree. Returns a
-// double-NUL-terminated block: "Label\0*.a;*.b\0...\0All files\0*.*\0\0".
-std::wstring BuildImportDialogFilter();
+// The editor's Import-dialog type filter, built from the SOURCE FORMATS table so the
+// dialog and the importer can never disagree (the old literal had silently fallen
+// behind and hid .psd/.gif/.dae/.ply/.mp3/.flac). Grouped "All supported assets",
+// then per-category. Extensions are bare dotless tokens; the native-dialog backend
+// renders them and appends its own "All files" - this stays free of any OS filter
+// format. See Core/NativeDialogs.h for how it is consumed.
+std::vector<platform::FileFilter> ImportFileFilters();
 
 } // namespace hbe::assets

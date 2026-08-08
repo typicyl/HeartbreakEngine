@@ -112,6 +112,59 @@ std::string MachineId() {
     return out;
 }
 
+bool LaunchDetached(const fs::path& exe, const std::vector<fs::path>& args) {
+    // Build the command line: "exe" "arg0" "arg1" ... - each token quoted so a space in a
+    // path survives. A double-quote cannot appear in a Windows path, so plain quote-wrapping
+    // is sufficient (and matches the hand-rolled launch this replaced). Quoting a flag like
+    // "--project" is harmless: the child's argv parser strips the quotes.
+    std::wstring cmd = L"\"" + exe.wstring() + L"\"";
+    for (const fs::path& a : args) {
+        cmd += L" \"";
+        cmd += a.wstring();
+        cmd += L'"';
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    // Run the exe DIRECTLY (lpApplicationName set) - no shell, no PATH search. CreateProcess
+    // may write into the command-line buffer, so it must be mutable: cmd.data(), not c_str().
+    if (!::CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                          &si, &pi)) {
+        return false;
+    }
+    ::CloseHandle(pi.hThread); // a detached hand-off, not a child we wait on
+    ::CloseHandle(pi.hProcess);
+    return true;
+}
+
+// InstallCrashHandler() is deliberately NOT here. It calls into Core/Log (HBE_ERROR/FlushLog),
+// and this translation unit is also linked into hbe_hubcore (the engine-free launcher), which
+// does not link Log.cpp - putting the handler here would drag an unresolved Log symbol into
+// the Hub. It lives in its own TU, Core/CrashHandler_Win32.cpp, added only to the engine
+// libraries. SystemUiFontCandidates() below uses nothing but kernel32, so it stays.
+
+std::vector<fs::path> SystemUiFontCandidates() {
+    // ASK THE OS for its Windows directory rather than hardcoding "C:\\Windows". The two
+    // copies of this that this replaces both assumed C:, which is simply wrong on a machine
+    // whose system drive is D: (an SSD swap, an enterprise image) - there the font failed to
+    // load and UI text silently vanished. GetWindowsDirectory is kernel32, so this adds no
+    // link dependency; the Fonts subfolder is a fixed relative name under it.
+    fs::path fonts;
+    if (const UINT n = ::GetWindowsDirectoryW(nullptr, 0); n > 0) {
+        std::vector<wchar_t> buf(n);
+        const UINT got = ::GetWindowsDirectoryW(buf.data(), n);
+        if (got > 0 && got < n) fonts = fs::path(std::wstring(buf.data(), got)) / L"Fonts";
+    }
+    if (fonts.empty()) fonts = fs::path(L"C:\\Windows\\Fonts"); // last-resort, matches old behaviour
+
+    std::vector<fs::path> out;
+    // Preference order preserved from the old ReadFontFile: Segoe UI (the modern system UI
+    // face), then Arial, then Tahoma as a floor that exists on essentially every install.
+    for (const wchar_t* face : {L"segoeui.ttf", L"arial.ttf", L"tahoma.ttf"})
+        out.push_back(fonts / face);
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -171,12 +224,26 @@ bool SelfTest() {
         Check(id.size() >= 8, "a machine id that short is not an identifier");
     }
 
+    // System fonts: the list must exist, every entry must be an absolute path (a caller feeds
+    // it straight to a file open), and on Windows at least one of the faces must actually be
+    // present - a machine with no Segoe UI / Arial / Tahoma at all does not exist in practice,
+    // and if this returns nothing the UI silently loses its text.
+    const std::vector<fs::path> fonts = SystemUiFontCandidates();
+    Check(!fonts.empty(), "at least one system UI font candidate must be offered");
+    bool anyFontExists = false;
+    for (const fs::path& f : fonts) {
+        Check(f.is_absolute(), "every font candidate must be an absolute path");
+        if (fs::exists(f, ec)) anyFontExists = true;
+    }
+    Check(anyFontExists, "at least one offered system UI font must exist on this machine");
+
     (void)IsElevated(); // must not crash; the value itself is environment-dependent
 
     if (g_fails == 0)
         std::printf("platform: one executable path (grown, never truncated at MAX_PATH like "
                     "the 12 hand-rolled copies), one user-data directory with ONE fallback "
-                    "policy instead of the previous two, and a stable machine id\n");
+                    "policy instead of the previous two, a stable machine id, and system UI "
+                    "fonts resolved from the OS Windows dir (not a hardcoded C:)\n");
     return g_fails == 0;
 }
 

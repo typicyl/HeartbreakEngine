@@ -1,5 +1,7 @@
 // Editor/Editor.cpp
 #include "Editor/Editor.h"
+
+#include "Construction/ConstructionSystem.h"
 #include "Core/Platform.h"
 
 #include "Assets/MeshFaceSelect.h"
@@ -57,9 +59,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-#include <windows.h>
-#include <commdlg.h>
-#include <shobjidl.h> // IFileDialog (folder picker)
+#include "Core/NativeDialogs.h" // native file/folder pickers + eyedropper, behind the platform seam
 
 #include <nlohmann/json.hpp>
 #include <stb_image.h> // brush-tip image import (implementation in stb_image_impl.cpp)
@@ -131,34 +131,8 @@ void DrawAudioIcon(ImDrawList* dl, ImVec2 c, f32 s) {
     }
 }
 
-// Modern folder-picker dialog (IFileDialog with FOS_PICKFOLDERS).
-std::optional<std::filesystem::path> BrowseForFolderDialog() {
-    // S_FALSE (already initialized) is fine.
-    ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    IFileDialog* dlg = nullptr;
-    if (FAILED(::CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
-                                  IID_PPV_ARGS(&dlg)))) {
-        return std::nullopt;
-    }
-    DWORD opts = 0;
-    dlg->GetOptions(&opts);
-    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST);
-
-    std::optional<std::filesystem::path> out;
-    if (SUCCEEDED(dlg->Show(nullptr))) {
-        IShellItem* item = nullptr;
-        if (SUCCEEDED(dlg->GetResult(&item))) {
-            PWSTR psz = nullptr;
-            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &psz))) {
-                out = std::filesystem::path(psz);
-                ::CoTaskMemFree(psz);
-            }
-            item->Release();
-        }
-    }
-    dlg->Release();
-    return out;
-}
+// The modern folder-picker (IFileDialog) now lives in platform::PickFolderDialog(); this
+// file no longer touches COM/shell headers. Callers use platform::PickFolderDialog() directly.
 
 // Where the recent-projects list persists (per user).
 std::filesystem::path RecentProjectsFile() {
@@ -241,13 +215,15 @@ void Editor::EnableLayoutPersistence(const char* iniPath) {
 }
 
 void Editor::ApplyTheme() {
-    // Crisp system font instead of ImGui's bitmap default (13px ProggyClean).
+    // Crisp system font instead of ImGui's bitmap default (13px ProggyClean). The OS font
+    // list (resolved from the real Windows/Fonts dir, not a hardcoded C:) is tried in order.
     ImGuiIO& io = ImGui::GetIO();
-    const char* font = "C:\\Windows\\Fonts\\segoeui.ttf";
     std::error_code ec;
-    if (std::filesystem::exists(font, ec)) {
+    for (const std::filesystem::path& font : platform::SystemUiFontCandidates()) {
+        if (!std::filesystem::exists(font, ec)) continue;
         io.Fonts->Clear();
-        io.Fonts->AddFontFromFileTTF(font, 17.0f);
+        io.Fonts->AddFontFromFileTTF(font.string().c_str(), 17.0f);
+        break;
     }
 
     ImGuiStyle& s = ImGui::GetStyle();
@@ -781,6 +757,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawBuildSettings(engine);
     DrawArtEditor(engine);
     DrawSchematicEditor(engine);
+    DrawConstructionPanel(engine);
     DrawDialogueEditor(engine);
     DrawInputIconsPanel(engine);
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
@@ -869,7 +846,8 @@ void Editor::DrawWindowMenu() {
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
-        "Tags", "UI Editor", "Collaborate", "People", "Review changes"};
+        "Tags", "UI Editor", "Collaborate", "People", "Review changes",
+        "Construction"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -3732,15 +3710,9 @@ void Editor::DrawBrushEditor() {
     if (ImGui::TreeNode("Custom tip (image / pixels)")) {
         constexpr u32 kStamp = 32; // edit/import resolution
         if (ImGui::Button("Import Image...")) {
-            wchar_t file[2048] = {};
-            OPENFILENAMEW ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrFilter = L"Images\0*.png;*.jpg;*.jpeg;*.tga;*.bmp\0All files\0*.*\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = static_cast<DWORD>(std::size(file));
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameW(&ofn) &&
-                LoadBrushStamp(std::filesystem::path(file), kStamp, brushDef_.customAlpha)) {
+            const auto picked = platform::OpenFileDialog(
+                {{"Images", {"png", "jpg", "jpeg", "tga", "bmp"}}});
+            if (picked && LoadBrushStamp(*picked, kStamp, brushDef_.customAlpha)) {
                 brushDef_.customSize = kStamp;
                 brushDirty_ = true;
             }
@@ -4150,15 +4122,9 @@ void Editor::UpdateArtTool(Engine& engine) {
     if (colorPickMode_) {
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) colorPickMode_ = false;
         if (vpVisible_ && vpHovered_ && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            POINT pt{};
-            if (::GetCursorPos(&pt)) {
-                HDC dc = ::GetDC(nullptr); // screen DC
-                const COLORREF c = ::GetPixel(dc, pt.x, pt.y);
-                ::ReleaseDC(nullptr, dc);
-                if (c != CLR_INVALID)
-                    brushColor_ = glm::vec4(GetRValue(c) / 255.0f, GetGValue(c) / 255.0f,
-                                            GetBValue(c) / 255.0f, brushColor_.a);
-            }
+            u8 r = 0, g = 0, b = 0;
+            if (platform::SampleDesktopColorAtCursor(r, g, b))
+                brushColor_ = glm::vec4(r / 255.0f, g / 255.0f, b / 255.0f, brushColor_.a);
             colorPickMode_ = false;
             paintConsumedClick_ = true; // don't paint / pick an entity with this click
         }
@@ -4834,7 +4800,9 @@ void Editor::RefreshAssets() {
         currentDir_ = root;
     } else {
         const auto rel = std::filesystem::relative(currentDir_, root, ec);
-        if (ec || rel.empty() || rel.native().starts_with(L"..")) currentDir_ = root;
+        // generic_string() (portable, '/'-separated) rather than native()+L".." - the ".."
+        // escape check is separator-agnostic and needs no wide-string / Windows assumption.
+        if (ec || rel.empty() || rel.generic_string().starts_with("..")) currentDir_ = root;
     }
 
     for (const auto& entry : std::filesystem::directory_iterator(currentDir_, ec)) {
@@ -5380,19 +5348,12 @@ void Editor::DrawAssetBrowser(Engine& engine) {
         const std::filesystem::path dst =
             currentDir_.empty() ? Project::Active().AssetsDir() : currentDir_;
         if (ImGui::MenuItem("Import...")) {
-            wchar_t file[2048] = {};
-            OPENFILENAMEW ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            // Generated from the format registry, so the dialog always offers
-            // exactly what importer::IsSupportedSource accepts. The old literal had
-            // silently fallen behind and hid .psd/.gif/.dae/.ply/.mp3/.flac.
-            const std::wstring filter = assets::BuildImportDialogFilter();
-            ofn.lpstrFilter = filter.c_str();
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = static_cast<DWORD>(std::size(file));
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameW(&ofn)) {
-                hbe::importer::Import(std::filesystem::path(file), dst);
+            // Filters are generated from the format registry, so the dialog always offers
+            // exactly what importer::IsSupportedSource accepts. The old literal had silently
+            // fallen behind and hid .psd/.gif/.dae/.ply/.mp3/.flac.
+            const auto picked = platform::OpenFileDialog(assets::ImportFileFilters());
+            if (picked) {
+                hbe::importer::Import(*picked, dst);
                 // A re-import may overwrite an asset the GPU caches as resident.
                 scene::ClearInstantiateCaches();
                 ui::ClearFontCache();
@@ -7089,7 +7050,8 @@ void Editor::DrawHierarchy(Engine& engine) {
     // build, so a big terrain's chunk bucket is never even sorted).
     scene::BuildChildrenMap(reg, childrenByParent_,
                             [](const entt::registry& r, entt::entity c) {
-                                return r.try_get<const TerrainChunk>(c) == nullptr;
+                                return r.try_get<const TerrainChunk>(c) == nullptr &&
+                                       r.try_get<const BuildChunkTag>(c) == nullptr;
                             });
 
     // Roots: every live entity without a (valid) parent. Gather then draw in the
@@ -7097,6 +7059,10 @@ void Editor::DrawHierarchy(Engine& engine) {
     std::vector<entt::entity> roots;
     for (const entt::entity e : reg.view<entt::entity>()) {
         if (reg.try_get<TerrainChunk>(e)) continue; // generated terrain chunk
+        // Generated building geometry, for the same reason: it is derived data, and deleting a
+        // chunk by hand would not be undone by construction::Sync (which is revision-gated), so
+        // the building would sit with a permanent hole until something bumped its revision.
+        if (reg.try_get<BuildChunkTag>(e)) continue;
         const Parent* p = reg.try_get<Parent>(e);
         if (p && reg.valid(p->entity)) continue;
         roots.push_back(e);
@@ -7860,6 +7826,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             PushUndo(scene);
             reg.emplace<MotionMatching>(sel);
             if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // MM drives an Animator
+        }
+        if (!reg.all_of<ProceduralBuilding>(sel) && ImGui::MenuItem("Procedural Building")) {
+            PushUndo(scene);
+            reg.emplace<ProceduralBuilding>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
         if (!reg.all_of<Rotator>(sel) && ImGui::MenuItem("Rotator")) {
             PushUndo(scene);
@@ -9068,6 +9039,43 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<MotionMatching>(sel);
+        }
+    }
+
+    // --- Procedural Building -------------------------------------------------
+    if (ProceduralBuilding* pb = reg.try_get<ProceduralBuilding>(sel)) {
+        const SectionState s = ComponentSection("Procedural Building");
+        if (s.open) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf), "%s", pb->source.c_str());
+            if (ImGui::InputText("Source (.hbbuild)", buf, sizeof(buf))) {
+                PushUndo(scene);
+                pb->source = buf;
+                ++pb->revision; // the source changed, so the geometry must be rebuilt
+            }
+            if (ImGui::DragFloat("Chunk Size", &pb->chunkSize, 0.25f, 0.5f, 64.0f, "%.2f m")) {
+                PushUndo(scene);
+                ++pb->revision;
+            }
+
+            // REGENERATION IS EXPLICIT, not automatic on edit. The RHI cannot free a mesh, so a
+            // rebuild abandons the previous buffers for the process lifetime - regenerating on
+            // every slider frame would leak an entire building per frame.
+            if (ImGui::Button("Rebuild")) ++pb->revision;
+            ImGui::SameLine();
+            u32 chunkEntities = 0;
+            for (const entt::entity ce : reg.view<BuildChunkTag>())
+                if (reg.get<BuildChunkTag>(ce).owner == sel) ++chunkEntities;
+            ImGui::Text("%u generated chunk mesh(es)", chunkEntities);
+
+            if (pb->source.empty())
+                ImGui::TextDisabled("Set a .hbbuild path, or use the Construction panel to author "
+                                    "one and spawn it.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            construction::ClearGenerated(scene, sel);
+            reg.remove<ProceduralBuilding>(sel);
         }
     }
 
@@ -11227,6 +11235,932 @@ std::filesystem::path Editor::CreateSchematicAsset(const std::filesystem::path& 
     return p;
 }
 
+
+// ---------------------------------------------------------------------------
+// Procedural construction
+// ---------------------------------------------------------------------------
+
+void Editor::ConstructionRegenerate() {
+    namespace con = construction;
+    conErrors_.clear();
+    con::BuildPreset(conPresetId_.c_str(), conParams_, conDef_);
+    conDef_.Validate(conErrors_);
+    con::BuildChunked(conDef_, nullptr, con::kInvalidComponent, conChunkSize_, conChunks_);
+    conGraph_.Build(conDef_);
+    conDirty_ = false;
+}
+
+
+// --- Direct manipulation of construction components -------------------------
+//
+// THE POINT: a parameter list is not control. These four functions turn every component of a
+// building into a real entity the existing gizmo can move, rotate and scale - so the artist builds
+// the structure they want instead of the one the preset author imagined.
+
+void Editor::ConstructionPushToScene(Scene& scene) {
+    if (Project::Active().Root().empty()) return;
+
+    construction::BuildAsset a;
+    a.presetId = conPresetId_;
+    a.params = conParams_;
+    a.def = conDef_;
+    a.chunkSize = conChunkSize_;
+    std::string err;
+    const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
+    if (!construction::SaveBuild(f, a, err)) {
+        conStatus_ = "Could not save: " + err;
+        return;
+    }
+
+    // Bump every building pointing at this asset. WITHOUT THIS the panel edits nothing the artist
+    // can see: construction::Sync is revision-gated, so a spawned building keeps whatever geometry
+    // it was created with no matter what the parameters say. That gap is why age, seed and every
+    // other dial appeared to do nothing at all.
+    entt::registry& reg = scene.Registry();
+    u32 bumped = 0;
+    for (const entt::entity e : reg.view<ProceduralBuilding>()) {
+        ProceduralBuilding& pb = reg.get<ProceduralBuilding>(e);
+        if (pb.source == conFileName_) {
+            ++pb.revision;
+            ++bumped;
+        }
+    }
+    conStatus_ = bumped ? ("Pushed to " + std::to_string(bumped) + " building(s) in the scene.")
+                        : "Saved. Nothing in the scene references this file yet - use Spawn.";
+}
+
+void Editor::ConstructionClearProxies(Scene& scene) {
+    entt::registry& reg = scene.Registry();
+    std::vector<entt::entity> doomed;
+    for (const entt::entity e : reg.view<BuildComponentProxy>()) doomed.push_back(e);
+    for (const entt::entity e : doomed)
+        if (reg.valid(e)) reg.destroy(e);
+    conEditTarget_ = entt::null;
+}
+
+void Editor::ConstructionSpawnProxies(Scene& scene, entt::entity owner) {
+    ConstructionClearProxies(scene);
+    if (!scene.Registry().valid(owner)) return;
+    entt::registry& reg = scene.Registry();
+    conEditTarget_ = owner;
+
+    for (const construction::ConstructionComponent& c : conDef_.components) {
+        const entt::entity e = scene.CreateEntity(
+            std::string(construction::ToString(c.kind)) + " #" + std::to_string(c.id) +
+            (c.name.empty() ? "" : " - " + c.name));
+        reg.emplace<Parent>(e, owner);
+
+        // THE TRANSFORM *IS* THE DEFINITION. Scale carries the half-extent, so dragging a scale
+        // handle resizes the wall itself rather than stretching a mesh - which is the whole
+        // difference between "a procedural asset" and "a thing I can build with".
+        Transform t;
+        t.position = c.position;
+        t.rotation = c.rotation;
+        t.scale = c.extent;
+        reg.emplace<Transform>(e, t);
+
+        // Unit box scaled by the transform, so viewport picking (Transform + AABB) selects it.
+        reg.emplace<AABB>(e, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)});
+        reg.emplace<BuildComponentProxy>(e, BuildComponentProxy{owner, c.id});
+    }
+    conStatus_ = "Edit mode: drag the handles to move, rotate and SCALE each part.";
+}
+
+bool Editor::ConstructionPullProxies(Scene& scene) {
+    if (conEditTarget_ == entt::null) return false;
+    entt::registry& reg = scene.Registry();
+    bool changed = false;
+
+    for (const entt::entity e : reg.view<BuildComponentProxy, Transform>()) {
+        const BuildComponentProxy& p = reg.get<BuildComponentProxy>(e);
+        const Transform& t = reg.get<Transform>(e);
+        construction::ConstructionComponent* c = conDef_.Find(p.componentId);
+        if (!c) continue;
+
+        // A scale handle dragged to zero would produce a degenerate component that generates
+        // nothing - which reads as "the tool deleted my wall". Clamp instead.
+        const glm::vec3 ext = glm::max(t.scale, glm::vec3(0.01f));
+        if (glm::any(glm::epsilonNotEqual(c->position, t.position, 1e-5f)) ||
+            glm::any(glm::epsilonNotEqual(c->extent, ext, 1e-5f)) ||
+            glm::any(glm::epsilonNotEqual(glm::vec4(c->rotation.x, c->rotation.y, c->rotation.z,
+                                                    c->rotation.w),
+                                          glm::vec4(t.rotation.x, t.rotation.y, t.rotation.z,
+                                                    t.rotation.w),
+                                          1e-5f))) {
+            c->position = t.position;
+            c->rotation = t.rotation;
+            c->extent = ext;
+            // Hand-placed by the artist: a later "Rebuild from preset" must not throw it away.
+            c->locked = true;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+
+// --- BOX BRUSH --------------------------------------------------------------
+
+void Editor::ConstructionClearHandles(Scene& scene) {
+    entt::registry& reg = scene.Registry();
+    std::vector<entt::entity> doomed;
+    for (const entt::entity e : reg.view<BuildFaceHandle>()) doomed.push_back(e);
+    for (const entt::entity e : reg.view<BuildPathPoint>()) doomed.push_back(e);
+    for (const entt::entity e : doomed)
+        if (reg.valid(e)) reg.destroy(e);
+    conHandleComponent_ = 0;
+}
+
+void Editor::ConstructionSpawnFaceHandles(Scene& scene, u32 componentId) {
+    ConstructionClearHandles(scene);
+    const construction::ConstructionComponent* c = conDef_.Find(componentId);
+    if (!c || conEditTarget_ == entt::null) return;
+    entt::registry& reg = scene.Registry();
+    conHandleComponent_ = componentId;
+
+    static const char* kNames[6] = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"};
+    for (int i = 0; i < 6; ++i) {
+        const u8 axis = static_cast<u8>(i / 2);
+        const i8 sign = (i % 2) ? -1 : 1;
+
+        glm::vec3 offset(0.0f);
+        offset[axis] = static_cast<f32>(sign) * c->extent[axis];
+
+        const entt::entity e = scene.CreateEntity(std::string("Face ") + kNames[i]);
+        reg.emplace<Parent>(e, conEditTarget_);
+        Transform t;
+        t.position = c->position + glm::vec3(glm::mat4_cast(c->rotation) * glm::vec4(offset, 0.0f));
+        // Deliberately a fixed small size rather than proportional: a handle that scales with the
+        // part becomes unusable on both a 20 m wall and a 0.1 m batten.
+        t.scale = glm::vec3(0.09f);
+        reg.emplace<Transform>(e, t);
+        reg.emplace<AABB>(e, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)});
+        reg.emplace<BuildFaceHandle>(e, BuildFaceHandle{conEditTarget_, componentId, axis, sign});
+    }
+    conStatus_ = "Box brush: drag a face handle to push that face. The opposite face stays put.";
+}
+
+bool Editor::ConstructionPullFaceHandles(Scene& scene) {
+    if (conHandleComponent_ == 0) return false;
+    construction::ConstructionComponent* c = conDef_.Find(conHandleComponent_);
+    if (!c) return false;
+    entt::registry& reg = scene.Registry();
+
+    // Work in the part's LOCAL frame, so a rotated wall still pushes along its own length rather
+    // than along a world axis - dragging the end of a rotated wall sideways is the classic way
+    // this feature feels broken.
+    const glm::mat4 inv = glm::inverse(glm::mat4_cast(c->rotation));
+    glm::vec3 mn = -c->extent, mx = c->extent;
+    bool moved = false;
+
+    for (const entt::entity e : reg.view<BuildFaceHandle, Transform>()) {
+        const BuildFaceHandle& h = reg.get<BuildFaceHandle>(e);
+        if (h.componentId != conHandleComponent_) continue;
+        const Transform& t = reg.get<Transform>(e);
+
+        const glm::vec3 local = glm::vec3(inv * glm::vec4(t.position - c->position, 0.0f));
+        const f32 want = local[h.axis];
+        f32& edge = (h.sign > 0) ? mx[h.axis] : mn[h.axis];
+        if (std::fabs(want - edge) > 1e-4f) {
+            edge = want;
+            moved = true;
+        }
+    }
+    if (!moved) return false;
+
+    // A face dragged past its opposite would invert the box - it would render inside out and its
+    // collider would be inverted too. Refuse rather than produce that.
+    for (int a = 0; a < 3; ++a)
+        if (mx[a] - mn[a] < 0.02f) {
+            const f32 mid = (mx[a] + mn[a]) * 0.5f;
+            mn[a] = mid - 0.01f;
+            mx[a] = mid + 0.01f;
+        }
+
+    const glm::vec3 newExtent = (mx - mn) * 0.5f;
+    const glm::vec3 localCentre = (mx + mn) * 0.5f;
+    c->position += glm::vec3(glm::mat4_cast(c->rotation) * glm::vec4(localCentre, 0.0f));
+    c->extent = newExtent;
+    c->locked = true; // hand-shaped: a preset rebuild must not undo it
+    return true;
+}
+
+// --- PATH -------------------------------------------------------------------
+
+void Editor::ConstructionSpawnPathPoints(Scene& scene, entt::entity owner) {
+    entt::registry& reg = scene.Registry();
+    if (!reg.valid(owner) || !reg.all_of<ProceduralBuilding>(owner)) return;
+    const ProceduralBuilding& pb = reg.get<ProceduralBuilding>(owner);
+
+    for (usize i = 0; i < pb.path.size(); ++i) {
+        const entt::entity e = scene.CreateEntity("Path " + std::to_string(i));
+        reg.emplace<Parent>(e, owner);
+        Transform t;
+        t.position = pb.path[i];
+        t.scale = glm::vec3(0.16f);
+        reg.emplace<Transform>(e, t);
+        reg.emplace<AABB>(e, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)});
+        reg.emplace<BuildPathPoint>(e, BuildPathPoint{owner, static_cast<u32>(i)});
+    }
+}
+
+bool Editor::ConstructionPullPathPoints(Scene& scene) {
+    entt::registry& reg = scene.Registry();
+    bool moved = false;
+    for (const entt::entity e : reg.view<BuildPathPoint, Transform>()) {
+        const BuildPathPoint& p = reg.get<BuildPathPoint>(e);
+        if (!reg.valid(p.owner) || !reg.all_of<ProceduralBuilding>(p.owner)) continue;
+        ProceduralBuilding& pb = reg.get<ProceduralBuilding>(p.owner);
+        if (p.index >= pb.path.size()) continue;
+        const glm::vec3 pos = reg.get<Transform>(e).position;
+        if (glm::any(glm::epsilonNotEqual(pb.path[p.index], pos, 1e-4f))) {
+            pb.path[p.index] = pos;
+            moved = true;
+        }
+    }
+    return moved;
+}
+
+void Editor::ConstructionRebuildFromPath(const ProceduralBuilding& pb) {
+    // Drop the walls this path previously produced, keeping everything else the artist placed.
+    // Identified by name rather than by a flag so a hand-renamed wall is left alone - the artist
+    // renaming something is a clear signal they now own it.
+    std::vector<construction::ComponentId> old;
+    for (const construction::ConstructionComponent& c : conDef_.components)
+        if (c.name.rfind("path:", 0) == 0) old.push_back(c.id);
+    for (construction::ComponentId id : old) conDef_.RemoveComponent(id);
+
+    if (pb.path.size() < 2) return;
+
+    // The foundation anchors the whole thing; without it the structural graph reports every
+    // generated wall as unsupported the moment the path is drawn.
+    construction::ComponentId anchor = construction::kInvalidComponent;
+    for (const construction::ConstructionComponent& c : conDef_.components)
+        if (c.role == construction::StructuralRole::Foundation) anchor = c.id;
+
+    const usize segs = pb.pathClosed ? pb.path.size() : pb.path.size() - 1;
+    for (usize i = 0; i < segs; ++i) {
+        const glm::vec3 a = pb.path[i];
+        const glm::vec3 b = pb.path[(i + 1) % pb.path.size()];
+        const glm::vec3 d = b - a;
+        const f32 len = glm::length(glm::vec2(d.x, d.z));
+        if (len < 0.05f) continue; // two points on top of each other make no wall
+
+        construction::ConstructionComponent w;
+        w.kind = construction::ComponentKind::Wall;
+        w.role = construction::StructuralRole::LoadBearing;
+        w.material = static_cast<construction::MaterialKind>(conParams_.exteriorMaterial);
+        w.name = "path:" + std::to_string(i);
+        w.position = glm::vec3((a.x + b.x) * 0.5f, pb.pathWallHeight * 0.5f, (a.z + b.z) * 0.5f);
+        // Rotate the wall to face along the segment - the whole point of a path is that walls
+        // follow it rather than staying axis-aligned.
+        w.rotation = glm::angleAxis(std::atan2(d.x, d.z), glm::vec3(0.0f, 1.0f, 0.0f));
+        w.extent = glm::vec3(len * 0.5f, pb.pathWallHeight * 0.5f, pb.pathWallThickness * 0.5f);
+        w.masonry = conParams_.masonry;
+        w.timber = conParams_.timber;
+        w.plank = conParams_.plank;
+        w.shingle = conParams_.shingle;
+        w.weathering = conParams_.weathering;
+        const construction::ComponentId id = conDef_.AddComponent(w);
+        if (anchor != construction::kInvalidComponent)
+            conDef_.AddEdge(id, anchor, construction::EdgeKind::Bears);
+    }
+}
+
+void Editor::DrawConstructionPanel(Engine& engine) {
+    Scene& sceneRef = engine.GetScene();
+    if (!panelOpen_[Panel_Construction]) return;
+    namespace con = construction;
+
+    ImGui::SetNextWindowSize(ImVec2(380, 640), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Construction", &panelOpen_[Panel_Construction])) {
+        ImGui::End();
+        return;
+    }
+
+    if (conDirty_) {
+        ConstructionRegenerate();
+        // AND PUSH. Regenerating only refreshed this panel's own preview - the spawned building
+        // stayed on whatever geometry it was created with, which is why every slider still looked
+        // dead after the push function existed. Fixing the function was not the same as calling it.
+        if (conLiveScene_) ConstructionPushToScene(sceneRef);
+    }
+
+    // -- BUILD DIRECTLY ------------------------------------------------------
+    //
+    // THIS IS THE PRIMARY WORKFLOW, and the preset picker below it is the shortcut.
+    //
+    // A parameter list cannot make the building someone actually wants - it makes the building the
+    // preset author imagined, and "Window Count = 3, evenly spaced" is not a design. So: start
+    // from nothing, drop parts in, and move and scale them with the ordinary gizmo. Each part is a
+    // real construction component, so it still generates true brickwork or framing, still carries
+    // its structural role into the graph, and still chunks and collides like everything else.
+    if (ImGui::Button("New empty building")) {
+        conDef_ = construction::ConstructionDef{};
+        conDef_.seed = conParams_.seed;
+        conErrors_.clear();
+        conChunks_ = construction::ChunkedSection{};
+        conGraph_.Build(conDef_);
+
+        // A foundation to build on: something to stand parts on so the structural graph has an
+        // anchor from the first part placed, rather than reporting everything unsupported.
+        construction::ConstructionComponent base;
+        base.kind = construction::ComponentKind::Foundation;
+        base.role = construction::StructuralRole::Foundation;
+        base.material = construction::MaterialKind::PouredConcrete;
+        base.position = glm::vec3(0.0f, -0.15f, 0.0f);
+        base.extent = glm::vec3(4.0f, 0.15f, 3.0f);
+        base.locked = true;
+        conDef_.AddComponent(base);
+
+        PushUndo(sceneRef);
+        const entt::entity e = sceneRef.CreateEntity("Building");
+        sceneRef.Registry().emplace<Transform>(e);
+        ProceduralBuilding pb;
+        pb.source = conFileName_;
+        pb.chunkSize = conChunkSize_;
+        sceneRef.Registry().emplace<ProceduralBuilding>(e, pb);
+        selected_ = e;
+        ConstructionPushToScene(sceneRef);
+        ConstructionSpawnProxies(sceneRef, e);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Start from a bare foundation and build it yourself. Parts are still "
+                          "real construction - brick bonds, framing, structure - just placed by "
+                          "hand instead of by a preset.");
+    ImGui::SameLine();
+    ImGui::TextDisabled("or start from a preset:");
+    ImGui::Separator();
+
+    // -- Preset picker, grouped by category ---------------------------------
+    u32 presetCount = 0;
+    const con::PresetDesc* presets = con::Presets(presetCount);
+    const con::PresetDesc* current = con::FindPreset(conPresetId_.c_str());
+
+    ImGui::TextUnformatted("Preset");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::BeginCombo("##preset", current ? current->name : "(none)")) {
+        const char* lastCategory = nullptr;
+        for (u32 i = 0; i < presetCount; ++i) {
+            const con::PresetDesc& d = presets[i];
+            if (!lastCategory || std::strcmp(lastCategory, d.category) != 0) {
+                if (lastCategory) ImGui::Separator();
+                ImGui::TextDisabled("%s", d.category);
+                lastCategory = d.category;
+            }
+            const bool sel = current == &d;
+            if (ImGui::Selectable(d.name, sel)) {
+                conPresetId_ = d.id;
+                // Defaults on switch: a Wall's parameter ranges are not a House's, and carrying a
+                // 40 m width into a preset that clamps at 20 would silently snap it.
+                conParams_ = con::DefaultParams(d.id);
+                conDirty_ = true;
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    if (current && current->summary && *current->summary) {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", current->summary);
+        ImGui::PopTextWrapPos();
+    }
+    ImGui::Separator();
+
+    if (!current) {
+        ImGui::TextDisabled("No preset selected.");
+        ImGui::End();
+        return;
+    }
+
+    // -- Parameters, grouped -------------------------------------------------
+    //
+    // EVERY WIDGET HERE COMES FROM THE DESCRIPTOR TABLE. Nothing about masonry, framing or roofs
+    // is named in this function. Adding a parameter to a generator makes it appear here with no
+    // edit to this file, which is the whole reason the table exists - the alternative is a widget
+    // per field kept in lockstep by hand, and this codebase has been bitten by that repeatedly.
+    bool changed = false;
+    const char* openGroup = nullptr;
+    bool groupVisible = false;
+
+    for (u32 i = 0; i < current->paramCount; ++i) {
+        const con::ParamDesc& d = current->params[i];
+
+        // Groups are consecutive RUNS in declaration order, not a sort - that gives the preset
+        // author control over both group order and order within a group.
+        if (!openGroup || std::strcmp(openGroup, d.group) != 0) {
+            openGroup = d.group;
+            groupVisible = ImGui::CollapsingHeader(d.group, ImGuiTreeNodeFlags_DefaultOpen);
+        }
+        if (!groupVisible) continue;
+
+        ImGui::PushID(static_cast<int>(i));
+        switch (d.type) {
+            case con::ParamType::Float: {
+                f32 v = con::GetFloat(conParams_, d);
+                const std::string label =
+                    (d.unit && *d.unit) ? (std::string(d.name) + " (" + d.unit + ")") : d.name;
+                if (ImGui::DragFloat(label.c_str(), &v, d.step > 0.0f ? d.step : 0.01f, d.min,
+                                     d.max, "%.3f")) {
+                    con::SetFloat(conParams_, d, v);
+                    changed = true;
+                }
+                break;
+            }
+            case con::ParamType::Int: {
+                int v = con::GetInt(conParams_, d);
+                if (ImGui::DragInt(d.name, &v, 1.0f, static_cast<int>(d.min),
+                                   static_cast<int>(d.max))) {
+                    con::SetInt(conParams_, d, v);
+                    changed = true;
+                }
+                break;
+            }
+            case con::ParamType::Enum: {
+                int v = con::GetInt(conParams_, d);
+                if (v < 0 || v >= static_cast<int>(d.enumCount)) v = 0;
+                if (ImGui::Combo(d.name, &v, d.enumNames, static_cast<int>(d.enumCount))) {
+                    con::SetInt(conParams_, d, v);
+                    changed = true;
+                }
+                break;
+            }
+            case con::ParamType::Bool: {
+                bool v = con::GetBool(conParams_, d);
+                if (ImGui::Checkbox(d.name, &v)) {
+                    con::SetBool(conParams_, d, v);
+                    changed = true;
+                }
+                break;
+            }
+            case con::ParamType::Seed: {
+                int v = static_cast<int>(con::GetSeed(conParams_, d) & 0x7FFFFFFFull);
+                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 70.0f);
+                if (ImGui::InputInt(d.name, &v)) {
+                    con::SetSeed(conParams_, d, static_cast<u64>(v < 0 ? -v : v));
+                    changed = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reroll")) {
+                    con::SetSeed(conParams_, d, con::GetSeed(conParams_, d) * 6364136223846793005ull + 1);
+                    changed = true;
+                }
+                break;
+            }
+            default: break;
+        }
+        if (d.tooltip && *d.tooltip && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", d.tooltip);
+        ImGui::PopID();
+    }
+
+    // -- Optimization --------------------------------------------------------
+    if (ImGui::CollapsingHeader("Optimization", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::DragFloat("Chunk Size (m)", &conChunkSize_, 0.25f, 0.5f, 64.0f, "%.2f"))
+            changed = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Smaller chunks cull and invalidate more finely, at the cost of "
+                              "more draw calls.");
+        ImGui::Checkbox("Auto-regenerate", &conAutoRegen_);
+    }
+
+    if (changed && conAutoRegen_) conDirty_ = true;
+
+    // -- Actions -------------------------------------------------------------
+    ImGui::Separator();
+    if (ImGui::Button("Generate")) {
+        conDirty_ = true;
+        if (conLiveScene_) {
+            ConstructionRegenerate();
+            ConstructionPushToScene(sceneRef);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset")) {
+        conParams_ = con::DefaultParams(conPresetId_.c_str());
+        conDirty_ = true;
+    }
+
+    // -- What was actually built --------------------------------------------
+    //
+    // The three counts are shown SEPARATELY on purpose (brief SS8/SS25): logical units, draw
+    // calls and chunks are different things, and a system that reports only "triangles" hides
+    // exactly the number that decides whether a structure is viable on this renderer.
+    ImGui::Separator();
+    u32 units = 0;
+    for (const con::ConstructionChunk& c : conChunks_.chunks) units += c.pieceCount;
+    const u32 draws = conChunks_.DrawCount();
+    const u32 tris = conChunks_.TotalIndices() / 3;
+
+    ImGui::Text("Components  %d", static_cast<int>(conDef_.components.size()));
+    ImGui::Text("Logical units  %u", units);
+    ImGui::Text("Chunks  %d", static_cast<int>(conChunks_.chunks.size()));
+    ImGui::Text("Draw calls  %u", draws);
+    ImGui::Text("Triangles  %u", tris);
+
+    // The frame-wide draw budget is a hard limit that TRUNCATES SILENTLY when exceeded, so it is
+    // surfaced here rather than discovered as missing geometry.
+    if (draws > 500)
+        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.2f, 1.0f),
+                           "%u draws is a large share of the ~5,400 frame budget - raise the "
+                           "chunk size.", draws);
+
+    if (!conErrors_.empty()) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Definition errors:");
+        for (const std::string& e : conErrors_) ImGui::BulletText("%s", e.c_str());
+    }
+
+    // -- Structure (brief SS26/SS27) -----------------------------------------
+    //
+    // The structural graph is the half of this system that a mesh cannot show you. A building can
+    // look finished and still have a roof resting on nothing, and the only way to find that before
+    // a destruction pass does is to ask.
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Structure")) {
+        const auto unsupported = conGraph_.Unsupported();
+        if (unsupported.empty()) {
+            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
+                               "Stands up: every structural component reaches a foundation.");
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                               "%d component(s) have NO load path to a foundation:",
+                               static_cast<int>(unsupported.size()));
+            for (construction::ComponentId id : unsupported)
+                if (const construction::ConstructionComponent* c = conDef_.Find(id))
+                    ImGui::BulletText("%s #%u%s", construction::ToString(c->kind),
+                                      static_cast<unsigned>(id),
+                                      c->name.empty() ? "" : (" (" + c->name + ")").c_str());
+        }
+
+        // DESTRUCTION PREVIEW. Answers "what stops standing if I remove this?" WITHOUT mutating
+        // anything - the same hypothetical a future destruction pass will ask on impact.
+        ImGui::Separator();
+        std::vector<const char*> labels;
+        static std::vector<std::string> labelStore;
+        labelStore.clear();
+        for (const construction::ConstructionComponent& c : conDef_.components) {
+            labelStore.push_back(std::string(construction::ToString(c.kind)) + " #" +
+                                 std::to_string(static_cast<unsigned>(c.id)) +
+                                 (c.name.empty() ? "" : " - " + c.name));
+        }
+        for (const std::string& l : labelStore) labels.push_back(l.c_str());
+
+        if (!labels.empty()) {
+            if (conTestRemove_ >= static_cast<int>(labels.size())) conTestRemove_ = -1;
+            int sel = conTestRemove_;
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::Combo("##testremove", &sel, labels.data(), static_cast<int>(labels.size())))
+                conTestRemove_ = sel;
+
+            if (conTestRemove_ >= 0) {
+                const construction::ComponentId victim =
+                    conDef_.components[static_cast<usize>(conTestRemove_)].id;
+                const auto stranded = conGraph_.UnsupportedIfRemoved({victim});
+                if (stranded.empty()) {
+                    ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
+                                       "Removing it strands nothing - the load has another path.");
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
+                                       "Removing it would strand %d component(s):",
+                                       static_cast<int>(stranded.size()));
+                    for (construction::ComponentId id : stranded)
+                        if (const construction::ConstructionComponent* c = conDef_.Find(id))
+                            ImGui::BulletText("%s #%u", construction::ToString(c->kind),
+                                              static_cast<unsigned>(id));
+                }
+                ImGui::Text("Integrity of selection: %.2f", conGraph_.Integrity(victim));
+            } else {
+                ImGui::TextDisabled("Pick a component to preview what its loss would strand.");
+            }
+        }
+        ImGui::TextDisabled("%d node(s), %d support edge(s)",
+                            static_cast<int>(conGraph_.NodeCount()),
+                            static_cast<int>(conGraph_.EdgeCount()));
+    }
+
+    // -- Persistence ---------------------------------------------------------
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputText("##buildfile", conFileName_, sizeof(conFileName_));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Path relative to the project's Assets folder.");
+
+    const bool haveProject = !Project::Active().Root().empty();
+    ImGui::BeginDisabled(!haveProject);
+    if (ImGui::Button("Save")) {
+        construction::BuildAsset a;
+        a.presetId = conPresetId_;
+        a.params = conParams_;
+        a.def = conDef_;
+        a.chunkSize = conChunkSize_;
+        std::string err;
+        const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
+        conStatus_ = construction::SaveBuild(f, a, err) ? ("Saved " + f.filename().string())
+                                                        : ("Save failed: " + err);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Load")) {
+        construction::BuildAsset a;
+        std::string err;
+        const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
+        if (construction::LoadBuild(f, a, err)) {
+            // THE DEFINITION WINS, not the parameters. It is what the artist last saw, and it
+            // carries every manual override. Re-running the preset is a deliberate action
+            // ("Rebuild from preset") that discards them, never something a load does silently.
+            conPresetId_ = a.presetId;
+            conParams_ = a.params;
+            conDef_ = a.def;
+            conChunkSize_ = a.chunkSize;
+            conErrors_.clear();
+            conDef_.Validate(conErrors_);
+            construction::BuildChunked(conDef_, &a.damage, construction::kInvalidComponent,
+                                       conChunkSize_, conChunks_);
+            conDirty_ = false;
+            conStatus_ = err.empty() ? ("Loaded " + f.filename().string()) : err;
+        } else {
+            conStatus_ = "Load failed: " + err;
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Rebuild from preset")) {
+        // Explicit and destructive to overrides - which is why it is its own button with its own
+        // label, rather than something Generate does behind the artist's back.
+        conDirty_ = true;
+        conStatus_ = "Rebuilt from preset parameters (manual overrides discarded).";
+    }
+    ImGui::EndDisabled();
+    if (!haveProject) ImGui::TextDisabled("Open a project to save or load.");
+    if (!conStatus_.empty()) ImGui::TextWrapped("%s", conStatus_.c_str());
+
+    // -- Direct manipulation -------------------------------------------------
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader("Parts", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const bool editing = conEditTarget_ != entt::null;
+        if (!editing) {
+            ImGui::TextDisabled("Select a spawned building and press Edit to get a handle on "
+                                "every part.");
+            const bool canEdit = sceneRef.Registry().valid(selected_) &&
+                                 sceneRef.Registry().all_of<ProceduralBuilding>(selected_);
+            ImGui::BeginDisabled(!canEdit);
+            if (ImGui::Button("Edit parts in viewport")) ConstructionSpawnProxies(sceneRef, selected_);
+            ImGui::EndDisabled();
+        } else {
+            if (ImGui::Button("Done editing")) {
+                ConstructionClearHandles(sceneRef);
+                ConstructionClearProxies(sceneRef);
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Drag the gizmo. Scale resizes the part itself.");
+
+            // Add a part. Placed at the current selection or the origin, deliberately oversized
+            // enough to be visible and grabbable rather than a speck the artist has to hunt for.
+            const std::pair<const char*, construction::ComponentKind> kinds[] = {
+                {"Wall", construction::ComponentKind::Wall},
+                {"Floor", construction::ComponentKind::Floor},
+                {"Roof", construction::ComponentKind::Roof},
+                {"Column", construction::ComponentKind::Column},
+                {"Beam", construction::ComponentKind::Beam},
+                {"Opening", construction::ComponentKind::Opening},
+            };
+            for (int i = 0; i < 6; ++i) {
+                if (i) ImGui::SameLine();
+                if (ImGui::SmallButton(kinds[i].first)) {
+                    construction::ConstructionComponent nc;
+                    nc.kind = kinds[i].second;
+                    nc.role = kinds[i].second == construction::ComponentKind::Opening
+                                  ? construction::StructuralRole::None
+                                  : construction::StructuralRole::LoadBearing;
+                    nc.material = static_cast<construction::MaterialKind>(conParams_.exteriorMaterial);
+                    nc.extent = glm::vec3(1.5f, 1.2f, 0.15f);
+                    nc.locked = true; // authored by hand; a preset rebuild must not remove it
+                    conDef_.AddComponent(nc);
+                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
+                    ConstructionPushToScene(sceneRef);
+                }
+            }
+
+            // Per-part kind and material. Placing a box is only half of it: the artist has to be
+            // able to say what that box IS, because kind and material together decide whether it
+            // becomes a brick bond, a stud wall or a solid slab.
+            if (sceneRef.Registry().valid(selected_) &&
+                sceneRef.Registry().all_of<BuildComponentProxy>(selected_)) {
+                const u32 pid = sceneRef.Registry().get<BuildComponentProxy>(selected_).componentId;
+                if (construction::ConstructionComponent* pc = conDef_.Find(pid)) {
+                    ImGui::Separator();
+                    ImGui::Text("Part #%u", pid);
+
+                    u32 matCount = 0;
+                    const char* const* matNames = construction::MaterialKindNames(matCount);
+                    int mat = static_cast<int>(pc->material);
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::Combo("##partmat", &mat, matNames, static_cast<int>(matCount))) {
+                        pc->material = static_cast<construction::MaterialKind>(mat);
+                        conDirty_ = true;
+                    }
+
+                    static const char* kKindNames[] = {"Wall",   "Floor", "Roof",
+                                                       "Column", "Beam",  "Opening"};
+                    static const construction::ComponentKind kKindVals[] = {
+                        construction::ComponentKind::Wall,   construction::ComponentKind::Floor,
+                        construction::ComponentKind::Roof,   construction::ComponentKind::Column,
+                        construction::ComponentKind::Beam,   construction::ComponentKind::Opening};
+                    int kind = 0;
+                    for (int i = 0; i < 6; ++i)
+                        if (kKindVals[i] == pc->kind) kind = i;
+                    ImGui::SetNextItemWidth(-1.0f);
+                    if (ImGui::Combo("##partkind", &kind, kKindNames, 6)) {
+                        pc->kind = kKindVals[kind];
+                        conDirty_ = true;
+                    }
+
+                    // An Opening must be PARENTED to the wall it cuts - a cutter with no host cuts
+                    // nothing, which would read as "the tool ignored me".
+                    if (pc->kind == construction::ComponentKind::Opening &&
+                        pc->parent == construction::kInvalidComponent) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
+                                           "This opening cuts nothing until it is attached:");
+                        for (const construction::ConstructionComponent& w : conDef_.components) {
+                            if (w.kind != construction::ComponentKind::Wall) continue;
+                            ImGui::PushID(static_cast<int>(w.id));
+                            if (ImGui::SmallButton(("Cut into wall #" + std::to_string(w.id)).c_str())) {
+                                pc->parent = w.id;
+                                // Openings are authored in the HOST's space, so rebase the
+                                // position the artist dragged it to.
+                                if (const construction::ConstructionComponent* host =
+                                        conDef_.Find(w.id))
+                                    pc->position -= host->position;
+                                conDirty_ = true;
+                                ConstructionSpawnProxies(sceneRef, conEditTarget_);
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                }
+            }
+
+            // Delete the selected part.
+            if (sceneRef.Registry().valid(selected_) &&
+                sceneRef.Registry().all_of<BuildComponentProxy>(selected_)) {
+                const u32 id = sceneRef.Registry().get<BuildComponentProxy>(selected_).componentId;
+                if (ImGui::Button("Delete selected part")) {
+                    conDef_.RemoveComponent(id);
+                    selected_ = entt::null;
+                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
+                    ConstructionPushToScene(sceneRef);
+                }
+            }
+
+            // BOX BRUSH. Selecting a part offers face handles; selecting a handle keeps them.
+            if (sceneRef.Registry().valid(selected_) &&
+                sceneRef.Registry().all_of<BuildComponentProxy>(selected_)) {
+                const u32 pid = sceneRef.Registry().get<BuildComponentProxy>(selected_).componentId;
+                ImGui::Separator();
+                if (conHandleComponent_ != pid) {
+                    if (ImGui::Button("Box brush this part"))
+                        ConstructionSpawnFaceHandles(sceneRef, pid);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Puts a handle on each of the six faces. Drag one to "
+                                          "push that face; the opposite face does not move.");
+                } else if (ImGui::Button("Hide face handles")) {
+                    ConstructionClearHandles(sceneRef);
+                }
+            }
+
+            // --- PATH: shape the footprint by dragging points --------------
+            ImGui::Separator();
+            if (sceneRef.Registry().valid(conEditTarget_) &&
+                sceneRef.Registry().all_of<ProceduralBuilding>(conEditTarget_)) {
+                ProceduralBuilding& pb =
+                    sceneRef.Registry().get<ProceduralBuilding>(conEditTarget_);
+                ImGui::Text("Footprint path (%d point(s))", static_cast<int>(pb.path.size()));
+
+                if (ImGui::Button("Add point")) {
+                    // Placed off the end of the run so it is never buried inside the existing
+                    // shape where it cannot be grabbed.
+                    glm::vec3 p(0.0f, 0.0f, 0.0f);
+                    if (pb.path.size() >= 2)
+                        p = pb.path.back() + (pb.path.back() - pb.path[pb.path.size() - 2]);
+                    else if (pb.path.size() == 1)
+                        p = pb.path.back() + glm::vec3(4.0f, 0.0f, 0.0f);
+                    pb.path.push_back(p);
+                    ConstructionRebuildFromPath(pb);
+                    ConstructionClearHandles(sceneRef);
+                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
+                    ConstructionSpawnPathPoints(sceneRef, conEditTarget_);
+                    conDirty_ = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Square") ) {
+                    pb.path = {{-4.0f, 0.0f, -3.0f},
+                               { 4.0f, 0.0f, -3.0f},
+                               { 4.0f, 0.0f,  3.0f},
+                               {-4.0f, 0.0f,  3.0f}};
+                    ConstructionRebuildFromPath(pb);
+                    ConstructionClearHandles(sceneRef);
+                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
+                    ConstructionSpawnPathPoints(sceneRef, conEditTarget_);
+                    conDirty_ = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear path")) {
+                    pb.path.clear();
+                    ConstructionRebuildFromPath(pb);
+                    ConstructionClearHandles(sceneRef);
+                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
+                    conDirty_ = true;
+                }
+
+                bool pathChanged = false;
+                pathChanged |= ImGui::DragFloat("Wall Height", &pb.pathWallHeight, 0.05f, 0.3f,
+                                                20.0f, "%.2f m");
+                pathChanged |= ImGui::DragFloat("Wall Thickness", &pb.pathWallThickness, 0.01f,
+                                                0.02f, 2.0f, "%.3f m");
+                pathChanged |= ImGui::Checkbox("Closed loop", &pb.pathClosed);
+
+                // Dragging a point is the whole feature: rebuild the run it belongs to as it moves.
+                if (ConstructionPullPathPoints(sceneRef)) pathChanged = true;
+                if (pathChanged) {
+                    ConstructionRebuildFromPath(pb);
+                    conErrors_.clear();
+                    conDef_.Validate(conErrors_);
+                    construction::BuildChunked(conDef_, nullptr, construction::kInvalidComponent,
+                                               conChunkSize_, conChunks_);
+                    conGraph_.Build(conDef_);
+                    ConstructionPushToScene(sceneRef);
+                }
+            }
+
+            // Face handles are read back before the whole-part gizmo, because a handle drag must
+            // not also be interpreted as a move of the part it belongs to.
+            if (ConstructionPullFaceHandles(sceneRef)) {
+                conErrors_.clear();
+                conDef_.Validate(conErrors_);
+                construction::BuildChunked(conDef_, nullptr, construction::kInvalidComponent,
+                                           conChunkSize_, conChunks_);
+                conGraph_.Build(conDef_);
+                ConstructionPushToScene(sceneRef);
+                // Reposition the other five handles onto the resized box.
+                ConstructionSpawnFaceHandles(sceneRef, conHandleComponent_);
+            }
+
+            // Read the gizmo back every frame and regenerate when something actually moved.
+            if (ConstructionPullProxies(sceneRef)) {
+                conErrors_.clear();
+                conDef_.Validate(conErrors_);
+                construction::BuildChunked(conDef_, nullptr, construction::kInvalidComponent,
+                                           conChunkSize_, conChunks_);
+                conGraph_.Build(conDef_);
+                ConstructionPushToScene(sceneRef);
+            }
+        }
+    }
+
+    // -- Spawn ---------------------------------------------------------------
+    ImGui::Separator();
+    ImGui::Checkbox("Live update scene", &conLiveScene_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Push parameter changes straight to the spawned building. Each push "
+                          "re-uploads its meshes, and this RHI cannot free a mesh, so leave it "
+                          "off while dragging a slider hard.");
+    ImGui::SameLine();
+    if (ImGui::Button("Push to scene")) ConstructionPushToScene(sceneRef);
+    ImGui::BeginDisabled(!haveProject);
+    if (ImGui::Button("Spawn into scene")) {
+        // Save first, unconditionally. The scene entity references the ASSET, not this panel's
+        // in-memory parameters - a spawn that skipped the save would produce a building generated
+        // from whatever was last on disk, silently ignoring every edit made since.
+        construction::BuildAsset a;
+        a.presetId = conPresetId_;
+        a.params = conParams_;
+        a.def = conDef_;
+        a.chunkSize = conChunkSize_;
+        std::string err;
+        const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
+        if (!construction::SaveBuild(f, a, err)) {
+            conStatus_ = "Spawn failed - could not save: " + err;
+        } else {
+            PushUndo(sceneRef);
+            const entt::entity e = sceneRef.CreateEntity(
+                conPresetId_ + " (" + std::filesystem::path(conFileName_).stem().string() + ")");
+            sceneRef.Registry().emplace<Transform>(e);
+            ProceduralBuilding pb;
+            pb.source = conFileName_;
+            pb.chunkSize = conChunkSize_;
+            sceneRef.Registry().emplace<ProceduralBuilding>(e, pb);
+            selected_ = e;
+            conStatus_ = "Spawned. Geometry is regenerated from the asset by construction::Sync.";
+        }
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Saves the .hbbuild, then adds an entity that regenerates its geometry "
+                          "from it. The mesh is never stored in the scene file.");
+
+    ImGui::End();
+}
+
 void Editor::DrawSchematicEditor(Engine& engine) {
     (void)engine;
     if (!panelOpen_[Panel_SchematicEditor]) return;
@@ -12151,7 +13085,7 @@ std::string AssetRelPath(const std::filesystem::path& abs) {
     std::error_code ec;
     const std::filesystem::path rel =
         std::filesystem::relative(abs, Project::Active().AssetsDir(), ec);
-    if (ec || rel.empty() || rel.native().rfind(L"..", 0) == 0)
+    if (ec || rel.empty() || rel.generic_string().rfind("..", 0) == 0)
         return abs.filename().generic_string();
     return rel.generic_string();
 }
@@ -15987,7 +16921,17 @@ void Editor::DrawAssetViewer(Engine& engine) {
     if (!panelOpen_[Panel_AssetViewer]) return;
     Renderer& renderer = engine.GetRenderer();
     Scene& scene = engine.GetScene();
-    ImGui::Begin("Asset Viewer", &panelOpen_[Panel_AssetViewer]);
+    // ALWAYS reserve the vertical scrollbar's width. Without this the panel oscillates every
+    // frame: the mesh/texture preview is sized to GetContentRegionAvail().x, so when the
+    // content is a hair taller than the panel the scrollbar appears -> the content region
+    // narrows by the scrollbar width -> the (aspect-locked) preview shrinks in BOTH dimensions
+    // -> the content now fits -> the scrollbar vanishes -> the region widens again -> repeat.
+    // Because the whole content-region WIDTH flips each frame, everything - the preview AND all
+    // the text - shifts left/right at frame rate, which reads as a back-and-forth smear.
+    // Reserving the scrollbar makes the available width constant regardless of content height,
+    // which breaks the loop. (Nothing to do with TAA - this is a pure CPU layout feedback.)
+    ImGui::Begin("Asset Viewer", &panelOpen_[Panel_AssetViewer],
+                 ImGuiWindowFlags_AlwaysVerticalScrollbar);
     // One claim for the whole panel; AssetViewerSurface() resolves WHICH of the three
     // inline sub-editors (material / audio event / mesh slots) is live at dispatch
     // time. A texture or a read-only preview resolves to "nothing open to save" -
@@ -17931,19 +18875,8 @@ namespace {
 void LaunchEditorDetached(const std::filesystem::path& hbproj) {
     const std::filesystem::path editorExe =
         platform::ExecutableDir() / "HeartbreakEditor.exe";
-
-    std::wstring cmd = L"\"" + editorExe.wstring() + L"\" --project \"" +
-                       hbproj.wstring() + L"\"";
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    if (::CreateProcessW(editorExe.c_str(), cmd.data(), nullptr, nullptr, FALSE, 0,
-                         nullptr, nullptr, &si, &pi)) {
-        ::CloseHandle(pi.hThread);
-        ::CloseHandle(pi.hProcess);
-    } else {
+    if (!platform::LaunchDetached(editorExe, {"--project", hbproj}))
         HBE_ERROR("Hub: failed to launch '{}'", editorExe.string());
-    }
 }
 } // namespace
 
@@ -18118,7 +19051,7 @@ void Editor::DrawProjectManager() {
     ImGui::InputText("Location", newProjectDir_, sizeof(newProjectDir_));
     ImGui::SameLine();
     if (ImGui::Button("...")) {
-        if (const auto dir = BrowseForFolderDialog()) {
+        if (const auto dir = platform::PickFolderDialog()) {
             std::snprintf(newProjectDir_, sizeof(newProjectDir_), "%s",
                           dir->string().c_str());
         }
@@ -18134,16 +19067,8 @@ void Editor::DrawProjectManager() {
 
     ImGui::Separator();
     if (ImGui::Button("Open existing (.hbproj)...")) {
-        wchar_t file[1024] = {};
-        OPENFILENAMEW ofn{};
-        ofn.lStructSize = sizeof(ofn);
-        ofn.lpstrFilter = L"Heartbreak project\0*.hbproj\0All files\0*.*\0";
-        ofn.lpstrFile = file;
-        ofn.nMaxFile = static_cast<DWORD>(std::size(file));
-        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-        if (GetOpenFileNameW(&ofn)) {
-            OpenProject(std::filesystem::path(file));
-        }
+        if (const auto picked = platform::OpenFileDialog({{"Heartbreak project", {"hbproj"}}}))
+            OpenProject(*picked);
     }
     if (Project::HasActive()) {
         ImGui::SameLine();

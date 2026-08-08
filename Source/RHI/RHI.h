@@ -417,6 +417,29 @@ inline u32 CollectCensors(const SceneView& view, glm::vec4 outCensors[kMaxCensor
 }
 
 // Material feature flags (packed into DrawItem::materialFlags).
+// Procedural construction surface, packed into bits 16-23 of MaterialFlags.
+//
+// IN THE SPARE BITS OF AN EXISTING WORD, not a new ObjectCB field, and that is a measured choice:
+// ObjectCB is 528 bytes aligned to 768 against a 4 MB per-frame constant arena, so every field
+// added to it directly reduces how many objects the renderer can draw in a frame (~5,400 today,
+// and it TRUNCATES silently past that). Must match Construction.hlsli.
+enum ProceduralSurface : u32 {
+    ProcSurface_None = 0,
+    ProcSurface_Brick = 1,
+    ProcSurface_Stone = 2,
+    ProcSurface_Concrete = 3,
+    ProcSurface_Wood = 4,
+    ProcSurface_Plaster = 5,
+    ProcSurface_Metal = 6,
+    ProcSurface_Shingle = 7,
+    ProcSurface_Mortar = 8,
+};
+inline constexpr u32 kProcSurfaceShift = 16u;
+inline constexpr u32 kProcSurfaceMask = 0xFFu;
+inline constexpr u32 PackProcSurface(ProceduralSurface s) {
+    return (static_cast<u32>(s) & kProcSurfaceMask) << kProcSurfaceShift;
+}
+
 enum MaterialFlags : u32 {
     MaterialFlag_None       = 0,
     MaterialFlag_Subsurface = 1u << 0, // skin / SSS shading (pre-integrated)

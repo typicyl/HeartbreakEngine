@@ -83,6 +83,9 @@ const std::vector<EngineAsset> kEngineAssets = {
      "branching conversation graph"},
     {".hbcutscene", "Cutscene",         true,  RefScan::JsonScan, nullptr, ""},
     {".hbmusic",    "Music Graph",      true,  RefScan::JsonScan, nullptr, "adaptive music"},
+    {".hbbuild",    "Procedural Build", true,  RefScan::JsonScan, nullptr,
+     "procedural construction: preset + parameters + the construction graph; JsonScan finds any "
+     "material path an override names"},
     {".hbchar",     "Character",        true,  RefScan::JsonScan, nullptr,
      "modular rig; CharacterSystem loads it via the VFS"},
     {".hbprefab",   "Prefab",           true,  RefScan::JsonScan, nullptr,
@@ -249,6 +252,34 @@ bool RegistrySelfTest() {
         CollectorOf(".not-a-real-ext") != nullptr)
         fail("an unregistered extension is not inert.");
 
+    // The editor's Import-dialog filter is DERIVED from kSourceFormats. Verify the derivation
+    // (grouping + the dotless-token contract the dialog backend relies on) so a future change
+    // to ImportFileFilters, or to how SourceFormat stores its extension, cannot silently ship
+    // a broken Import dialog. Headless: no dialog is shown, only the data is inspected.
+    {
+        const auto isRegisteredSource = [](const std::string& dotless) {
+            for (const SourceFormat& f : kSourceFormats)
+                if (f.extension == "." + dotless) return true;
+            return false;
+        };
+        const std::vector<platform::FileFilter> filters = ImportFileFilters();
+        if (filters.empty() && !kSourceFormats.empty())
+            fail("ImportFileFilters() is empty though source formats are registered.");
+        for (const platform::FileFilter& f : filters) {
+            if (f.label.empty()) fail("an import filter has an empty label.");
+            if (f.label == "All files")
+                fail("ImportFileFilters must not carry 'All files' - the dialog backend appends it.");
+            if (f.extensions.empty()) fail("import filter '" + f.label + "' offers no extensions.");
+            for (const std::string& e : f.extensions) {
+                if (e.empty() || e.front() == '.')
+                    fail("import filter extension '" + e + "' must be a bare, dotless token; the "
+                         "dialog backend adds the '*.' - a leading dot would yield '*..ext'.");
+                else if (!isRegisteredSource(e))
+                    fail("import filter offers '" + e + "', not a registered source format.");
+            }
+        }
+    }
+
     if (failures != 0) {
         HBE_ERROR("assetformats: {} registry violation(s).", failures);
         return false;
@@ -258,47 +289,39 @@ bool RegistrySelfTest() {
     return true;
 }
 
-std::wstring BuildImportDialogFilter() {
-    // Win32 filters are "Label\0patterns\0...\0\0" - embedded NULs, so build the
-    // std::wstring explicitly rather than from a literal.
-    const auto patternsFor = [](SourceKind k) {
-        std::wstring out;
-        for (const SourceFormat& f : kSourceFormats) {
-            if (f.kind != k) continue;
-            if (!out.empty()) out += L';';
-            out += L'*';
-            const std::string e = f.extension;
-            out.append(e.begin(), e.end()); // extensions are ASCII
-        }
+std::vector<platform::FileFilter> ImportFileFilters() {
+    // SourceFormat extensions are stored WITH a leading dot (".png"); the neutral filter
+    // wants bare, dotless tokens, and the Win32 (or any) dialog backend adds the "*." itself.
+    const auto bare = [](const std::string& ext) {
+        return (!ext.empty() && ext.front() == '.') ? ext.substr(1) : ext;
+    };
+    const auto extsFor = [&bare](SourceKind k) {
+        std::vector<std::string> out;
+        for (const SourceFormat& f : kSourceFormats)
+            if (f.kind == k) out.push_back(bare(f.extension));
         return out;
     };
-    const std::wstring images = patternsFor(SourceKind::Image);
-    const std::wstring models = patternsFor(SourceKind::Model);
-    const std::wstring audio = patternsFor(SourceKind::Audio);
-    const std::wstring fonts = patternsFor(SourceKind::Font);
-    std::wstring all = images;
-    for (const std::wstring* g : {&models, &audio, &fonts}) {
-        if (g->empty()) continue;
-        if (!all.empty()) all += L';';
-        all += *g;
-    }
+    const std::vector<std::string> images = extsFor(SourceKind::Image);
+    const std::vector<std::string> models = extsFor(SourceKind::Model);
+    const std::vector<std::string> audio = extsFor(SourceKind::Audio);
+    const std::vector<std::string> fonts = extsFor(SourceKind::Font);
 
-    std::wstring filter;
-    const auto add = [&filter](const wchar_t* label, const std::wstring& patterns) {
-        if (patterns.empty()) return;
-        filter += label;
-        filter += L'\0';
-        filter += patterns;
-        filter += L'\0';
+    std::vector<std::string> all;
+    for (const std::vector<std::string>* g : {&images, &models, &audio, &fonts})
+        all.insert(all.end(), g->begin(), g->end());
+
+    std::vector<platform::FileFilter> out;
+    const auto add = [&out](const char* label, const std::vector<std::string>& exts) {
+        if (exts.empty()) return; // an empty group is not offered (e.g. no font importer built)
+        out.push_back(platform::FileFilter{std::string(label), exts});
     };
-    add(L"All supported assets", all);
-    add(L"Images", images);
-    add(L"Models", models);
-    add(L"Audio", audio);
-    add(L"Fonts", fonts);
-    add(L"All files", L"*.*");
-    filter += L'\0'; // terminating empty entry
-    return filter;
+    add("All supported assets", all);
+    add("Images", images);
+    add("Models", models);
+    add("Audio", audio);
+    add("Fonts", fonts);
+    // NB: no "All files" here - the native-dialog backend appends that itself.
+    return out;
 }
 
 } // namespace hbe::assets
