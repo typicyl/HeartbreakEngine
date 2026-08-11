@@ -94,7 +94,7 @@ public:
     // per-parameter-change path - cheap enough to run on a slider drag, unlike Init.
     void Rebake(const OceanParams& p);
     // Fill h0 + queue this frame's compute chain. Call before Renderer::RenderScene (like
-    // SetVolumeParticles). No-op until Init succeeds.
+    // QueueCompute). No-op until Init succeeds.
     void Update(Renderer& renderer, f32 time);
 
     rhi::GpuBufferHandle DisplacementBuffer() const { return disp_; }

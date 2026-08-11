@@ -275,6 +275,10 @@ struct PostCB {
     glm::vec4 grade1{0.0f, 0.0f, 0.0f, 0.0f}; // (lift.rgb, gradeEnabled)
     glm::vec4 grade2{1.0f, 1.0f, 1.0f, 0.0f}; // (gamma.rgb, timeSeconds)
     glm::vec4 grade3{1.0f, 1.0f, 1.0f, 0.0f}; // (gain.rgb, -)
+    // Volume raymarch color (appended at END; must match PostCommon.hlsli). Default albedo (1,1,1)
+    // reproduces today's grey smoke; emission tint inert until a temperature grid is fed (P2).
+    glm::vec4 volAlbedo{1.0f, 1.0f, 1.0f, 0.0f};   // (albedo.rgb, emissionMode)
+    glm::vec4 volEmission{1.0f, 0.45f, 0.15f, 0.0f}; // (emissionColor.rgb, hasTemp)
 };
 
 struct ObjectCB {
@@ -420,8 +424,8 @@ public:
     bool UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) override;
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
-    void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
-    void SetVolumeGrid(const void* bytes, usize byteSize, const VolumeRenderParams& params) override;
+    void SetVolumeGrid(const void* density, usize densitySize, const void* temperature, usize tempSize,
+                       const VolumeRenderParams& params) override;
     bool SupportsGpuCompute() const override { return true; }
     GpuBufferHandle CreateGpuBuffer(const GpuBufferDesc& desc) override;
     void* MapGpuBuffer(GpuBufferHandle handle) override;
@@ -569,21 +573,6 @@ private:
     // the first frame it's enabled (off by default -> zero cost on low-end GPUs).
     // Enable is currently HBE_VOLTEST env scaffolding to verify the compute path;
     // VV5 wires the real per-emitter enable. VV4 adds the raymarch that reads it.
-    u32 volDim_ = 96;           // volume voxel dim (from VolumeParams.resolution, first enable)
-    bool volInit_ = false;      // resources created (or attempted)
-    bool volFailed_ = false;
-    TextureHandle volTex_;      // 3D density/temperature volume (SRV bindless + UAV)
-    u32 volUavSlot_ = 0;
-    ComPtr<ID3D12RootSignature> computeRootSig_;
-    ComPtr<ID3D12PipelineState> volSplatPSO_;
-    // Per-frame blob buffer (SetVolumeParticles feeds it; the splat reads it).
-    ComPtr<ID3D12Resource> volBlobBuffers_[kMaxBackBuffers];
-    u8* volBlobCpu_[kMaxBackBuffers] = {};
-    const VolumeBlob* volBlobs_ = nullptr;
-    u32 volBlobCount_ = 0;
-    VolumeParams volParams_{};
-    bool EnsureVolumeResources();
-    void DispatchVolumeSplat();
 
     // --- General GPU compute + GPU-writable structured buffers ----------------
     // The generalisation of the volumetric path above: buffers a compute kernel
@@ -797,7 +786,6 @@ private:
     bool ssrReady_ = false;          // SSR PSO built
     bool exposureReady_ = false;     // auto-exposure PSO built
     bool volReady_ = false;          // volumetric fog PSO built
-    ComPtr<ID3D12PipelineState> volPartPSO_; // volumetric-particles raymarch PSO (LEGACY splat)
     // NanoVDB baked-volume raymarch (the runtime volume path). The raw NanoVDB blob is uploaded
     // to a per-frame StructuredBuffer<uint> (volGridBuffer_ + its bindless SRV slotVolGrid_);
     // volRaymarchPSO_ (VolumeRaymarch.hlsl) PNanoVDB-samples it. Grows on demand.
@@ -809,9 +797,17 @@ private:
     u32 slotVolGrid_[kMaxBackBuffers] = {};
     const void* volGridBytes_ = nullptr;
     usize volGridSize_ = 0;
+    // Optional SECOND grid (temperature -> emission glow); mirrors the density grid exactly, bound at
+    // t1 space6. Fed together with density via SetVolumeGrid so both are the same frame/bounds.
+    ComPtr<ID3D12Resource> volTempBuffer_[kMaxBackBuffers];
+    u8* volTempCpu_[kMaxBackBuffers] = {};
+    u64 volTempCapacity_[kMaxBackBuffers] = {};
+    u32 slotVolTemp_[kMaxBackBuffers] = {};
+    const void* volTempBytes_ = nullptr;
+    usize volTempSize_ = 0;
     VolumeRenderParams volRenderParams_;
-    bool EnsureVolumeGridBuffer(usize size); // (re)alloc this frame's grid buffer + SRV
-    bool volPartReady_ = false;      // volumetric-particles raymarch PSO built
+    bool EnsureVolumeGridBuffer(usize size); // (re)alloc this frame's density grid buffer + SRV
+    bool EnsureVolumeTempBuffer(usize size); // (re)alloc this frame's temperature grid buffer + SRV
     bool ssgiReady_ = false;         // screen-space GI PSO built
     bool painterlyReady_ = false;    // painterly stroke PSO built
     bool brushStrokesReady_ = false; // brush-stroke splat PSO built
@@ -1837,8 +1833,13 @@ bool D3D12Device::CreateMeshPipeline() {
     volRange.BaseShaderRegister = 0;
     volRange.RegisterSpace = 6;
     volRange.OffsetInDescriptorsFromTableStart = 0;
+    // Second SRV table (t1 space6) for the OPTIONAL temperature grid (emission glow). A SEPARATE root
+    // param, NOT a 2-wide table off volRange: slotVolGrid_[] are allocated consecutively across FRAMES,
+    // so a 2-wide table based at the density slot would read the NEXT frame's density as temperature.
+    D3D12_DESCRIPTOR_RANGE volRange2 = volRange;
+    volRange2.BaseShaderRegister = 1; // t1 space6
 
-    D3D12_ROOT_PARAMETER params[7] = {};
+    D3D12_ROOT_PARAMETER params[8] = {};
     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     params[0].Descriptor.ShaderRegister = 0;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
@@ -1879,6 +1880,13 @@ bool D3D12Device::CreateMeshPipeline() {
     params[6].Descriptor.ShaderRegister = 2;
     params[6].Descriptor.RegisterSpace = 1;
     params[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    // Volume TEMPERATURE grid SRV table (t1 space6, pixel-only) - the raymarch emission read. Bound to
+    // a valid buffer every frame the pass runs (fallback = the density SRV); hasTemp gates the sample,
+    // so the static shader reference always resolves. Unbound/unused by every other pass.
+    params[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[7].DescriptorTable.NumDescriptorRanges = 1;
+    params[7].DescriptorTable.pDescriptorRanges = &volRange2;
+    params[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     // Static samplers: s0 = anisotropic wrap (materials), s1 = linear clamp
     // (post-process sampling; wrap would bleed opposite screen edges).
@@ -1903,7 +1911,7 @@ bool D3D12Device::CreateMeshPipeline() {
     samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC rsDesc{};
-    rsDesc.NumParameters = 7;
+    rsDesc.NumParameters = 8;
     rsDesc.pParameters = params;
     rsDesc.NumStaticSamplers = 2;
     rsDesc.pStaticSamplers = samplers;
@@ -2600,10 +2608,8 @@ bool D3D12Device::CreatePostPipelines() {
                              DXGI_FORMAT_UNKNOWN, exposurePSO_);
     volReady_ = makePso(L"VolumetricFog", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                         DXGI_FORMAT_UNKNOWN, volPSO_); // composites in HDR
-    volPartReady_ = makePso(L"VolumetricParticles", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
-                            DXGI_FORMAT_UNKNOWN, volPartPSO_); // raymarch -> half-res, then ApplyHalfRes
-    // NanoVDB raymarch PSO (the runtime volume path): same half-res target/blend as the splat
-    // raymarch, but samples a StructuredBuffer<uint> grid via PNanoVDB instead of a Texture3D.
+    // NanoVDB raymarch PSO (the runtime volume path): samples a StructuredBuffer<uint> grid
+    // via PNanoVDB, raymarch -> half-res target, then ApplyHalfRes composite.
     volRaymarchReady_ = makePso(L"VolumeRaymarch", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                                 DXGI_FORMAT_UNKNOWN, volRaymarchPSO_);
     ssgiReady_ = makePso(L"SSGI", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
@@ -2674,8 +2680,8 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     // Reserve the bindless slots once; resizes rewrite the same descriptors so
     // shader-visible indices stay stable.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 22 + kMaxBackBuffers + kBloomMaxMips > kMaxBindlessTextures)
-            return false;
+        if (bindlessNextSlot_ + 22 + 2 * kMaxBackBuffers + kBloomMaxMips > kMaxBindlessTextures)
+            return false; // 2*kMaxBackBuffers = density + temperature grid SRVs, one pair per frame
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
@@ -2687,6 +2693,8 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         // NanoVDB grid StructuredBuffer<uint> SRV, one per frame-in-flight (the blob differs
         // per frame). The SRV is (re)created when the per-frame buffer grows.
         for (u32 i = 0; i < kMaxBackBuffers; ++i) slotVolGrid_[i] = bindlessNextSlot_++;
+        // Temperature grid SRV, one per frame-in-flight (mirrors slotVolGrid_; the emission grid).
+        for (u32 i = 0; i < kMaxBackBuffers; ++i) slotVolTemp_[i] = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
         slotSsgiHalf_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
@@ -2859,7 +2867,7 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
                        nullptr, volHalf_))
             return false;
     }
-    if (volPartReady_) { // volumetric particles: full-res composite + half-res raymarch
+    if (volRaymarchReady_) { // NanoVDB volume raymarch: full-res composite + half-res raymarch
         if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 19 + kBloomMaxMips,
                        slotVolPart_, nullptr, volPartScatter_))
             return false;
@@ -3041,14 +3049,24 @@ void D3D12Device::RunPostStack(const SceneView& view) {
     // --- NanoVDB baked volume: the RUNTIME volume path. Upload the raw NanoVDB blob to a
     //     per-frame StructuredBuffer<uint>, bind it at the volume SRV table (root param 5), and
     //     PNanoVDB-raymarch it (half res) + composite over the HDR - same shape as fog/splat.
-    //     Takes precedence over the legacy splat (below); the two never both draw. -----------
-    bool nanoVolumeDrawn = false;
+    //     PNanoVDB-raymarch it (half res) + composite over the HDR. ----------------------------
     if (volGridSize_ > 0 && volGridBytes_ && volRaymarchReady_ &&
         EnsureVolumeGridBuffer(volGridSize_)) {
         std::memcpy(volGridCpu_[frameIndex_], volGridBytes_, volGridSize_);
         D3D12_GPU_DESCRIPTOR_HANDLE gridSrv = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
         gridSrv.ptr += static_cast<UINT64>(slotVolGrid_[frameIndex_]) * bindlessDescSize_;
         cmdList_->SetGraphicsRootDescriptorTable(5, gridSrv); // StructuredBuffer<uint> t0 space6
+        // Temperature grid (emission). Bind a VALID SRV every frame (fallback = the density SRV);
+        // hasTemp gates the sample, so the static t1 space6 reference always resolves.
+        bool hasTemp = false;
+        if (volTempSize_ > 0 && volTempBytes_ && EnsureVolumeTempBuffer(volTempSize_)) {
+            std::memcpy(volTempCpu_[frameIndex_], volTempBytes_, volTempSize_);
+            hasTemp = true;
+        }
+        D3D12_GPU_DESCRIPTOR_HANDLE tempSrv = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
+        tempSrv.ptr += static_cast<UINT64>(hasTemp ? slotVolTemp_[frameIndex_]
+                                                   : slotVolGrid_[frameIndex_]) * bindlessDescSize_;
+        cmdList_->SetGraphicsRootDescriptorTable(7, tempSrv); // StructuredBuffer<uint> t1 space6
         const u32 hw = (sceneW_ + 1u) / 2u, hh = (sceneH_ + 1u) / 2u;
         const glm::vec2 vTexel(1.0f / hw, 1.0f / hh);
         const VolumeRenderParams& rp = volRenderParams_;
@@ -3061,6 +3079,9 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.params2 = {rp.emission, static_cast<f32>(rp.shadowSteps), rp.extinction,
                       ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
         cb.params3 = {rp.worldOffset.x, rp.worldOffset.y, rp.worldOffset.z, 0.0f}; // volume placement
+        cb.volAlbedo = {rp.albedo.x, rp.albedo.y, rp.albedo.z, static_cast<f32>(rp.emissionMode)};
+        cb.volEmission = {rp.emissionColor.x, rp.emissionColor.y, rp.emissionColor.z,
+                          hasTemp ? 1.0f : 0.0f}; // .w = hasTemp gate
         DrawPostPass(volRaymarchPSO_.Get(), volPartHalf_.Get(), rtvAt(20 + kBloomMaxMips), hw, hh, cb);
         PostCB ap;
         ap.input0 = hdrInput;
@@ -3072,53 +3093,8 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         DrawPostPass(applyPSO_.Get(), volPartScatter_.Get(), rtvAt(19 + kBloomMaxMips), sceneW_,
                      sceneH_, ap);
         hdrInput = slotVolPart_;
-        nanoVolumeDrawn = true;
     }
-
-    // --- Volumetric particles: raymarch the density/temperature volume (half res),
-    //     lit + self-shadowed + blackbody-emissive, then composite over the HDR
-    //     (scene*transmittance + inscatter), same shape as the fog pass. LEGACY splat path -
-    //     runs only when no NanoVDB grid was drawn above. ------------
-    if (!nanoVolumeDrawn && volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
-        slotTextures_.count(volTex_.index)) {
-        ID3D12Resource* volRes = slotTextures_[volTex_.index].resource;
-        // The splat wrote the volume as a UAV; make it sampleable for the raymarch.
-        auto toSrv = TransitionBarrier(volRes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-        cmdList_->ResourceBarrier(1, &toSrv);
-        D3D12_GPU_DESCRIPTOR_HANDLE volSrv = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
-        volSrv.ptr += static_cast<UINT64>(volTex_.index) * bindlessDescSize_;
-        cmdList_->SetGraphicsRootDescriptorTable(5, volSrv); // Texture3D t0 space6
-
-        const u32 hw = (sceneW_ + 1u) / 2u, hh = (sceneH_ + 1u) / 2u;
-        const glm::vec2 vTexel(1.0f / hw, 1.0f / hh);
-        PostCB cb;
-        cb.input2 = slotDepth_;
-        cb.outTexel = vTexel;
-        cb.inTexel = sceneTexel;
-        cb.params0 = {volParams_.boundsMin.x, volParams_.boundsMin.y, volParams_.boundsMin.z,
-                      static_cast<f32>(volParams_.stepCount)};
-        cb.params1 = {volParams_.boundsMax.x, volParams_.boundsMax.y, volParams_.boundsMax.z,
-                      1.0f}; // densityMul: 1.0 — the splat already baked densityScale into the volume
-        cb.params2 = {volParams_.emission, 4.0f, volParams_.extinction, // emission, shadowSteps, extinction
-                      ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
-        cb.params3 = {view.timeSeconds, volParams_.noiseDetail, volParams_.noiseScale, 0.0f}; // time, detail, scale
-        DrawPostPass(volPartPSO_.Get(), volPartHalf_.Get(), rtvAt(20 + kBloomMaxMips), hw, hh, cb);
-        PostCB ap;
-        ap.input0 = hdrInput;
-        ap.input1 = slotVolPartHalf_;
-        ap.input2 = slotDepth_;
-        ap.outTexel = sceneTexel;
-        ap.inTexel = vTexel;
-        ap.params0 = {1.0f, 0.0f, 0.0f, 0.0f}; // mild bilateral upscale
-        DrawPostPass(applyPSO_.Get(), volPartScatter_.Get(), rtvAt(19 + kBloomMaxMips), sceneW_,
-                     sceneH_, ap);
-        hdrInput = slotVolPart_;
-        auto toUav = TransitionBarrier(volRes, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-                                       D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        cmdList_->ResourceBarrier(1, &toUav);
-    }
-    GpuMark("volparticles");
+    GpuMark("volume");
 
     // --- Painterly: repaint the lit HDR as edge-aware brush strokes ----------
     // Skipped when the true 3D surface-stroke renderer is active (no double-paint).
@@ -3774,94 +3750,15 @@ MeshHandle D3D12Device::CreateMeshReserved(const hbe::MeshData& initial, u32 ver
     return h;
 }
 
-bool D3D12Device::EnsureVolumeResources() {
-    if (volInit_) return !volFailed_;
-    volInit_ = true;
-    volDim_ = glm::clamp(volParams_.resolution, 32u, 192u); // quality knob (first enable)
-
-    // 3D density/temperature volume (RGBA16F, compute-writable).
-    TextureDesc vd{};
-    vd.width = volDim_; vd.height = volDim_; vd.depth = volDim_;
-    vd.format = Format::R16G16B16A16_FLOAT;
-    vd.storage = true;
-    vd.debugName = "VolumeDensity";
-    volTex_ = CreateVolumeTexture(vd);
-    if (!volTex_.IsValid()) { volFailed_ = true; return false; }
-    volUavSlot_ = volumeUav_.count(volTex_.index) ? volumeUav_[volTex_.index] : 0;
-
-    // Compute root signature: b0 = params CBV (root), u0 = volume UAV (table),
-    // t0 = blob StructuredBuffer (root SRV).
-    D3D12_DESCRIPTOR_RANGE uavRange{};
-    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    uavRange.NumDescriptors = 1;
-    uavRange.BaseShaderRegister = 0; // u0
-    uavRange.RegisterSpace = 0;
-    uavRange.OffsetInDescriptorsFromTableStart = 0;
-    D3D12_ROOT_PARAMETER cp[3]{};
-    cp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    cp[0].Descriptor.ShaderRegister = 0; // b0
-    cp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    cp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    cp[1].DescriptorTable.NumDescriptorRanges = 1;
-    cp[1].DescriptorTable.pDescriptorRanges = &uavRange;
-    cp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    cp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-    cp[2].Descriptor.ShaderRegister = 0; // t0
-    cp[2].Descriptor.RegisterSpace = 0;
-    cp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    D3D12_ROOT_SIGNATURE_DESC rd{};
-    rd.NumParameters = 3;
-    rd.pParameters = cp;
-    rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE; // compute: no input assembler
-    ComPtr<ID3DBlob> sig, err;
-    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
-        if (err) HBE_ERROR("[D3D12] Volume compute RootSig: {}",
-                           static_cast<const char*>(err->GetBufferPointer()));
-        volFailed_ = true; return false;
-    }
-    if (FAILED(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
-                                            IID_PPV_ARGS(&computeRootSig_)))) {
-        volFailed_ = true; return false;
-    }
-
-    const std::wstring dir = ExecutableDir() + L"shaders\\";
-    const std::vector<u8> cs = ReadBinaryFile(dir + L"VolumeSplat.cs.dxil");
-    if (cs.empty()) { HBE_ERROR("[D3D12] VolumeSplat.cs.dxil missing"); volFailed_ = true; return false; }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC cpso{};
-    cpso.pRootSignature = computeRootSig_.Get();
-    cpso.CS = {cs.data(), cs.size()};
-    if (FAILED(device_->CreateComputePipelineState(&cpso, IID_PPV_ARGS(&volSplatPSO_)))) {
-        volFailed_ = true; return false;
-    }
-
-    // Per-frame blob upload buffers (persistently mapped, like the particle ring).
-    const u64 blobBytes = static_cast<u64>(kMaxVolumeBlobs) * sizeof(VolumeBlob);
-    for (u32 i = 0; i < kMaxBackBuffers; ++i) {
-        volBlobBuffers_[i] = CreateUploadBuffer(device_.Get(), blobBytes);
-        if (!volBlobBuffers_[i]) { volFailed_ = true; return false; }
-        void* m = nullptr;
-        D3D12_RANGE noRead{0, 0};
-        volBlobBuffers_[i]->Map(0, &noRead, &m);
-        volBlobCpu_[i] = static_cast<u8*>(m);
-    }
-    HBE_INFO("[D3D12] Volumetric compute pipeline ready ({}^3 volume).", volDim_);
-    return true;
-}
-
-void D3D12Device::SetVolumeParticles(const VolumeBlob* blobs, u32 count,
-                                     const VolumeParams& params) {
-    volBlobs_ = blobs;
-    volBlobCount_ = (blobs && count <= kMaxVolumeBlobs) ? count
-                    : (blobs ? kMaxVolumeBlobs : 0u);
-    volParams_ = params;
-}
-
-void D3D12Device::SetVolumeGrid(const void* bytes, usize byteSize,
+void D3D12Device::SetVolumeGrid(const void* density, usize densitySize,
+                                const void* temperature, usize tempSize,
                                 const VolumeRenderParams& params) {
-    // Store the pointer + size; the upload + SRV happen in RunPostStack (like SetVolumeParticles
-    // defers to DispatchVolumeSplat). Pointer must stay valid through the frame.
-    volGridBytes_ = (bytes && byteSize > 0) ? bytes : nullptr;
-    volGridSize_ = volGridBytes_ ? byteSize : 0u;
+    // Store the pointers + sizes; the upload + SRVs happen in RunPostStack (deferred to the post pass
+    // so the bindless slots exist). Pointers must stay valid through the frame.
+    volGridBytes_ = (density && densitySize > 0) ? density : nullptr;
+    volGridSize_ = volGridBytes_ ? densitySize : 0u;
+    volTempBytes_ = (temperature && tempSize > 0) ? temperature : nullptr;
+    volTempSize_ = volTempBytes_ ? tempSize : 0u;
     volRenderParams_ = params;
 }
 
@@ -3893,55 +3790,30 @@ bool D3D12Device::EnsureVolumeGridBuffer(usize size) {
     return true;
 }
 
-void D3D12Device::DispatchVolumeSplat() {
-    if (volBlobCount_ == 0 || volFailed_) return; // data-driven: no blobs -> no volume
-    if (!EnsureVolumeResources()) return;
-
-    // Upload this frame's blobs into the ring buffer.
-    std::memcpy(volBlobCpu_[frameIndex_], volBlobs_,
-                static_cast<usize>(volBlobCount_) * sizeof(VolumeBlob));
-
-    // Params CB (must match VolumeSplat.hlsl's VolumeCB, 64 bytes).
-    struct VolCB {
-        f32 boundsMin[3]; f32 p0;
-        f32 boundsMax[3]; f32 p1;
-        u32 dim[3];       u32 count;
-        f32 densityScale; f32 noiseDetail; f32 noiseScale; f32 p2;
-    };
-    D3D12_GPU_VIRTUAL_ADDRESS gpu{};
-    void* cpu = AllocConstants(sizeof(VolCB), gpu);
-    if (!cpu) return;
-    VolCB cb{};
-    cb.boundsMin[0] = volParams_.boundsMin.x; cb.boundsMin[1] = volParams_.boundsMin.y;
-    cb.boundsMin[2] = volParams_.boundsMin.z;
-    cb.boundsMax[0] = volParams_.boundsMax.x; cb.boundsMax[1] = volParams_.boundsMax.y;
-    cb.boundsMax[2] = volParams_.boundsMax.z;
-    cb.dim[0] = volDim_; cb.dim[1] = volDim_; cb.dim[2] = volDim_;
-    cb.count = volBlobCount_;
-    cb.densityScale = volParams_.densityScale;
-    cb.noiseDetail = volParams_.noiseDetail;  // splat-side turbulence (de-sphere)
-    cb.noiseScale = volParams_.noiseScale;    // stable world scale (no crawl on move)
-    std::memcpy(cpu, &cb, sizeof(cb));
-
-    ID3D12DescriptorHeap* heaps[] = {bindlessHeap_.Get()};
-    cmdList_->SetDescriptorHeaps(1, heaps);
-    cmdList_->SetComputeRootSignature(computeRootSig_.Get());
-    cmdList_->SetPipelineState(volSplatPSO_.Get());
-    cmdList_->SetComputeRootConstantBufferView(0, gpu);
-    D3D12_GPU_DESCRIPTOR_HANDLE uavGpu = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
-    uavGpu.ptr += static_cast<UINT64>(volUavSlot_) * bindlessDescSize_;
-    cmdList_->SetComputeRootDescriptorTable(1, uavGpu);
-    cmdList_->SetComputeRootShaderResourceView(2, volBlobBuffers_[frameIndex_]->GetGPUVirtualAddress());
-    const u32 groups = (volDim_ + 3) / 4; // numthreads(4,4,4)
-    cmdList_->Dispatch(groups, groups, groups);
-
-    // UAV barrier so the raymarch (VV4) sees the writes; the volume stays in the
-    // UNORDERED_ACCESS state it was created in (no layout transition needed).
-    D3D12_RESOURCE_BARRIER uavb{};
-    uavb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    uavb.UAV.pResource = slotTextures_.count(volTex_.index)
-                             ? slotTextures_[volTex_.index].resource : nullptr;
-    if (uavb.UAV.pResource) cmdList_->ResourceBarrier(1, &uavb);
+// Twin of EnsureVolumeGridBuffer for the TEMPERATURE grid (its own per-frame buffer + SRV slot).
+bool D3D12Device::EnsureVolumeTempBuffer(usize size) {
+    if (slotHdr_ == 0) return false;
+    if (volTempBuffer_[frameIndex_] && volTempCapacity_[frameIndex_] >= size) return true;
+    const u64 cap = (static_cast<u64>(size) + 0xFFFFFull) & ~0xFFFFFull; // round up to 1 MiB
+    volTempBuffer_[frameIndex_] = CreateUploadBuffer(device_.Get(), cap);
+    if (!volTempBuffer_[frameIndex_]) return false;
+    void* m = nullptr;
+    D3D12_RANGE noRead{0, 0};
+    volTempBuffer_[frameIndex_]->Map(0, &noRead, &m);
+    volTempCpu_[frameIndex_] = static_cast<u8*>(m);
+    volTempCapacity_[frameIndex_] = cap;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement = 0;
+    srv.Buffer.NumElements = static_cast<UINT>(cap / 4u);
+    srv.Buffer.StructureByteStride = 4u; // StructuredBuffer<uint>
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<SIZE_T>(slotVolTemp_[frameIndex_]) * bindlessDescSize_;
+    device_->CreateShaderResourceView(volTempBuffer_[frameIndex_].Get(), &srv, h);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -4269,7 +4141,6 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         ClearGpuParticleGroups();
         return;
     }
-    DispatchVolumeSplat(); // volumetric density splat (no-op unless enabled)
     const bool drawSky = (view.skyIndex != 0) && skyPSO_;
     // Without the post stack there is nothing to resolve, so an empty scene
     // can skip the pass entirely (legacy behavior).

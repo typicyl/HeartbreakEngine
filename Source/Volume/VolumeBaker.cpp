@@ -34,25 +34,59 @@ u64 HashVolumeConfig(const VolumeSimConfig& c) {
     mix(&c.ambientTemperature, sizeof(f32));
     mix(&c.gravity, sizeof(glm::vec3));
     mix(&c.seed, sizeof(u32));
-    for (const VolumeEmitter& e : c.emitters) {
-        // Hash VolumeShape FIELD BY FIELD, not as a raw blob: VolumeShape has interior padding after
-        // the u8 `kind`, and padding bytes are indeterminate, so a raw memcpy hash would differ
-        // between two logically-identical configs (default-constructed vs deserialized) and defeat
-        // the stale-detection this hash exists for.
-        const u8 kind = static_cast<u8>(e.shape.kind);
+    // Field-by-field helpers. Hash shapes/curves FIELD BY FIELD, not as raw blobs: VolumeShape has
+    // interior padding after the u8 `kind` (indeterminate bytes), so a raw memcpy hash would differ
+    // between two logically-identical configs (default-constructed vs deserialized) and defeat the
+    // stale-detection this hash exists for.
+    auto mixShape = [&](const VolumeShape& s) {
+        const u8 kind = static_cast<u8>(s.kind);
         mix(&kind, sizeof(u8));
-        mix(&e.shape.center, sizeof(glm::vec3));
-        mix(&e.shape.halfExtents, sizeof(glm::vec3));
-        mix(&e.shape.rotation, sizeof(glm::quat));
-        mix(&e.shape.coneHeight, sizeof(f32));
-        mix(&e.shape.edgeSoftness, sizeof(f32));
-        mix(&e.shape.meshId, sizeof(u32));
+        mix(&s.center, sizeof(glm::vec3));
+        mix(&s.halfExtents, sizeof(glm::vec3));
+        mix(&s.rotation, sizeof(glm::quat));
+        mix(&s.coneHeight, sizeof(f32));
+        mix(&s.edgeSoftness, sizeof(f32));
+        mix(&s.meshId, sizeof(u32));
+    };
+    auto mixVec3Curve = [&](const VolumeVec3Curve& cv) {
+        mix(&cv.constant, sizeof(glm::vec3));
+        for (const VolumeVec3Key& k : cv.keys) { mix(&k.time, sizeof(f32)); mix(&k.value, sizeof(glm::vec3)); }
+    };
+    auto mixScalarCurve = [&](const VolumeScalarCurve& cv) {
+        mix(&cv.constant, sizeof(f32));
+        for (const VolumeScalarKey& k : cv.keys) { mix(&k.time, sizeof(f32)); mix(&k.value, sizeof(f32)); }
+    };
+    for (const VolumeEmitter& e : c.emitters) {
+        mixShape(e.shape);
         mix(&e.densityRate, sizeof(f32));
         mix(&e.temperatureRate, sizeof(f32));
         mix(&e.temperatureTarget, sizeof(f32));
         mix(&e.fuelRate, sizeof(f32));
         mix(&e.velocity, sizeof(glm::vec3));
+        // These change sim output (Burst vs Continuous, timing, inflow frame) but were omitted before,
+        // so the live preview + stale-bake check ignored edits to them.
+        const u8 mode = static_cast<u8>(e.mode);
+        mix(&mode, sizeof(u8));
+        mix(&e.startTime, sizeof(f32));
+        mix(&e.endTime, sizeof(f32));
+        mix(&e.burstDuration, sizeof(f32));
+        const u8 wv = e.worldVelocity ? 1u : 0u;
+        mix(&wv, sizeof(u8));
+        mixVec3Curve(e.translationCurve);
+        mixScalarCurve(e.densityRateCurve);
     }
+    for (const VolumeObstacle& o : c.obstacles) {
+        mix(o.name.data(), o.name.size());
+        mixShape(o.shape);
+        const u8 kind = static_cast<u8>(o.kind);
+        mix(&kind, sizeof(u8));
+        const u8 moving = o.moving ? 1u : 0u;
+        mix(&moving, sizeof(u8));
+        mixVec3Curve(o.translationCurve);
+    }
+    for (const std::string& fld : c.bakeFields) mix(fld.data(), fld.size());
+    mix(&c.keyframeInterval, sizeof(u32));
+    for (const auto& [k, v] : c.modelParams) { mix(k.data(), k.size()); mix(&v, sizeof(f32)); } // std::map: key order
     return h;
 }
 

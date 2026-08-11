@@ -5,7 +5,7 @@
 // DXIL (D3D12) and SPIR-V (Vulkan) through DXC. The renderer knows how to render a volume, not
 // how it was made: the volume arrives as opaque NanoVDB bytes + a world AABB.
 //
-// The lighting is ported from the old VolumetricParticles.hlsl (RayBox empty-space clip, a
+// The lighting is a standard volume march (RayBox empty-space clip, a
 // short self-shadow march, the Wrenninge/Haggstrom 3-octave multi-scatter approximation,
 // Henyey-Greenstein phase, blackbody temperature emission, front-to-back compositing) - all of
 // which is FORMAT-AGNOSTIC. Only the source changed: SampleVolume() now traverses a NanoVDB tree
@@ -25,12 +25,18 @@
 // it fine). Vulkan: a DISTINCT storage-buffer binding (6) - binding 5 is a SAMPLED_IMAGE in the
 // shared post descriptor-set layout and cannot double as a storage buffer.
 [[vk::binding(6, 0)]] StructuredBuffer<uint> gVolumeGrid : register(t0, space6);
+// The OPTIONAL temperature grid (same bake bounds as density) for emission glow. D3D12: t1 space6
+// (its own root-param descriptor table). Vulkan: storage-buffer binding 7. Bound to a VALID buffer
+// EVERY frame (fallback = the density buffer when no temperature); gVolEmission.w (hasTemp) gates
+// whether it is actually sampled, so the static shader reference always resolves.
+[[vk::binding(7, 0)]] StructuredBuffer<uint> gVolumeTemp : register(t1, space6);
 
 // PostParams packing (set by the backend's volume raymarch pass):
 //   p0 = (boundsMin.xyz, stepCount)
 //   p1 = (boundsMax.xyz, densityMul)
 //   p2 = (emissionMul, shadowSteps, extinction, ditherFrame)
-//   p3 = reserved (temperature grid / detail knobs) - unused in P1
+//   p3 = (worldOffset.xyz, unused)
+//   gVolAlbedo = (albedo.rgb, emissionMode) ; gVolEmission = (emissionColor.rgb, hasTemp)
 
 float3 Blackbody(float t) {
     t = saturate(t);
@@ -88,6 +94,10 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float emissionMul = gPostParams2.x;
     const int   shadowSteps = max(0, (int)gPostParams2.y);
     const float extinction = max(gPostParams2.z, 1e-3f);
+    // Volume color (P1): albedo tints single-scatter; emissionColor/emissionMode tint the glow.
+    const float3 volAlbedo    = gVolAlbedo.xyz;
+    const int    emissionMode = (int)gVolAlbedo.w;   // 0=blackbody, 1=tint, 2=tint x blackbody
+    const float3 volEmissTint = gVolEmission.xyz;
 
     // Ray from the camera toward the scene surface at this pixel.
     const float depth = SamplePost(gInput2, uv).r;
@@ -110,6 +120,16 @@ float4 PSMain(FSOutput input) : SV_Target {
     const pnanovdb_root_handle_t root = pnanovdb_tree_get_root(buf, tree);
     pnanovdb_readaccessor_t acc;
     pnanovdb_readaccessor_init(acc, root);
+
+    // Second accessor for the temperature grid (drives emission). Only sampled when hasTemp>0.5.
+    const float hasTemp = gVolEmission.w;
+    pnanovdb_buf_t tbuf = gVolumeTemp;
+    pnanovdb_grid_handle_t tgrid;
+    tgrid.address = pnanovdb_address_null();
+    const pnanovdb_tree_handle_t ttree = pnanovdb_grid_get_tree(tbuf, tgrid);
+    const pnanovdb_root_handle_t troot = pnanovdb_tree_get_root(tbuf, ttree);
+    pnanovdb_readaccessor_t tacc;
+    pnanovdb_readaccessor_init(tacc, troot);
 
     const float marchLen = box.y - box.x;
     const float stepLen = marchLen / steps;
@@ -153,12 +173,19 @@ float4 PSMain(FSOutput input) : SV_Target {
         msSun += 0.06f;
         const float3 sun = gLightColor * (gLightIntensity * (msSun * 0.28f));
 
-        // Temperature emission (P1: no temperature grid yet -> temp 0 -> inert). Kept so the
-        // baker (P4) only has to feed a temperature field, not re-add the lighting.
-        const float temp = 0.0f;
-        const float3 emission = Blackbody(temp) * (emissionMul * temp * temp * temp);
+        // Temperature emission. Sample the temperature grid (same transform as density) only when one
+        // is bound (hasTemp); placed AFTER the density early-out so cool/empty voxels never pay for the
+        // temp tree walk. temp==0 -> inert. emissionMode: 0=blackbody(temp), 1=tint, 2=tint x blackbody.
+        const float temp = (hasTemp > 0.5f)
+                         ? VR_SampleDensity(tbuf, tgrid, tacc, pos - worldOffset) // generic scalar read
+                         : 0.0f;
+        const float3 bb = Blackbody(temp);
+        const float3 ecol = (emissionMode == 1) ? volEmissTint
+                          : (emissionMode == 2) ? bb * volEmissTint : bb;
+        const float3 emission = ecol * (emissionMul * temp * temp * temp);
 
-        const float3 scat = (sun + ambient * 0.4f) * d + emission * d;
+        // albedo multiplies the SCATTERED light (single-scatter tint); emission is added separately.
+        const float3 scat = (sun + ambient * 0.4f) * volAlbedo * d + emission * d;
         const float stepTrans = exp(-d * stepLen * extinction);
         inscatter += transmittance * scat * stepLen;
         transmittance *= stepTrans;

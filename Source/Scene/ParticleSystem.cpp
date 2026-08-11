@@ -511,79 +511,6 @@ u32 BuildGpuRecords(Scene& scene, Renderer& renderer, const std::filesystem::pat
     return cursor;
 }
 
-bool BuildVolumetricBlobs(Scene& scene, std::vector<rhi::VolumeBlob>& blobsOut,
-                          rhi::VolumeParams& paramsOut) {
-    blobsOut.clear();
-    auto& reg = scene.Registry();
-
-    glm::vec3 bmin(std::numeric_limits<f32>::max());
-    glm::vec3 bmax(std::numeric_limits<f32>::lowest());
-    f32 radiusSum = 0.0f; // -> average blob radius = the STABLE world noise scale
-    bool haveParams = false; // first volumetric emitter seeds the tuning knobs
-
-    for (const entt::entity e : reg.view<ParticleEmitter>()) {
-        ParticleEmitter& em = reg.get<ParticleEmitter>(e);
-        if (!em.volumetric || em.pool.count == 0) continue;
-
-        const f32 radScale = glm::max(0.01f, em.volRadiusScale);
-        const bool simSize = em.pool.Has(vfx::Attr::Size);
-        for (u32 i = 0; i < em.pool.count; ++i) {
-            if (blobsOut.size() >= rhi::kMaxVolumeBlobs) break;
-            const f32 t = glm::clamp(em.pool.age[i] / glm::max(em.pool.lifetime[i], 1e-4f),
-                                     0.0f, 1.0f);
-            const f32 size = simSize ? em.pool.sizeX[i] : glm::mix(em.startSize, em.endSize, t);
-
-            // Density fades in/out with the same envelope as the billboard alpha so
-            // blobs appear and dissipate smoothly instead of popping. Deliberately the
-            // fade envelope and NOT the simulated colour's alpha: the colour ramp also
-            // carries the start/end alpha keys, which the volumetric presets set to 0.
-            f32 env = 1.0f;
-            if (em.fadeIn > 0.0f && t < em.fadeIn) env *= t / em.fadeIn;
-            if (em.fadeOut > 0.0f && t > 1.0f - em.fadeOut) env *= (1.0f - t) / em.fadeOut;
-            env = glm::clamp(env, 0.0f, 1.0f);
-
-            rhi::VolumeBlob b;
-            b.pos = em.pool.position[i];
-            b.radius = glm::max(0.01f, size * radScale);
-            b.density = glm::max(0.0f, em.volDensity) * env;
-            // Fire cools as it rises: hot at birth, fading to smoke over life.
-            b.temperature = glm::clamp(em.volTemperature * (1.0f - t), 0.0f, 1.0f);
-            if (b.density <= 1e-4f) continue;
-            blobsOut.push_back(b);
-            radiusSum += b.radius;
-
-            // Tuning knobs come from the first emitter that actually CONTRIBUTES a blob
-            // (not merely the first with a non-empty pool), so the emitter that lights
-            // the shared volume is one that put density into it.
-            if (!haveParams) {
-                haveParams = true;
-                paramsOut.densityScale = 1.0f;
-                paramsOut.emission = glm::max(0.0f, em.volEmission);
-                paramsOut.extinction = glm::max(1e-3f, em.volExtinction);
-                paramsOut.stepCount = static_cast<u32>(glm::clamp(em.volSteps, 4, 256));
-                paramsOut.resolution = static_cast<u32>(glm::clamp(em.volResolution, 32, 192));
-                paramsOut.noiseDetail = glm::clamp(em.volDetail, 0.0f, 1.0f);
-            }
-
-            bmin = glm::min(bmin, b.pos - glm::vec3(b.radius));
-            bmax = glm::max(bmax, b.pos + glm::vec3(b.radius));
-        }
-    }
-
-    if (blobsOut.empty()) return false;
-
-    // Pad the AABB slightly so the raymarch fully clips soft blob edges.
-    const glm::vec3 pad(0.25f);
-    paramsOut.boundsMin = bmin - pad;
-    paramsOut.boundsMax = bmax + pad;
-    paramsOut.blobCount = static_cast<u32>(blobsOut.size());
-    // Average blob radius = the world-space turbulence scale. Derived from particle
-    // size (stable frame-to-frame), NOT the AABB extent (which jumps when the emitter
-    // moves fast) - so the procedural noise stays world-anchored and doesn't crawl/pop.
-    paramsOut.noiseScale = glm::max(0.05f, radiusSum / static_cast<f32>(blobsOut.size()));
-    return true;
-}
-
 const char* TemplateName(Template t) {
     switch (t) {
         case Template::Fire: return "Fire";
@@ -594,9 +521,6 @@ const char* TemplateName(Template t) {
         case Template::Explosion: return "Explosion";
         case Template::Sparks: return "Sparks";
         case Template::Magic: return "Magic";
-        case Template::VolFire: return "Volumetric Fire";
-        case Template::VolSmoke: return "Volumetric Smoke";
-        case Template::VolExplosion: return "Volumetric Explosion (mushroom)";
         default: return "?";
     }
 }
@@ -676,54 +600,6 @@ ParticleEmitter MakeTemplate(Template t) {
             e.startColor = {0.5f, 0.7f, 1.0f, 1.0f}; e.endColor = {0.8f, 0.4f, 1.0f, 0.0f};
             e.startSize = 0.15f; e.endSize = 0.05f; e.fadeIn = 0.1f; e.fadeOut = 0.4f;
             e.turbulence = 1.5f; e.turbulenceScale = 1.2f;
-            break;
-        case Template::VolFire:
-            // Real raymarched fire: particles are invisible carriers (billboard alpha
-            // ~0), the 3D volume does the rendering. Hot base cools as it rises.
-            e.additive = false; e.shape = S::Cone; e.coneAngle = 18.0f; e.emitRadius = 0.25f;
-            e.direction = {0, 1, 0}; e.startSpeed = 1.4f; e.speedVariance = 0.4f;
-            e.gravity = {0, 0.9f, 0}; e.drag = 0.9f; e.rate = 90.0f; e.maxParticles = 500;
-            e.lifetime = 1.6f; e.lifetimeVariance = 0.3f;
-            e.startColor = {1, 1, 1, 0.0f}; e.endColor = {1, 1, 1, 0.0f}; // volume renders it
-            e.startSize = 0.5f; e.endSize = 0.9f; e.fadeIn = 0.1f; e.fadeOut = 0.4f;
-            e.turbulence = 1.1f; e.turbulenceScale = 1.4f;
-            e.volumetric = true; e.volDensity = 0.6f; e.volRadiusScale = 2.2f;
-            e.volTemperature = 1.0f; e.volEmission = 3.5f; e.volExtinction = 1.4f;
-            e.volSteps = 56; e.volResolution = 96;
-            break;
-        case Template::VolSmoke:
-            e.additive = false; e.shape = S::Sphere; e.emitRadius = 0.3f;
-            e.direction = {0, 1, 0}; e.startSpeed = 0.6f; e.speedVariance = 0.4f;
-            e.gravity = {0, 0.4f, 0}; e.drag = 0.7f; e.rate = 45.0f; e.maxParticles = 400;
-            e.lifetime = 3.5f; e.lifetimeVariance = 0.3f; e.spin = 0.2f;
-            e.startColor = {1, 1, 1, 0.0f}; e.endColor = {1, 1, 1, 0.0f}; // volume renders it
-            e.startSize = 0.6f; e.endSize = 2.0f; e.fadeIn = 0.15f; e.fadeOut = 0.5f;
-            e.turbulence = 0.6f; e.turbulenceScale = 0.7f;
-            e.volumetric = true; e.volDensity = 0.9f; e.volRadiusScale = 2.6f;
-            e.volTemperature = 0.0f; e.volEmission = 0.0f; e.volExtinction = 1.8f;
-            e.volSteps = 48; e.volResolution = 96;
-            break;
-        case Template::VolExplosion:
-            // Nuclear-style mushroom cloud. A NARROW, sustained upward column feeds the
-            // stem; buoyancy rockets the hot front up; the vortex ring pushes outward
-            // MORE the higher a particle has risen (see particle::Update) so the risen
-            // material blooms into a cap while fresh particles stay in the stem -> the
-            // classic funnel. Billboard alpha 0: the volume renders it.
-            e.additive = false; e.shape = S::Sphere; e.emitRadius = 0.3f;
-            e.burst = 80; e.loop = false; e.duration = 1.5f; e.rate = 260.0f;
-            e.maxParticles = 1300;
-            e.direction = {0, 1, 0}; e.startSpeed = 7.0f; e.speedVariance = 0.4f; e.spread = 0.25f;
-            e.gravity = {0, 0.2f, 0}; e.drag = 1.2f;
-            e.lifetime = 5.0f; e.lifetimeVariance = 0.3f;
-            e.startColor = {1, 1, 1, 0.0f}; e.endColor = {1, 1, 1, 0.0f};
-            e.startSize = 0.6f; e.endSize = 2.4f; e.fadeIn = 0.05f; e.fadeOut = 0.5f;
-            e.turbulence = 1.6f; e.turbulenceScale = 0.7f;
-            e.buoyancy = 10.0f; // strong rise -> the cap climbs high and piles up
-            e.vortex = 4.5f;    // height-scaled toroidal roll -> the mushroom overhang
-            e.volumetric = true; e.volDensity = 0.85f; e.volRadiusScale = 2.3f;
-            e.volTemperature = 1.0f; e.volEmission = 4.5f; e.volExtinction = 1.5f;
-            e.volSteps = 64; e.volDetail = 0.75f; // extra billowing for the hero cloud
-            e.volResolution = 128; // hero effect: bigger volume (lower for low-end)
             break;
         default:
             break;

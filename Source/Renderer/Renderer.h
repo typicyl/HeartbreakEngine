@@ -117,30 +117,19 @@ public:
         g.count = static_cast<u32>(batches.size());
     }
 
-    // Volumetric-VFX blobs for this frame (splatted into a 3D density volume; see
-    // VolumeSplat.hlsl). Forwarded to the device IMMEDIATELY (not deferred like
-    // particles) because the Vulkan splat runs in BeginFrame - so call this BEFORE
-    // RenderScene. Empty = volumetrics off this frame (zero GPU cost).
-    void SetVolumeParticles(const std::vector<rhi::VolumeBlob>& blobs,
-                            const rhi::VolumeParams& params) {
-        if (device_) {
-            device_->SetVolumeParticles(blobs.empty() ? nullptr : blobs.data(),
-                                        static_cast<u32>(blobs.size()), params);
-        }
-    }
-
-    // Baked NanoVDB volume grid for this frame (the RUNTIME volume path; supersedes the splat).
-    // `bytes` is a raw NanoVDB blob (streamed from a .hbvol by VolumeCache, or hand-built for
-    // tests); the PNanoVDB raymarch samples it. Call BEFORE RenderScene; the pointer must stay
-    // valid through the frame. byteSize==0 disables the volume this frame.
-    void SetVolumeGrid(const void* bytes, usize byteSize, const rhi::VolumeRenderParams& params) {
-        if (device_) device_->SetVolumeGrid(bytes, byteSize, params);
+    // Baked NanoVDB volume for this frame (the RUNTIME volume path). `density` is a raw NanoVDB blob
+    // (streamed from a .hbvol by VolumeCache, or hand-built for tests); `temperature` is an OPTIONAL
+    // second grid (same frame/bounds) driving the emission glow - pass nullptr/0 for grey smoke. Call
+    // BEFORE RenderScene; the pointers must stay valid through the frame. densitySize==0 disables it.
+    void SetVolumeGrid(const void* density, usize densitySize, const void* temperature, usize tempSize,
+                       const rhi::VolumeRenderParams& params) {
+        if (device_) device_->SetVolumeGrid(density, densitySize, temperature, tempSize, params);
     }
 
     // -- GPU compute + GPU-writable structured buffers -----------------------
-    // Thin forwarders (the SetVolumeParticles pattern). QueueCompute must be
-    // called BEFORE RenderScene: both backends execute the queue in their
-    // BeginFrame, because Vulkan cannot record compute inside a render pass.
+    // Thin forwarders. QueueCompute must be called BEFORE RenderScene: both backends
+    // execute the queue in their BeginFrame, because Vulkan cannot record compute
+    // inside a render pass.
     bool SupportsGpuCompute() const { return device_ && device_->SupportsGpuCompute(); }
     rhi::GpuBufferHandle CreateGpuBuffer(const rhi::GpuBufferDesc& desc) {
         return device_ ? device_->CreateGpuBuffer(desc) : rhi::GpuBufferHandle{};

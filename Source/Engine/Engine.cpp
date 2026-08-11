@@ -3106,7 +3106,7 @@ int Engine::Run(const EngineConfig& configIn) {
             // compute dispatches queued here write the very buffer the vertex shader
             // then reads. Queued BEFORE RenderScene because both backends execute the
             // compute queue in their BeginFrame (Vulkan cannot record compute inside a
-            // render pass) - the same rule SetVolumeParticles follows. It is inside
+            // render pass) - the same rule QueueCompute follows. It is inside
             // the vfx-expand timer on purpose: this IS the phase, and what the timer
             // should show is it collapsing to O(emitters).
             if (particle::AnyGpuSim(scene)) {
@@ -3118,48 +3118,9 @@ int Engine::Run(const EngineConfig& configIn) {
                 std::chrono::duration<f64, std::milli>(clock::now() - _pt).count() - mapWaitMs;
         }
 
-        // Volumetric VFX: feed the density-splat compute. Blobs come from every
-        // `volumetric`-flagged emitter (one per live particle); the raymarch pass
-        // then lights + composites them. HBE_VOLTEST injects a static test plume as
-        // a fallback so the splat path can be exercised with no authored emitter.
-        {
-            static std::vector<rhi::VolumeBlob> volumeBlobs; // persists across the frame
-            rhi::VolumeParams vp{};
-            const bool haveEmitters = particle::BuildVolumetricBlobs(scene, volumeBlobs, vp);
-            if (!haveEmitters) {
-                static const bool kVolTest = [] {
-                    const char* e = std::getenv("HBE_VOLTEST");
-                    return e && e[0] && e[0] != '0';
-                }();
-                volumeBlobs.clear();
-                vp = rhi::VolumeParams{};
-                if (kVolTest) {
-                    for (int i = 0; i < 10; ++i) {
-                        rhi::VolumeBlob b;
-                        b.pos = {0.0f, 0.3f + 0.35f * static_cast<f32>(i), 0.0f};
-                        b.radius = 0.6f + 0.05f * static_cast<f32>(i);
-                        b.density = 0.35f; // blobs overlap heavily; keep the sum reasonable
-                        b.temperature = glm::clamp(1.0f - 0.12f * static_cast<f32>(i), 0.0f, 1.0f);
-                        volumeBlobs.push_back(b);
-                    }
-                    glm::vec3 lo(1e9f), hi(-1e9f);
-                    for (const rhi::VolumeBlob& b : volumeBlobs) {
-                        lo = glm::min(lo, b.pos - glm::vec3(b.radius));
-                        hi = glm::max(hi, b.pos + glm::vec3(b.radius));
-                    }
-                    vp.boundsMin = lo - glm::vec3(0.25f); // small padding
-                    vp.boundsMax = hi + glm::vec3(0.25f);
-                    vp.blobCount = static_cast<u32>(volumeBlobs.size());
-                    vp.densityScale = 1.0f;
-                }
-            }
-            renderer.SetVolumeParticles(volumeBlobs, vp); // before RenderScene (Vulkan splats in BeginFrame)
-        }
-
         // Baked volume playback (VolumeComponent -> .hbvol). Advance every component's playhead, and
         // feed the ONE active volume's current-frame density grid to the renderer (the RHI volume feed
-        // is single-grid). Runs before RenderScene like SetVolumeParticles, and SUPERSEDES it: a fed
-        // grid takes precedence over the legacy splat, while feeding a null grid lets the splat draw.
+        // is single-grid). Runs before RenderScene (Vulkan uploads the volume in BeginFrame).
         {
             auto& vcache = volume::GlobalVolumeCache();
             bool fedVolume = false;
@@ -3178,19 +3139,23 @@ int Engine::Run(const EngineConfig& configIn) {
                 vc.resolvedFrame = frame;
                 const volume::VolumeAsset::GridView g = vcache.DensityGrid(vc.cacheHandle, frame);
                 if (!g.valid()) continue;
+                // Optional temperature grid (drives the emission glow); invalid when the .hbvol has no
+                // temperature field -> feed nullptr so the glow stays inert (grey smoke).
+                const volume::VolumeAsset::GridView tg = vcache.TemperatureGrid(vc.cacheHandle, frame);
                 const volume::VolumeBounds b = vcache.Bounds(vc.cacheHandle);
                 rhi::VolumeRenderParams rp = vc.render;
                 rp.boundsMin = b.worldMin; // grid's baked LOCAL AABB
                 rp.boundsMax = b.worldMax;
                 rp.worldOffset = glm::vec3(scene.WorldMatrix(e)[3]); // place at entity world position
-                renderer.SetVolumeGrid(g.bytes, g.size, rp);
+                renderer.SetVolumeGrid(g.bytes, g.size, tg.valid() ? tg.bytes : nullptr,
+                                       tg.valid() ? tg.size : 0, rp);
                 fedVolume = true;
             }
-            if (!fedVolume) renderer.SetVolumeGrid(nullptr, 0, {}); // no active volume -> allow the splat
+            if (!fedVolume) renderer.SetVolumeGrid(nullptr, 0, nullptr, 0, {}); // no active volume this frame
         }
 
         // FFT ocean (Tessendorf): drive the GPU compute FFT for any fftOcean water and bind its
-        // displacement buffer for the water VS - BEFORE RenderScene, like SetVolumeParticles
+        // displacement buffer for the water VS - BEFORE RenderScene, like QueueCompute
         // (the compute runs at BeginFrame). SetVertexShaderBuffer applies + consumes the binding
         // in the next DrawScene (the backend re-binds root param 6 / set 2 every DrawScene, with
         // a never-read dummy when nothing is set), and SetOceanActive gates the shader so it

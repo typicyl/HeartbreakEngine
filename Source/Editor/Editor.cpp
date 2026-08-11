@@ -32,6 +32,11 @@
 #include "Scene/PaintSystem.h"
 #include "Scene/ParticleGpuSim.h"
 #include "Scene/ParticleSystem.h"
+#include "Volume/VolumeBaker.h"       // Volume Baker panel: BakeSimulation / HashVolumeConfig / WriteHbvolFile
+#include "Volume/VolumeAsset.h"       // ReadHbvolSourceHash (stale check)
+#include "Volume/VolumeSimRegistry.h" // model list + Create
+#include "Volume/VolumeSimConfigIO.h" // .hbvolsim authoring asset load/save
+#include "Volume/VolumeNano.h"        // BuildDensityGridBlob/BuildScalarGridBlob (live preview bridge)
 #include "Scene/SceneSerializer.h"
 #include "Scene/StreamingSalvage.h" // SALVAGE 2: the hysteresis clamp the sim must share
 #include "Scene/StrokeZone.h" // 3D paint strokes group + stream with their zone
@@ -78,6 +83,18 @@ namespace hbe {
 
 // Defined further down; the asset browser needs it long before that point.
 std::string AssetRelPath(const std::filesystem::path& abs);
+
+// A volumetric-effect preset (Smoke/Fire/...). Declared early because the Add-Component menu and the
+// VolumeComponent inspector both use it well above the recipe table's definition (further down).
+namespace {
+struct VolumeEffectPreset {
+    std::string             name;
+    volume::VolumeSimConfig config;
+    rhi::VolumeRenderParams render;
+    const char*             note;
+};
+const std::vector<VolumeEffectPreset>& VolumeEffectPresets();
+} // namespace
 
 namespace {
 // Splits a TRS matrix back into a Transform (no shear support).
@@ -762,6 +779,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
     DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
     DrawMovieRender(engine);      // trailer render (ticks the job; pins the viewport last)
+    DrawVolumeBaker(engine);      // author + bake a .hbvol volume (ticks the bake job)
     DrawUIDocumentPanel(engine);  // .hbui open/new/save/close + the active edit target
     // The dedicated `.hbui` authoring canvas. AFTER DrawGameView on purpose: both
     // claim the in-game UI pointer via Engine::SetUIPointer, and when the UI editor
@@ -826,6 +844,11 @@ void Editor::BuildUI(Engine& engine) {
     ProcessEditRequest(engine);
     ProcessSaveRequest(engine);
     DrawSaveToast();
+
+    // In-scene live volume preview: runs the selected volume's low-res CPU sim and feeds it via
+    // SetVolumeGrid. LAST in BuildUI so it sees this frame's inspector edits; BuildUI runs after the
+    // Engine's baked-volume drive and before RenderScene, so this feed wins (edit mode only).
+    DriveVolumePreview(engine);
 }
 
 void Editor::DrawWindowMenu() {
@@ -844,7 +867,7 @@ void Editor::DrawWindowMenu() {
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
-        "Tags", "UI Editor", "Collaborate", "People", "Review changes"};
+        "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -4961,6 +4984,14 @@ void Editor::RefreshAssets() {
             item.isUIDoc = true;
             item.label = entry.path().stem().string();
             item.typeName = "UI Document";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbvolsim") {
+            item.isVolumeSim = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "Volume Sim";
+        } else if (entry.is_regular_file() && entry.path().extension() == ".hbvol") {
+            item.isVolumeCache = true;
+            item.label = entry.path().stem().string();
+            item.typeName = "Volume Cache";
         } else if (entry.is_regular_file() && entry.path().extension() == ".uaf") {
             const uaf::AssetType type = uaf::PeekType(entry.path()); // header only
             item.isMesh = (type == uaf::AssetType::Mesh);
@@ -5228,6 +5259,7 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
         else if (item.isSchematic) OpenSchematic(item.path);
         else if (item.isDialogue) OpenDialogue(item.path);
         else if (item.isCutscene) OpenCutscene(engine, item.path);
+        else if (item.isVolumeSim) OpenVolumeSim(item.path);
         else if (item.isPrefab) InstantiatePrefab(engine, item.path);
         else if (item.isMesh) SpawnMeshAsset(scene, renderer, item.path);
         else if (item.isAudio) engine.GetAudio().PlayUAF(item.path);
@@ -5282,6 +5314,9 @@ void Editor::DrawAssetTile(Engine& engine, AssetItem& item) {
         }
         if (item.isCutscene && ImGui::MenuItem("Edit in Timeline")) {
             OpenCutscene(engine, item.path);
+        }
+        if (item.isVolumeSim && ImGui::MenuItem("Edit in Volume Baker")) {
+            OpenVolumeSim(item.path);
         }
         if (item.isPrefab && ImGui::MenuItem("Instantiate")) {
             InstantiatePrefab(engine, item.path);
@@ -5480,6 +5515,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
             if (ImGui::MenuItem("Schematic")) beginCreate(4, "NewSchematic");
             if (ImGui::MenuItem("Dialogue")) beginCreate(6, "NewDialogue");
             if (ImGui::MenuItem("Cutscene")) beginCreate(7, "NewCutscene");
+            if (ImGui::MenuItem("Volume Simulation")) beginCreate(8, "NewVolume");
             ImGui::EndMenu();
         }
         ImGui::Separator();
@@ -5518,6 +5554,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
                             : pendingCreateKind_ == 5 ? "Prefab name"
                             : pendingCreateKind_ == 6 ? "Dialogue name"
                             : pendingCreateKind_ == 7 ? "Cutscene name"
+                            : pendingCreateKind_ == 8 ? "Volume sim name"
                                                       : "Audio event name";
         ImGui::TextUnformatted(label);
         ImGui::SetNextItemWidth(240.0f);
@@ -5539,6 +5576,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
                     break;
                 case 6: created = CreateDialogueAsset(pendingCreateDir_, newAssetNameBuf_); break;
                 case 7: created = CreateCutsceneAsset(pendingCreateDir_, newAssetNameBuf_); break;
+                case 8: created = CreateVolumeSimAsset(pendingCreateDir_, newAssetNameBuf_); break;
                 default: break;
             }
             if (!created.empty()) {
@@ -5546,6 +5584,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
                 assetsDirty_ = true;
                 if (pendingCreateKind_ == 4) OpenSchematic(created); // jump to canvas
                 else if (pendingCreateKind_ == 7) OpenCutscene(engine, created); // jump to timeline
+                else if (pendingCreateKind_ == 8) OpenVolumeSim(created); // jump to Volume Baker
                 else SelectAsset(created);
             }
             pendingCreateKind_ = 0;
@@ -7879,9 +7918,18 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 }
                 ImGui::EndMenu();
             }
-            if (!reg.all_of<VolumeComponent>(sel) && ImGui::MenuItem("Volume (Baked Smoke/Fire)")) {
+            if (!reg.all_of<VolumeComponent>(sel) &&
+                ImGui::MenuItem("Volume Effect (Smoke/Fire/Explosion...)")) {
                 PushUndo(scene);
-                reg.emplace<VolumeComponent>(sel);
+                VolumeComponent& vc = reg.emplace<VolumeComponent>(sel);
+                // Seed the first preset (Smoke) with live preview on, so it renders immediately in scene.
+                const auto& presets = VolumeEffectPresets();
+                if (!presets.empty()) {
+                    vc.sim = presets[0].config;
+                    vc.render = presets[0].render;
+                    vc.effectName = presets[0].name;
+                }
+                vc.livePreview = true;
                 if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
             }
             if (!reg.all_of<CensorComponent>(sel) && ImGui::MenuItem("Painterly Censor")) {
@@ -8770,9 +8818,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             ImGui::TextDisabled("Live: %u / %u", pe->pool.count, pe->maxParticles);
             // Apply a preset: bulk-replaces authored params, keeps the live pool.
             {
-                const char* kTemplates = "Fire\0Smoke\0Dust\0Rain\0Leaves\0Explosion\0Sparks\0Magic\0"
-                                         "Volumetric Fire\0Volumetric Smoke\0"
-                                         "Volumetric Explosion (mushroom)\0";
+                const char* kTemplates = "Fire\0Smoke\0Dust\0Rain\0Leaves\0Explosion\0Sparks\0Magic\0";
                 int pick = -1;
                 ImGui::SetNextItemWidth(160.0f);
                 if (ImGui::Combo("Template", &pick, kTemplates) && pick >= 0) {
@@ -8932,16 +8978,10 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                   "the batch stops truncating at ~26k particles. Worth it on "
                                   "dense emitters; irrelevant on small ones.");
             bool gpuSimulate = pe->gpuSim;
-            // Mutually exclusive with Volumetric by construction, not by taste: a GPU
-            // emitter holds ZERO CPU pool (ParticleGpuSim.cpp Reserve(0,0)) and the
-            // volumetric blob build reads that pool, so the combination silently
-            // produces no plume at all. Refuse it rather than let it look broken.
-            ImGui::BeginDisabled(pe->volumetric);
             if (ImGui::Checkbox("GPU simulation (compute)", &gpuSimulate)) {
                 PushUndo(scene);
                 pe->gpuSim = gpuSimulate;
             }
-            ImGui::EndDisabled();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Runs the SIMULATION in a compute shader (VfxSim.hlsl), not "
                                   "just the billboarding - zero per-particle CPU work.\n\n"
@@ -8951,10 +8991,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                   "ignored (spawn is a sphere of Emit radius with Spread), "
                                   "Turbulence becomes divergence-free curl noise, Drag becomes "
                                   "exponential, and Buoyancy/Vortex have no v1 equivalent and "
-                                  "are dropped. Preview it before shipping it.\n\n"
-                                  "Unavailable on a Volumetric emitter: the raymarched plume is "
-                                  "built from the CPU particle pool, which a GPU emitter does "
-                                  "not have.");
+                                  "are dropped. Preview it before shipping it.");
             if (pe->gpuSim) {
                 ImGui::TextDisabled("  ring %u slots (rate x lifetime + burst + 25%%)",
                                     particle::GpuRingCapacity(*pe));
@@ -9005,57 +9042,6 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                 pe->textureResolved = false;
                             });
 
-            ImGui::SeparatorText("Volumetric VFX (raymarched 3D)");
-            bool vol = pe->volumetric;
-            // The other half of the exclusion above.
-            ImGui::BeginDisabled(pe->gpuSim);
-            if (ImGui::Checkbox("Volumetric", &vol)) { PushUndo(scene); pe->volumetric = vol; }
-            ImGui::EndDisabled();
-            if (pe->gpuSim && ImGui::IsItemHovered())
-                ImGui::SetTooltip("Unavailable while \"GPU simulation (compute)\" is on: the "
-                                  "raymarched volume is built from the CPU particle pool, "
-                                  "which a GPU-simulated emitter does not have.");
-            if (pe->volumetric) {
-                ImGui::TextWrapped(
-                    "This emitter's particles feed a raymarched 3D density/temperature "
-                    "volume (real smoke/fire). Only one volumetric emitter drives the volume "
-                    "at a time. Turn Additive off + keep the billboard subtle for a pure look.");
-                ImGui::SliderFloat("Density", &pe->volDensity, 0.0f, 4.0f); undoOnActivate();
-                ImGui::SliderFloat("Radius scale", &pe->volRadiusScale, 0.25f, 8.0f); undoOnActivate();
-                ImGui::SliderFloat("Temperature (0=smoke,1=fire)", &pe->volTemperature, 0.0f, 1.0f);
-                undoOnActivate();
-                ImGui::SliderFloat("Emission (fire glow)", &pe->volEmission, 0.0f, 10.0f);
-                undoOnActivate();
-                ImGui::SliderFloat("Extinction (density/darkness)", &pe->volExtinction, 0.1f, 6.0f);
-                undoOnActivate();
-                ImGui::SliderFloat("Detail (procedural wisps)", &pe->volDetail, 0.0f, 1.0f);
-                undoOnActivate();
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("0 = raw blobs. Higher = animated fractal noise warps + "
-                                      "erodes the volume into continuous billowing smoke/fire.");
-                ImGui::SliderInt("Raymarch steps", &pe->volSteps, 4, 256); undoOnActivate();
-                pe->volSteps = glm::clamp(pe->volSteps, 4, 256);
-                // Volume resolution: lower = cheaper (low-end scalability). Applied at
-                // first enable per run; a tooltip flags that a restart re-reads it.
-                int resIdx = pe->volResolution <= 48 ? 0
-                             : pe->volResolution <= 72 ? 1
-                             : pe->volResolution <= 112 ? 2
-                                                        : 3;
-                ImGui::SetNextItemWidth(180.0f);
-                if (ImGui::Combo("Volume resolution", &resIdx,
-                                 "Low (48^3)\0Medium (64^3)\0High (96^3)\0Ultra (160^3)\0")) {
-                    PushUndo(scene);
-                    const int res[] = {48, 64, 96, 160};
-                    pe->volResolution = res[glm::clamp(resIdx, 0, 3)];
-                }
-                if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Lower = faster (mid/low-end GPUs).");
-                // Always-visible caveat (not just a hover tooltip): the volume texture is
-                // sized once, when the first volumetric emitter activates this run, so a
-                // resolution change here won't take effect until the app is relaunched.
-                ImGui::TextColored(ImVec4(0.85f, 0.75f, 0.35f, 1.0f),
-                                   "Applies at next launch (volume sized once per run).");
-            }
         }
         if (s.remove) { PushUndo(scene); reg.remove<ParticleEmitter>(sel); }
     }
@@ -9674,8 +9660,10 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         const SectionState s = ComponentSection("Spawner");
         if (s.open) {
             char b[192];
-            std::snprintf(b, sizeof(b), "%s", sp->prefab.c_str());
-            if (ImGui::InputText("Prefab (.hbprefab)", b, sizeof(b))) sp->prefab = b;
+            std::string prefabPick;
+            if (AssetPicker("Prefab (.hbprefab)", sp->prefab, ".hbprefab", uaf::AssetType::Unknown,
+                            prefabPick))
+                sp->prefab = prefabPick;
             std::snprintf(b, sizeof(b), "%s", sp->spawnerId.c_str());
             if (ImGui::InputText("Spawner id", b, sizeof(b))) sp->spawnerId = b;
             std::snprintf(b, sizeof(b), "%s", sp->encounterId.c_str());
@@ -9741,8 +9729,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             }
             if (en->clearedAction == InteractAction::Dialogue ||
                 en->clearedAction == InteractAction::Cutscene) {
-                std::snprintf(b, sizeof(b), "%s", en->clearedAsset.c_str());
-                if (ImGui::InputText("Asset", b, sizeof(b))) en->clearedAsset = b;
+                const char* ext = en->clearedAction == InteractAction::Dialogue ? ".hbdialogue"
+                                                                                : ".hbcutscene";
+                std::string clearedPick;
+                if (AssetPicker("Asset", en->clearedAsset, ext, uaf::AssetType::Unknown, clearedPick))
+                    en->clearedAsset = clearedPick;
             } else if (en->clearedAction != InteractAction::None) {
                 std::snprintf(b, sizeof(b), "%s", en->clearedFlag.c_str());
                 if (ImGui::InputText("Flag / Objective id", b, sizeof(b))) en->clearedFlag = b;
@@ -10472,11 +10463,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
     if (UIAnimator* an = reg.try_get<UIAnimator>(sel)) {
         const SectionState s = ComponentSection("UI Animator");
         if (s.open) {
-            char cbuf[128];
-            std::snprintf(cbuf, sizeof(cbuf), "%s", an->clip.c_str());
-            if (ImGui::InputText("Clip (.hbuianim)", cbuf, sizeof(cbuf))) {
+            std::string clipPick;
+            if (AssetPicker("Clip (.hbuianim)", an->clip, ".hbuianim", uaf::AssetType::Unknown,
+                            clipPick)) {
                 PushUndo(scene);
-                an->clip = cbuf;
+                an->clip = clipPick;
             }
             int trig = static_cast<int>(an->trigger);
             if (ImGui::Combo("Trigger", &trig,
@@ -10582,11 +10573,10 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             undoOnActivate();
             ImGui::ColorEdit4("Color", &wt->color.x);
             undoOnActivate();
-            char fbuf[256];
-            std::snprintf(fbuf, sizeof(fbuf), "%s", wt->font.c_str());
-            if (ImGui::InputText("Font (asset)", fbuf, sizeof(fbuf))) {
+            std::string fontPick;
+            if (AssetPicker("Font (asset)", wt->font, ".uaf", uaf::AssetType::Font, fontPick)) {
                 PushUndo(scene);
-                wt->font = fbuf;
+                wt->font = fontPick;
             }
             bool bb = wt->billboard;
             if (ImGui::Checkbox("Billboard (face camera)", &bb)) {
@@ -10921,15 +10911,94 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
-    // --- Volume (baked .hbvol playback) ------------------------------------------
+    // --- Volume effect (in-scene authoring + baked .hbvol playback) --------------
     if (VolumeComponent* vc = reg.try_get<VolumeComponent>(sel)) {
         const SectionState s = ComponentSection("Volume");
         if (s.open) {
-            char buf[300];
-            std::snprintf(buf, sizeof(buf), "%s", vc->source.c_str());
-            if (ImGui::InputText("Source (.hbvol)", buf, sizeof(buf))) vc->source = buf;
-            if (ImGui::IsItemDeactivatedAfterEdit()) {
+            // Effect preset: the primary way to choose a look. Applies a ready-made recipe + render.
+            const auto& presets = VolumeEffectPresets();
+            const std::string effLabel = vc->effectName.empty() ? std::string("(custom)") : vc->effectName;
+            if (ImGui::BeginCombo("Effect", effLabel.c_str())) {
+                for (const auto& p : presets) {
+                    // Guard on a real change: Selectable fires on any click (incl. the active row), and an
+                    // unconditional apply would wipe the user's tuned sim/render when re-picking the same effect.
+                    if (ImGui::Selectable(p.name.c_str(), p.name == vc->effectName) &&
+                        p.name != vc->effectName) {
+                        PushUndo(scene);
+                        vc->sim = p.config;
+                        vc->render = p.render;
+                        vc->effectName = p.name;
+                        vc->livePreview = true;
+                        volPreviewRestart_ = true; // rebuild the preview sim from the new recipe
+                    }
+                    if (ImGui::IsItemHovered() && p.note) ImGui::SetTooltip("%s", p.note);
+                }
+                ImGui::EndCombo();
+            }
+            for (const auto& p : presets)
+                if (p.name == vc->effectName && p.note) { ImGui::TextDisabled("%s", p.note); break; }
+            // Only ONE volume renders at a time (the RHI feed is single-grid) - surface it so a scene
+            // with several volumes isn't silently confusing.
+            if (reg.view<VolumeComponent>().size() > 1)
+                ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f),
+                                   "Note: only one volume renders at a time (%zu in scene).",
+                                   reg.view<VolumeComponent>().size());
+
+            // Live preview (edit mode): the selected volume runs a low-res sim you see in the scene.
+            if (ImGui::Checkbox("Live Preview", &vc->livePreview)) volPreviewRestart_ = true;
+            undoOnActivate();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Restart")) volPreviewRestart_ = true;
+            if (ImGui::DragInt("Preview Res", &vc->previewRes, 1.0f, 8, 128)) volPreviewRestart_ = true;
+            undoOnActivate();
+
+            // Bake in place: run the offline bake of the embedded sim to a .hbvol next to the project
+            // and switch to baked playback (the shipped game streams the cache, not the live sim).
+            // Any pending job (running OR finished-but-not-yet-consumed): DrawVolumeBaker resets
+            // volBakeJob_ only AFTER writing+assigning the result, so gating on != nullptr keeps the
+            // button disabled through the one-frame completion window (else a click there drops the bake).
+            const bool baking = volBakeJob_ != nullptr;
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::DragInt("Bake frames", &volBakeInPlaceFrames_, 1.0f, 1, 100000); // static fog/clouds: few
+            if (baking) ImGui::BeginDisabled();
+            if (ImGui::Button("Bake in place", ImVec2(150, 0)) && Project::HasActive()) {
+                std::string stem = vc->effectName.empty() ? std::string("Volume") : vc->effectName;
+                stem += "_" + std::to_string(static_cast<u32>(sel)); // disambiguate per entity
+                const std::filesystem::path rel = std::filesystem::path("Volumes") / (stem + ".hbvol");
+                auto job = std::make_shared<VolBakeJob>();
+                const int frames = glm::max(1, volBakeInPlaceFrames_);
+                job->total = frames;
+                job->outAbs = (Project::Active().AssetsDir() / rel).string();
+                volBakeStatus_.clear();
+                volBakeJob_ = job;
+                volBakePendingAssign_ = sel;
+                volBakePendingRel_ = rel.generic_string();
+                auto* payload = new VolBakePayload{job, vc->sim, frames};
+                if (jobs::IsInitialized()) jobs::RunDetached(&Editor::RunBakeJob, payload);
+                else Editor::RunBakeJob(payload);
+            }
+            if (baking) ImGui::EndDisabled();
+            if (baking && volBakeJob_) {
+                ImGui::SameLine();
+                ImGui::Text("baking %d/%d", volBakeJob_->done.load(),
+                            std::max(1, volBakeJob_->total.load()));
+            } else if (!volBakeStatus_.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", volBakeStatus_.c_str());
+            }
+
+            // Simulation recipe (the preview updates live as you tweak physics/emitters).
+            if (ImGui::TreeNode("Simulation")) {
+                DrawVolumeConfigControls(vc->sim);
+                ImGui::TreePop();
+            }
+
+            ImGui::SeparatorText("Baked source + render");
+            std::string srcPick;
+            if (AssetPicker("Source (.hbvol)", vc->source, ".hbvol", uaf::AssetType::Unknown, srcPick,
+                            "(none)")) {
                 PushUndo(scene);
+                vc->source = srcPick;
                 vc->cacheHandle = 0xFFFFFFFFu; // re-acquire on a path change
             }
             if (ImGui::BeginDragDropTarget()) {
@@ -10937,7 +11006,11 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     const std::filesystem::path src(static_cast<const char*>(p->Data));
                     if (src.extension() == ".hbvol") {
                         PushUndo(scene);
-                        vc->source = src.string();
+                        // Store RELATIVE to Assets/ like every other asset field (the drag payload is
+                        // an absolute path); an absolute source breaks on project move / other machine
+                        // / shipped build, and VolumeCache resolves the source relative to Assets.
+                        vc->source = Project::HasActive() ? Project::Active().RelativeAssetPath(src)
+                                                          : src.string();
                         vc->cacheHandle = 0xFFFFFFFFu;
                     }
                 }
@@ -10956,6 +11029,12 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             ImGui::DragFloat("Extinction", &vc->render.extinction, 0.02f, 0.01f, 20.0f);
             undoOnActivate();
             ImGui::DragFloat("Emission", &vc->render.emission, 0.02f, 0.0f, 20.0f);
+            undoOnActivate();
+            ImGui::ColorEdit3("Albedo", &vc->render.albedo.x); // scatter tint (dust brown, magic blue...)
+            undoOnActivate();
+            ImGui::ColorEdit3("Glow Color", &vc->render.emissionColor.x);
+            undoOnActivate();
+            ImGui::Combo("Glow Mode", &vc->render.emissionMode, "Blackbody\0Tint\0Tint x Blackbody\0");
             undoOnActivate();
             ImGui::DragInt("March Steps", &vc->render.stepCount, 1.0f, 4, 512);
             undoOnActivate();
@@ -16300,6 +16379,500 @@ void Editor::DrawUIDocumentPanel(Engine& engine) {
 }
 
 // --- Movie Render: offline trailer -> .mp4 (video + audio) ---------------------
+// Detached bake worker (function-pointer entry). Runs the CPU solver + baker; NO RHI/Renderer here.
+void Editor::RunBakeJob(void* arg) {
+    std::unique_ptr<VolBakePayload> p(static_cast<VolBakePayload*>(arg));
+    auto sim = volume::VolumeSimRegistry::Get().Create(p->cfg);
+    bool ok = false;
+    if (sim) {
+        const u32 endFrame = static_cast<u32>(std::max(1, p->frames)) - 1u;
+        ok = volume::BakeSimulation(*sim, p->cfg, 0, endFrame, p->job->out, 0.005f,
+                                    [j = p->job](u32 d, u32 t) {
+                                        j->done.store(static_cast<int>(d));
+                                        j->total.store(static_cast<int>(t));
+                                        return j->cancel.load();
+                                    });
+    }
+    if (p->job->cancel.load())
+        p->job->state.store(4, std::memory_order_release);
+    else
+        p->job->state.store(ok ? 2 : 3, std::memory_order_release);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Volumetric-effect PRESET LIBRARY. Each is a ready-to-run VolumeSimConfig + its render look, from
+// the design's source-verified recipe table. HONEST fidelity: Smoke/Steam/Fog are native; Fire/
+// Explosion/Mushroom/Magic need the P2 temperature emission (now wired) for their glow; Dust needs
+// the albedo tint; Tornado + Clouds are STYLIZED APPROXIMATIONS (the solver has no driven-rotation
+// nor cloud-shape primitive) and say so in `note` / the UI.
+// ---------------------------------------------------------------------------------------------
+namespace {
+// Emitter builders (shared defaults keep the recipes terse).
+volume::VolumeEmitter VESphere(glm::vec3 c, float r, float densR, float tempR, float tempT,
+                               glm::vec3 vel, volume::VolumeEmitter::Mode mode, float burst = 0.3f) {
+    volume::VolumeEmitter e;
+    e.shape.kind = volume::VolumeShapeKind::Sphere;
+    e.shape.center = c;
+    e.shape.halfExtents = glm::vec3(r);
+    e.densityRate = densR; e.temperatureRate = tempR; e.temperatureTarget = tempT;
+    e.velocity = vel; e.mode = mode; e.burstDuration = burst;
+    return e;
+}
+volume::VolumeEmitter VECone(glm::vec3 c, float r, float h, float densR, float tempR, float tempT,
+                             glm::vec3 vel) {
+    volume::VolumeEmitter e;
+    e.shape.kind = volume::VolumeShapeKind::Cone;
+    e.shape.center = c;
+    e.shape.halfExtents = glm::vec3(r);
+    e.shape.coneHeight = h;
+    e.densityRate = densR; e.temperatureRate = tempR; e.temperatureTarget = tempT;
+    e.velocity = vel; e.mode = volume::VolumeEmitter::Mode::Continuous;
+    return e;
+}
+volume::VolumeEmitter VEBox(glm::vec3 c, glm::vec3 he, float densR, glm::vec3 vel) {
+    volume::VolumeEmitter e;
+    e.shape.kind = volume::VolumeShapeKind::Box;
+    e.shape.center = c;
+    e.shape.halfExtents = he;
+    e.densityRate = densR; e.temperatureRate = 0.0f; e.temperatureTarget = 0.0f;
+    e.velocity = vel; e.mode = volume::VolumeEmitter::Mode::Continuous;
+    return e;
+}
+
+const std::vector<VolumeEffectPreset>& VolumeEffectPresets() {
+    static const std::vector<VolumeEffectPreset> presets = [] {
+        using M = volume::VolumeEmitter::Mode;
+        std::vector<VolumeEffectPreset> v;
+        auto base = [](glm::vec3 mn, glm::vec3 mx, glm::ivec3 dim, float alpha, float beta,
+                       float diss, float cool, float vort, int iters) {
+            volume::VolumeSimConfig c;
+            c.model = "eulerian-smoke";
+            c.bounds.worldMin = mn; c.bounds.worldMax = mx; c.bounds.dim = dim;
+            c.frameRate = 30.0f; c.substeps = 2;
+            c.buoyancyAlpha = alpha; c.buoyancyBeta = beta;
+            c.densityDissipation = diss; c.temperatureCooling = cool;
+            c.vorticityStrength = vort; c.pressureIterations = iters;
+            return c;
+        };
+        auto look = [](float dens, float ext, float emis, int steps, int shadow) {
+            rhi::VolumeRenderParams r;
+            r.densityScale = dens; r.extinction = ext; r.emission = emis;
+            r.stepCount = steps; r.shadowSteps = shadow;
+            return r;
+        };
+        auto push = [&](const char* name, const char* note, volume::VolumeSimConfig c,
+                        rhi::VolumeRenderParams r) {
+            VolumeEffectPreset p; p.name = name; p.note = note;
+            p.config = std::move(c); p.render = r;
+            v.push_back(std::move(p));
+        };
+
+        { auto c = base({-2,0,-2}, {2,8,2}, {48,96,48}, 0.5f, 6.0f, 0.1f, 0.6f, 12.0f, 40);
+          c.emitters = {VESphere({0,0.5f,0}, 0.4f, 4.0f, 5.0f, 0.6f, {0,1.5f,0}, M::Continuous)};
+          push("Smoke", "Native solver behaviour.", std::move(c), look(1.2f, 1.8f, 0.0f, 96, 6)); }
+
+        { auto c = base({-1,0,-1}, {1,4,1}, {48,96,48}, 0.15f, 14.0f, 1.5f, 2.0f, 20.0f, 40);
+          c.emitters = {VECone({0,0.15f,0}, 0.35f, 0.8f, 2.0f, 10.0f, 1.0f, {0,3.0f,0})};
+          push("Fire", "Blackbody glow (needs temperature emission - now wired).", std::move(c),
+               look(1.0f, 1.0f, 3.5f, 96, 2)); }
+
+        { auto c = base({-4,0,-4}, {4,8,4}, {64,64,64}, 0.4f, 12.0f, 0.5f, 1.2f, 25.0f, 50);
+          c.emitters = {VESphere({0,1.2f,0}, 1.2f, 30.0f, 30.0f, 1.0f, {0,6.0f,0}, M::Burst, 0.25f),
+                        VESphere({0,1.2f,0}, 1.6f, 12.0f, 10.0f, 0.3f, {0,3.0f,0}, M::Burst, 0.4f)};
+          push("Explosion", "Rising glowing fireball (no radial-shockwave primitive - approximation).",
+               std::move(c), look(1.5f, 1.6f, 4.0f, 96, 4)); }
+
+        { auto c = base({-6,0,-6}, {6,16,6}, {64,128,64}, 0.5f, 10.0f, 0.08f, 0.8f, 30.0f, 60);
+          auto stem = VECone({0,0.5f,0}, 0.5f, 0.8f, 6.0f, 10.0f, 0.8f, {0,3.0f,0});
+          stem.endTime = 2.5f;
+          c.emitters = {VESphere({0,1.5f,0}, 1.5f, 25.0f, 25.0f, 1.0f, {0,8.0f,0}, M::Burst, 0.4f), stem};
+          push("Mushroom cloud", "Cap roll-up is emergent; glow needs P2 emission (wired).",
+               std::move(c), look(1.3f, 1.4f, 3.0f, 128, 6)); }
+
+        { auto c = base({-16,0,-16}, {16,4,16}, {96,24,96}, 0.0f, 0.0f, 0.02f, 0.0f, 4.0f, 20);
+          c.emitters = {VEBox({0,0.4f,0}, {16,0.5f,16}, 0.3f, {0.5f,0,0.2f})};
+          push("Fog", "Ground fog (static fog: bake ~1 frame).", std::move(c),
+               look(0.4f, 0.6f, 0.0f, 64, 2)); }
+
+        { auto c = base({-6,0,-6}, {6,5,6}, {72,48,72}, 1.5f, 0.0f, 0.3f, 0.0f, 8.0f, 40);
+          c.emitters = {VESphere({0,0.5f,0}, 1.0f, 8.0f, 0.0f, 0.0f, {3.0f,1.0f,0}, M::Burst, 0.3f)};
+          auto r = look(1.0f, 1.2f, 0.0f, 80, 4);
+          r.albedo = {0.55f, 0.40f, 0.25f}; // brown (needs the albedo tint)
+          push("Dust", "Settling dust; brown via albedo tint.", std::move(c), r); }
+
+        { auto c = base({-1,0,-1}, {1,4,1}, {48,96,48}, 0.3f, 5.0f, 0.8f, 1.5f, 8.0f, 40);
+          c.emitters = {VESphere({0,0.15f,0}, 0.25f, 3.0f, 6.0f, 0.5f, {0,2.0f,0}, M::Continuous)};
+          push("Steam", "Native; low density reads white.", std::move(c), look(0.7f, 0.9f, 0.0f, 80, 3)); }
+
+        { auto c = base({-20,10,-20}, {20,20,20}, {96,24,96}, 0.0f, 0.0f, 0.0f, 0.0f, 6.0f, 20);
+          auto e = VESphere({0,15,0}, 3.0f, 2.0f, 0.0f, 0.0f, {0,0,0}, M::Continuous);
+          e.shape.edgeSoftness = 0.6f;
+          c.emitters = {e};
+          push("Clouds", "APPROXIMATION - prefer the dedicated volumetric-clouds pass for real clouds.",
+               std::move(c), look(2.0f, 0.8f, 0.0f, 128, 8)); }
+
+        { auto c = base({-3,0,-3}, {3,12,3}, {48,96,48}, 0.3f, 6.0f, 0.05f, 0.5f, 40.0f, 50);
+          c.emitters = {VESphere({0,0.3f,0}, 0.4f, 5.0f, 8.0f, 0.8f, {0,4.0f,0}, M::Continuous)};
+          for (int i = 0; i < 8; ++i) { // ring of tangential emitters to SEED rotation (weak)
+              const float a = 6.2831853f * static_cast<float>(i) / 8.0f;
+              const glm::vec3 pos{1.2f * std::cos(a), 0.4f, 1.2f * std::sin(a)};
+              const glm::vec3 tang{-std::sin(a) * 4.0f, 1.0f, std::cos(a) * 4.0f}; // tangent + slight lift
+              auto e = VESphere(pos, 0.3f, 2.0f, 4.0f, 0.6f, tang, M::Continuous);
+              e.worldVelocity = true;
+              c.emitters.push_back(e);
+          }
+          auto r = look(1.2f, 1.4f, 0.0f, 96, 4);
+          r.albedo = {0.5f, 0.42f, 0.32f};
+          push("Tornado", "STYLIZED APPROXIMATION - solver has no driven rotation; swirl is weak.",
+               std::move(c), r); }
+
+        { auto c = base({-2,0,-2}, {2,4,2}, {64,64,64}, 0.1f, 1.5f, 0.4f, 0.3f, 30.0f, 40);
+          c.emitters = {VESphere({0,1.5f,0}, 0.3f, 3.0f, 8.0f, 1.0f, {0,0.5f,0}, M::Continuous)};
+          auto r = look(1.0f, 0.7f, 4.0f, 96, 2);
+          r.emissionMode = 1; // tint (blackbody would only make orange->white)
+          r.emissionColor = {0.30f, 0.50f, 1.0f};
+          r.albedo = {0.5f, 0.6f, 1.0f};
+          push("Magic", "Arcane colored glow (needs emission + tint - both wired).", std::move(c), r); }
+
+        return v;
+    }();
+    return presets;
+}
+} // namespace
+
+void Editor::DriveVolumePreview(Engine& engine) {
+    Scene& scene = engine.GetScene();
+    auto& reg = scene.Registry();
+    // EDIT mode only (play mode uses the Engine's baked-playback drive), and only the SELECTED volume
+    // with livePreview on - preview one at a time (the RHI feeds a single grid).
+    entt::entity target = entt::null;
+    if (!engine.GetPhysics().IsRunning() && selected_ != entt::null && reg.valid(selected_)) {
+        if (const VolumeComponent* vc = reg.try_get<VolumeComponent>(selected_))
+            if (vc->livePreview) target = selected_;
+    }
+    if (target == entt::null) {
+        volPreviewEntity_ = entt::null;
+        volPreviewSim_.reset(); // release the sim; the Engine's earlier feed (baked frame / nullptr) stands
+        return;
+    }
+
+    VolumeComponent& vc = reg.get<VolumeComponent>(target);
+    // Preview config = the embedded sim at a lower resolution (keep the domain's aspect ratio).
+    volume::VolumeSimConfig cfg = vc.sim;
+    const glm::vec3 ext = glm::max(cfg.bounds.worldMax - cfg.bounds.worldMin, glm::vec3(1e-3f));
+    const float longest = glm::max(ext.x, glm::max(ext.y, ext.z));
+    const float res = static_cast<float>(glm::clamp(vc.previewRes, 8, 128));
+    cfg.bounds.dim = glm::max(glm::ivec3(4), glm::ivec3(glm::round(ext / longest * res)));
+    // Bound the live-preview cost: this steps a CPU fluid sim on the UI thread every frame, so cap the
+    // TOTAL voxel count and the pressure-solve iterations. Without this, Preview Res 128 (~2.1M voxels)
+    // or a high pressureIterations would block the editor for hundreds of ms/frame. The offline BAKE
+    // still uses the config's own full resolution + iterations (this only shrinks the interactive view).
+    {
+        constexpr long long kMaxPreviewVoxels = 64ll * 64ll * 64ll; // ~262k
+        const long long prod = static_cast<long long>(cfg.bounds.dim.x) *
+                               static_cast<long long>(cfg.bounds.dim.y) *
+                               static_cast<long long>(cfg.bounds.dim.z);
+        if (prod > kMaxPreviewVoxels) {
+            const float s = std::cbrt(static_cast<float>(kMaxPreviewVoxels) / static_cast<float>(prod));
+            cfg.bounds.dim = glm::max(glm::ivec3(4), glm::ivec3(glm::vec3(cfg.bounds.dim) * s));
+        }
+        cfg.pressureIterations = glm::min(cfg.pressureIterations, 24);
+    }
+
+    // Rebuild the sim when the target or the config (physics/emitters/dim) changes, or on an explicit
+    // Restart. HashVolumeConfig hashes the whole recipe, so tweaking a slider restarts the preview.
+    const u64 h = volume::HashVolumeConfig(cfg);
+    if (target != volPreviewEntity_ || h != volPreviewHash_ || volPreviewRestart_ || !volPreviewSim_) {
+        volPreviewSim_ = volume::VolumeSimRegistry::Get().Create(cfg);
+        if (volPreviewSim_) volPreviewSim_->Reset();
+        volPreviewEntity_ = target;
+        volPreviewHash_ = h;
+        volPreviewFrame_ = 0;
+        volPreviewRestart_ = false;
+    }
+    if (!volPreviewSim_) return;
+
+    // Advance one baked-frame's worth of substeps; auto-restart so the loop stays lively.
+    const int substeps = glm::max(cfg.substeps, 1);
+    const float dt = 1.0f / (cfg.frameRate * static_cast<float>(substeps));
+    for (int s = 0; s < substeps; ++s) volPreviewSim_->Step(dt);
+    if (++volPreviewFrame_ > 300) { volPreviewSim_->Reset(); volPreviewFrame_ = 0; }
+
+    volume::VolumeFrame fr;
+    volPreviewSim_->ReadbackFrame(fr);
+    if (!volume::BuildDensityGridBlob(fr, volPreviewDensity_, volPreviewMin_, volPreviewMax_, 0.005f))
+        return; // no density yet (very first frames) - leave the Engine feed as-is
+    volPreviewTemp_.clear();
+    if (const volume::VolumeField* tf = fr.field("temperature")) {
+        volume::GridBuildStats st;
+        volume::BuildScalarGridBlob(*tf, fr.bounds, volPreviewTemp_, st, 0.005f); // same transform as density
+    }
+    rhi::VolumeRenderParams rp = vc.render;
+    rp.boundsMin = volPreviewMin_;
+    rp.boundsMax = volPreviewMax_;
+    rp.worldOffset = glm::vec3(scene.WorldMatrix(target)[3]); // place at the entity (translation only)
+    engine.GetRenderer().SetVolumeGrid(volPreviewDensity_.data(), volPreviewDensity_.size(),
+                                       volPreviewTemp_.empty() ? nullptr : volPreviewTemp_.data(),
+                                       volPreviewTemp_.size(), rp);
+}
+
+void Editor::DrawVolumeConfigControls(volume::VolumeSimConfig& c) {
+    ImGui::SeparatorText("Domain");
+    ImGui::DragInt3("Resolution", &c.bounds.dim.x, 1.0f, 1, 512);
+    ImGui::DragFloat3("Bounds min", glm::value_ptr(c.bounds.worldMin), 0.05f);
+    ImGui::DragFloat3("Bounds max", glm::value_ptr(c.bounds.worldMax), 0.05f);
+    ImGui::DragFloat("Frame rate", &c.frameRate, 1.0f, 1.0f, 240.0f);
+    ImGui::DragInt("Substeps", &c.substeps, 1, 1, 16);
+    ImGui::DragInt("Pressure iters", &c.pressureIterations, 1, 1, 118);
+
+    ImGui::SeparatorText("Physics");
+    ImGui::DragFloat("Buoyancy (beta)", &c.buoyancyBeta, 0.05f, 0.0f, 50.0f);
+    ImGui::DragFloat("Smoke weight (alpha)", &c.buoyancyAlpha, 0.01f, 0.0f, 10.0f);
+    ImGui::DragFloat("Dissipation", &c.densityDissipation, 0.005f, 0.0f, 5.0f);
+    ImGui::DragFloat("Cooling", &c.temperatureCooling, 0.02f, 0.0f, 10.0f);
+    ImGui::DragFloat("Vorticity", &c.vorticityStrength, 0.1f, 0.0f, 40.0f);
+
+    ImGui::SeparatorText("Emitters");
+    int rm = -1;
+    for (int i = 0; i < static_cast<int>(c.emitters.size()); ++i) {
+        ImGui::PushID(i);
+        volume::VolumeEmitter& e = c.emitters[i];
+        ImGui::Text("Emitter %d", i);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Remove")) rm = i;
+        int kind = static_cast<int>(e.shape.kind);
+        if (ImGui::Combo("Shape", &kind, "Sphere\0Box\0Cone\0Mesh(AABB)\0"))
+            e.shape.kind = static_cast<volume::VolumeShapeKind>(kind);
+        ImGui::DragFloat3("Center", glm::value_ptr(e.shape.center), 0.05f);
+        ImGui::DragFloat3("Size", glm::value_ptr(e.shape.halfExtents), 0.02f, 0.001f, 100.0f);
+        if (e.shape.kind == volume::VolumeShapeKind::Cone)
+            ImGui::DragFloat("Cone height", &e.shape.coneHeight, 0.02f, 0.01f, 100.0f);
+        int mode = static_cast<int>(e.mode);
+        if (ImGui::Combo("Mode", &mode, "Continuous\0Burst\0"))
+            e.mode = static_cast<volume::VolumeEmitter::Mode>(mode);
+        if (e.mode == volume::VolumeEmitter::Mode::Burst)
+            ImGui::DragFloat("Burst dur", &e.burstDuration, 0.01f, 0.01f, 10.0f);
+        ImGui::DragFloat("Density rate", &e.densityRate, 0.05f, 0.0f, 50.0f);
+        ImGui::DragFloat("Temp rate", &e.temperatureRate, 0.05f, 0.0f, 50.0f);
+        // Temperature is normalized ~[0,1] (emission = Blackbody(saturate(T)) * T^3 and buoyancy scales
+        // with T); keep the ceiling near 1 so a hot core glows correctly instead of blowing up T^3.
+        ImGui::DragFloat("Temp target", &e.temperatureTarget, 0.02f, 0.0f, 1.5f);
+        ImGui::DragFloat3("Velocity", glm::value_ptr(e.velocity), 0.05f);
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    if (rm >= 0) c.emitters.erase(c.emitters.begin() + rm);
+    if (ImGui::Button("Add Emitter")) c.emitters.push_back(volume::VolumeEmitter{});
+}
+
+std::filesystem::path Editor::CreateVolumeSimAsset(const std::filesystem::path& dirIn,
+                                                   const std::string& name) {
+    if (!Project::HasActive()) return {};
+    // An empty dir defaults to Assets/Volumes so the file lands inside the project.
+    const std::filesystem::path dir =
+        dirIn.empty() ? Project::Active().AssetsDir() / "Volumes" : dirIn;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    std::string base = SanitizeFileStem(name);
+    if (base.empty()) base = "NewVolume";
+    std::string stem = base;
+    for (int i = 1; std::filesystem::exists(dir / (stem + volume::kVolumeSimExtension), ec); ++i)
+        stem = base + std::to_string(i);
+    const std::filesystem::path p = dir / (stem + volume::kVolumeSimExtension);
+    // Seed from the first registered model's default config (a runnable smoke plume).
+    const auto& types = volume::VolumeSimRegistry::Get().Types();
+    volume::VolumeSimConfig cfg = types.empty() ? volume::VolumeSimConfig{} : types[0].defaultConfig;
+    return volume::SaveVolumeSimConfig(p, cfg) ? p : std::filesystem::path{};
+}
+
+void Editor::OpenVolumeSim(const std::filesystem::path& path) {
+    volume::VolumeSimConfig cfg;
+    if (!volume::LoadVolumeSimConfig(path, cfg)) {
+        volBakeStatus_ = "Failed to load " + path.filename().string();
+        panelOpen_[Panel_VolumeBaker] = true;
+        return;
+    }
+    volBakeConfig_ = std::move(cfg);
+    volBakeSeeded_ = true; // do NOT re-seed from the model default over the loaded config
+    volBakeSimPath_ = path;
+    // Point the model combo at the loaded config's model id (fall back to 0 if unknown).
+    const auto& types = volume::VolumeSimRegistry::Get().Types();
+    volBakeModel_ = 0;
+    for (int i = 0; i < static_cast<int>(types.size()); ++i)
+        if (types[i].id == volBakeConfig_.model) { volBakeModel_ = i; break; }
+    // Default the bake output next to the .hbvolsim (same stem, .hbvol), relative to Assets/.
+    if (Project::HasActive()) {
+        const std::filesystem::path assets = Project::Active().AssetsDir();
+        std::error_code ec;
+        std::filesystem::path rel = std::filesystem::relative(path, assets, ec); // non-throwing overload
+        if (ec || rel.empty() || rel.generic_string().rfind("..", 0) == 0) rel = path.filename();
+        rel.replace_extension(".hbvol");
+        std::snprintf(volBakePath_, sizeof(volBakePath_), "%s", rel.generic_string().c_str());
+    }
+    volBakeStatus_ = "Loaded " + path.filename().string();
+    panelOpen_[Panel_VolumeBaker] = true;
+    ImGui::SetWindowFocus("Volume Baker");
+}
+
+// Volume Baker panel: author a VolumeSimConfig, bake it to a .hbvol on a background job, assign it.
+void Editor::DrawVolumeBaker(Engine& engine) {
+    // Tick the bake job every frame (even when hidden) so a finished bake writes its file + stamps.
+    if (volBakeJob_ && volBakeJob_->state.load(std::memory_order_acquire) >= 2) {
+        const int st = volBakeJob_->state.load(std::memory_order_acquire);
+        if (st == 2) {
+            std::error_code ec;
+            std::filesystem::create_directories(
+                std::filesystem::path(volBakeJob_->outAbs).parent_path(), ec);
+            if (volume::WriteHbvolFile(volBakeJob_->outAbs, volBakeJob_->out)) {
+                StampNewAsset(volBakeJob_->outAbs);
+                volBakeStatus_ = "Baked " + std::to_string(volBakeJob_->out.size()) + " bytes.";
+                // "Bake in place": assign the fresh .hbvol to the requesting entity + play it baked.
+                if (volBakePendingAssign_ != entt::null) {
+                    auto& breg = engine.GetScene().Registry();
+                    if (breg.valid(volBakePendingAssign_) &&
+                        breg.all_of<VolumeComponent>(volBakePendingAssign_)) {
+                        VolumeComponent& bvc = breg.get<VolumeComponent>(volBakePendingAssign_);
+                        bvc.source = volBakePendingRel_;
+                        bvc.cacheHandle = 0xFFFFFFFFu;
+                        bvc.livePreview = false; // now plays the baked cache (Game mode)
+                    }
+                }
+            } else {
+                volBakeStatus_ = "Write failed.";
+            }
+        } else {
+            volBakeStatus_ = (st == 3) ? "Bake failed." : "Cancelled.";
+        }
+        volBakePendingAssign_ = entt::null;
+        volBakePendingRel_.clear();
+        volBakeJob_.reset();
+    }
+
+    if (!panelOpen_[Panel_VolumeBaker]) return;
+    if (!ImGui::Begin("Volume Baker", &panelOpen_[Panel_VolumeBaker])) {
+        ImGui::End();
+        return;
+    }
+    if (!Project::HasActive()) {
+        ImGui::TextDisabled("Open a project to bake volumes.");
+        ImGui::End();
+        return;
+    }
+    const auto& types = volume::VolumeSimRegistry::Get().Types();
+    if (types.empty()) {
+        ImGui::TextDisabled("No volume simulation models are registered.");
+        ImGui::End();
+        return;
+    }
+    if (volBakeModel_ >= static_cast<int>(types.size())) volBakeModel_ = 0;
+    if (!volBakeSeeded_) {
+        volBakeConfig_ = types[volBakeModel_].defaultConfig;
+        volBakeSeeded_ = true;
+    }
+
+    const bool running = volBakeJob_ && volBakeJob_->state.load() == 1;
+    if (running) ImGui::BeginDisabled();
+
+    if (ImGui::BeginCombo("Model", types[volBakeModel_].displayName.c_str())) {
+        for (int i = 0; i < static_cast<int>(types.size()); ++i) {
+            const bool sel = i == volBakeModel_;
+            // Only reset when the model ACTUALLY changes: Selectable returns true on any click,
+            // including re-clicking the current row, and an unconditional reset would silently wipe
+            // a loaded/edited config (which is not on the undo stack) with the model default.
+            if (ImGui::Selectable(types[i].displayName.c_str(), sel) && i != volBakeModel_) {
+                volBakeModel_ = i;
+                volBakeConfig_ = types[i].defaultConfig; // reset to the model's default
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    // The `.hbvolsim` authoring asset this config is bound to (from the Assets "Create > Volume
+    // Simulation" menu or double-clicking a .hbvolsim). Save writes the edited config back to it.
+    ImGui::SeparatorText("Authoring asset");
+    if (volBakeSimPath_.empty()) {
+        ImGui::TextDisabled("Unsaved config. Create one from the Assets panel: Create > Volume "
+                            "Simulation (or double-click a .hbvolsim).");
+    } else {
+        ImGui::Text("File: %s", volBakeSimPath_.filename().string().c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Save")) {
+            if (volume::SaveVolumeSimConfig(volBakeSimPath_, volBakeConfig_)) {
+                StampNewAsset(volBakeSimPath_.string());
+                volBakeStatus_ = "Saved " + volBakeSimPath_.filename().string();
+            } else {
+                volBakeStatus_ = "Save failed.";
+            }
+        }
+    }
+
+    volume::VolumeSimConfig& c = volBakeConfig_;
+    DrawVolumeConfigControls(c);
+
+    ImGui::SeparatorText("Bake");
+    ImGui::DragInt("Frames", &volBakeFrames_, 1, 1, 100000);
+    ImGui::InputText("Output (.hbvol, rel Assets/)", volBakePath_, sizeof(volBakePath_));
+
+    if (running) ImGui::EndDisabled();
+
+    const std::filesystem::path assets = Project::Active().AssetsDir();
+    const bool haveName = volBakePath_[0] != '\0';
+    const std::filesystem::path outAbs =
+        haveName ? (assets / volBakePath_) : std::filesystem::path{};
+
+    if (haveName && !running) {
+        u64 fileHash = 0;
+        if (volume::ReadHbvolSourceHash(outAbs.string(), fileHash))
+            ImGui::TextDisabled(fileHash == volume::HashVolumeConfig(c)
+                                    ? "Existing .hbvol is up to date."
+                                    : "Existing .hbvol is STALE (config changed).");
+        else
+            ImGui::TextDisabled("No baked file at this path yet.");
+    }
+
+    if (running) {
+        const int done = volBakeJob_->done.load();
+        const int total = std::max(1, volBakeJob_->total.load());
+        ImGui::ProgressBar(static_cast<float>(done) / static_cast<float>(total), ImVec2(-1, 0));
+        ImGui::Text("Baking frame %d / %d", done, total);
+        if (ImGui::Button("Cancel")) volBakeJob_->cancel.store(true);
+    } else {
+        if (!haveName) ImGui::BeginDisabled();
+        if (ImGui::Button("Bake", ImVec2(120, 0))) {
+            auto job = std::make_shared<VolBakeJob>();
+            job->total = volBakeFrames_;
+            job->outAbs = outAbs.string();
+            volBakeStatus_.clear();
+            volBakeJob_ = job;
+            auto* payload = new VolBakePayload{job, c, volBakeFrames_};
+            if (jobs::IsInitialized())
+                jobs::RunDetached(&Editor::RunBakeJob, payload);
+            else
+                Editor::RunBakeJob(payload); // synchronous fallback (no job system)
+        }
+        if (!haveName) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        Scene& scene = engine.GetScene();
+        auto& reg = scene.Registry();
+        const bool canAssign = haveName && selected_ != entt::null && reg.valid(selected_);
+        if (!canAssign) ImGui::BeginDisabled();
+        if (ImGui::Button("Assign to selected", ImVec2(160, 0))) {
+            PushUndo(scene);
+            VolumeComponent& vc = reg.get_or_emplace<VolumeComponent>(selected_);
+            vc.source = volBakePath_;
+            vc.cacheHandle = 0xFFFFFFFFu; // re-acquire the newly-assigned asset
+            if (!reg.all_of<Transform>(selected_)) reg.emplace<Transform>(selected_);
+        }
+        if (!canAssign) ImGui::EndDisabled();
+    }
+
+    if (!volBakeStatus_.empty()) ImGui::TextUnformatted(volBakeStatus_.c_str());
+    ImGui::TextDisabled("Bakes on a background thread; assign the .hbvol to an entity's Volume.");
+    ImGui::End();
+}
+
 void Editor::DrawMovieRender(Engine& engine) {
     // Tick a running render every frame (even if the panel is hidden) so it finishes.
     // The job pins the viewport size + fixed dt each tick; running this LAST in BuildUI

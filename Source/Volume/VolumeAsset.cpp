@@ -115,4 +115,16 @@ VolumeAsset::GridView VolumeAsset::Grid(u32 frame, const std::string& fieldName)
     return idx < 0 ? GridView{} : Grid(frame, static_cast<u32>(idx));
 }
 
+bool ReadHbvolSourceHash(const std::string& path, u64& outHash) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    // Header prefix: magic[8] + version/flags/frameCount/fps/codec/fieldCount (6*4) + worldMin[3] +
+    // worldMax[3] + dim[3] (3*12) + sourceHash(8). sourceHash sits at offset 68.
+    u8 hdr[76];
+    if (!f.read(reinterpret_cast<char*>(hdr), sizeof(hdr))) return false;
+    if (std::memcmp(hdr, kHbvolMagic, sizeof(kHbvolMagic)) != 0) return false;
+    std::memcpy(&outHash, hdr + 68, sizeof(u64));
+    return true;
+}
+
 } // namespace hbe::volume

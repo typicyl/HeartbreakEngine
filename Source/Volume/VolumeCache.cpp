@@ -74,6 +74,13 @@ VolumeAsset::GridView VolumeCache::DensityGrid(u32 handle, i32 frame) const {
     return e->asset->Grid(static_cast<u32>(frame), "density");
 }
 
+VolumeAsset::GridView VolumeCache::TemperatureGrid(u32 handle, i32 frame) const {
+    const Entry* e = Get(handle);
+    if (!e || e->state.load(std::memory_order_acquire) != State::Ready || !e->asset || frame < 0)
+        return {};
+    return e->asset->Grid(static_cast<u32>(frame), "temperature"); // invalid GridView if unbaked
+}
+
 VolumeBounds VolumeCache::Bounds(u32 handle) const {
     const Entry* e = Get(handle);
     return (e && e->state.load(std::memory_order_acquire) == State::Ready && e->asset)

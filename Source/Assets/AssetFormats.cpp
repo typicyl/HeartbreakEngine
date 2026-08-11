@@ -100,6 +100,9 @@ const std::vector<EngineAsset> kEngineAssets = {
      "pre-fractured destructible chunks + adjacency; header names an interior .hbmat"},
     {".hbvol",      "Volume Cache",     true,  RefScan::Leaf,     nullptr,
      "baked NanoVDB volume frames (VolumeComponent.source); binary grid blobs, names no other asset"},
+    {".hbvolsim",   "Volume Sim",       false, RefScan::Leaf,     nullptr,
+     "editor-only volume authoring config (VolumeSimConfig); the offline baker turns it into a "
+     ".hbvol which the runtime consumes. Pure numeric JSON, references no other asset, never packed"},
     // NOT packed by extension - each for a specific reason. Do not "fix" these to
     // true: .hbproj IS read at runtime through the VFS, but it ships via the
     // separate uap::ExtraFile path (BuildShipping packs it under the virtual name

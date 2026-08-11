@@ -35,6 +35,9 @@ cbuffer PostConstants : register(b1)
     float4 gGrade1;           // (lift.rgb, gradeEnabled)
     float4 gGrade2;           // (gamma.rgb, timeSeconds  - grain animation)
     float4 gGrade3;           // (gain.rgb, unused)
+    // Volume raymarch color (0 elsewhere). Appended at the END so no existing pass offset moves.
+    float4 gVolAlbedo;        // (albedo.rgb, emissionMode)
+    float4 gVolEmission;      // (emissionColor.rgb, hasTemp)
 };
 
 // Linear-clamp sampler for post sampling (the bindless s0 sampler wraps).

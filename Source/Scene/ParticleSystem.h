@@ -41,7 +41,6 @@ namespace particle {
 // (procedural soft-dot sprite, so they work with no texture assets).
 enum class Template : u32 {
     Fire = 0, Smoke, Dust, Rain, Leaves, Explosion, Sparks, Magic,
-    VolFire, VolSmoke, VolExplosion, // true raymarched volumetric (volumetric flag on)
     Count
 };
 ParticleEmitter MakeTemplate(Template t);
@@ -92,15 +91,6 @@ u32 LiveCount(Scene& scene);
 u32 BuildGpuRecords(Scene& scene, Renderer& renderer, const std::filesystem::path& assetsDir,
                     const glm::vec3& camRight, const glm::vec3& camUp, void* dst,
                     u32 capacityElements, std::vector<rhi::GpuParticleBatch>& batchesOut);
-
-// Collects density/temperature blobs from every `volumetric`-flagged emitter (one
-// blob per live particle) for the raymarched volumetric pass. Fills `blobsOut`
-// (cleared first, capped at rhi::kMaxVolumeBlobs) and `paramsOut` (world-space AABB
-// enclosing all blobs + the tuning knobs taken from the first volumetric emitter).
-// Returns true if any volumetric blobs were produced (params valid); false means no
-// volumetric emitters are active and the caller should clear the volume.
-bool BuildVolumetricBlobs(Scene& scene, std::vector<rhi::VolumeBlob>& blobsOut,
-                          rhi::VolumeParams& paramsOut);
 
 // Headless, GPU-free A/B proof that moving onto the module stack changed nothing.
 //

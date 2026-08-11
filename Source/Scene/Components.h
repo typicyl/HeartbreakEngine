@@ -10,6 +10,7 @@
 #include "Schematic/Schematic.h" // schematic::Value (SchematicComponent blackboard)
 #include "Vfx/VfxLegacy.h"       // vfx::LegacyParams (ParticleEmitter compat block)
 #include "Vfx/VfxStack.h"        // vfx::CompiledStack / ParticleSoA (ParticleEmitter pool)
+#include "Volume/VolumeSimConfig.h" // volume::VolumeSimConfig (VolumeComponent's embedded sim recipe)
 
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
@@ -162,20 +163,8 @@ struct ParticleEmitter {
     f32 subUVFps = 0.0f;                 // >0 loops the sheet; 0 plays it once over life
     f32 softFade = 0.0f;                 // soft-particle depth-fade distance (0 = hard)
 
-    // --- True volumetric VFX (raymarched 3D density; see heartbreak-volumetric-vfx) ---
-    // When set, this emitter's particles ALSO feed a 3D density/temperature volume
-    // that a compute pass splats and a raymarch pass lights + composites (real
-    // volumetric smoke/fire, not billboards). The billboard pass still runs too;
-    // set emitting/rate low + additive off for pure volumetric.
-    bool volumetric = false;
-    f32 volDensity = 1.0f;       // per-particle density contribution
-    f32 volRadiusScale = 2.0f;   // blob radius = particle size * this
-    f32 volTemperature = 0.0f;   // 0 = smoke, 1 = fire (drives blackbody emission)
-    f32 volEmission = 2.5f;      // fire glow strength
-    f32 volExtinction = 1.5f;    // absorption (higher = denser/darker smoke)
-    i32 volSteps = 48;           // raymarch step count (perf vs quality)
-    i32 volResolution = 96;      // volume voxel dim (quality knob; 64 = low-end)
-    f32 volDetail = 0.6f;        // procedural noise detail: 0 = raw blobs, 1 = heavy wisps
+    // (Legacy per-emitter volumetric splatting was removed; real smoke/fire is now the baked
+    //  VolumeComponent path - author it with the Volume Baker panel.)
 
     // --- Module-stack opt-ins (serialized; defaults == the pre-stack simulation) ---
     // Each flag swaps one compatibility module for a real one. They are OFF by
@@ -1445,19 +1434,30 @@ struct PointLightComponent {
     f32 range = 10.0f;
 };
 
-// Runtime playback of a baked `.hbvol` density volume (smoke/fire/etc), placed at the entity's
-// world position. The loaded asset + resolved grid are runtime-only (owned by volume::VolumeCache);
-// only the source path + playback + look knobs serialize. The runtime renders ONE volume at a time
-// (the RHI volume feed is single-grid), so with several VolumeComponents only the first eligible one
-// renders - the rest still advance their playhead. Placement is translation only (no rotation/scale).
+// A volumetric effect (smoke/fire/explosion/...) placed at the entity's world position. It has TWO
+// sides: (1) AUTHORING - an embedded volume::VolumeSimConfig recipe the editor runs as a live low-res
+// CPU preview so you see it in the real scene before baking; (2) RUNTIME - a baked `.hbvol` (`source`)
+// the shipped game streams + plays. "Bake in place" turns the config into a `.hbvol` and sets source.
+// The loaded asset + resolved grid are runtime-only (owned by volume::VolumeCache); the source path,
+// playback/look knobs, and the sim config serialize. The runtime renders ONE volume at a time (the RHI
+// feed is single-grid), so with several VolumeComponents only the first eligible one renders - the rest
+// still advance their playhead. Placement is translation only (no rotation/scale).
 struct VolumeComponent {
-    std::string             source;              // ".hbvol" asset path (serialized)
+    std::string             source;              // ".hbvol" asset path (serialized; empty until baked)
     bool                    playing = true;      // serialized
     bool                    loop = true;         // serialized
     f32                     time = 0.0f;         // playhead seconds (serialized; resumes)
     f32                     speed = 1.0f;        // serialized
-    rhi::VolumeRenderParams render{};            // density/emission/extinction/steps (serialized;
+    rhi::VolumeRenderParams render{};            // density/emission/extinction/albedo/steps (serialized;
                                                  // boundsMin/Max + worldOffset are drive-owned each frame)
+    // Authoring (serialized): the embedded sim recipe + live-preview state. When livePreview is on and
+    // the editor is in edit mode, the editor runs a low-res CPU sim of `sim` and feeds it live at this
+    // entity's transform. previewRes overrides sim.bounds.dim for the LIVE preview only (bake uses the
+    // config's own resolution). effectName is the preset it was seeded from (UI label only).
+    volume::VolumeSimConfig sim{};
+    bool                    livePreview = true;
+    i32                     previewRes = 40;
+    std::string             effectName;
     // Runtime-only (never serialized):
     u32                     cacheHandle = 0xFFFFFFFFu; // volume::VolumeCache handle (invalid = unassigned)
     i32                     resolvedFrame = -1;        // last frame the drive selected (inspector/debug)

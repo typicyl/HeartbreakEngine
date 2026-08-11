@@ -6,8 +6,8 @@
 namespace hbe::volume {
 namespace {
 
-// Gradient (Perlin) noise - direction-neutral, no axis-aligned lattice signature (the same
-// reason VolumeSplat.hlsl uses gradient noise for its warp). CPU port; deterministic.
+// Gradient (Perlin) noise - direction-neutral, no axis-aligned lattice signature. CPU;
+// deterministic (machine-independent), so baked frames are bit-exact across hosts.
 glm::vec3 Hash33(glm::vec3 p) {
     p = glm::fract(p * glm::vec3(0.1031f, 0.1030f, 0.0973f));
     p += glm::dot(p, glm::vec3(p.y, p.x, p.z) + 33.33f);

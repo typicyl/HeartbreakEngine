@@ -16,6 +16,7 @@
 #include "Scene/PostSettingsSerialization.h"
 #include "Scene/Scene.h"
 #include "Scene/TagTable.h" // tags::Name / Intern / Assign (streaming groups)
+#include "Volume/VolumeSimConfigIO.h" // ConfigToJson/ConfigFromJson (VolumeComponent embedded sim)
 #include "UI/UIDocumentJson.h" // the shared per-component UI JSON blocks (.hbscene + .hbui)
 #include "UI/UISystem.h" // PreloadUIAssets (eager UI font/texture load)
 
@@ -724,7 +725,14 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                             {"emission", v->render.emission},
                             {"extinction", v->render.extinction},
                             {"stepCount", v->render.stepCount},
-                            {"shadowSteps", v->render.shadowSteps}};
+                            {"shadowSteps", v->render.shadowSteps},
+                            {"albedo", ToJson(v->render.albedo)},
+                            {"emissionColor", ToJson(v->render.emissionColor)},
+                            {"emissionMode", v->render.emissionMode},
+                            {"livePreview", v->livePreview},
+                            {"previewRes", v->previewRes},
+                            {"effectName", v->effectName},
+                            {"sim", volume::ConfigToJson(v->sim)}};
         }
         if (const SpotLightComponent* l = reg.try_get<SpotLightComponent>(e)) {
             je["spotLight"] = {{"color", ToJson(l->color)},
@@ -1081,12 +1089,6 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                 {"render", static_cast<u32>(pe->render)}, {"stretch", pe->stretch},
                 {"subUVCols", pe->subUVCols}, {"subUVRows", pe->subUVRows},
                 {"subUVFps", pe->subUVFps}, {"softFade", pe->softFade},
-                // True volumetric VFX (all optional; omit == billboard-only defaults).
-                {"volumetric", pe->volumetric}, {"volDensity", pe->volDensity},
-                {"volRadiusScale", pe->volRadiusScale}, {"volTemperature", pe->volTemperature},
-                {"volEmission", pe->volEmission}, {"volExtinction", pe->volExtinction},
-                {"volSteps", pe->volSteps}, {"volResolution", pe->volResolution},
-                {"volDetail", pe->volDetail},
                 // Module-stack opt-ins. Every one is written, but every one also
                 // parses back to the pre-stack behaviour when ABSENT, which is what
                 // lets a scene saved before the module stack load unchanged.
@@ -1519,6 +1521,14 @@ void ParseSceneJson(const json& root, SceneData& out) {
             v.render.extinction = it->value("extinction", v.render.extinction);
             v.render.stepCount = glm::clamp(it->value("stepCount", v.render.stepCount), 4, 512);
             v.render.shadowSteps = glm::clamp(it->value("shadowSteps", v.render.shadowSteps), 0, 32);
+            v.render.albedo = Vec3(it->value("albedo", json()), v.render.albedo);
+            v.render.emissionColor = Vec3(it->value("emissionColor", json()), v.render.emissionColor);
+            v.render.emissionMode = glm::clamp(it->value("emissionMode", v.render.emissionMode), 0, 2);
+            v.livePreview = it->value("livePreview", v.livePreview);
+            v.previewRes = glm::clamp(it->value("previewRes", v.previewRes), 8, 192);
+            v.effectName = it->value("effectName", std::string());
+            if (auto sit = it->find("sim"); sit != it->end())
+                volume::ConfigFromJson(*sit, v.sim); // embedded authoring recipe (empty -> defaults)
         }
         if (auto it = je.find("pointLight"); it != je.end()) {
             d.hasPointLight = true;
@@ -1998,15 +2008,6 @@ void ParseSceneJson(const json& root, SceneData& out) {
             p.subUVRows = it->value("subUVRows", p.subUVRows);
             p.subUVFps = it->value("subUVFps", p.subUVFps);
             p.softFade = it->value("softFade", p.softFade);
-            p.volumetric = it->value("volumetric", p.volumetric);
-            p.volDensity = it->value("volDensity", p.volDensity);
-            p.volRadiusScale = it->value("volRadiusScale", p.volRadiusScale);
-            p.volTemperature = it->value("volTemperature", p.volTemperature);
-            p.volEmission = it->value("volEmission", p.volEmission);
-            p.volExtinction = it->value("volExtinction", p.volExtinction);
-            p.volSteps = glm::clamp(it->value("volSteps", p.volSteps), 4, 256);
-            p.volResolution = glm::clamp(it->value("volResolution", p.volResolution), 32, 192);
-            p.volDetail = glm::clamp(it->value("volDetail", p.volDetail), 0.0f, 1.0f);
             // Module-stack opt-ins. The struct defaults are all "off", so a scene
             // authored before the module stack omits every key here and compiles to
             // the pure legacy stack - which is the compatibility guarantee, expressed
@@ -2023,14 +2024,6 @@ void ParseSceneJson(const json& root, SceneData& out) {
             // Absent in every scene saved before GPU simulation existed -> false ->
             // the legacy CPU stack, unchanged. Same contract as every flag above it.
             p.gpuSim = it->value("gpuSim", p.gpuSim);
-            // A GPU-simulated emitter holds no CPU pool, and the raymarched volume is
-            // built from that pool - so the combination renders no plume at all. The
-            // inspector now refuses it; this catches a scene authored before it did.
-            if (p.gpuSim && p.volumetric) {
-                HBE_WARN("[scene] Particle emitter has both Volumetric and GPU simulation; "
-                         "GPU simulation disabled (it would silently remove the volume).");
-                p.gpuSim = false;
-            }
         }
         if (auto it = je.find("navAgent"); it != je.end()) {
             d.hasNavAgent = true;

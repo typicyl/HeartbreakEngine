@@ -1887,7 +1887,7 @@ int main(int argc, char** argv) {
                 rp.extinction = 1.2f;
                 rp.stepCount = 128;
                 rp.shadowSteps = 6;
-                e.GetRenderer().SetVolumeGrid(vpBlob.data(), vpBlob.size(), rp);
+                e.GetRenderer().SetVolumeGrid(vpBlob.data(), vpBlob.size(), nullptr, 0, rp);
             }
             if (++vpFrame >= 40) { // TAA convergence on the static volume
                 std::vector<hbe::u8> px;
@@ -1980,7 +1980,7 @@ int main(int argc, char** argv) {
                 rp.extinction = 1.1f;
                 rp.stepCount = 192;
                 rp.shadowSteps = 10;
-                e.GetRenderer().SetVolumeGrid(vspBlob.data(), vspBlob.size(), rp);
+                e.GetRenderer().SetVolumeGrid(vspBlob.data(), vspBlob.size(), nullptr, 0, rp);
             }
             if (++vspFrame >= 40) { // TAA convergence on the static (already-simulated) volume
                 std::vector<hbe::u8> px;
@@ -2068,16 +2068,18 @@ int main(int argc, char** argv) {
             cam.SetPerspective(40.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 1000.0f);
             cam.LookAt({0.0f, 4.5f, 15.0f}, {0.0f, 4.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
             const hbe::volume::VolumeAsset::GridView g = hvAsset.Grid(hvShowFrame, "density");
+            const hbe::volume::VolumeAsset::GridView tg = hvAsset.Grid(hvShowFrame, "temperature");
             if (g.valid()) {
                 hbe::rhi::VolumeRenderParams rp;
                 rp.boundsMin = hvMin;
                 rp.boundsMax = hvMax;
                 rp.densityScale = 1.8f;
-                rp.emission = 0.0f;
+                rp.emission = 3.0f; // show the baked temperature grid as blackbody glow (P2 emission test)
                 rp.extinction = 1.1f;
                 rp.stepCount = 192;
                 rp.shadowSteps = 10;
-                e.GetRenderer().SetVolumeGrid(g.bytes, g.size, rp);
+                e.GetRenderer().SetVolumeGrid(g.bytes, g.size, tg.valid() ? tg.bytes : nullptr,
+                                              tg.valid() ? tg.size : 0, rp);
             }
             if (++hvFrame >= 40) {
                 std::vector<hbe::u8> px;

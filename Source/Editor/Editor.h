@@ -26,11 +26,16 @@
 #include "Scene/TagShard.h" // save-time spatial shard bake (BakeReport / TagStat)
 #include "Scene/TagStreaming.h" // stream::Streamer - the editor's own LIVE zone streamer
 #include "UI/UIDocument.h" // `.hbui` documents: the UI Document panel authors these
+#include "Volume/VolumeSimConfig.h" // Volume Baker panel edits a VolumeSimConfig
+#include "Volume/IVolumeSimulation.h" // in-scene live-preview sim instance (unique_ptr member)
 
 #include <entt/entt.hpp>
+#include <memory>
 #include <glm/glm.hpp>
 
+#include <atomic>
 #include <filesystem>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -314,6 +319,8 @@ private:
         bool isCharacter = false;  // .hbchar modular-character rig
         bool isUIAnim = false;     // .hbuianim UI animation clip
         bool isUIDoc = false;      // .hbui UI document (screen/world UI tree)
+        bool isVolumeSim = false;  // .hbvolsim volume authoring config (opens the Volume Baker)
+        bool isVolumeCache = false;// .hbvol baked volume frames (drag onto a Volume component)
         u64  thumbId = 0;       // ImGui texture id (textures only; 0 = icon)
         bool thumbTried = false;
     };
@@ -1583,6 +1590,7 @@ private:
         Panel_Collaborate,
         Panel_People,
         Panel_Review,
+        Panel_VolumeBaker,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
@@ -1592,6 +1600,65 @@ private:
     // Ctrl+S saves the level the author is looking at instead of opening Save As.
     bool bootSceneAdopted_ = false;
     void DrawWindowMenu();
+
+    // -- Volume Baker panel: author a VolumeSimConfig and bake it to a `.hbvol` -------
+    // The bake runs on a background fiber-job (CPU solver) so the UI stays responsive; the panel
+    // polls the shared job state and writes the file on the main thread when it completes.
+    void DrawVolumeBaker(Engine&);
+    volume::VolumeSimConfig volBakeConfig_{};       // edit copy, seeded from the model's defaultConfig
+    int                     volBakeModel_ = 0;      // index into VolumeSimRegistry::Get().Types()
+    bool                    volBakeSeeded_ = false;
+    int                     volBakeFrames_ = 60;    // frames to bake (start=0)
+    char                    volBakePath_[256] = "Volumes/smoke.hbvol"; // rel to Assets/
+    std::string             volBakeStatus_;
+    // The `.hbvolsim` authoring asset currently loaded in the panel (absolute path; empty = editing an
+    // unsaved default). Set by OpenVolumeSim; the Save button writes volBakeConfig_ back to it.
+    std::filesystem::path   volBakeSimPath_;
+    // Author a new `.hbvolsim` (default config of the default model) under `dir`. Returns the path.
+    std::filesystem::path CreateVolumeSimAsset(const std::filesystem::path& dir, const std::string& name);
+    // Load a `.hbvolsim` into the Volume Baker panel and open it (jumped to on create / double-click).
+    void OpenVolumeSim(const std::filesystem::path& path);
+    struct VolBakeJob {
+        std::atomic<int>  state{1};   // 1 running, 2 done, 3 failed, 4 cancelled
+        std::atomic<int>  done{0};
+        std::atomic<int>  total{0};
+        std::atomic<bool> cancel{false};
+        std::vector<u8>   out;        // written by the job; read on the main thread once state>=2
+        std::string       outAbs;     // resolved absolute output path
+    };
+    std::shared_ptr<VolBakeJob> volBakeJob_;
+    // "Bake in place" (from the VolumeComponent inspector): when the shared bake job completes, assign
+    // the resulting .hbvol (relative path) as this entity's source and switch it to baked playback.
+    entt::entity volBakePendingAssign_ = entt::null;
+    std::string  volBakePendingRel_;
+    // Heap payload handed to the detached bake job (freed by the job). The job entry must be a plain
+    // function pointer (the fiber system takes void(*)(void*)), so a static trampoline owns the work.
+    struct VolBakePayload {
+        std::shared_ptr<VolBakeJob> job;
+        volume::VolumeSimConfig     cfg;
+        int                         frames = 1;
+    };
+    static void RunBakeJob(void* arg); // CPU bake on a worker fiber; deletes the payload
+
+    // -- In-scene volume live preview -----------------------------------------------
+    // Runs a low-res CPU sim of the SELECTED VolumeComponent's embedded config in EDIT mode and feeds
+    // it (density + temperature) at the entity's transform, so authoring is WYSIWYG in the real scene.
+    // Called at the end of BuildUI (after the Engine's baked drive, before RenderScene, so it wins).
+    // One at a time (the RHI feeds a single grid); play mode uses the Engine's baked-playback drive.
+    void DriveVolumePreview(Engine&);
+    // Shared Domain/Physics/Emitters editor for a VolumeSimConfig (used by the Volume Baker panel AND
+    // the in-scene VolumeComponent inspector).
+    void DrawVolumeConfigControls(volume::VolumeSimConfig& c);
+    entt::entity                               volPreviewEntity_ = entt::null;
+    std::unique_ptr<volume::IVolumeSimulation> volPreviewSim_;
+    u64                                        volPreviewHash_ = 0;  // config+res hash; rebuild on change
+    int                                        volPreviewFrame_ = 0;
+    bool                                       volPreviewRestart_ = false;
+    std::vector<u8>                            volPreviewDensity_; // persist through the frame (fed to RHI)
+    std::vector<u8>                            volPreviewTemp_;
+    int                                        volBakeInPlaceFrames_ = 90; // "Bake in place" duration (frames)
+    glm::vec3                                  volPreviewMin_{0.0f};
+    glm::vec3                                  volPreviewMax_{1.0f};
 
     // -- Undo / redo ----------------------------------------------------------------
     // Snapshot-based: the scene serializes to an in-memory .hbscene JSON string

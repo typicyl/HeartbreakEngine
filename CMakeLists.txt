@@ -256,7 +256,8 @@ set(HBE_VOLUME_SOURCES
     "Source/Volume/ProceduralVolumeSimulation.cpp"
     "Source/Volume/VolumeBaker.cpp"
     "Source/Volume/VolumeAsset.cpp"
-    "Source/Volume/VolumeCache.cpp")
+    "Source/Volume/VolumeCache.cpp"
+    "Source/Volume/VolumeSimConfigIO.cpp")
 
 # Core sources common to both the runtime and editor libraries.
 set(HBE_RUNTIME_SOURCES

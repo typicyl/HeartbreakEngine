@@ -709,39 +709,9 @@ inline constexpr u32 kMaxGpuParticleBatchElements = 65536;
 // carries only an element offset, so the buffer identity has to come from the group.
 inline constexpr u32 kMaxGpuParticleGroups = 4;
 
-// One volumetric "blob": a spherical density/temperature sample the compute
-// splat writes into the 3D volume (Embergen-style volumetric smoke/fire). Built
-// per-frame from particle emitters. GPU-ready layout (32 bytes, float4-packed).
-struct VolumeBlob {
-    glm::vec3 pos{0.0f};   // world position
-    f32 radius = 0.3f;     // world-space influence radius
-    f32 density = 1.0f;    // opacity contribution
-    f32 temperature = 0.0f; // 0..1 -> blackbody emission (fire) in the raymarch
-    f32 _pad0 = 0.0f, _pad1 = 0.0f;
-};
-
-// Per-frame volumetric parameters: the world-space AABB the volume covers (built
-// from the blob bounds), plus the blob count. The raymarch (VV4) reuses the same
-// bounds to map ray samples into the volume's UVW space.
-struct VolumeParams {
-    // NOTE: densityScale is applied EXACTLY ONCE, in the compute splat (VolumeSplat.hlsl),
-    // which bakes it into the stored volume. The raymarch reads that volume with a density
-    // multiplier of 1.0 — do NOT re-scale by densityScale there or density becomes squared.
-    glm::vec3 boundsMin{0.0f}; f32 densityScale = 1.0f;
-    glm::vec3 boundsMax{0.0f}; f32 emission = 2.5f;   // fire glow strength
-    u32 blobCount = 0;
-    f32 extinction = 1.5f;     // absorption (denser/darker smoke)
-    u32 stepCount = 48;        // raymarch steps
-    u32 resolution = 96;       // volume voxel dim (quality knob; read once at first enable)
-    f32 noiseDetail = 0.6f;    // procedural detail: 0 = raw blobs, 1 = heavy billowing wisps
-    f32 noiseScale = 1.0f;     // world-space turbulence scale (avg blob radius); STABLE across
-                               // frames so the noise doesn't crawl/pop when the AABB resizes
-};
-inline constexpr u32 kMaxVolumeBlobs = 4096; // cap (per-frame upload buffer size)
-
-// Render-side params for a BAKED NanoVDB volume - the source-agnostic RUNTIME representation
-// (VolumeParams above is splat/blob-specific and on its way out). The world AABB clips the
-// raymarch (empty-space skip); the grid's own affine map handles world->index sampling.
+// Render-side params for a BAKED NanoVDB volume - the source-agnostic RUNTIME representation.
+// The world AABB clips the raymarch (empty-space skip); the grid's own affine map handles
+// world->index sampling.
 // densityScale is applied ONCE, in the shader (the baked grid stores RAW density) - never also
 // bake a scale into the grid. Carries only look knobs + bounds, nothing about how it was made.
 struct VolumeRenderParams {
@@ -756,18 +726,22 @@ struct VolumeRenderParams {
     // stay the grid's LOCAL AABB; the raymarch offsets the RayBox by this and un-offsets before
     // sampling. Translation only - rotation/scale of the volume are not supported.
     glm::vec3 worldOffset{0.0f};
+    // Look color. Default albedo (1,1,1) renders EXISTING grids byte-identically to today's grey smoke
+    // (the shader multiplies the SCATTERED light by albedo; 1 is a no-op). emissionColor tints the glow
+    // (fire=warm, magic=blue) and is INERT until a temperature grid is fed (emission term is 0 while
+    // temp==0). emissionMode: 0=blackbody(temp), 1=tint only, 2=tint x blackbody.
+    glm::vec3 albedo{1.0f};                       // single-scatter tint (dust=brown, magic/clouds tints)
+    glm::vec3 emissionColor{1.0f, 0.45f, 0.15f};  // glow tint
+    i32       emissionMode = 0;
 };
 
 // ---------------------------------------------------------------------------
 // GPU compute + GPU-writable structured buffers
 // ---------------------------------------------------------------------------
 //
-// The volumetric splat (CreateVolumeTexture / SetVolumeParticles) is a CLOSED
-// compute path: one hard-coded root signature, one hard-coded shader, one
-// hard-coded resource set, private to each backend. Nothing outside the RHI can
-// dispatch through it. These types are the general seam - a structured buffer a
-// compute shader WRITES and a vertex shader READS, plus a way to run a kernel
-// over it - which is what GPU particle simulation + GPU vertex expansion need.
+// These types are the general compute seam - a structured buffer a compute shader
+// WRITES and a vertex shader READS, plus a way to run a kernel over it - which is
+// what GPU particle simulation + GPU vertex expansion (and the volume solver) need.
 //
 // Deliberately NOT here: indirect draw. Every draw the particle system issues has
 // a CPU-known vertex count (the spawn scheduler stays on the CPU - it owns an f64
@@ -941,26 +915,22 @@ public:
 
     // Creates an uninitialised texture writable by a compute pass. With depth>1
     // it is a 3D volume (TEXTURE3D / VK_IMAGE_TYPE_3D). It always gets a sampled
-    // SRV (the returned handle, for the raymarch) and, when desc.storage, a UAV
-    // the backend records internally for the compute splat to bind. Used by the
-    // volumetric-VFX system; returns an invalid handle when unsupported.
+    // SRV (the returned handle) and, when desc.storage, a UAV the backend records
+    // internally for a compute pass to bind. Returns an invalid handle when
+    // unsupported. (General 3D-texture allocator; the volume solver's Phase-3
+    // texture-field path and any future compute-written volume use it.)
     virtual TextureHandle CreateVolumeTexture(const TextureDesc&) { return {}; }
 
-    // Feeds the volumetric-VFX system for this frame: `blobs` are splatted into a
-    // 3D density/temperature volume by a compute pass (see VolumeSplat.hlsl), which
-    // the raymarch then lights + composites. count==0 disables volumetrics this
-    // frame (zero GPU cost). Pointers must stay valid through DrawScene, like
-    // SetParticles. No-op on backends without compute support.
-    virtual void SetVolumeParticles(const VolumeBlob* /*blobs*/, u32 /*count*/,
-                                    const VolumeParams& /*params*/) {}
-
-    // Feeds a BAKED NanoVDB volume grid for this frame - the RUNTIME volume path. `bytes` is a
-    // raw, byte-exact NanoVDB grid blob (from the baker / streamed from a .hbvol by VolumeCache);
-    // the PNanoVDB raymarch (VolumeRaymarch.hlsl) samples it via a StructuredBuffer<uint>.
-    // byteSize==0 / bytes==nullptr disables the volume this frame. The pointer must stay valid
-    // through the frame (like SetParticles). This SUPERSEDES SetVolumeParticles' render feed; the
-    // splat sim is offline-only now. No-op on backends without the volume raymarch.
-    virtual void SetVolumeGrid(const void* /*bytes*/, usize /*byteSize*/,
+    // Feeds a BAKED NanoVDB volume for this frame - the RUNTIME volume path. `density` is a raw,
+    // byte-exact NanoVDB grid blob (from the baker / streamed from a .hbvol by VolumeCache); the
+    // PNanoVDB raymarch (VolumeRaymarch.hlsl) samples it via a StructuredBuffer<uint>. `temperature`
+    // is an OPTIONAL second grid (same frame/bounds) that drives blackbody/tint emission (fire glow);
+    // temperature==nullptr / tempSize==0 keeps the glow inert (grey smoke). densitySize==0 /
+    // density==nullptr disables the volume this frame. Pointers must stay valid through the frame
+    // (like SetParticles). The volume sim is offline-only: it bakes to .hbvol and this feeds the
+    // cached grids. No-op on backends without the volume raymarch.
+    virtual void SetVolumeGrid(const void* /*density*/, usize /*densitySize*/,
+                               const void* /*temperature*/, usize /*tempSize*/,
                                const VolumeRenderParams& /*params*/) {}
 
     // -- GPU compute + GPU-writable structured buffers (optional capability) --
@@ -993,8 +963,7 @@ public:
     virtual ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc&) { return {}; }
 
     // Queues a dispatch to run at the START of the next frame, BEFORE any render
-    // pass opens. Call it before Renderer::RenderScene, exactly like
-    // SetVolumeParticles - and for the same reason: Vulkan cannot record compute
+    // pass opens. Call it before Renderer::RenderScene - Vulkan cannot record compute
     // inside an active render pass, and ClearBackBuffer opens one that stays open
     // through DrawScene. Both backends execute the queue at the same point (their
     // BeginFrame), so the two frame timelines stay comparable. The queue is

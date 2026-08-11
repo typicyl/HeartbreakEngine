@@ -36,6 +36,10 @@ public:
 
     // Density GridView for `frame` (bytes owned by the resident VolumeAsset; valid while cached).
     VolumeAsset::GridView DensityGrid(u32 handle, i32 frame) const;
+    // Temperature GridView for `frame` (drives blackbody/tint emission). GridView::valid() is false
+    // when the .hbvol has no temperature field (or it is all-background), so the caller feeds nullptr
+    // and the glow stays inert. Same frame/bounds as DensityGrid (baked together, shared transform).
+    VolumeAsset::GridView TemperatureGrid(u32 handle, i32 frame) const;
 
     VolumeBounds Bounds(u32 handle) const;
     f32          Fps(u32 handle) const;

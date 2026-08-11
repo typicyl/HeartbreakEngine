@@ -55,4 +55,8 @@ private:
     std::size_t               payloadOffset_ = 0;
 };
 
+// Cheap header-only read of a `.hbvol`'s stamped sourceHash (for stale-bake detection) - reads just
+// the fixed header prefix, not the whole file. Returns false if the file is missing / not a `.hbvol`.
+bool ReadHbvolSourceHash(const std::string& path, u64& outHash);
+
 } // namespace hbe::volume
