@@ -485,6 +485,48 @@ void PhysicsWorld::AddImpulseAtPoint(Scene& scene, entt::entity e, const glm::ve
     bi.ActivateBody(body);
 }
 
+void PhysicsWorld::ApplyBuoyancy(Scene& scene, f32 dt,
+                                const std::function<f32(f32, f32)>& surfaceHeightAt,
+                                f32 buoyancy, f32 linearDrag, f32 angularDrag) {
+    if (!impl_ || dt <= 0.0f || !surfaceHeightAt) return;
+    JPH::BodyInterface& bi = impl_->system.GetBodyInterface();
+    auto& reg = scene.Registry();
+    const JPH::Vec3 gravity = impl_->system.GetGravity();
+    for (const auto& [id, e] : impl_->bodyToEntity) {
+        const RigidBody* rb = reg.try_get<RigidBody>(e);
+        if (!rb || rb->motion != RigidBody::Motion::Dynamic) continue;
+        // Skip a STALE mapping: if the component's live handle no longer matches this map key,
+        // the body was re-created (e.g. Motion flipped in the editor this frame) and the OLD
+        // Jolt body is about to be reaped by physics.Update - touching it (still Static) would
+        // crash ApplyBuoyancyImpulse on its null MotionProperties once submerged.
+        if (rb->bodyId != id) continue;
+        const JPH::BodyID body(id);
+        const JPH::RVec3 p = bi.GetPosition(body);
+        const f32 surfaceY = surfaceHeightAt(static_cast<f32>(p.GetX()),
+                                             static_cast<f32>(p.GetZ()));
+        if (surfaceY < -1.0e8f) continue; // no water under this body
+        bool submerged = false;
+        {
+            // Jolt's packaged buoyancy clips the body's shape against the water plane and
+            // applies the Archimedes impulse + linear/angular drag - mass-correct, no manual
+            // volume math. The plane is (surface point under the body, world-up).
+            JPH::BodyLockWrite lock(impl_->system.GetBodyLockInterface(), body);
+            if (lock.Succeeded()) {
+                JPH::Body& b = lock.GetBody();
+                // Guard the ACTUAL Jolt state (mirrors BodyInterface::ApplyBuoyancyImpulse): a
+                // non-dynamic body has no MotionProperties, and ApplyBuoyancyImpulse derefs it
+                // the moment it reports submerged.
+                if (b.IsDynamic())
+                    submerged = b.ApplyBuoyancyImpulse(
+                        JPH::RVec3(p.GetX(), static_cast<JPH::Real>(surfaceY), p.GetZ()),
+                        JPH::Vec3(0.0f, 1.0f, 0.0f), buoyancy, linearDrag, angularDrag,
+                        JPH::Vec3::sZero(), gravity, dt);
+            }
+        }
+        if (submerged) bi.ActivateBody(body); // keep the float awake as the waves move it
+    }
+}
+
 f32 PhysicsWorld::Raycast(const glm::vec3& origin, const glm::vec3& dir, f32 maxDist) const {
     if (!impl_ || maxDist <= 0.0f) return maxDist;
     const JPH::RRayCast ray{ToJph(origin), ToJph(dir) * maxDist};
@@ -843,6 +885,10 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
         if (body.IsInvalid()) continue;
         rb.bodyId = body.GetIndexAndSequenceNumber();
         impl_->bodyToEntity[rb.bodyId] = e;
+        // A body RE-created in place (bodyId invalidated by an inspector edit while
+        // running) starts fresh; re-seed interpolation so it does not blend from the
+        // previous body's stale prev/cur pose.
+        rb.renderPoseInit = false;
     }
 
     // --- Create CharacterVirtual capsules for CharacterControllers ----------
@@ -864,6 +910,7 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
         cc.bodyId = impl_->nextCharId++;
         impl_->characters[cc.bodyId] = cv;
         impl_->charToEntity[cc.bodyId] = e;
+        cc.renderPoseInit = false; // fresh capsule: re-seed interpolation
     }
 
     // --- Drop bodies whose entity/RigidBody went away or was invalidated ----
@@ -901,8 +948,11 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
         // moves colliders too; velocities reset so resuming doesn't carry
         // stale momentum from before the teleport.
         for (const entt::entity e : reg.view<Transform, RigidBody>()) {
-            const RigidBody& rb = reg.get<RigidBody>(e);
+            RigidBody& rb = reg.get<RigidBody>(e);
             if (rb.bodyId == RigidBody::kInvalidBody) continue;
+            // Re-seed render interpolation on resume: the body may have been moved
+            // by the gizmo while paused, so the pre-pause prev/cur are stale.
+            rb.renderPoseInit = false;
 
             glm::vec3 pos, scale;
             glm::quat rot;
@@ -928,6 +978,7 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
             const glm::vec3 wp = glm::vec3(scene.WorldMatrix(e)[3]);
             cit->second->SetPosition(JPH::RVec3(wp.x, wp.y, wp.z));
             cc.velocityY = 0.0f;
+            cc.renderPoseInit = false; // re-seed interpolation on resume
         }
         return;
     }
@@ -953,6 +1004,7 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
         // (cc.desiredVelocity / jumpRequested set by character::Update), resolved
         // against the world's colliders.
         for (const entt::entity e : reg.view<Transform, CharacterController>()) {
+            if (e == edited_) continue; // user is dragging this capsule (followed below)
             CharacterController& cc = reg.get<CharacterController>(e);
             const auto cit = impl_->characters.find(cc.bodyId);
             if (cit == impl_->characters.end()) continue;
@@ -981,21 +1033,44 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
             cc.grounded =
                 cv->GetGroundState() == JPH::CharacterBase::EGroundState::OnGround;
 
-            // Write the capsule centre back into the entity Transform.
+            // Track the two most recent stepped capsule centres (WORLD space) for
+            // render interpolation. The Transform is written AFTER the step loop
+            // from mix(prev, cur, alpha), not raw here (see the interpolation pass
+            // below) - writing the raw last step is what made the mesh jitter.
             const glm::vec3 wp = ToGlm(cv->GetPosition());
-            Transform& t = reg.get<Transform>(e);
-            const Parent* par = reg.try_get<Parent>(e);
-            if (par && reg.valid(par->entity)) {
-                const glm::mat4 world = glm::translate(glm::mat4(1.0f), wp) *
-                                        glm::mat4_cast(t.rotation) *
-                                        glm::scale(glm::mat4(1.0f), t.scale);
-                const glm::mat4 local = glm::inverse(scene.WorldMatrix(par->entity)) * world;
-                glm::vec3 lpos, lscale;
-                glm::quat lrot;
-                DecomposeWorld(local, lpos, lrot, lscale);
-                t.position = lpos;
+            if (!cc.renderPoseInit) {
+                cc.renderPrevPos = cc.renderCurPos = wp;
+                cc.renderPoseInit = true;
             } else {
-                t.position = wp;
+                cc.renderPrevPos = cc.renderCurPos;
+                cc.renderCurPos = wp;
+            }
+        }
+
+        // Capture each dynamic body's stepped pose for render interpolation, the
+        // same way. The gizmo-edited body is skipped (the user owns it) and
+        // re-seeds when released.
+        for (const entt::entity e : reg.view<Transform, RigidBody>()) {
+            if (e == edited_) continue;
+            RigidBody& rb = reg.get<RigidBody>(e);
+            if (rb.bodyId == RigidBody::kInvalidBody ||
+                rb.motion != RigidBody::Motion::Dynamic) {
+                continue;
+            }
+            JPH::RVec3 bp;
+            JPH::Quat br;
+            bi.GetPositionAndRotation(JPH::BodyID(rb.bodyId), bp, br);
+            const glm::vec3 gp = ToGlm(bp);
+            const glm::quat gr = ToGlm(br);
+            if (!rb.renderPoseInit) {
+                rb.renderPrevPos = rb.renderCurPos = gp;
+                rb.renderPrevRot = rb.renderCurRot = gr;
+                rb.renderPoseInit = true;
+            } else {
+                rb.renderPrevPos = rb.renderCurPos;
+                rb.renderCurPos = gp;
+                rb.renderPrevRot = rb.renderCurRot;
+                rb.renderCurRot = gr;
             }
         }
 
@@ -1007,7 +1082,7 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
     // While the gizmo drags an entity, its body FOLLOWS the Transform (and
     // never overwrites it), so objects stay manipulable mid-simulation.
     if (edited_ != entt::null && reg.valid(edited_)) {
-        if (const RigidBody* rb = reg.try_get<RigidBody>(edited_);
+        if (RigidBody* rb = reg.try_get<RigidBody>(edited_);
             rb && rb->bodyId != RigidBody::kInvalidBody) {
             glm::vec3 pos, scale;
             glm::quat rot;
@@ -1016,37 +1091,92 @@ void PhysicsWorld::Update(Scene& scene, f32 dt) {
             bi.SetPositionAndRotation(id, JPH::RVec3(pos.x, pos.y, pos.z), ToJph(rot),
                                       JPH::EActivation::Activate);
             bi.SetLinearAndAngularVelocity(id, JPH::Vec3::sZero(), JPH::Vec3::sZero());
+            rb->renderPoseInit = false; // re-seed interpolation when the drag ends
+        }
+        // A dragged CharacterController capsule follows its Transform the same way
+        // (its step + interpolation are skipped below while it is edited_), so it is
+        // manipulable mid-simulation instead of being snapped back by the interp write.
+        if (CharacterController* cc = reg.try_get<CharacterController>(edited_)) {
+            if (const auto cit = impl_->characters.find(cc->bodyId);
+                cit != impl_->characters.end()) {
+                const glm::vec3 wp = glm::vec3(scene.WorldMatrix(edited_)[3]);
+                cit->second->SetPosition(JPH::RVec3(wp.x, wp.y, wp.z));
+                cc->velocityY = 0.0f;
+                cc->renderPoseInit = false; // re-seed interpolation when the drag ends
+            }
         }
     }
 
-    // --- Write dynamic body poses back into entity Transforms ---------------
+    // --- Render interpolation: write the visual (smoothly interpolated) poses ---
+    // Blend the two most recent fixed steps by the leftover-accumulator fraction so
+    // the drawn Transform advances evenly every frame regardless of how many 60 Hz
+    // steps ran (0..4). cam::Update and CollectDrawItems both read this Transform,
+    // so the camera and the mesh now agree automatically. Costs up to one step
+    // (~16 ms) of visual latency - the standard, expected trade for smooth motion.
+    const f32 alpha = glm::clamp(accumulator_ / kStep, 0.0f, 1.0f);
+
+    // Characters: position only (rotation is already smoothed per-frame by
+    // character::Update, so leave t.rotation alone).
+    for (const entt::entity e : reg.view<Transform, CharacterController>()) {
+        if (e == edited_) continue; // user owns this one right now (followed above)
+        CharacterController& cc = reg.get<CharacterController>(e);
+        if (!cc.renderPoseInit) continue;
+        const glm::vec3 wp = glm::mix(cc.renderPrevPos, cc.renderCurPos, alpha);
+        Transform& t = reg.get<Transform>(e);
+        const Parent* par = reg.try_get<Parent>(e);
+        const glm::mat4 pw = (par && reg.valid(par->entity)) ? scene.WorldMatrix(par->entity)
+                                                             : glm::mat4(1.0f);
+        // Rebase the world pose into the parent's space - but only if the parent is
+        // invertible. A zero-scale ancestor makes WorldMatrix singular and glm::inverse
+        // would yield NaN (the mesh would vanish); write the world pose directly then.
+        if (par && reg.valid(par->entity) &&
+            glm::abs(glm::determinant(glm::mat3(pw))) > 1e-8f) {
+            const glm::mat4 world = glm::translate(glm::mat4(1.0f), wp) *
+                                    glm::mat4_cast(t.rotation) *
+                                    glm::scale(glm::mat4(1.0f), t.scale);
+            const glm::mat4 local = glm::inverse(pw) * world;
+            glm::vec3 lpos, lscale;
+            glm::quat lrot;
+            DecomposeWorld(local, lpos, lrot, lscale);
+            t.position = lpos;
+        } else {
+            t.position = wp;
+        }
+    }
+
+    // Dynamic bodies: position lerp + rotation slerp.
     for (const entt::entity e : reg.view<Transform, RigidBody>()) {
         if (e == edited_) continue; // the user owns this one right now
         const RigidBody& rb = reg.get<RigidBody>(e);
         if (rb.bodyId == RigidBody::kInvalidBody ||
-            rb.motion != RigidBody::Motion::Dynamic) {
+            rb.motion != RigidBody::Motion::Dynamic || !rb.renderPoseInit) {
             continue;
         }
-        JPH::RVec3 pos;
-        JPH::Quat rot;
-        bi.GetPositionAndRotation(JPH::BodyID(rb.bodyId), pos, rot);
+        const glm::vec3 wpos = glm::mix(rb.renderPrevPos, rb.renderCurPos, alpha);
+        const glm::quat wrot =
+            glm::normalize(glm::slerp(rb.renderPrevRot, rb.renderCurRot, alpha));
 
         Transform& t = reg.get<Transform>(e);
         const Parent* p = reg.try_get<Parent>(e);
-        if (p && reg.valid(p->entity)) {
+        const glm::mat4 pw = (p && reg.valid(p->entity)) ? scene.WorldMatrix(p->entity)
+                                                         : glm::mat4(1.0f);
+        // Rebase into the parent's space unless the parent is singular (zero-scale
+        // ancestor -> glm::inverse yields NaN); write the world pose directly then.
+        if (p && reg.valid(p->entity) &&
+            glm::abs(glm::determinant(glm::mat3(pw))) > 1e-8f) {
             // Body poses are world space; convert into the parent's space.
-            glm::mat4 world = glm::translate(glm::mat4(1.0f), ToGlm(pos)) *
-                              glm::mat4_cast(ToGlm(rot)) *
+            glm::mat4 world = glm::translate(glm::mat4(1.0f), wpos) *
+                              glm::mat4_cast(wrot) *
                               glm::scale(glm::mat4(1.0f), t.scale);
-            const glm::mat4 local = glm::inverse(scene.WorldMatrix(p->entity)) * world;
+            const glm::mat4 local = glm::inverse(pw) * world;
             glm::vec3 lpos, lscale;
             glm::quat lrot;
             DecomposeWorld(local, lpos, lrot, lscale);
             t.position = lpos;
             t.rotation = lrot;
         } else {
-            t.position = ToGlm(pos);
-            t.rotation = ToGlm(rot);
+            t.position = wpos;
+            t.rotation = wrot;
         }
     }
 }

@@ -45,6 +45,13 @@ struct ProceduralSkyParams {
 // Equirectangular maps match Shaders/Common.hlsli's EquirectUV mapping.
 IBLMaps GenerateProceduralIBL(Renderer& renderer, const ProceduralSkyParams& params = {});
 
+// Leak-free dynamic re-bake of the sun-dependent AMBIENT maps only (irradiance +
+// prefiltered specular), written IN PLACE into `maps`' existing handles via UpdateTexture
+// (no new bindless slots). For the day/night + weather cohesion re-bake: cheap (low-res
+// atmosphere source), keeps boot resolution. Leaves sky/brdf/skin untouched.
+void RebakeProceduralIBLInto(Renderer& renderer, const ProceduralSkyParams& params,
+                             IBLMaps& maps);
+
 // Bakes a LOCAL environment probe at `position`: CPU ray-casts the scene's mesh
 // geometry, lights the hit surfaces with the scene's point/spot lights (so a
 // sealed interior goes dark, lit only by its own lamps), and falls back to the

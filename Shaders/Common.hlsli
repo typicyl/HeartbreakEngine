@@ -20,6 +20,8 @@ struct PunctualLight
 #define HBE_MAX_PUNCTUAL_LIGHTS 16
 #define HBE_MAX_SHADOW_CASCADES 4
 #define HBE_MAX_PROBES 64
+#define HBE_MAX_DECALS 16
+#define HBE_MAX_RIPPLES 16
 
 // One baked local light/reflection probe (matches rhi::ProbeData).
 struct Probe
@@ -32,6 +34,16 @@ struct Probe
     uint   prefilteredIndex;
     float  prefilteredMaxLod;
     float  _p1;
+};
+
+// One forward projected decal (matches rhi::DecalData; each line packs to float4s).
+struct Decal
+{
+    float4x4 invWorld;                    // world -> decal unit cube [-0.5,0.5]
+    float3   forwardWS; float opacity;    // projection axis (box local +Z)
+    float3   tangentWS; float angleFade;  // decal U axis; pow() on surface-faces-projector
+    uint albedoIndex; uint normalIndex; uint mrIndex; uint flags;
+    float4   params;                      // x=normalStrength, y=roughness, z=metallic
 };
 
 // Per-frame constants (camera + primary directional light + ambient/IBL).
@@ -52,7 +64,7 @@ cbuffer FrameConstants : register(b0)
     uint     gSkyIndex;          // bindless sky/environment equirect (0 = none)
     uint     gOutputLinear;      // 1 = HDR post pipeline active: shaders emit
                                  // linear radiance (exposure/tonemap in post)
-    float2   _padFrame0;
+    float2   gScreenTexel;       // (1/renderW, 1/renderH): SV_Position.xy * this = screen UV
     // Cascaded shadow maps: per-cascade light frusta rendered into a 2x2 atlas
     // (cascade i occupies tile ((i&1), (i>>1)) of the shadow map).
     float4x4 gCascadeViewProj[HBE_MAX_SHADOW_CASCADES];
@@ -62,7 +74,8 @@ cbuffer FrameConstants : register(b0)
     float2   _padFrame1;
     uint     gPunctualCount;     // active entries in gPunctualLights
     uint     gSkinLUTIndex;      // pre-integrated SSS LUT (0 = none)
-    float2   _padFrame2;
+    uint     gTaaActive;         // 1 when TAA is resolving this frame (0 = FXAA/no AA)
+    uint     _padFrame2;
     PunctualLight gPunctualLights[HBE_MAX_PUNCTUAL_LIGHTS];
     float4x4 gPrevViewProj;      // previous frame's (jittered) view-proj, for TAA
     // 3D painterly surface-stroke params (global; 0 = mode off). Appended at the
@@ -84,6 +97,30 @@ cbuffer FrameConstants : register(b0)
     float4 gWeather;
     // x,y = wind velocity (cloud-UV units/sec); clouds drift by gWeather1.xy * time.
     float4 gWeather1;
+    // Weather surface response (appended at the tail). Drives the wet/puddle/snow
+    // block in MeshPBR. gWeather2: x = wetness (0..1), y = puddle coverage (0..1),
+    // z = snow accumulation (0..1), w = RAIN intensity (0..1, drives puddle ripples; 0 for snow).
+    // gWeather3: x = puddle noise world scale (m), y = snow break-up scale (m),
+    // z = volumetric clouds (>0.5 = raymarched slab, else 2D layer), w = cloud quality.
+    float4 gWeather2;
+    float4 gWeather3;
+    // Forward projected decals (appended at the tail). gDecalCount active entries.
+    uint   gDecalCount; float3 _padDecal;
+    Decal  gDecals[HBE_MAX_DECALS];
+    // Water surface (Gerstner) - global scene ocean params (read by Water.hlsl only).
+    float4 gWaveA[4];      // per wave: (dirX, dirZ, amplitude, wavelength)
+    float4 gWaveB[4];      // per wave: (speed, steepness, 0, 0)
+    float4 gWaterShallow;  // (rgb grazing tint, fresnel power)
+    float4 gWaterDeep;     // (rgb deep body colour, reflection roughness 0..1)
+    float4 gWaterParams;   // (foamAmount, rippleStrength, rippleScale, fftOn: >0.5 = FFT ocean)
+    uint   gRippleCount;
+    float3 gFftParams;     // FFT ocean: (tilePatchSize m, heightScale, unused)
+    float4 gRipples[HBE_MAX_RIPPLES]; // (centerX, centerZ, age seconds, strength)
+    // Depth-based water: the water PS reads scene depth to grade absorption/foam/soft edges.
+    uint   gSceneDepthIndex; // bindless scene-depth SRV (0 = not bound; skip depth grading)
+    float  gAbsorptionDepth; // metres of water column to full deep-colour absorption
+    float  gShorelineWidth;  // metres of the shoreline foam band
+    float  gEdgeFade;        // metres of soft depth-fade where water meets geometry
 };
 
 // Per-object constants.
@@ -150,6 +187,14 @@ cbuffer ObjectConstants : register(b1)
     uint2    _padMorph;
     uint4    gMorphTargets[2]; // 8 active atlas rows
     float4   gMorphWeights[2]; // 8 active weights (parallel to gMorphTargets)
+    // CLEARCOAT: a thin, sharp dielectric layer over the base material - wet skin,
+    // sweat, wet eyes, blood sheen, varnish, car paint. A second GGX lobe with its
+    // own (low) roughness and a fixed F0=0.04, energy-conserved against the base.
+    // Zero-init (gClearcoat = 0) = off, so every existing draw stays byte-identical.
+    float    gClearcoat;          // strength (0 = off)
+    float    gClearcoatRoughness; // clear layer roughness (low = wet/glossy)
+    float    _padCc0;
+    float    _padCc1;
 };
 
 // Per-frame joint palettes (every skinned draw appends its global*inverseBind
@@ -174,11 +219,7 @@ cbuffer ObjectConstants : register(b1)
 #define HBE_MAT_PAINTERLY_EXEMPT 128u // dynamic-layer object: write the painterly mask
 #define HBE_MAT_TERRAIN_HOLE 256u     // clip terrain pixels where the hole mask (thickness slot) is set
 #define HBE_MAT_TERRAIN_SPLAT 512u    // blend 4 tiling layer albedos (albedo/normal/mr/ao slots) by the emissive-slot weight mask
-#define HBE_MAT_CENSORED 1024u
-// Bits 16-23 carry a PROCEDURAL CONSTRUCTION MATERIAL id (see Construction.hlsli). Packed into the
-// spare high bits of this existing word rather than added as a new ObjectCB field: ObjectCB is
-// 528 B aligned to 768 against a 4 MB per-frame arena, so growing it would directly cut how many
-// objects this renderer can draw in a frame.        // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
+#define HBE_MAT_CENSORED 1024u // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
 
 // ---------------------------------------------------------------------------
 // Bindless texture table.
@@ -201,6 +242,14 @@ float4 SampleBindless(uint index, float2 uv)
 float4 SampleBindlessLod(uint index, float2 uv, float lod)
 {
     return gTextures[NonUniformResourceIndex(index)].SampleLevel(gBindlessSampler, uv, lod);
+}
+
+// Samples a bindless texture with EXPLICIT screen-space gradients. Well-defined inside
+// divergent control flow (e.g. a per-decal loop that `continue`s per lane), where the
+// implicit-derivative Sample() would be undefined behaviour.
+float4 SampleBindlessGrad(uint index, float2 uv, float2 dx, float2 dy)
+{
+    return gTextures[NonUniformResourceIndex(index)].SampleGrad(gBindlessSampler, uv, dx, dy);
 }
 
 // POINT-fetches a bindless texel (no filtering, no addressing). For masks whose texel
@@ -387,8 +436,16 @@ float ShadowFactor(float3 positionWS, float NdotL)
         // halving it gives the daytime frame the headroom to reach the vsync cap that
         // night already hits. A per-world-position rotation dithers the sparser kernel
         // so it doesn't reveal a fixed grid (same trick as ShadowFactorCheap below).
-        const float rot =
+        //
+        // With ONLY the spatial hash the dither is WORLD-LOCKED, so a soft penumbra reads
+        // as a stationary salt-and-pepper speckle. When TAA is resolving this frame
+        // (gTaaActive), sweep the rotation over time so each surface point samples a
+        // DIFFERENT kernel orientation every frame and TAA averages them into a smooth soft
+        // shadow - at ZERO extra taps. Gated so the Low preset (no TAA) keeps the stable
+        // static dither instead of shimmering. gWeather.w = time.
+        float rot =
             frac(sin(dot(positionWS.xz, float2(12.9898f, 78.233f))) * 43758.5453f) * 6.2831853f;
+        rot += gWeather.w * 30.0f * float(gTaaActive);
         const float sr = sin(rot), cr = cos(rot);
         const float2 kBase[4] = {float2(0.9f, 0.9f), float2(-0.9f, 0.9f), float2(0.9f, -0.9f),
                                  float2(-0.9f, -0.9f)};

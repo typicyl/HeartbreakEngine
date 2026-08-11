@@ -48,6 +48,7 @@ struct EnvironmentSettings {
     f32 timeOfDay = 10.0f;
     f32 dayLengthSeconds = 0.0f;
     u32 dynamicSky = 0;
+    u32 dynamicIBL = 0; // 1 = throttled ambient/reflection IBL re-bake as the sun moves
 
     // Weather: cloud cover/density for the analytic sky + an overcast gray-out.
     f32 cloudCoverage = 0.0f;
@@ -55,6 +56,22 @@ struct EnvironmentSettings {
     f32 overcast = 0.0f;
     f32 windAngle = 45.0f;  // direction clouds drift toward (degrees)
     f32 windSpeed = 0.01f;  // cloud drift speed
+
+    // Weather surface response + precipitation defaults (copied into every scene by
+    // SetupEnvironment). See SceneEnvironment for the meaning of each; when
+    // dynamicWeather is on the engine simulates wetness/puddles/snow from precip.
+    f32 wetness = 0.0f;
+    f32 puddles = 0.0f;
+    f32 snowAmount = 0.0f;
+    u32 precipType = 0;         // 0 none, 1 rain, 2 snow
+    f32 precipIntensity = 0.0f;
+    u32 dynamicWeather = 0;
+    f32 puddleScale = 6.0f;     // puddle noise world tiling (m)
+    f32 snowScale = 4.0f;       // snow break-up noise world tiling (m)
+    u32 volumetricClouds = 0;   // 1 = raymarched volumetric clouds (else the 2D layer)
+    f32 cloudQuality = 0.4f;    // volumetric cloud step-count scale
+    u32 lightning = 0;          // 1 = weather-driven lightning flashes during storms
+    std::string thunderSound;   // optional .uaf (rel to Assets) played after a strike
 
     // Project-wide HDR post-process stack (bloom/AO/SSR/fog/grade/...). Applied
     // to the scene by SetupEnvironment; edited in the Project Settings window.

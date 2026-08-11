@@ -45,7 +45,10 @@ void SampleAt(const AnimationTrack& track, f32 t, Transform& out) {
     const AnimationTrack::Key& a = keys[next - 1];
     const AnimationTrack::Key& b = keys[next];
     const f32 span = glm::max(b.time - a.time, 1e-6f);
-    const f32 f = glm::clamp((t - a.time) / span, 0.0f, 1.0f);
+    // The curve on the DESTINATION key `b` shapes the interpolation into it (so an
+    // ease-out settle is authored per landing), matching the cutscene convention.
+    const f32 lin = glm::clamp((t - a.time) / span, 0.0f, 1.0f);
+    const f32 f = ease::Ease(b.ease, lin);
 
     out.position = glm::mix(a.position, b.position, f);
     out.rotation = glm::normalize(glm::slerp(a.rotation, b.rotation, f));
@@ -332,7 +335,8 @@ void UpdateMotionMatching(Scene& scene, const std::filesystem::path& assetsDir, 
             }
             if (bestClip != an.clip) {
                 an.clip = bestClip;
-                an.time = bestTime; // jump to the matched pose (UpdateSkeletal blends via remap)
+                an.time = bestTime; // jump to the matched pose; UpdateSkeletal detects
+                                    // the clip change and crossfades so it does not pop
             }
             an.playing = true;
         }
@@ -424,6 +428,16 @@ void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt
         if (!source->clips.empty()) {
             an.clip = glm::clamp(an.clip, 0, static_cast<i32>(source->clips.size()) - 1);
             clip = &source->clips[static_cast<usize>(an.clip)];
+        }
+
+        // Detect a clip switch (by hand, MotionMatching, or a cutscene marker) and
+        // start a crossfade FROM the pose snapshotted last frame, so the switch eases
+        // in instead of popping. The blend itself is applied after sampling, below.
+        if (clip && an.clip != an.activeClip) {
+            an.activeClip = an.clip;
+            an.blending = an.blendPoseValid && an.blendTime > 1e-4f &&
+                          an.blendPos.size() == jointCount;
+            an.blendElapsed = 0.0f;
         }
 
         // Advance the playhead.
@@ -571,6 +585,37 @@ void UpdateSkeletal(Scene& scene, const std::filesystem::path& assetsDir, f32 dt
         } else {
             an.rootTrackValid = false;
         }
+
+        // Crossfade: ease the freshly sampled pose OUT of the snapshot captured at
+        // the last clip switch. w runs 0->1 over blendTime; at w=0 we hold the old
+        // pose (no pop), at w=1 we are fully on the new clip. Applied AFTER root
+        // motion so the entity travel above comes from the pure new clip (blending
+        // the root translation would lurch the character by the inter-clip offset).
+        if (an.blending && an.blendPos.size() == jointCount &&
+            an.blendRot.size() == jointCount && an.blendScale.size() == jointCount) {
+            an.blendElapsed += dt;
+            const f32 w =
+                glm::clamp(an.blendElapsed / glm::max(an.blendTime, 1e-4f), 0.0f, 1.0f);
+            for (usize j = 0; j < jointCount; ++j) {
+                locals[j].p = glm::mix(an.blendPos[j], locals[j].p, w);
+                locals[j].r = glm::normalize(glm::slerp(an.blendRot[j], locals[j].r, w));
+                locals[j].s = glm::mix(an.blendScale[j], locals[j].s, w);
+            }
+            if (w >= 1.0f) an.blending = false;
+        }
+        // Refresh the snapshot with the FINAL local pose (pre-body-scale, so the
+        // constant body-shape scale is not baked in and then re-applied) for the
+        // next clip switch - kept fresh so a switch mid-blend eases from wherever
+        // the blend currently is.
+        an.blendPos.resize(jointCount);
+        an.blendRot.resize(jointCount);
+        an.blendScale.resize(jointCount);
+        for (usize j = 0; j < jointCount; ++j) {
+            an.blendPos[j] = locals[j].p;
+            an.blendRot[j] = locals[j].r;
+            an.blendScale[j] = locals[j].s;
+        }
+        an.blendPoseValid = true;
 
         // Compose model-space globals (parents precede children).
         static thread_local std::vector<glm::mat4> globals;

@@ -438,7 +438,13 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
     // stays true for the whole editor process (it drives EditorHidden culling), so
     // on its own it left the authored screen force-visible while playing, stacked
     // over whatever the game flow actually showed. See Scene::SetUIAuthoringView.
-    const bool editorView = scene.EditorView() && scene.UIAuthoringView();
+    //
+    // ALSO gated on docFilter != 0: the force-show belongs ONLY to the UI editor's
+    // own document-scoped canvas build (BuildDocumentVertices passes the active doc
+    // id). The main scene/game-view overlay build passes docFilter == 0 and must use
+    // pure runtime semantics, or an authored screen leaks into the 3D scene view the
+    // moment the UI editor tags it - which is not wanted while editing a UI document.
+    const bool editorView = scene.EditorView() && scene.UIAuthoringView() && docFilter != 0;
 
     // Root membership test for the editor's document-scoped build.
     const auto inDoc = [&](entt::entity e) {

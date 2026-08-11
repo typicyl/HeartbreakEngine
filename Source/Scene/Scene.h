@@ -37,6 +37,7 @@ struct SceneEnvironment {
     f32  timeOfDay = 10.0f;       // hours [0,24)
     f32  dayLengthSeconds = 0.0f; // real seconds for one 24h cycle (0 = paused)
     u32  dynamicSky = 0;          // 1 = drive the sun from timeOfDay
+    u32  dynamicIBL = 0;          // 1 = re-bake ambient/reflection IBL as the sun/weather move
     // 1 = the three fields above came from the SCENE FILE's header, not from the
     // project. They are a per-level OVERRIDE (see scene::ApplyEnvironment), and this
     // flag is what makes them round-trip: a scene that never authored an override
@@ -59,6 +60,24 @@ struct SceneEnvironment {
     f32  overcast = 0.0f;
     f32  windAngle = 45.0f;   // compass heading clouds drift toward (degrees)
     f32  windSpeed = 0.01f;   // cloud drift speed (UV units/sec)
+
+    // Weather surface response + precipitation state. wetness/puddles/snowAmount are
+    // the CURRENT ground state (possibly simulated). precipType + precipIntensity are
+    // the driver: when dynamicWeather is on, weather::Update eases the three toward
+    // targets each frame (rain wets & pools, snow accumulates, clear dries/melts);
+    // off = the authored values are used as-is (a permanently wet/snowy scene).
+    f32  wetness = 0.0f;         // 0 dry .. 1 soaked
+    f32  puddles = 0.0f;         // 0 none .. 1 standing water in flat/low areas
+    f32  snowAmount = 0.0f;      // 0 none .. 1 snow on up-facing surfaces
+    u32  precipType = 0;         // 0 none, 1 rain, 2 snow
+    f32  precipIntensity = 0.0f; // 0..1 precip rate
+    u32  dynamicWeather = 0;     // 1 = weather::Update simulates wet/puddle/snow
+    f32  puddleScale = 6.0f;     // puddle noise world tiling (m)
+    f32  snowScale = 4.0f;       // snow break-up noise world tiling (m)
+    u32  volumetricClouds = 0;   // 1 = raymarched volumetric clouds (else the 2D layer)
+    f32  cloudQuality = 0.4f;    // volumetric cloud step-count scale (low-end: lower)
+    u32  lightning = 0;          // 1 = weather-driven lightning flashes during storms
+    std::string thunderSound;    // optional .uaf (rel to Assets) played after a strike ("" = none)
 
     // Image-based lighting (bindless); zero handles -> flat ambient fallback.
     rhi::TextureHandle irradiance;
@@ -237,6 +256,29 @@ public:
     SceneEnvironment&       Environment()       { return env_; }
     const SceneEnvironment& Environment() const { return env_; }
 
+    // Runtime interactive-water ripple ring buffer (rain splashes + water::AddRipple);
+    // NOT serialized. Each entry = (centerX, centerZ, age seconds, strength). Aged/spawned
+    // by water::Update, read into the SceneView by MakeView; capped at rhi::kMaxRipples.
+    std::vector<glm::vec4>&       WaterRipples()       { return waterRipples_; }
+    const std::vector<glm::vec4>& WaterRipples() const { return waterRipples_; }
+
+    // Runtime lightning flash intensity (0 = none); set by lightning::Update, read by
+    // MakeView to briefly boost scene light/ambient/exposure. NOT serialized.
+    f32& LightningFlash()       { return lightningFlash_; }
+    f32  LightningFlash() const { return lightningFlash_; }
+
+    // Accumulated scene animation clock (seconds). ONE source for both the GPU wave/sky time
+    // (gWeather.w, via MakeView -> SceneView.timeSeconds) and CPU water buoyancy, so floating
+    // objects sit exactly on the rendered surface. Advanced by water::Update; NOT serialized.
+    void AdvanceTime(f32 dt) { time_ += dt; }
+    f32  Time() const { return time_; }
+
+    // Whether the GPU FFT ocean is live AND its displacement buffer is bound this frame. Set by
+    // the Engine after driving ocean::UpdateForScene; MakeView gates the water VS's FFT branch
+    // on it so the shader never reads an unbound buffer. NOT serialized.
+    void SetOceanActive(bool a) { oceanActive_ = a; }
+    bool OceanActive() const { return oceanActive_; }
+
     // Creates an entity, optionally tagging it with a Name component.
     entt::entity CreateEntity(const std::string& name = {});
 
@@ -347,6 +389,10 @@ private:
 
     entt::registry   registry_;
     SceneEnvironment env_;
+    std::vector<glm::vec4> waterRipples_; // runtime water ripple ring buffer (see WaterRipples)
+    f32 lightningFlash_ = 0.0f;           // runtime lightning flash intensity (see LightningFlash)
+    f32 time_ = 0.0f;                     // scene animation clock (see AdvanceTime/Time)
+    bool oceanActive_ = false;            // GPU FFT ocean bound this frame (see SetOceanActive)
     u64              worldToken_ = 1; // see WorldToken()
     StreamingResidency streaming_;
     bool             editorView_ = false; // editor-only EditorHidden culling
@@ -402,6 +448,11 @@ void ApplyGraphicsPreset(rhi::PostSettings& p, int preset);
 // that makes the viewport brighter than the file it opened. `SetupSky` is
 // idempotent and look-preserving; it is safe to press.
 void SetupSky(Scene& scene, Renderer& renderer);
+
+// Throttled dynamic-IBL cohesion: re-bake the ambient + reflection maps in place from the
+// LIVE day/night sun (leak-free; see Scene.cpp). Call from the engine loop when the sun
+// has moved and dynamicIBL is on.
+void RebakeSkyLive(Scene& scene, Renderer& renderer);
 
 // Stamps the PROJECT's look defaults (ambientIntensity / exposure / post) onto the
 // scene, destroying whatever the loaded scene authored. Legitimate at BOOT, before

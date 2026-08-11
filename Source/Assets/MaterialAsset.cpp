@@ -43,6 +43,8 @@ bool SaveMaterial(const fs::path& path, const MaterialAsset& mat) {
     j["emissiveIntensity"] = mat.emissiveIntensity;
     j["subsurfaceColor"] = ToJson(mat.subsurfaceColor);
     j["subsurfaceRadius"] = mat.subsurfaceRadius;
+    j["clearcoat"] = mat.clearcoat;
+    j["clearcoatRoughness"] = mat.clearcoatRoughness;
     j["flags"] = mat.flags;
     json& tex = j["textures"] = json::object();
     if (!mat.albedoTex.empty()) tex["albedo"] = mat.albedoTex;
@@ -81,8 +83,10 @@ std::optional<MaterialAsset> LoadMaterial(const fs::path& path) {
     m.roughness = j.value("roughness", 0.5f);
     m.emissiveColor = Vec3(j.value("emissiveColor", json()), glm::vec3(0.0f));
     m.emissiveIntensity = j.value("emissiveIntensity", 1.0f);
-    m.subsurfaceColor = Vec3(j.value("subsurfaceColor", json()), {1.0f, 0.3f, 0.2f});
+    m.subsurfaceColor = Vec3(j.value("subsurfaceColor", json()), {0.85f, 0.2f, 0.16f});
     m.subsurfaceRadius = j.value("subsurfaceRadius", 1.0f);
+    m.clearcoat = j.value("clearcoat", 0.0f);
+    m.clearcoatRoughness = j.value("clearcoatRoughness", 0.08f);
     m.flags = j.value("flags", 0u);
     if (const auto it = j.find("textures"); it != j.end() && it->is_object()) {
         m.albedoTex = it->value("albedo", "");
@@ -105,6 +109,8 @@ void ApplyMaterial(Renderer& renderer, const fs::path& assetsDir,
     instance.emissiveIntensity = mat.emissiveIntensity;
     instance.subsurfaceColor = mat.subsurfaceColor;
     instance.subsurfaceRadius = mat.subsurfaceRadius;
+    instance.clearcoat = mat.clearcoat;
+    instance.clearcoatRoughness = mat.clearcoatRoughness;
     instance.materialFlags = mat.flags;
 
     auto load = [&](const std::string& rel) -> rhi::TextureHandle {

@@ -88,6 +88,8 @@ struct EntityData {
     u32 materialFlags = 0;
     glm::vec3 subsurfaceColor{1.0f, 0.3f, 0.2f};
     f32 subsurfaceRadius = 1.0f;
+    f32 clearcoat = 0.0f;
+    f32 clearcoatRoughness = 0.08f;
     glm::vec3 emissiveColor{0.0f};
     f32 emissiveIntensity = 1.0f;
     std::string materialAsset; // MaterialRef::asset (.hbmat, optional)
@@ -131,10 +133,10 @@ struct EntityData {
     TerrainComponent terrain;
     bool hasMotionMatching = false;
     MotionMatching motionMatching;
-    bool hasBuilding = false;
-    ProceduralBuilding building;
     bool hasRotator = false;
     Rotator rotator;
+    bool hasModelGroup = false;
+    ModelGroup modelGroup;
     bool hasCensor = false;
     CensorComponent censor;
     bool hasCharacter = false;
@@ -177,6 +179,10 @@ struct EntityData {
     PostVolume postVolume;
     bool hasProbe = false;
     ReflectionProbe probe;
+    bool hasDecal = false;
+    DecalComponent decal;
+    bool hasWater = false;
+    WaterComponent water;
     bool hasCheckpoint = false;
     Checkpoint checkpoint;
     bool hasHealth = false;

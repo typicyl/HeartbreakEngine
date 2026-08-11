@@ -1,7 +1,6 @@
 // Engine/Engine.cpp
 #include "Engine/Engine.h"
 
-#include "Construction/ConstructionSystem.h"
 #include "Core/Platform.h"
 #include "Engine/CutscenePlayer.h"
 #include "Assets/CutsceneAsset.h"
@@ -25,6 +24,11 @@
 #include "Scene/CameraSystem.h"
 #include "Scene/CharacterController.h"
 #include "Scene/ParticleSystem.h"
+#include "Scene/WeatherSystem.h"
+#include "Scene/DecalSystem.h"
+#include "Scene/WaterSystem.h"
+#include "Scene/LightningSystem.h"
+#include "Assets/MeshGenerator.h"
 #include "Scene/PaintSystem.h" // --test-terraincollide: terrain brush raycast + dab
 #include "Scene/TerrainSystem.h"
 #include "Scene/SceneSerializer.h"
@@ -163,6 +167,12 @@ int Engine::Run(const EngineConfig& configIn) {
     forceTimeOfDay_ = config.forceTimeOfDay;
     forceDayLength_ = config.forceDayLength;
     forceClouds_ = config.forceClouds;
+    forceWetness_ = config.forceWetness;
+    forceSnow_ = config.forceSnow;
+    forceRain_ = config.forceRain;
+    forceVolClouds_ = config.forceVolClouds;
+    forceDynIBL_ = config.forceDynIBL;
+    forceLightning_ = config.forceLightning;
 
     // Register any schematics that were transpiled to native C++ and linked into
     // this executable (a baked runtime). The stub registers nothing, so the editor
@@ -1898,7 +1908,12 @@ int Engine::Run(const EngineConfig& configIn) {
     // frame or two afterwards. Safe here: BindMenuWorld is a no-op unless the
     // project asks for it, and it falls back to the flat menu rather than a black
     // screen if the scene will not bind.
-    BindMenuWorld();
+    //
+    // NOT under --play (playOnBoot_): that skips the menu entirely and boots straight
+    // into gameplay, so binding + force-streaming the menu backdrop here would be pure
+    // wasted work that FlowPlay then immediately discards (and the settle-hold below
+    // would stall boot on it for nothing).
+    if (!playOnBoot_) BindMenuWorld();
     if (studioSplash && menuWorldBound_) PresentBootSplash(0.75f); // world is up
 
     // THE resident UI layer: open the `.hbui` document holding ALL screens
@@ -2088,6 +2103,33 @@ int Engine::Run(const EngineConfig& configIn) {
     if (config.stressParticles > 0) {
         scene::SpawnParticleStress(scene, config.stressParticles, config.gpuParticles,
                                    config.gpuSimParticles);
+    }
+    if (config.spawnWater) { // --water: a Gerstner water plane at the origin (Y=0)
+        const entt::entity e = scene.CreateEntity("Water");
+        scene.Registry().emplace<Transform>(e, Transform{});
+        WaterComponent wc{};
+        wc.fftOcean = config.fftOcean; // --fftocean: exercise the GPU FFT path instead of Gerstner
+        scene.Registry().emplace<WaterComponent>(e, wc);
+        // A few dynamic spheres over the water to demo buoyancy (run physics with --play).
+        const MeshData ball = mesh::GenerateSphere(0.5f, 24, 16);
+        const rhi::MeshHandle ballMesh = renderer.UploadMesh(ball);
+        for (int i = 0; i < 6; ++i) {
+            const entt::entity b = scene.CreateEntity("FloatBall");
+            Transform bt;
+            bt.position = {static_cast<f32>(i % 3) * 2.5f - 2.5f, 3.0f + (i / 3) * 1.2f,
+                           static_cast<f32>(i / 3) * 2.5f - 1.25f};
+            scene.Registry().emplace<Transform>(b, bt);
+            MeshInstance mi;
+            mi.mesh = ballMesh;
+            mi.baseColor = {0.85f, 0.35f, 0.2f, 1.0f};
+            mi.roughness = 0.4f;
+            scene.Registry().emplace<MeshInstance>(b, mi);
+            RigidBody rb;
+            rb.shape = RigidBody::Shape::Sphere;
+            rb.radius = 0.5f;
+            rb.motion = RigidBody::Motion::Dynamic;
+            scene.Registry().emplace<RigidBody>(b, rb);
+        }
     }
 
     if (config.forceDof) scene.Environment().post.dofEnabled = 1;
@@ -2495,6 +2537,8 @@ int Engine::Run(const EngineConfig& configIn) {
         anim::Update(scene, dt, simulating); // keyframe tracks pose entities first
         // Build/refresh any dirty chunked terrain (cheap when nothing changed).
         terrain::Update(scene, renderer);
+        // Water surfaces: build/refresh their grids, age ripples, spawn rain splashes.
+        water::Update(scene, renderer, dt);
         // Motion matching picks each animator's clip from movement intent BEFORE
         // the skeletal pose is sampled (play mode / runtime only).
         if (physics.IsRunning()) anim::UpdateMotionMatching(scene, assetsDir, dt);
@@ -2692,6 +2736,9 @@ int Engine::Run(const EngineConfig& configIn) {
         // is false there) - play-in-editor characters still move.
         if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing))
             character::Update(scene, input, dt, renderer.GetCamera().Forward());
+        // Buoyancy: float dynamic bodies on the water surface. BEFORE the step so the forces
+        // it queues are integrated this frame (matching destruction's after-step ordering).
+        if (physics.IsRunning()) water::ApplyBuoyancy(scene, physics, dt);
         physics.Update(scene, dt);
         // Destruction runs immediately after physics so this frame's contacts are
         // still queued: it is the only consumer of PhysicsWorld::PopContact, and a
@@ -2768,9 +2815,6 @@ int Engine::Run(const EngineConfig& configIn) {
             UpdateInteractions(scene, dt);
         }
         if (physics.IsRunning()) anim::UpdateRotators(scene, dt);
-        // Regenerates any ProceduralBuilding whose revision moved. Cheap when nothing changed
-        // (one view iteration), and revision-gated because the RHI cannot free a mesh.
-        construction::Sync(scene, GetRenderer());
         // Spatial-audio occlusion: push the project's tuning + a physics segment
         // test so 3D sources are attenuated/muffled by geometry (multi-ray leaks
         // through gaps). Only fed while the game runs (colliders live then).
@@ -3003,12 +3047,17 @@ int Engine::Run(const EngineConfig& configIn) {
             pRight = glm::dot(pRight, pRight) > 1e-6f ? glm::normalize(pRight)
                                                       : glm::vec3(1.0f, 0.0f, 0.0f);
             const glm::vec3 pUp = glm::normalize(glm::cross(pRight, fwd));
+            decal::Update(scene, renderer, assetsDir); // resolve decal .uaf -> bindless
             particle::BuildVertices(scene, renderer, assetsDir, pRight, pUp, particleAlpha,
                                     particleAdd);
             // 3D text objects (WorldText) ride the same depth-tested quad batch.
             // They are arbitrary font-atlas glyph quads with no particle and no
             // emitter behind them, so they stay on the CPU path by construction.
             ui::AppendWorldText(scene, renderer, assetsDir, pRight, pUp, particleAlpha);
+            // Weather precipitation: a camera-following rain/snow field driven by the
+            // scene's precip state, appended to the same alpha billboard batch.
+            precip::UpdateAndBuild(precip_, scene, renderer.GetCamera().Position(), pRight,
+                                   pUp, dt, particleAlpha);
             renderer.SetParticles(particleAlpha, particleAdd);
 
             // GPU vertex expansion for emitters that opted in: upload 64-byte
@@ -3106,6 +3155,20 @@ int Engine::Run(const EngineConfig& configIn) {
             renderer.SetVolumeParticles(volumeBlobs, vp); // before RenderScene (Vulkan splats in BeginFrame)
         }
 
+        // FFT ocean (Tessendorf): drive the GPU compute FFT for any fftOcean water and bind its
+        // displacement buffer for the water VS - BEFORE RenderScene, like SetVolumeParticles
+        // (the compute runs at BeginFrame). SetVertexShaderBuffer applies + consumes the binding
+        // in the next DrawScene (the backend re-binds root param 6 / set 2 every DrawScene, with
+        // a never-read dummy when nothing is set), and SetOceanActive gates the shader so it
+        // never reads an unbound buffer. Shares the VS structured-buffer seam with GPU-sim
+        // particles - a scene should not drive both at once (documented limit).
+        {
+            const rhi::GpuBufferHandle oceanBuf =
+                ocean::UpdateForScene(ocean_, scene, renderer, scene.Time());
+            renderer.SetVertexShaderBuffer(oceanBuf, 0); // valid = bind; invalid = unbind (Gerstner)
+            scene.SetOceanActive(oceanBuf.IsValid());
+        }
+
         // Advance UI animation clips (writes UIElement transform/color/frame fields)
         // BEFORE building the UI geometry so this frame reflects the animated pose.
         ui::UpdateAnimations(scene, dt, assetsDir);
@@ -3189,9 +3252,59 @@ int Engine::Run(const EngineConfig& configIn) {
             scene.Environment().dayLengthSeconds = forceDayLength_;
         }
         if (forceClouds_ >= 0.0f) scene.Environment().cloudCoverage = forceClouds_;
+        // --wetness / --snow / --rain: force the ground weather each frame (dev/demo).
+        // --rain also turns on the simulation so wetness/puddles accumulate live.
+        if (forceWetness_ >= 0.0f) scene.Environment().wetness = forceWetness_;
+        if (forceSnow_ >= 0.0f) {
+            scene.Environment().snowAmount = forceSnow_;
+            scene.Environment().precipType = 2u; // snow (for precip particles later)
+        }
+        if (forceRain_ >= 0.0f) {
+            scene.Environment().precipType = 1u; // rain
+            scene.Environment().precipIntensity = forceRain_;
+            scene.Environment().dynamicWeather = 1u; // let it wet the ground + pool
+        }
+        if (forceVolClouds_) {
+            scene.Environment().volumetricClouds = 1u;
+            if (scene.Environment().cloudCoverage < 0.1f)
+                scene.Environment().cloudCoverage = 0.5f; // give it something to draw
+        }
+        if (forceDynIBL_) {
+            scene.Environment().dynamicIBL = 1u;
+            scene.Environment().dynamicSky = 1u;
+            if (forceDayLength_ < 0.0f && forceTimeOfDay_ < 0.0f)
+                scene.Environment().dayLengthSeconds = 20.0f; // move the sun so it re-bakes
+        }
+        if (forceLightning_) {
+            SceneEnvironment& le = scene.Environment();
+            le.lightning = 1u;
+            le.precipType = 1u;
+            le.precipIntensity = 0.8f;
+            le.overcast = 0.6f;
+            le.cloudCoverage = std::max(le.cloudCoverage, 0.6f);
+        }
         // Day/night: advance the time of day and drive the sun + ambient so the
         // analytic sky and scene lighting move together (no-op unless dynamicSky).
         UpdateDayNight(scene, dt);
+        // Dynamic-IBL cohesion (opt-in): re-bake the ambient + reflection maps from the
+        // LIVE sun so ambient light and reflections (incl. water) follow the day/night sun
+        // instead of the stale boot bake. Throttled - only when the sun has moved ~4.4 deg
+        // AND >= 2 s since the last bake - because the re-bake is a few-ms CPU hitch.
+        iblRebakeTimer_ += dt;
+        if (scene.Environment().dynamicIBL != 0 && scene.Environment().dynamicSky != 0 &&
+            iblRebakeTimer_ >= 2.0f) {
+            const glm::vec3 sun = scene.Environment().sun.direction;
+            if (glm::dot(sun, iblLastSunDir_) < 0.997f) { // moved (or first bake: last=0)
+                scene::RebakeSkyLive(scene, renderer);
+                iblRebakeTimer_ = 0.0f;
+                iblLastSunDir_ = sun;
+            }
+        }
+        // Ground weather: ease wetness/puddles/snow from the precip state (no-op
+        // unless dynamicWeather). Runs before RenderScene so MakeView sees the update.
+        weather::Update(scene, dt);
+        // Weather-driven lightning flashes (storm-gated); may fire a thunder cue.
+        lightning::Update(scene, dt, &audio, assetsDir);
         {
             const auto _pt = clock::now();
             renderer.RenderScene(scene, dt);
@@ -3256,7 +3369,8 @@ void Engine::UpdateTagStreaming(Scene& scene, Renderer& renderer) {
     // test driver. Anything else - MainMenu, Boot, and every editor frame - returns.
     if (!tagStreamTestActive_ && gameState_ != GameState::Playing &&
         gameState_ != GameState::Loading &&
-        !(gameState_ == GameState::MainMenu && menuWorldBound_)) // 3D menu backdrop
+        !(gameState_ == GameState::MainMenu && menuWorldBound_) && // 3D menu backdrop
+        !(gameState_ == GameState::Booting && menuWorldBound_))    // ...preloaded behind the splash
         return;
     // And the editor's AUTHORING world never streams at all, whatever gameState_ says.
     // onInit_ is set only by the editor (see its other uses); --tagstreamtest runs
@@ -4049,30 +4163,57 @@ void Engine::BindMenuWorld() {
 void Engine::FlowMainMenu() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
     if (!uiManagerMode_) return; // no menu concept without a UI scene
-    // LEAVE THE LEVEL THROUGH THE STREAMER FIRST (plan blocker B7). The sweep below
-    // destroys entities; doing that to a resident shard without capturing it would
-    // silently discard every delta the player made in it - the door they opened, the
-    // guard they killed - so quit-to-menu-and-Play-again would reset the world. UnloadAll
-    // captures the resident set AND every resident shard, drains any staging job (so no
-    // worker is left writing into a level that is going away), and then despawns.
-    // Reset() forgets the binding; the next FlowPlay binds afresh.
-    tagStream_.UnloadAll(*scene_);
-    tagStream_.Reset(scene_);
-    // Unload the gameplay world but keep the resident UI, then show the initial
-    // (menu) panel. No scene swap. The spare predicate is IDENTICAL to
-    // scene::Instantiate's Replace sweep - Persistent (the runtime decoration and
-    // the legacy UI layer) plus UIDocMember::screenOwned (an open `.hbui`). The
-    // flag lives in the component so both sites can evaluate the same test.
-    auto& reg = scene_->Registry();
-    std::vector<entt::entity> kill;
-    for (const entt::entity e : reg.storage<entt::entity>()) {
-        const UIDocMember* m = reg.try_get<UIDocMember>(e);
-        if (!reg.all_of<Persistent>(e) && !(m && m->screenOwned)) kill.push_back(e);
+
+    // Close a lingering boot/studio splash document. Normally FlowAfterBoot reaps it
+    // before dispatching here (so this no-ops, bootDoc_ == 0), but the dev overlay's
+    // "Main menu" and F3 can call FlowMainMenu DIRECTLY during Booting, bypassing
+    // FlowAfterBoot - and the boot document is screenOwned, so the sweep below spares it,
+    // leaving the splash drawing on top of the menu forever. Reaping it here is idempotent.
+    if (bootDoc_ != 0 && scene_) {
+        docs_.Close(*scene_, bootDoc_);
+        bootDoc_ = 0;
     }
-    for (const entt::entity e : kill)
-        if (reg.valid(e)) reg.destroy(e);
-    currentScenePath_.clear(); // no gameplay world resident any more
-    loadingPanelEntities_.clear();
+
+    // TWO paths reach here and they need OPPOSITE handling:
+    //   * QUIT-TO-MENU (from gameplay): a gameplay world is resident and must be torn
+    //     down, then the menu backdrop rebound.
+    //   * BOOT -> FlowAfterBoot: the backdrop was already bound AND streamed in behind
+    //     the studio splash (UpdateGameFlow holds boot until it settles), so it must be
+    //     KEPT. Tearing it down and rebinding here is exactly what made the world pop in
+    //     a beat AFTER the menu appeared - the reload happened once the menu was already up.
+    // menuWorldBound_ is true ONLY on the boot path (FlowPlay clears it entering gameplay)
+    // and no gameplay scene is resident there, so this pair tells the two apart cleanly.
+    const bool bootKeep = menuWorldBound_ && currentScenePath_.empty();
+
+    if (!bootKeep) {
+        // LEAVE THE LEVEL THROUGH THE STREAMER FIRST (plan blocker B7). The sweep below
+        // destroys entities; doing that to a resident shard without capturing it would
+        // silently discard every delta the player made in it - the door they opened, the
+        // guard they killed - so quit-to-menu-and-Play-again would reset the world. UnloadAll
+        // captures the resident set AND every resident shard, drains any staging job (so no
+        // worker is left writing into a level that is going away), and then despawns.
+        // Reset() forgets the binding; the rebind below binds afresh.
+        tagStream_.UnloadAll(*scene_);
+        tagStream_.Reset(scene_);
+        // Reset unbinds the streamer + the sweep destroys the backdrop, so keep the Engine
+        // flag in sync - else the rebind guard below sees a stale `true` and skips it.
+        menuWorldBound_ = false;
+        // Unload the gameplay world but keep the resident UI, then show the initial
+        // (menu) panel. No scene swap. The spare predicate is IDENTICAL to
+        // scene::Instantiate's Replace sweep - Persistent (the runtime decoration and
+        // the legacy UI layer) plus UIDocMember::screenOwned (an open `.hbui`). The
+        // flag lives in the component so both sites can evaluate the same test.
+        auto& reg = scene_->Registry();
+        std::vector<entt::entity> kill;
+        for (const entt::entity e : reg.storage<entt::entity>()) {
+            const UIDocMember* m = reg.try_get<UIDocMember>(e);
+            if (!reg.all_of<Persistent>(e) && !(m && m->screenOwned)) kill.push_back(e);
+        }
+        for (const entt::entity e : kill)
+            if (reg.valid(e)) reg.destroy(e);
+        currentScenePath_.clear(); // no gameplay world resident any more
+        loadingPanelEntities_.clear();
+    }
     // Leaving gameplay: stop any in-progress dialogue and clear its captions so
     // they don't linger/resume over the menu.
     ResetDialogueRuntime();
@@ -4082,15 +4223,10 @@ void Engine::FlowMainMenu() {
     cutsceneTime_ = -1.0f;
     if (physics_) physics_->SetRunning(true);
     fadeAlpha_ = 0.0f; // clear any leftover fade curtain from an interrupted load
-    // 3D menu: rebind the AUTHORED backdrop (MenuWorld mode - the teardown above
-    // already captured the gameplay run; this bind writes no world:: state at all).
-    //
-    // ONLY WHEN NOTHING IS BOUND. Two paths reach here: quit-to-menu, where the
-    // sweep above just destroyed the world and a rebind is the point; and
-    // FlowAfterBoot, where the splash ALREADY bound it. Rebinding at boot would
-    // UnloadAll and rebuild the exact world the splash spent its time loading -
-    // undoing the load-behind-the-splash this feature exists for. FlowPlay clears
-    // the flag, so the quit-to-menu path still binds.
+    // 3D menu: rebind the AUTHORED backdrop only when it isn't already up. The
+    // quit-to-menu path just tore it down (guard true -> rebind); the boot path KEPT its
+    // splash-preloaded world (menuWorldBound_ still true -> skip), so it stays exactly as
+    // it streamed in - no reload, no pop-in. The bind writes no world:: state at all.
     if (!menuWorldBound_) BindMenuWorld();
     uiManager_.ShowInitial(*scene_);
     SetCursorLocked(false);
@@ -5353,7 +5489,13 @@ void Engine::UpdateGameFlow(f32 dt) {
         const f32 p = glm::clamp(loadTimer_ / kBootDuration, 0.0f, 1.0f);
         SetProgressFill(*scene_, p);
         SubstituteUITokens(p); // backend/gpu/audio/version/progress
-        if (loadTimer_ >= kBootDuration) FlowAfterBoot();
+        // Hold the splash until BOTH the minimum time has elapsed AND the 3D menu
+        // backdrop has finished streaming in behind it (so the menu appears with its
+        // world already present - no pop-in), capped so a broken shard can't hang boot.
+        const bool menuReady = !menuWorldBound_ ||
+                               (renderer_ && tagStream_.IsSettled(StreamFoci(*scene_, *renderer_)));
+        if ((loadTimer_ >= kBootDuration && menuReady) || loadTimer_ >= kMaxLoadDuration)
+            FlowAfterBoot();
         break;
     }
     case GameState::MainMenu: {
@@ -5638,6 +5780,23 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.forceDayLength = std::stof(argv[++i]); // auto-cycle seconds
         } else if (arg == "--clouds" && i + 1 < argc) {
             config.forceClouds = std::stof(argv[++i]); // cloud coverage 0..1
+        } else if (arg == "--wetness" && i + 1 < argc) {
+            config.forceWetness = std::stof(argv[++i]); // ground wetness 0..1
+        } else if (arg == "--snow" && i + 1 < argc) {
+            config.forceSnow = std::stof(argv[++i]); // snow accumulation 0..1
+        } else if (arg == "--rain" && i + 1 < argc) {
+            config.forceRain = std::stof(argv[++i]); // rain intensity 0..1 (wets ground)
+        } else if (arg == "--volclouds") {
+            config.forceVolClouds = true; // raymarched volumetric clouds
+        } else if (arg == "--water") {
+            config.spawnWater = true; // spawn a test Gerstner water plane
+        } else if (arg == "--fftocean") {
+            config.spawnWater = true; // spawn the test water...
+            config.fftOcean = true;   // ...driven by the GPU Tessendorf FFT
+        } else if (arg == "--dynibl") {
+            config.forceDynIBL = true; // dynamic IBL re-bake + dynamic sky
+        } else if (arg == "--lightning") {
+            config.forceLightning = true; // enable lightning + set a storm
         }
     }
 

@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "Core/Easing.h"      // ease::Curve (per-key AnimationTrack interpolation)
 #include "Scene/BodyShape.h"
 #include "RHI/RHI.h"
 #include "Scene/CameraRig.h"   // cam::CinematicSettings (CameraComponent cinematic rig)
@@ -272,9 +273,22 @@ struct MeshInstance {
     rhi::TextureHandle thicknessTexture; // SSS transmission thickness (0 = none)
     glm::vec3 emissiveColor{0.0f};
     f32 emissiveIntensity = 1.0f;
-    glm::vec3 subsurfaceColor{1.0f, 0.3f, 0.2f};
+    glm::vec3 subsurfaceColor{0.85f, 0.2f, 0.16f}; // deep crimson (blood), not sunburn orange
     f32 subsurfaceRadius = 1.0f;          // SSS scatter scale
+    f32 clearcoat = 0.0f;                 // wet/oily clear layer strength (0 = off)
+    f32 clearcoatRoughness = 0.08f;       // clear layer roughness (low = wet/glossy)
     u32 materialFlags = rhi::MaterialFlag_None;
+};
+
+// ROOT of a placed multi-submesh model. A model imported with N submeshes spawns as
+// one root + N child MeshInstances; this tags the root so the hierarchy shows the model
+// as ONE collapsed row (its submesh children are filtered from the outliner) instead of
+// exploding into N entries. `modular` records the authored choice: modular = the parts
+// stay individually swappable; static = they are a locked group. Both collapse in the
+// outliner; the children remain real, serialized entities either way.
+struct ModelGroup {
+    bool modular = true;
+    std::string source; // the .uaf this was placed from (relative to Assets/), for info
 };
 
 // One paint layer in a PaintComponent's stack (bottom -> top). Each layer holds
@@ -422,6 +436,16 @@ struct RigidBody {
 
     static constexpr u32 kInvalidBody = 0xFFFFFFFFu;
     u32 bodyId = kInvalidBody; // managed by PhysicsWorld
+
+    // Render interpolation between fixed physics steps (see CharacterController for
+    // why). The two most recent stepped world poses; PhysicsWorld lerps/slerps
+    // between them by the leftover-accumulator fraction each frame for the drawn
+    // Transform. Not serialized - rebuilt at runtime.
+    glm::vec3 renderPrevPos{0.0f};
+    glm::vec3 renderCurPos{0.0f};
+    glm::quat renderPrevRot{1.0f, 0.0f, 0.0f, 0.0f};
+    glm::quat renderCurRot{1.0f, 0.0f, 0.0f, 0.0f};
+    bool renderPoseInit = false;
 };
 
 // Optional human-readable label (debugging / editor).
@@ -635,6 +659,10 @@ struct Animator {
     // Transform instead of the skeleton (the character animates in place and
     // actually travels through the world, surviving loop wraps).
     bool rootMotion = false;
+    // Crossfade duration (seconds) when the clip changes. A clip switch - by hand,
+    // by MotionMatching, or by a cutscene marker - eases from the pose held at the
+    // switch into the new clip over this window instead of popping. 0 = hard cut.
+    f32 blendTime = 0.15f;
 
     // Runtime state (managed by anim::UpdateSkeletal; not serialized).
     std::vector<glm::mat4> palette; // per-joint global * inverseBind
@@ -645,6 +673,19 @@ struct Animator {
     glm::vec3 lastRootPos{0.0f};     // previous frame's sampled root position
     f32 lastRootTime = 0.0f;
     bool rootTrackValid = false;     // lastRootPos primed (no first-frame jump)
+
+    // Crossfade runtime state. On a clip switch the FINAL local pose of the frame
+    // before the switch (already snapshotted below) is eased into the new clip's
+    // pose over blendTime. The snapshot is the posed local transforms (pre-body-
+    // scale), refreshed every frame so a switch mid-blend re-eases from wherever
+    // the blend currently is. Not serialized. See anim::UpdateSkeletal.
+    i32 activeClip = -1;             // clip currently being posed (switch detector)
+    bool blending = false;           // a crossfade is in progress
+    f32 blendElapsed = 0.0f;         // seconds into the current crossfade
+    bool blendPoseValid = false;     // the snapshot below holds a real pose
+    std::vector<glm::vec3> blendPos; // snapshot local translations
+    std::vector<glm::quat> blendRot; // snapshot local rotations
+    std::vector<glm::vec3> blendScale; // snapshot local scales
 };
 
 // ROOT of a MODULAR CHARACTER: a character built from swappable PARTS (head,
@@ -694,6 +735,9 @@ struct AnimationTrack {
         glm::vec3 position{0.0f};
         glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
         glm::vec3 scale{1.0f};
+        // Curve used to reach THIS key from the previous one (serialized as an int;
+        // append-only). InOutCubic reads as a natural "ease into the pose".
+        ease::Curve ease = ease::Curve::InOutCubic;
     };
     std::vector<Key> keys; // kept sorted by time
     f32  duration = 5.0f;  // seconds
@@ -1316,76 +1360,6 @@ struct IKConstraint {
 
 // Constant rotation applied to the entity's Transform while the simulation runs
 // (local axis, degrees per second). A simple gameplay helper component.
-// A procedurally generated structure. THE SOURCE IS THE ASSET, NOT THE GEOMETRY.
-//
-// Everything visible is regenerated from the `.hbbuild` by construction::Sync, so the meshes are
-// never serialized and never round-trip. That is not a preference - an entity carrying a
-// MeshInstance with no resolvable MeshRef saves an empty mesh source and reloads with nothing, and
-// undo restores through LoadMode::Replace which destroys the world. A building survives both only
-// because it is reconstructible from this one string.
-struct ProceduralBuilding {
-    // Footprint control points, in the building's local space. Walls are generated along the
-    // segments between consecutive points, so dragging a point reshapes the plan.
-    std::vector<glm::vec3> path;
-    f32 pathWallHeight = 3.0f;
-    f32 pathWallThickness = 0.25f;
-    bool pathClosed = true;
-
-    std::string source;      // .hbbuild path relative to Assets/ (persisted)
-    f32 chunkSize = 4.0f;    // spatial chunk edge, metres (persisted)
-    // Bumped by anything that invalidates the generated children. NOT serialized: a freshly loaded
-    // building has no children yet, so it must always regenerate once.
-    u32 revision = 1;
-    u32 builtRevision = 0;   // runtime only
-};
-
-// Marker on the entities construction::Sync generates. One per (chunk, material).
-//
-// EXCLUDED from .hbscene by kExclusions, with Sync as the named regenerator. Without that row
-// these would serialize as authored content with an empty mesh source and paste back as junk -
-// the exact failure SkinnedPartRef already had.
-struct BuildChunkTag {
-    entt::entity owner = entt::null;
-    i32 cx = 0, cy = 0, cz = 0;
-};
-
-// A DIRECTLY MANIPULABLE construction component.
-//
-// WHY THIS EXISTS. A parameter list is not control. "Window Count = 3, evenly spaced" cannot make
-// the building the artist actually wants - it makes the building the preset author imagined. So
-// every component of a ProceduralBuilding can be spawned as a real entity whose Transform IS its
-// definition: position and rotation map straight across, and SCALE IS THE HALF-EXTENT, so the
-// existing translate/rotate/scale gizmo edits the construction directly with no new tooling.
-//
-// These are editor-only scaffolding: excluded from the scene file, destroyed when edit mode ends.
-struct BuildComponentProxy {
-    entt::entity owner = entt::null; // the ProceduralBuilding entity
-    u32 componentId = 0;             // construction::ComponentId
-};
-
-// ONE DRAGGABLE FACE OF A CONSTRUCTION PART - the Unreal-style box brush handle.
-//
-// A transform gizmo can only move, rotate or uniformly grab a whole object. Pulling ONE FACE is
-// what actually makes box modelling feel like modelling: you push a wall longer from its end
-// rather than scaling it about its middle and then re-centring it.
-//
-// Each handle is a small entity sitting at the centre of one face. Dragging it along its axis
-// moves that face's plane; the opposite face stays exactly where it was.
-struct BuildFaceHandle {
-    entt::entity owner = entt::null; // the ProceduralBuilding
-    u32 componentId = 0;
-    u8 axis = 0;  // 0 = X, 1 = Y, 2 = Z
-    i8 sign = 1;  // +1 = the max face, -1 = the min face
-};
-
-// A control point of a WALL PATH: draw a footprint by dragging points, and walls generate along
-// the segments between them. This is the "visual adjustment like splines" half - laying out a
-// building by its plan rather than by typing dimensions.
-struct BuildPathPoint {
-    entt::entity owner = entt::null;
-    u32 index = 0;
-};
-
 struct Rotator {
     glm::vec3 axis{0.0f, 1.0f, 0.0f};
     f32 speed = 45.0f; // degrees per second
@@ -1443,6 +1417,17 @@ struct CharacterController {
     bool grounded = false;           // touching ground after the last step
     static constexpr u32 kInvalidBody = 0xFFFFFFFFu;
     u32 bodyId = kInvalidBody;       // CharacterVirtual id (PhysicsWorld)
+
+    // Render interpolation between fixed physics steps. The simulation runs at a
+    // fixed 60 Hz (0..4 steps per rendered frame), so writing the raw last-step
+    // capsule position into the Transform makes the mesh lurch against the variable
+    // frame rate - while a damped follow-camera stays smooth (the "player jitters,
+    // camera doesn't" symptom). PhysicsWorld keeps the two most recent stepped
+    // world positions here and writes Transform = mix(prev, cur, accumulator/step)
+    // once per frame, so the drawn pose advances evenly. Not serialized.
+    glm::vec3 renderPrevPos{0.0f};
+    glm::vec3 renderCurPos{0.0f};
+    bool renderPoseInit = false;     // false until the first step seeds prev == cur
 };
 
 // A directional light source (one is used as the scene's primary light).
@@ -1549,6 +1534,74 @@ struct ReflectionProbe {
     rhi::TextureHandle prefiltered;
     f32 prefilteredMaxLod = 0.0f;
     bool baked = false;
+};
+
+// A projected decal. The box (the entity's Transform, sized by halfExtents) projects
+// its albedo/normal/metal-rough onto whatever surfaces it overlaps, blended into the
+// material in the forward pass BEFORE lighting - so decals are correctly lit and conform
+// to any geometry (blood, cracks, posters, puddle stains, ...). Projects along the box
+// local +Z: orient the decal so +Z points INTO the surface. Reuses `.uaf` textures
+// (bindless), resolved by decal::Update. Runs on up to rhi::kMaxDecals decals per frame.
+struct DecalComponent {
+    glm::vec3 halfExtents{0.5f, 0.5f, 0.15f}; // local box half-size (thin Z = projection depth)
+    f32 opacity = 1.0f;
+    f32 angleFade = 2.0f;      // pow() falloff as the surface turns away from the projector
+    f32 normalStrength = 1.0f; // decal normal-map blend (when a normal map is set)
+    f32 roughness = 0.8f;      // used only when no metal-rough map is set
+    f32 metallic = 0.0f;       // used only when no metal-rough map is set
+    std::string albedoTex;     // .uaf (rel to Assets); "" = tint only (no colour change)
+    std::string normalTex;     // .uaf; "" = keep the surface normal
+    std::string mrTex;         // .uaf (glTF b=metal g=rough); "" = use roughness/metallic above
+    // Runtime: resolved bindless indices (NOT serialized; decal::Update fills them).
+    rhi::TextureHandle albedo;
+    rhi::TextureHandle normal;
+    rhi::TextureHandle mr;
+    bool resolved = false;
+};
+
+// A Gerstner-wave water surface. water::Update gives the entity a flat grid MeshInstance
+// (flagged Water|Transparent|NoShadow so it draws in the dedicated water pass) that the
+// water VS displaces by the summed waves. The wave/colour/ripple params are GLOBAL for the
+// scene (Water.hlsl reads them from the frame constants) and the FIRST water entity drives
+// them; interactive ripples (rain splashes + water::AddRipple) ride a scene-global ring
+// buffer (Scene::WaterRipples). Reuses the terrain-style build-on-dirty pattern.
+struct WaterComponent {
+    f32 size = 120.0f;    // world extent of the (square) grid, metres
+    u32 resolution = 128; // grid cells per side (verts = (res+1)^2); clamped 16..256
+    // Gerstner waves (4): direction (compass degrees), amplitude (m), wavelength (m),
+    // speed (m/s), steepness (0 rolling .. 1 sharp crests).
+    f32 waveAngle[4]     = {20.0f, 70.0f, 115.0f, 160.0f};
+    f32 waveAmplitude[4] = {0.55f, 0.32f, 0.16f, 0.08f};
+    f32 waveLength[4]    = {26.0f, 15.0f, 8.5f, 5.0f};
+    f32 waveSpeed[4]     = {5.0f, 4.2f, 3.3f, 2.6f};
+    f32 waveSteepness[4] = {0.50f, 0.50f, 0.45f, 0.40f};
+    // Look.
+    glm::vec3 shallowColor{0.10f, 0.30f, 0.42f}; // grazing / sky-blended tint
+    f32 fresnelPower = 5.0f;
+    glm::vec3 deepColor{0.02f, 0.08f, 0.13f};    // body colour looking straight down
+    f32 reflectionRoughness = 0.10f;             // IBL reflection blur (0 = mirror)
+    f32 foam = 0.5f;
+    f32 rippleStrength = 1.0f; // rain micro-ripple + interactive ring intensity
+    f32 rippleScale = 1.0f;
+    f32 buoyancy = 1.2f;       // floating strength for rigid bodies (1 = neutral, >1 floats up)
+    // FFT ocean (Tessendorf). When on, the surface is displaced by the GPU spectral FFT (a
+    // real ocean) instead of the Gerstner sum above; Gerstner then only feeds CPU buoyancy.
+    // The FFT tile is a fixed 256x256 grid repeating every fftPatchSize metres. See OceanFFT.h.
+    bool fftOcean = false;
+    f32 fftWindSpeed = 18.0f;  // wind speed (m/s) - sets the dominant wavelength
+    f32 fftWindDir = 35.0f;    // wind direction (compass degrees)
+    f32 fftPatchSize = 128.0f; // world metres per FFT tile (smaller = finer/choppier detail)
+    f32 fftChoppiness = 1.0f;  // horizontal-displacement strength (sharper crests)
+    f32 fftAmplitude = 4.0f;   // overall wave-height scale
+    f32 fftHeightScale = 1.0f; // extra runtime vertical multiplier applied in the VS
+    // Depth-based water: the PS reads scene depth to grade absorption/foam/soft edges by the
+    // water-column depth (deeper = deep colour + opaque; shallow = see-through + shoreline foam).
+    f32 absorptionDepth = 6.0f;  // metres of water column to full deep-colour absorption
+    f32 shorelineWidth = 1.5f;   // metres of the shoreline foam band
+    f32 edgeFade = 0.5f;         // metres of soft depth-fade where water meets geometry
+    // Runtime (NOT serialized).
+    rhi::MeshHandle mesh;
+    bool dirty = true; // rebuild/UpdateMesh the grid on the next water::Update
 };
 
 // Opts an entity's mesh INTO the pathfinding geometry. When any entity in the

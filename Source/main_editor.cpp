@@ -11,13 +11,10 @@
 #include "Assets/SeamWeld.h"
 #include "Scene/BodyShape.h"
 #include "Assets/MeshDerive.h"
+#include "Assets/MeshGenerator.h" // --skin-preview (headless skin sphere render)
 #include "Assets/MeshSimplify.h"
 #include "Assets/MeshFaceSelect.h"
 #include "Core/Platform.h"
-#include "Construction/ConstructionGraph.h"  // --test-construction
-#include "Construction/ConstructionPreset.h"  // --test-preset
-#include "Construction/ConstructionChunk.h"
-#include "Construction/ConstructionIO.h"
 #include "Assets/SlotIds.h"      // --test-slotids / --migrate-slots (pack slot identity)
 #include "Assets/MusicGraph.h"   // --test-musicvoice (music director lifecycle)
 #include "Assets/UAP.h"          // uap::PackIndexOf (the migration plan prints pack numbers)
@@ -37,6 +34,8 @@
 #include "Core/JobSystem.h"
 #include "Core/Window.h"
 #include "Dialogue/DialogueGraph.h" // --test-graphfanin (node-graph reconvergence)
+#include "Scene/OceanFFT.h"         // --test-oceanfft (Tessendorf FFT reference/oracle)
+#include "Volume/VolumeNano.h"      // --test-nanovdb (header-only NanoVDB build gate)
 #include "Editor/Editor.h"
 #include "Editor/Importer.h"
 #include "Editor/MovieRender.h"
@@ -130,6 +129,15 @@ int main(int argc, char** argv) {
             std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
+        // --test-nanovdb: prove the header-only NanoVDB build (grid builder + createNanoGrid +
+        // accessor) compiles and links with zero external deps - the Phase-0 gate for the
+        // NanoVDB volumetric foundation. Pure CPU: no GPU, no window.
+        if (std::strcmp(argv[i], "--test-nanovdb") == 0) {
+            std::string report;
+            const bool ok = hbe::volume::SelfTestNanoVDB(report);
+            std::printf("nanovdb %s: %s\n", ok ? "PASS" : "FAIL", report.c_str());
+            return ok ? 0 : 1;
+        }
         // --test-bodyshape: the character sliders resolve from joint NAMES alone, and
         // length/girth split on a bone axis derived from the rig. Headless - it proves the
         // slider maths, not how the character looks, which only a person can judge.
@@ -145,26 +153,6 @@ int main(int argc, char** argv) {
         // --test-input: the portable half of Input, which became testable when it was
         // split out of Input_Win32.cpp - press edges, the ordered text stream, mouse
         // deltas, and the stick deadzone curve, none of which need a window.
-        // --test-construction: the procedural construction FOUNDATION - deterministic
-        // hierarchical seeds and the structural relationship graph. Headless; no project,
-        // no window, no GPU, because the definition layer deliberately depends on neither
-        // the scene nor the RHI.
-        // --test-preset: the PRESET + PARAMETER layer - the reflection table that makes an
-        // inspector possible without hardcoding a widget per field, and the presets that turn
-        // parameters into a construction graph.
-        if (std::strcmp(argv[i], "--test-preset") == 0) {
-            const bool ok = hbe::construction::ParamsSelfTest() &&
-                            hbe::construction::PresetSelfTest() &&
-                            hbe::construction::ChunkSelfTest() &&
-                            hbe::construction::IoSelfTest();
-            std::printf("preset %s\n", ok ? "PASS" : "FAIL");
-            return ok ? 0 : 1;
-        }
-        if (std::strcmp(argv[i], "--test-construction") == 0) {
-            const bool ok = hbe::construction::SelfTest();
-            std::printf("construction %s\n", ok ? "PASS" : "FAIL");
-            return ok ? 0 : 1;
-        }
         if (std::strcmp(argv[i], "--test-input") == 0) {
             const bool ok = hbe::InputSelfTest();
             std::printf("input %s\n", ok ? "PASS" : "FAIL");
@@ -246,6 +234,16 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-vfxcompat") == 0) {
             const bool ok = hbe::particle::CompatSelfTest();
             std::printf("vfxcompat %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-oceanfft: prove the Tessendorf FFT ocean MATH headless (no GPU): the
+        // radix-2 FFT round-trips (1D+2D), the evolved height field is Hermitian-real, and
+        // the spectrum is deterministic. This CPU reference is the oracle the GPU compute
+        // FFT is later diffed against (--test-oceanfft-gpu). Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-oceanfft") == 0) {
+            std::string report;
+            const bool ok = hbe::ocean::SelfTest(report);
+            std::printf("oceanfft %s (%s)\n", ok ? "PASS" : "FAIL", report.c_str());
             return ok ? 0 : 1;
         }
         // --test-entityguid: prove the stable per-entity identity contract -
@@ -1398,6 +1396,347 @@ int main(int argc, char** argv) {
         return (runRc == 0 && rbOk) ? 0 : 1;
     }
 
+    // --skin-preview: render a ROW of skin spheres (subsurface SSS) headless to a PNG so
+    // the skin/lighting can be EYEBALLED without a live window. No project needed - the sky
+    // IBL + the pre-integrated skin LUT are built at boot by scene::SetupEnvironment. The
+    // spheres are HIGH-poly (128x64) so faceting is not a factor - this isolates the SHADING.
+    // Iterate: edit the skin shader, rebuild, re-run, open the PNG.
+    bool skinPreview = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--skin-preview") == 0) skinPreview = true;
+    if (skinPreview) {
+        static hbe::Editor spEditor;
+        static int spFrame = 0;
+        hbe::Engine spEngine;
+        spEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+            e.GetScene().SetEditorView(true);
+            e.GetRenderer().SetOrbitEnabled(false);
+            if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                hbe::Editor::ApplyTheme();
+
+            hbe::Scene& scene = e.GetScene();
+            auto& reg = scene.Registry();
+            const hbe::MeshData sm = hbe::mesh::GenerateSphere(0.5f, 128, 64);
+            const hbe::rhi::MeshHandle sphere = e.GetRenderer().UploadMesh(sm);
+
+            // Row: 3 skin spheres (varying scatter radius / roughness) + 1 plain dielectric
+            // reference on the right, so the SSS effect reads by comparison.
+            const glm::vec4 skinTone{0.86f, 0.62f, 0.52f, 1.0f};
+            // {x, roughness, sssRadius, isSSS, clearcoat}. Sphere 0 = plain reference;
+            // 1-3 = SSS skin (last one WET via clearcoat) so the row shows dry->wet skin.
+            struct Cfg { float x; float roughness; float radius; bool sss; float cc; };
+            const Cfg cfgs[] = {{-1.7f, 0.40f, 0.0f, false, 0.0f}, {-0.57f, 0.40f, 1.0f, true, 0.0f},
+                                {0.57f, 0.40f, 2.0f, true, 0.0f}, {1.7f, 0.28f, 1.0f, true, 0.8f}};
+            for (const Cfg& c : cfgs) {
+                hbe::MeshInstance mi;
+                mi.mesh = sphere;
+                mi.baseColor = skinTone;
+                mi.roughness = c.roughness;
+                mi.metallic = 0.0f;
+                mi.subsurfaceColor = {0.85f, 0.2f, 0.16f};
+                mi.subsurfaceRadius = c.radius;
+                mi.clearcoat = c.cc;              // wet sheen on the rightmost sphere
+                mi.clearcoatRoughness = 0.06f;
+                if (c.sss) mi.materialFlags |= hbe::rhi::MaterialFlag_Subsurface;
+                const entt::entity ent = scene.CreateEntity("SkinSphere");
+                hbe::Transform tf;
+                tf.position = {c.x, 0.0f, 0.0f};
+                reg.emplace<hbe::Transform>(ent, tf);
+                reg.emplace<hbe::MeshInstance>(ent, mi);
+                reg.emplace<hbe::AABB>(ent, hbe::AABB{glm::vec3(-0.5f), glm::vec3(0.5f)});
+            }
+
+            // Ground plane so the sun casts a REAL contact shadow (verifies the
+            // bilinear shadow PCF) and gives the spheres bounce context.
+            {
+                const hbe::MeshData pm = hbe::mesh::GeneratePlane(14.0f, 1);
+                const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
+                hbe::MeshInstance gi;
+                gi.mesh = plane;
+                gi.baseColor = {0.5f, 0.5f, 0.5f, 1.0f};
+                gi.roughness = 0.9f;
+                gi.metallic = 0.0f;
+                const entt::entity g = scene.CreateEntity("Ground");
+                hbe::Transform gt;
+                gt.position = {0.0f, -0.5f, 0.0f};
+                reg.emplace<hbe::Transform>(g, gt);
+                reg.emplace<hbe::MeshInstance>(g, gi);
+                reg.emplace<hbe::AABB>(g, hbe::AABB{glm::vec3(-7.0f, 0.0f, -7.0f),
+                                                    glm::vec3(7.0f, 0.0f, 7.0f)});
+            }
+
+            const entt::entity sun = scene.CreateEntity("Sun");
+            reg.emplace<hbe::Transform>(sun);
+            hbe::DirectionalLightComponent dl;
+            dl.direction = glm::normalize(glm::vec3(-0.5f, -0.55f, -0.45f));
+            dl.color = {1.0f, 0.97f, 0.92f};
+            dl.intensity = 3.0f;
+            reg.emplace<hbe::DirectionalLightComponent>(sun, dl);
+            scene.Environment().ambientIntensity = 0.35f;
+            scene.Environment().exposure = 0.85f;
+            // Represent the SHIPPED config, not the raw all-on defaults: the headless
+            // harness can't resolve TAA, so the default SSGI/SSAO passes show raw
+            // screen-space noise that TAA denoises in-engine (High) and that Medium/Low
+            // don't run at all. Disable them here (as shipped Medium) so what I judge is
+            // the skin SHADING, not a headless-only noise pass.
+            scene.Environment().post.ssgiEnabled = 0;
+            scene.Environment().post.ssaoEnabled = 0;
+        });
+        spEngine.SetOnFrame([](hbe::Engine& e) {
+            spEditor.BuildUI(e);
+            constexpr hbe::u32 kW = 1600, kH = 620;
+            e.GetRenderer().SetViewportSize(kW, kH);
+            auto& cam = e.GetRenderer().GetCamera();
+            cam.SetPerspective(34.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 100.0f);
+            cam.LookAt({0.0f, 0.0f, 3.25f}, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+            if (++spFrame >= 40) { // TAA warmup
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                const auto out = std::filesystem::temp_directory_path() / "hbe_skin_preview.png";
+                if (e.GetRenderer().ReadbackViewportColor(px, w, h))
+                    hbe::movie::WritePng(out, w, h, px);
+                std::printf("skin-preview -> %s\n", out.string().c_str());
+                e.Quit();
+            }
+        });
+        return spEngine.Run(config);
+    }
+
+    // --water-preview: render the Gerstner water headless to a PNG so the depth-graded
+    // absorption/foam/shoreline AND the TAA behaviour of moving objects over water can be
+    // EYEBALLED without a live window (mirrors --skin-preview). A sandy floor is gently
+    // sloped so it crosses the waterline (a REAL shoreline gradient); 3 cubes sit
+    // half-submerged (waterline intersection foam); 4 cubes are hand-animated and the camera
+    // pans, so TAA has real motion to (mis)handle. Per-backend filename for A/B compare.
+    bool waterPreview = false;
+    bool wpNoSsr = false;     // --wp-nossr: disable SSR, to isolate SSR-on-water artifacts
+    bool wpTopdown = false;   // --wp-topdown: look straight down (tests rain streak billboarding)
+    bool wpClean = false;     // --wp-clean: no cubes (open water only), to isolate surface artifacts
+    bool wpFlatGrade = false; // --wp-flatgrade: neutralize the depth-grade (isolate reflection facets)
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--water-preview") == 0) waterPreview = true;
+        if (std::strcmp(argv[i], "--wp-nossr") == 0) wpNoSsr = true;
+        if (std::strcmp(argv[i], "--wp-topdown") == 0) wpTopdown = true;
+        if (std::strcmp(argv[i], "--wp-clean") == 0) wpClean = true;
+        if (std::strcmp(argv[i], "--wp-flatgrade") == 0) wpFlatGrade = true;
+    }
+    if (waterPreview) {
+        static hbe::Editor wpEditor;
+        static int wpFrame = 0;
+        static std::vector<entt::entity> wpMovers;
+        hbe::Engine wpEngine;
+        wpEngine.SetOnInit([wpNoSsr, wpClean, wpFlatGrade](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false); // movers are hand-animated (deterministic motion)
+            e.SetGameCameraEnabled(false);
+            e.GetScene().SetEditorView(true);
+            e.GetRenderer().SetOrbitEnabled(false);
+            if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                hbe::Editor::ApplyTheme();
+
+            hbe::Scene& scene = e.GetScene();
+            auto& reg = scene.Registry();
+
+            // Water plane at the origin (Y = 0).
+            const entt::entity we = scene.CreateEntity("Water");
+            reg.emplace<hbe::Transform>(we, hbe::Transform{});
+            hbe::WaterComponent wc{};
+            if (wpFlatGrade) { // neutralize the depth-grade to isolate reflection/mesh facets
+                wc.absorptionDepth = 1.0e6f;
+                wc.shorelineWidth = 0.0001f;
+                wc.edgeFade = 0.0001f;
+            }
+            reg.emplace<hbe::WaterComponent>(we, wc);
+
+            // Sandy floor gently sloped so it crosses the waterline: deep on the far side,
+            // dry on the near side. A too-wide shoreline-foam band shows as a broad fake band.
+            {
+                const hbe::MeshData pm = hbe::mesh::GeneratePlane(90.0f, 1);
+                const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
+                hbe::MeshInstance gi;
+                gi.mesh = plane;
+                gi.baseColor = {0.42f, 0.37f, 0.30f, 1.0f};
+                gi.roughness = 0.95f;
+                const entt::entity g = scene.CreateEntity("Floor");
+                hbe::Transform gt;
+                gt.position = {0.0f, -2.5f, 0.0f};
+                gt.rotation = glm::angleAxis(glm::radians(7.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+                reg.emplace<hbe::Transform>(g, gt);
+                reg.emplace<hbe::MeshInstance>(g, gi);
+                reg.emplace<hbe::AABB>(g, hbe::AABB{glm::vec3(-45.0f, -2.0f, -45.0f),
+                                                    glm::vec3(45.0f, 2.0f, 45.0f)});
+            }
+
+            if (!wpClean) { // --wp-clean: open water only, to isolate surface artifacts
+            const hbe::MeshData cm = hbe::mesh::GenerateCube(1.2f);
+            const hbe::rhi::MeshHandle cube = e.GetRenderer().UploadMesh(cm);
+
+            // Static half-submerged cubes -> object/waterline intersection foam.
+            for (int i = 0; i < 3; ++i) {
+                hbe::MeshInstance mi;
+                mi.mesh = cube;
+                mi.baseColor = {0.88f, 0.88f, 0.90f, 1.0f};
+                mi.roughness = 0.6f;
+                const entt::entity c = scene.CreateEntity("HalfCube");
+                hbe::Transform t;
+                t.position = {-7.0f + i * 7.0f, -0.15f, -6.0f};
+                reg.emplace<hbe::Transform>(c, t);
+                reg.emplace<hbe::MeshInstance>(c, mi);
+                reg.emplace<hbe::AABB>(c, hbe::AABB{glm::vec3(-0.6f), glm::vec3(0.6f)});
+            }
+
+            // Hand-animated cubes hovering over the water -> exercise TAA on moving objects.
+            for (int i = 0; i < 4; ++i) {
+                hbe::MeshInstance mi;
+                mi.mesh = cube;
+                mi.baseColor = {0.95f, 0.95f, 0.98f, 1.0f};
+                mi.roughness = 0.5f;
+                const entt::entity c = scene.CreateEntity("Mover");
+                hbe::Transform t;
+                t.position = {-6.0f + i * 4.0f, 1.6f, 2.0f};
+                reg.emplace<hbe::Transform>(c, t);
+                reg.emplace<hbe::MeshInstance>(c, mi);
+                reg.emplace<hbe::AABB>(c, hbe::AABB{glm::vec3(-0.6f), glm::vec3(0.6f)});
+                wpMovers.push_back(c);
+            }
+            } // end if (!wpClean)
+
+            auto& env = scene.Environment();
+            env.exposure = wpClean ? 0.55f : 0.9f;       // wpClean: dusk-ish, reflection-dominated
+            env.ambientIntensity = wpClean ? 0.15f : 0.35f;
+            env.post.taaEnabled = 1;  // the ghosting is a TAA behaviour - keep it ON
+            env.post.ssgiEnabled = 0; // headless can't denoise these (see --skin-preview)
+            env.post.ssaoEnabled = 0;
+            if (wpNoSsr) env.post.ssrEnabled = 0; // A/B: isolate SSR-on-water reflections
+            // Rain, so the streaks + physical surface impacts can be eyeballed.
+            env.precipType = 1;        // rain
+            env.precipIntensity = 0.9f;
+            env.windAngle = 25.0f;
+            env.windSpeed = 0.02f;
+        });
+        wpEngine.SetOnFrame([wpTopdown](hbe::Engine& e) {
+            wpEditor.BuildUI(e);
+            // Deliberately NOT the window size, so sceneW_/sceneH_ != width_/height_ and the
+            // editor-viewport depth-grade UV path is actually exercised (see the W2 screenTexel fix).
+            constexpr hbe::u32 kW = 1600, kH = 900;
+            e.GetRenderer().SetViewportSize(kW, kH);
+            auto& cam = e.GetRenderer().GetCamera();
+            cam.SetPerspective(38.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 300.0f);
+            if (wpTopdown) {
+                // Straight down: the OLD screen-projected rain streaks collapsed to bad dashes
+                // here; the world-velocity-stretched streaks should read as tidy dots/short
+                // streaks (you are looking along the fall axis).
+                cam.LookAt({0.0f, 24.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, -1.0f});
+            } else {
+                // Pan the eye each frame so the water surface (which writes no velocity) has
+                // apparent motion -> reveals TAA smear on the surface, while the hand-moved
+                // cubes reveal TAA ghosting on moving geometry.
+                const float cs = static_cast<float>(wpFrame) * 0.02f;
+                cam.LookAt({std::sin(cs) * 3.5f, 6.5f, 20.0f}, {0.0f, 0.5f, -3.0f}, {0.0f, 1.0f, 0.0f});
+            }
+
+            auto& reg = e.GetScene().Registry();
+            const float t = static_cast<float>(wpFrame) * 0.12f;
+            for (size_t k = 0; k < wpMovers.size(); ++k) {
+                if (!reg.valid(wpMovers[k])) continue;
+                auto& tf = reg.get<hbe::Transform>(wpMovers[k]);
+                tf.position.x = -6.0f + static_cast<float>(k) * 4.0f + std::sin(t + static_cast<float>(k)) * 2.2f;
+            }
+
+            if (++wpFrame >= 64) { // TAA accumulation + waves settle
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                const std::string api = ReadbackTag(e.GetRenderer().API());
+                const auto out = std::filesystem::temp_directory_path() /
+                                 ("hbe_water_preview_" + api + ".png");
+                if (e.GetRenderer().ReadbackViewportColor(px, w, h))
+                    hbe::movie::WritePng(out, w, h, px);
+                std::printf("water-preview -> %s\n", out.string().c_str());
+                e.Quit();
+            }
+        });
+        return wpEngine.Run(config);
+    }
+
+    // --volume-preview: render a BAKED NanoVDB volume (a static test density sphere) headless to a
+    // PNG through the RUNTIME PNanoVDB raymarch, so the new volumetric runtime can be EYEBALLED and
+    // DX12 vs Vulkan compared. This is the P1 acceptance gate for the NanoVDB volume foundation.
+    // Per-backend filename. The grid is hand-built (no bake/asset yet - those are P4/P5).
+    bool volumePreview = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--volume-preview") == 0) volumePreview = true;
+    if (volumePreview) {
+        static hbe::Editor vpEditor;
+        static int vpFrame = 0;
+        static std::vector<std::uint8_t> vpBlob;
+        static glm::vec3 vpMin(0.0f), vpMax(64.0f);
+        static bool vpOk = hbe::volume::BuildTestVolumeBlob(vpBlob, vpMin, vpMax, 64);
+        hbe::Engine vpEngine;
+        vpEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+            e.GetScene().SetEditorView(true);
+            e.GetRenderer().SetOrbitEnabled(false);
+            if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                hbe::Editor::ApplyTheme();
+            hbe::Scene& scene = e.GetScene();
+            auto& reg = scene.Registry();
+            // Ground plane under the volume so the raymarch has real scene depth behind it.
+            const hbe::MeshData pm = hbe::mesh::GeneratePlane(400.0f, 1);
+            const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
+            hbe::MeshInstance gi;
+            gi.mesh = plane;
+            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.roughness = 0.9f;
+            const entt::entity g = scene.CreateEntity("Ground");
+            hbe::Transform gt;
+            gt.position = {32.0f, -2.0f, 32.0f};
+            reg.emplace<hbe::Transform>(g, gt);
+            reg.emplace<hbe::MeshInstance>(g, gi);
+            reg.emplace<hbe::AABB>(g, hbe::AABB{glm::vec3(-200.0f, -1.0f, -200.0f),
+                                                glm::vec3(200.0f, 1.0f, 200.0f)});
+            auto& env = scene.Environment();
+            env.exposure = 1.0f;
+            env.ambientIntensity = 0.5f;
+            env.post.ssgiEnabled = 0;
+            env.post.ssaoEnabled = 0;
+        });
+        vpEngine.SetOnFrame([](hbe::Engine& e) {
+            vpEditor.BuildUI(e);
+            constexpr hbe::u32 kW = 1280, kH = 720;
+            e.GetRenderer().SetViewportSize(kW, kH);
+            auto& cam = e.GetRenderer().GetCamera();
+            cam.SetPerspective(40.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 1000.0f);
+            cam.LookAt({32.0f, 42.0f, 150.0f}, {32.0f, 32.0f, 32.0f}, {0.0f, 1.0f, 0.0f});
+            // Feed the baked NanoVDB grid every frame (pointer must stay valid - vpBlob is static).
+            if (vpOk && !vpBlob.empty()) {
+                hbe::rhi::VolumeRenderParams rp;
+                rp.boundsMin = vpMin;
+                rp.boundsMax = vpMax;
+                rp.densityScale = 2.5f;
+                rp.emission = 0.0f; // no temperature grid yet (P1 = density-only smoke)
+                rp.extinction = 1.2f;
+                rp.stepCount = 128;
+                rp.shadowSteps = 6;
+                e.GetRenderer().SetVolumeGrid(vpBlob.data(), vpBlob.size(), rp);
+            }
+            if (++vpFrame >= 40) { // TAA convergence on the static volume
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                const std::string api = ReadbackTag(e.GetRenderer().API());
+                const auto out = std::filesystem::temp_directory_path() /
+                                 ("hbe_volume_preview_" + api + ".png");
+                if (e.GetRenderer().ReadbackViewportColor(px, w, h))
+                    hbe::movie::WritePng(out, w, h, px);
+                std::printf("volume-preview -> %s (grid %zu bytes, built=%d)\n",
+                            out.string().c_str(), vpBlob.size(), static_cast<int>(vpOk));
+                e.Quit();
+            }
+        });
+        return vpEngine.Run(config);
+    }
+
     // --test-readback-compare: the D3D12 <-> Vulkan parity gate. Reads the raw
     // frames --test-readback left in temp for each backend and compares them.
     //
@@ -1573,6 +1912,95 @@ int main(int argc, char** argv) {
         gcEngine.Run(config);
         std::printf("gpucompute %s (%s)\n", t.pass ? "PASS" : "FAIL", t.why);
         return t.pass ? 0 : 1;
+    }
+
+    // --test-oceanfft-gpu: prove the GPU Tessendorf FFT ocean matches the CPU oracle. Runs
+    // the compute chain (evolve -> IFFT rows/cols -> assemble) on the ACTIVE backend and
+    // ReadGpuBuffer-diffs the displacement field against CpuOcean::Evolve at the same time.
+    // This is what stops a blind GPU FFT from being delivered on "it booted". Needs a real
+    // device (short engine session, no project), same shape as --test-gpucompute.
+    bool testOceanGpu = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-oceanfft-gpu") == 0) testOceanGpu = true;
+    if (testOceanGpu) {
+        struct OceanTest {
+            hbe::ocean::GpuOcean gpu;
+            int frame = 0;
+            bool inited = false, done = false, pass = false;
+            std::string why = "no result";
+        };
+        static OceanTest ot;
+        static constexpr hbe::f32 kTestTime = 3.25f;
+        hbe::Engine oEngine;
+        oEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+        });
+        oEngine.SetOnFrame([](hbe::Engine& e) {
+            auto& r = e.GetRenderer();
+            if (ot.done) return;
+            if (ot.frame == 1) {
+                if (!r.SupportsGpuCompute()) {
+                    ot.why = "backend has no compute";
+                    ot.done = true;
+                    e.Quit();
+                    return;
+                }
+                hbe::ocean::OceanParams p;
+                p.gridN = hbe::ocean::GpuOcean::kGpuN;
+                if (!ot.gpu.Init(r, p)) {
+                    ot.why = "GpuOcean::Init failed";
+                    ot.done = true;
+                    e.Quit();
+                    return;
+                }
+                ot.inited = true;
+            }
+            // Drive the compute every frame (fills h0's ring slot + queues the chain), so the
+            // readback at frame 5 sees a fully-populated displacement buffer.
+            if (ot.inited && ot.frame >= 1) ot.gpu.Update(r, kTestTime);
+            if (ot.inited && ot.frame >= 5) {
+                const hbe::u32 N = ot.gpu.N();
+                const hbe::u32 cells = N * N;
+                std::vector<glm::vec4> gpuField(cells);
+                if (!r.ReadGpuBuffer(ot.gpu.DisplacementBuffer(), gpuField.data(),
+                                     cells * static_cast<hbe::u32>(sizeof(glm::vec4)))) {
+                    ot.why = "ReadGpuBuffer failed";
+                    ot.done = true;
+                    e.Quit();
+                    return;
+                }
+                hbe::ocean::CpuOcean cpu;
+                cpu.Init(ot.gpu.Params());
+                std::vector<glm::vec4> cpuField;
+                cpu.Evolve(kTestTime, cpuField);
+                hbe::f32 maxDiff = 0.0f, maxRef = 1e-6f;
+                for (hbe::u32 i = 0; i < cells; ++i) {
+                    const glm::vec3 g(gpuField[i]), c(cpuField[i]); // xyz (foam is VS-side)
+                    maxDiff = std::max(maxDiff, glm::length(g - c));
+                    maxRef = std::max(maxRef, glm::length(c));
+                }
+                const hbe::f32 rel = maxDiff / maxRef;
+                ot.pass = std::isfinite(rel) && rel < 0.02f;
+                char b[160];
+                std::snprintf(b, sizeof(b), "rel err %.3e (maxDiff %.3e / fieldMax %.3e)", rel,
+                              maxDiff, maxRef);
+                ot.why = b;
+                ot.gpu.Shutdown(r);
+                ot.done = true;
+                e.Quit();
+                return;
+            }
+            if (ot.frame > 120) {
+                ot.why = "timed out";
+                ot.done = true;
+                e.Quit();
+            }
+            ++ot.frame;
+        });
+        oEngine.Run(config);
+        std::printf("oceanfft-gpu %s (%s)\n", ot.pass ? "PASS" : "FAIL", ot.why.c_str());
+        return ot.pass ? 0 : 1;
     }
 
     // --test-uidoc-invariants <file.hbui>: the P3 STRUCTURAL contract. Every

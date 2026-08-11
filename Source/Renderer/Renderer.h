@@ -129,6 +129,14 @@ public:
         }
     }
 
+    // Baked NanoVDB volume grid for this frame (the RUNTIME volume path; supersedes the splat).
+    // `bytes` is a raw NanoVDB blob (streamed from a .hbvol by VolumeCache, or hand-built for
+    // tests); the PNanoVDB raymarch samples it. Call BEFORE RenderScene; the pointer must stay
+    // valid through the frame. byteSize==0 disables the volume this frame.
+    void SetVolumeGrid(const void* bytes, usize byteSize, const rhi::VolumeRenderParams& params) {
+        if (device_) device_->SetVolumeGrid(bytes, byteSize, params);
+    }
+
     // -- GPU compute + GPU-writable structured buffers -----------------------
     // Thin forwarders (the SetVolumeParticles pattern). QueueCompute must be
     // called BEFORE RenderScene: both backends execute the queue in their

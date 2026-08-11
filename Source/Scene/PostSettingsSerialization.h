@@ -17,7 +17,8 @@ inline nlohmann::json PostToJson(const rhi::PostSettings& p) {
         {"ssaoRadius", p.ssaoRadius},       {"ssaoIntensity", p.ssaoIntensity},
         {"fxaa", p.fxaaEnabled},            {"taa", p.taaEnabled},
         {"vignette", p.vignette},           {"saturation", p.saturation},
-        {"contrast", p.contrast},           {"dof", p.dofEnabled},
+        {"contrast", p.contrast},           {"tonemapOperator", p.tonemapOperator},
+        {"dof", p.dofEnabled},
         {"dofFocusDistance", p.dofFocusDistance}, {"dofFocusRange", p.dofFocusRange},
         {"dofMaxBlur", p.dofMaxBlur},       {"motionBlur", p.motionBlurEnabled},
         {"motionBlurIntensity", p.motionBlurIntensity},
@@ -56,6 +57,12 @@ inline nlohmann::json PostToJson(const rhi::PostSettings& p) {
         {"painterlyStrokeMaskMaxX", p.painterlyStrokeMaskMaxX},
         {"painterlyStrokeMaskMaxY", p.painterlyStrokeMaskMaxY},
         {"painterly3D", p.painterly3D},
+        {"gradeEnabled", p.gradeEnabled},
+        {"gradeTemperature", p.gradeTemperature}, {"gradeTint", p.gradeTint},
+        {"gradeLift", {p.gradeLift.x, p.gradeLift.y, p.gradeLift.z}},
+        {"gradeGamma", {p.gradeGamma.x, p.gradeGamma.y, p.gradeGamma.z}},
+        {"gradeGain", {p.gradeGain.x, p.gradeGain.y, p.gradeGain.z}},
+        {"filmGrain", p.filmGrain}, {"chromaticAberration", p.chromaticAberration},
     };
 }
 
@@ -71,6 +78,7 @@ inline void PostFromJson(const nlohmann::json& j, rhi::PostSettings& p) {
     p.vignette = j.value("vignette", p.vignette);
     p.saturation = j.value("saturation", p.saturation);
     p.contrast = j.value("contrast", p.contrast);
+    p.tonemapOperator = j.value("tonemapOperator", p.tonemapOperator);
     p.dofEnabled = j.value("dof", p.dofEnabled);
     p.dofFocusDistance = j.value("dofFocusDistance", p.dofFocusDistance);
     p.dofFocusRange = j.value("dofFocusRange", p.dofFocusRange);
@@ -125,6 +133,17 @@ inline void PostFromJson(const nlohmann::json& j, rhi::PostSettings& p) {
     p.painterlyStrokeMaskMaxX = j.value("painterlyStrokeMaskMaxX", p.painterlyStrokeMaskMaxX);
     p.painterlyStrokeMaskMaxY = j.value("painterlyStrokeMaskMaxY", p.painterlyStrokeMaskMaxY);
     p.painterly3D = j.value("painterly3D", p.painterly3D);
+    p.gradeEnabled = j.value("gradeEnabled", p.gradeEnabled);
+    p.gradeTemperature = j.value("gradeTemperature", p.gradeTemperature);
+    p.gradeTint = j.value("gradeTint", p.gradeTint);
+    if (auto it = j.find("gradeLift"); it != j.end() && it->is_array() && it->size() == 3)
+        p.gradeLift = {(*it)[0].get<f32>(), (*it)[1].get<f32>(), (*it)[2].get<f32>()};
+    if (auto it = j.find("gradeGamma"); it != j.end() && it->is_array() && it->size() == 3)
+        p.gradeGamma = {(*it)[0].get<f32>(), (*it)[1].get<f32>(), (*it)[2].get<f32>()};
+    if (auto it = j.find("gradeGain"); it != j.end() && it->is_array() && it->size() == 3)
+        p.gradeGain = {(*it)[0].get<f32>(), (*it)[1].get<f32>(), (*it)[2].get<f32>()};
+    p.filmGrain = j.value("filmGrain", p.filmGrain);
+    p.chromaticAberration = j.value("chromaticAberration", p.chromaticAberration);
 }
 
 } // namespace hbe::scene

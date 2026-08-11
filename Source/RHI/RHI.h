@@ -167,6 +167,24 @@ struct ProbeData {
 // for a coarse full-level irradiance grid (auto-placed), not just a few rooms.
 inline constexpr u32 kMaxProbes = 64;
 
+// One forward projected decal. `invWorld` maps a world position into the decal's unit
+// cube ([-0.5,0.5]); inside it, the box projects albedo/normal/MR onto the surface,
+// blended into the material in MeshPBR BEFORE lighting (so decals are correctly lit and
+// conform to any geometry - no G-buffer albedo needed in this forward renderer).
+// forwardWS = projection axis (box local +Z); tangentWS = box local +X (decal normal-map
+// U axis). Mirrors PunctualLight/ProbeData as a fixed constant-buffer array.
+struct DecalData {
+    glm::mat4 invWorld{1.0f};
+    glm::vec3 forwardWS{0.0f, 0.0f, 1.0f}; f32 opacity = 1.0f;
+    glm::vec3 tangentWS{1.0f, 0.0f, 0.0f}; f32 angleFade = 2.0f;
+    u32 albedoIndex = 0, normalIndex = 0, mrIndex = 0, flags = 0;
+    glm::vec4 params{1.0f, 0.8f, 0.0f, 0.0f}; // x=normalStrength, y=roughness, z=metallic
+};
+inline constexpr u32 kMaxDecals = 16;
+
+// Interactive water ripple ring sources (object splashes + rain impacts) uploaded/frame.
+inline constexpr u32 kMaxRipples = 16;
+
 // Number of cascaded-shadow-map slices (rendered into a 2x2 atlas).
 inline constexpr u32 kMaxShadowCascades = 4;
 
@@ -198,6 +216,24 @@ struct PostSettings {
     f32 vignette = 0.18f;        // corner darkening (0 = off)
     f32 saturation = 1.05f;
     f32 contrast = 1.02f;
+    // Tone-mapping operator (the modular output stage). 0 = ACES (default, filmic),
+    // 1 = AgX (neutral, desaturating), 2 = Tony McMapface (neutral, hue-preserving).
+    // All are SDR display transforms; HDR-monitor output is a separate future phase.
+    u32 tonemapOperator = 0;
+
+    // Cinematic COLOR GRADE (applied inside the tonemap pass). White balance is a
+    // von-Kries scale in LINEAR before the tone curve; lift/gamma/gain (the ASC-CDL
+    // shadows/mids/highlights wheels) + optional film grain + chromatic aberration are
+    // applied after. Neutral defaults = identity, so this is invisible until dialed in.
+    // This is the stage that gives the moody warm-fire / cool-night cinematic look.
+    u32 gradeEnabled = 1;
+    f32 gradeTemperature = 0.0f;   // white balance: -1 cool (blue) .. +1 warm (amber)
+    f32 gradeTint = 0.0f;          // white balance: -1 green .. +1 magenta
+    glm::vec3 gradeLift{0.0f};     // SHADOWS colour offset (added, per channel)
+    glm::vec3 gradeGamma{1.0f};    // MIDTONES colour power (1 = neutral)
+    glm::vec3 gradeGain{1.0f};     // HIGHLIGHTS colour multiply (1 = neutral)
+    f32 filmGrain = 0.0f;          // animated luminance grain (0 = off; ~0.03 filmic)
+    f32 chromaticAberration = 0.0f;// RGB split toward the frame edges (0 = off)
 
     // Depth of field. Distances are world-space; everything within focusRange of
     // focusDistance is sharp, ramping to full blur (maxBlur source texels) by 2x
@@ -358,6 +394,34 @@ struct SceneView {
     u32 probeCount = 0;
     ProbeData probes[kMaxProbes];
 
+    // Forward projected decals: each box blends its albedo/normal/MR onto the surfaces
+    // it overlaps in MeshPBR (before lighting). Copied into frame constants.
+    u32 decalCount = 0;
+    DecalData decals[kMaxDecals];
+
+    // Water surface (Gerstner) - GLOBAL scene ocean params + interactive ripple ring
+    // sources; fed to Water.hlsl via the gWave*/gWater*/gRipples frame constants.
+    glm::vec4 waterWaveA[4]{}; // (dirX, dirZ, amplitude, wavelength)
+    glm::vec4 waterWaveB[4]{}; // (speed, steepness, 0, 0)
+    glm::vec4 waterShallow{0.10f, 0.30f, 0.42f, 5.0f}; // (rgb grazing tint, fresnel power)
+    glm::vec4 waterDeep{0.02f, 0.08f, 0.13f, 0.10f};   // (rgb body, reflection roughness)
+    glm::vec4 waterParams{0.5f, 1.0f, 1.0f, 0.0f};     // (foam, rippleStrength, rippleScale, fftOn)
+    u32 rippleCount = 0;
+    glm::vec4 ripples[kMaxRipples]{}; // (centerX, centerZ, impactTime, strength)
+
+    // FFT ocean (Tessendorf): when fftOcean != 0 the water VS displaces the grid from the GPU
+    // FFT displacement buffer (bound via SetVertexShaderBuffer) instead of the Gerstner sum.
+    // waterParams.w carries the on/off flag to the shader; these size the world<->tile mapping.
+    u32 fftOcean = 0;      // 0 = Gerstner, 1 = FFT displacement buffer
+    f32 fftPatch = 128.0f; // world metres the FFT tile spans (world XZ -> tile index)
+    f32 fftHeight = 1.0f;  // vertical displacement scale
+
+    // Depth-based water: how the water PS grades absorption/foam/soft edges by the water-column
+    // depth it reads from the scene depth buffer (bindless slot filled by the backend).
+    f32 waterAbsorptionDepth = 6.0f; // metres to full deep-colour absorption
+    f32 waterShorelineWidth = 1.5f;  // metres of the shoreline foam band
+    f32 waterEdgeFade = 0.5f;        // metres of soft depth-fade where water meets geometry
+
     // World-anchored painterly censors (CensorComponent): each re-paints a
     // dynamic object inside a soft sphere. CPU-side; the backend projects these
     // tests them in 3D and feeds the painterly passes (CollectCensors below).
@@ -385,6 +449,17 @@ struct SceneView {
     // Wind velocity in cloud-UV units/sec (clouds drift by this * timeSeconds).
     f32 windVelX = 0.0f;
     f32 windVelZ = 0.0f;
+
+    // Weather surface response (fed to gWeather2/gWeather3; drives the wet/puddle/
+    // snow block in MeshPBR). 0 across the board = clear/dry, and the shader early-outs.
+    f32 wetness = 0.0f;         // 0 dry .. 1 soaked (darkens albedo, boosts gloss)
+    f32 puddles = 0.0f;         // 0 none .. 1 standing water in flat/low areas
+    f32 snowAmount = 0.0f;      // 0 none .. 1 snow on up-facing surfaces
+    f32 precipIntensity = 0.0f; // RAIN intensity for puddle ripples (0 for snow/none)
+    f32 puddleScale = 6.0f;     // puddle noise world tiling (m)
+    f32 snowScale = 4.0f;       // snow break-up noise world tiling (m)
+    f32 cloudVolumetric = 0.0f; // 1 = raymarched volumetric clouds (else the 2D layer)
+    f32 cloudQuality = 0.4f;    // volumetric cloud step-count scale (0..1 -> 28..96 steps)
 
     // HDR post-process stack settings.
     PostSettings post;
@@ -417,29 +492,6 @@ inline u32 CollectCensors(const SceneView& view, glm::vec4 outCensors[kMaxCensor
 }
 
 // Material feature flags (packed into DrawItem::materialFlags).
-// Procedural construction surface, packed into bits 16-23 of MaterialFlags.
-//
-// IN THE SPARE BITS OF AN EXISTING WORD, not a new ObjectCB field, and that is a measured choice:
-// ObjectCB is 528 bytes aligned to 768 against a 4 MB per-frame constant arena, so every field
-// added to it directly reduces how many objects the renderer can draw in a frame (~5,400 today,
-// and it TRUNCATES silently past that). Must match Construction.hlsli.
-enum ProceduralSurface : u32 {
-    ProcSurface_None = 0,
-    ProcSurface_Brick = 1,
-    ProcSurface_Stone = 2,
-    ProcSurface_Concrete = 3,
-    ProcSurface_Wood = 4,
-    ProcSurface_Plaster = 5,
-    ProcSurface_Metal = 6,
-    ProcSurface_Shingle = 7,
-    ProcSurface_Mortar = 8,
-};
-inline constexpr u32 kProcSurfaceShift = 16u;
-inline constexpr u32 kProcSurfaceMask = 0xFFu;
-inline constexpr u32 PackProcSurface(ProceduralSurface s) {
-    return (static_cast<u32>(s) & kProcSurfaceMask) << kProcSurfaceShift;
-}
-
 enum MaterialFlags : u32 {
     MaterialFlag_None       = 0,
     MaterialFlag_Subsurface = 1u << 0, // skin / SSS shading (pre-integrated)
@@ -470,6 +522,9 @@ enum MaterialFlags : u32 {
     // painterly passes paint brush strokes onto ITS surface (and keep the painted
     // look on it) - confining the censor to the object, not the volume around it.
     MaterialFlag_Censored = 1u << 10,
+    // The entity is a water surface: drawn in a dedicated water pass (Gerstner-wave VS +
+    // reflective PS), not the normal opaque/transparent mesh path.
+    MaterialFlag_Water = 1u << 11,
 };
 
 // One mesh instance to draw with a metallic-roughness material.
@@ -490,6 +545,8 @@ struct DrawItem {
     glm::vec3  subsurfaceColor{1.0f, 0.3f, 0.2f};
     f32        subsurfaceRadius = 1.0f;    // scatter scale (curvature multiplier)
     TextureHandle thicknessTexture;        // back-light transmission thickness (0 = none)
+    f32        clearcoat = 0.0f;           // clearcoat lobe strength (0 = off; wet/sweat/varnish)
+    f32        clearcoatRoughness = 0.08f; // clear layer roughness (low = wet/glossy)
     u32        materialFlags = MaterialFlag_None;
 
     // Art Editor surface paint: a per-object paint canvas composited over the
@@ -599,6 +656,14 @@ struct ParticleVertex {
     u32 texIndex = 0;          // bindless sprite (0 = soft dot)
 };
 
+// The CPU particle path packs all alpha + additive billboards into ONE shared per-frame
+// vertex buffer; both backends clamp the COMBINED vertex count to this (6 MiB / stride).
+// Systems that APPEND to the shared list (weather precipitation) cap themselves against
+// it so they yield to authored VFX instead of silently overflowing the tail. Keep in
+// sync with the backends' kParticleVertexBufferSize (6 MiB).
+constexpr u32 kMaxCpuParticleVertices =
+    static_cast<u32>((6u * 1024u * 1024u) / sizeof(ParticleVertex));
+
 // One GPU-EXPANDED particle batch: one emitter's worth of billboards, drawn
 // straight out of a record buffer with no CPU vertex expansion at all.
 //
@@ -673,6 +738,21 @@ struct VolumeParams {
                                // frames so the noise doesn't crawl/pop when the AABB resizes
 };
 inline constexpr u32 kMaxVolumeBlobs = 4096; // cap (per-frame upload buffer size)
+
+// Render-side params for a BAKED NanoVDB volume - the source-agnostic RUNTIME representation
+// (VolumeParams above is splat/blob-specific and on its way out). The world AABB clips the
+// raymarch (empty-space skip); the grid's own affine map handles world->index sampling.
+// densityScale is applied ONCE, in the shader (the baked grid stores RAW density) - never also
+// bake a scale into the grid. Carries only look knobs + bounds, nothing about how it was made.
+struct VolumeRenderParams {
+    glm::vec3 boundsMin{0.0f};
+    glm::vec3 boundsMax{1.0f};
+    f32 densityScale = 1.0f;
+    f32 emission = 2.5f;   // temperature/blackbody glow (inert until a temperature grid, P4+)
+    f32 extinction = 1.5f; // absorption (denser/darker smoke)
+    i32 stepCount = 96;    // raymarch steps
+    i32 shadowSteps = 4;   // self-shadow march steps (0 = none)
+};
 
 // ---------------------------------------------------------------------------
 // GPU compute + GPU-writable structured buffers
@@ -864,6 +944,15 @@ public:
     // SetParticles. No-op on backends without compute support.
     virtual void SetVolumeParticles(const VolumeBlob* /*blobs*/, u32 /*count*/,
                                     const VolumeParams& /*params*/) {}
+
+    // Feeds a BAKED NanoVDB volume grid for this frame - the RUNTIME volume path. `bytes` is a
+    // raw, byte-exact NanoVDB grid blob (from the baker / streamed from a .hbvol by VolumeCache);
+    // the PNanoVDB raymarch (VolumeRaymarch.hlsl) samples it via a StructuredBuffer<uint>.
+    // byteSize==0 / bytes==nullptr disables the volume this frame. The pointer must stay valid
+    // through the frame (like SetParticles). This SUPERSEDES SetVolumeParticles' render feed; the
+    // splat sim is offline-only now. No-op on backends without the volume raymarch.
+    virtual void SetVolumeGrid(const void* /*bytes*/, usize /*byteSize*/,
+                               const VolumeRenderParams& /*params*/) {}
 
     // -- GPU compute + GPU-writable structured buffers (optional capability) --
     // True when CreateGpuBuffer / CreateComputePipeline / QueueCompute do real

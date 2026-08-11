@@ -29,6 +29,12 @@ cbuffer PostConstants : register(b1)
     float4 gCensorStrength;   // per-censor strength (.x=censor0 ... .w=censor3)
     float4 gCensorFeather;    // per-censor feather fraction (.x..w)
     uint4  gCensorCount;      // .x = active censor count
+    // Cinematic color grade (Tonemap pass only; 0 elsewhere). Appended at the END so
+    // existing pass offsets are unchanged.
+    float4 gGrade0;           // (temperature, tint, filmGrain, chromaticAberration)
+    float4 gGrade1;           // (lift.rgb, gradeEnabled)
+    float4 gGrade2;           // (gamma.rgb, timeSeconds  - grain animation)
+    float4 gGrade3;           // (gain.rgb, unused)
 };
 
 // Linear-clamp sampler for post sampling (the bindless s0 sampler wraps).

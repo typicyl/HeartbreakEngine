@@ -1,7 +1,6 @@
 // Editor/Editor.cpp
 #include "Editor/Editor.h"
 
-#include "Construction/ConstructionSystem.h"
 #include "Core/Platform.h"
 
 #include "Assets/MeshFaceSelect.h"
@@ -757,7 +756,6 @@ void Editor::BuildUI(Engine& engine) {
     DrawBuildSettings(engine);
     DrawArtEditor(engine);
     DrawSchematicEditor(engine);
-    DrawConstructionPanel(engine);
     DrawDialogueEditor(engine);
     DrawInputIconsPanel(engine);
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
@@ -846,8 +844,7 @@ void Editor::DrawWindowMenu() {
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
-        "Tags", "UI Editor", "Collaborate", "People", "Review changes",
-        "Construction"};
+        "Tags", "UI Editor", "Collaborate", "People", "Review changes"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -903,6 +900,12 @@ void Editor::DrawWindowMenu() {
         layoutBuilt_ = false;
         g_hadSavedLayout = false; // force the built-in default over the saved .ini
     }
+    ImGui::Separator();
+    ImGui::MenuItem("Lock viewport to game aspect", nullptr, &lockViewportAspect_);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Off (default): the Scene viewport fills its panel at any\n"
+                          "aspect, per monitor. On: letterbox it to the game's target\n"
+                          "aspect. The 'Game' tab always stays locked (export preview).");
     ImGui::Separator();
     ImGui::MenuItem("ImGui Demo", nullptr, &showDemo_);
     ImGui::EndMenu();
@@ -4633,6 +4636,16 @@ void Editor::DrawProjectSettings(Engine& engine) {
         }
         ImGui::EndDisabled();
         ImGui::TextDisabled("0 day length = time held; scrub it above. No re-bake needed.");
+        bool dynIBL = env.dynamicIBL != 0;
+        if (ImGui::Checkbox("Dynamic IBL (ambient/reflections follow the sun)", &dynIBL)) {
+            env.dynamicIBL = dynIBL ? 1u : 0u;
+            se.dynamicIBL = env.dynamicIBL;
+            s_skyDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Re-bakes the ambient + reflection maps from the moving sun so\n"
+                              "reflections (incl. water) track day/night + weather. Throttled\n"
+                              "(a few-ms CPU hitch per update); needs Dynamic sky on.");
 
         // --- PER-SCENE OVERRIDE ------------------------------------------------
         // The project's cycle FREE-RUNS: the clock advances from whenever the
@@ -4689,12 +4702,104 @@ void Editor::DrawProjectSettings(Engine& engine) {
             se.overcast = env.overcast;
             s_skyDirty = true;
         }
+        bool volClouds = env.volumetricClouds != 0;
+        if (ImGui::Checkbox("Volumetric clouds (raymarched)", &volClouds)) {
+            env.volumetricClouds = volClouds ? 1u : 0u;
+            se.volumetricClouds = env.volumetricClouds;
+            s_skyDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Real 3D clouds with depth + sun self-shadow (costlier, sky pixels\n"
+                              "only). Off = the cheap 2D sky-plane cloud layer. Uses Cloud Cover /\n"
+                              "Density / Wind above.");
+        ImGui::BeginDisabled(!volClouds);
+        if (ImGui::SliderFloat("Cloud Quality", &env.cloudQuality, 0.0f, 1.0f, "%.2f")) {
+            se.cloudQuality = env.cloudQuality;
+            s_skyDirty = true;
+        }
+        ImGui::EndDisabled();
         if (ImGui::SliderFloat("Wind Direction", &env.windAngle, 0.0f, 360.0f, "%.0f deg")) {
             se.windAngle = env.windAngle;
             s_skyDirty = true;
         }
         if (ImGui::SliderFloat("Wind Speed", &env.windSpeed, 0.0f, 0.2f, "%.3f")) {
             se.windSpeed = env.windSpeed;
+            s_skyDirty = true;
+        }
+
+        ImGui::Separator();
+        ImGui::TextDisabled("Ground response: wetness, puddles, snow accumulation.");
+        const char* kPrecip[] = {"None", "Rain", "Snow"};
+        int pt = static_cast<int>(env.precipType);
+        if (ImGui::Combo("Precipitation", &pt, kPrecip, IM_ARRAYSIZE(kPrecip))) {
+            env.precipType = static_cast<u32>(pt);
+            se.precipType = env.precipType;
+            s_skyDirty = true;
+        }
+        if (ImGui::SliderFloat("Precip Intensity", &env.precipIntensity, 0.0f, 1.0f, "%.2f")) {
+            se.precipIntensity = env.precipIntensity;
+            s_skyDirty = true;
+        }
+        bool dynW = env.dynamicWeather != 0;
+        if (ImGui::Checkbox("Simulate (accumulate wetness/snow over time)", &dynW)) {
+            env.dynamicWeather = dynW ? 1u : 0u;
+            se.dynamicWeather = env.dynamicWeather;
+            s_skyDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("On: rain wets the ground and pools; snow builds up; clear weather\n"
+                              "dries and melts. The three sliders below then read live (disabled).\n"
+                              "Off: the sliders are used exactly as authored.");
+        if (dynW) {
+            // Simulating: the three values are driven each frame by weather::Update on
+            // the LIVE scene env (se.*), which is what MakeView renders. Show those as a
+            // read-only live readout - binding the disabled sliders to the frozen project
+            // env.* would sit still while the ground visibly wets/snows (the bug the
+            // review caught). Locals so the disabled widgets can never write back.
+            float lw = se.wetness, lp = se.puddles, lsn = se.snowAmount;
+            ImGui::BeginDisabled(true);
+            ImGui::SliderFloat("Wetness", &lw, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Puddles", &lp, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Snow", &lsn, 0.0f, 1.0f, "%.2f");
+            ImGui::EndDisabled();
+        } else {
+            if (ImGui::SliderFloat("Wetness", &env.wetness, 0.0f, 1.0f, "%.2f")) {
+                se.wetness = env.wetness;
+                s_skyDirty = true;
+            }
+            if (ImGui::SliderFloat("Puddles", &env.puddles, 0.0f, 1.0f, "%.2f")) {
+                se.puddles = env.puddles;
+                s_skyDirty = true;
+            }
+            if (ImGui::SliderFloat("Snow", &env.snowAmount, 0.0f, 1.0f, "%.2f")) {
+                se.snowAmount = env.snowAmount;
+                s_skyDirty = true;
+            }
+        }
+        if (ImGui::DragFloat("Puddle Scale (m)", &env.puddleScale, 0.1f, 0.5f, 40.0f, "%.1f")) {
+            se.puddleScale = env.puddleScale;
+            s_skyDirty = true;
+        }
+        if (ImGui::DragFloat("Snow Patch Scale (m)", &env.snowScale, 0.1f, 0.5f, 40.0f, "%.1f")) {
+            se.snowScale = env.snowScale;
+            s_skyDirty = true;
+        }
+
+        ImGui::Separator();
+        bool lit = env.lightning != 0;
+        if (ImGui::Checkbox("Lightning (storm flashes)", &lit)) {
+            env.lightning = lit ? 1u : 0u;
+            se.lightning = env.lightning;
+            s_skyDirty = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Random flashes while it rains hard under heavy overcast.\n"
+                              "Set a Thunder sound below for the delayed audio cue.");
+        std::string thunderPick;
+        if (AssetPicker("Thunder (.uaf)", env.thunderSound, ".uaf", uaf::AssetType::Audio,
+                        thunderPick, "(none)")) {
+            env.thunderSound = thunderPick;
+            se.thunderSound = env.thunderSound;
             s_skyDirty = true;
         }
     }
@@ -5641,6 +5746,13 @@ entt::entity Editor::SpawnMeshAsset(Scene& scene, Renderer& renderer,
     }
 
     const std::string relUaf = Project::Active().RelativeAssetPath(uafPath);
+    // Tag the root so a multi-submesh model shows as ONE collapsed row in the hierarchy
+    // (its submesh children are filtered from the outliner). Default modular = parts stay
+    // swappable; the inspector lets the user switch it to a locked static group.
+    if (root != entt::null) {
+        ModelGroup& mg = scene.Registry().emplace<ModelGroup>(root);
+        mg.source = relUaf;
+    }
     glm::vec3 bmin(1e30f), bmax(-1e30f);
     u32 submeshIndex = 0;
     entt::entity lastSpawned = entt::null;
@@ -5757,12 +5869,16 @@ void Editor::DrawViewport(Engine& engine) {
 
     const ImVec2 avail = ImGui::GetContentRegionAvail();
     const ImVec2 pos = ImGui::GetCursorScreenPos();
-    // Letterbox to the game's target aspect: what you author/see here is exactly
-    // what the exported game renders (centered, with bars on the long axis).
-    const f32 aspect = GameTargetAspect();
+    // Fill the whole panel at whatever aspect the panel is (any monitor), unless the
+    // aspect lock is on - then letterbox to the game's target aspect (centered, bars on
+    // the long axis) so the scene view matches the export. The render target, camera
+    // aspect, picking and gizmo all derive from vp*, so either way they follow.
     f32 fw = avail.x > 1.0f ? avail.x : 1.0f;
     f32 fh = avail.y > 1.0f ? avail.y : 1.0f;
-    if (fw / fh > aspect) fw = fh * aspect; else fh = fw / aspect;
+    if (lockViewportAspect_) {
+        const f32 aspect = GameTargetAspect();
+        if (fw / fh > aspect) fw = fh * aspect; else fh = fw / aspect;
+    }
     vpX_ = pos.x + (avail.x - fw) * 0.5f;
     vpY_ = pos.y + (avail.y - fh) * 0.5f;
     vpW_ = fw; vpH_ = fh;
@@ -6780,6 +6896,20 @@ void Editor::DrawHierarchy(Engine& engine) {
             reg.emplace<ReflectionProbe>(e);
             selected_ = e;
         }
+        if (ImGui::MenuItem("Decal")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Decal");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<DecalComponent>(e);
+            selected_ = e;
+        }
+        if (ImGui::MenuItem("Water (Gerstner)")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Water");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<WaterComponent>(e);
+            selected_ = e;
+        }
         if (ImGui::MenuItem("Bake GI Volume (whole level)")) {
             const std::filesystem::path assets = Project::Active().AssetsDir();
             SceneEnvironment& env = scene.Environment();
@@ -7050,8 +7180,15 @@ void Editor::DrawHierarchy(Engine& engine) {
     // build, so a big terrain's chunk bucket is never even sorted).
     scene::BuildChildrenMap(reg, childrenByParent_,
                             [](const entt::registry& r, entt::entity c) {
-                                return r.try_get<const TerrainChunk>(c) == nullptr &&
-                                       r.try_get<const BuildChunkTag>(c) == nullptr;
+                                if (r.try_get<const TerrainChunk>(c)) return false;
+                                // A model root (ModelGroup) collapses to ONE row: drop its
+                                // direct submesh children so the outliner shows the model,
+                                // not every part. The children remain live + serialized.
+                                if (const Parent* p = r.try_get<const Parent>(c);
+                                    p && r.valid(p->entity) &&
+                                    r.try_get<const ModelGroup>(p->entity))
+                                    return false;
+                                return true;
                             });
 
     // Roots: every live entity without a (valid) parent. Gather then draw in the
@@ -7059,10 +7196,6 @@ void Editor::DrawHierarchy(Engine& engine) {
     std::vector<entt::entity> roots;
     for (const entt::entity e : reg.view<entt::entity>()) {
         if (reg.try_get<TerrainChunk>(e)) continue; // generated terrain chunk
-        // Generated building geometry, for the same reason: it is derived data, and deleting a
-        // chunk by hand would not be undone by construction::Sync (which is revision-gated), so
-        // the building would sit with a permanent hole until something bumped its revision.
-        if (reg.try_get<BuildChunkTag>(e)) continue;
         const Parent* p = reg.try_get<Parent>(e);
         if (p && reg.valid(p->entity)) continue;
         roots.push_back(e);
@@ -7782,6 +7915,16 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             PushUndo(scene);
             reg.emplace<FacialAnimator>(sel);
         }
+        if (!reg.all_of<DecalComponent>(sel) && ImGui::MenuItem("Decal")) {
+            PushUndo(scene);
+            reg.emplace<DecalComponent>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
+        if (!reg.all_of<WaterComponent>(sel) && ImGui::MenuItem("Water (Gerstner)")) {
+            PushUndo(scene);
+            reg.emplace<WaterComponent>(sel);
+            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        }
         if (!reg.all_of<ParticleEmitter>(sel) && ImGui::BeginMenu("Particle Emitter")) {
             const auto addEmitter = [&](ParticleEmitter em) {
                 PushUndo(scene);
@@ -7826,11 +7969,6 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             PushUndo(scene);
             reg.emplace<MotionMatching>(sel);
             if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // MM drives an Animator
-        }
-        if (!reg.all_of<ProceduralBuilding>(sel) && ImGui::MenuItem("Procedural Building")) {
-            PushUndo(scene);
-            reg.emplace<ProceduralBuilding>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
         }
         if (!reg.all_of<Rotator>(sel) && ImGui::MenuItem("Rotator")) {
             PushUndo(scene);
@@ -7946,11 +8084,9 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.open) {
             ImGui::DragFloat3("Position", glm::value_ptr(t->position), 0.05f);
             undoOnActivate();
-            // Edit rotation as Euler degrees for usability.
-            glm::vec3 euler = glm::degrees(glm::eulerAngles(t->rotation));
-            if (ImGui::DragFloat3("Rotation", glm::value_ptr(euler), 0.5f)) {
-                t->rotation = glm::quat(glm::radians(euler));
-            }
+            // Edit rotation as Euler degrees, via the stable editor (a naive
+            // quat->euler->quat round-trip every frame flips the other two axes).
+            RotationEulerEditor("Rotation", t->rotation, &t->rotation);
             undoOnActivate();
             ImGui::DragFloat3("Scale", glm::value_ptr(t->scale), 0.05f, 0.001f, 1000.0f);
             undoOnActivate();
@@ -7958,6 +8094,32 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<Transform>(sel);
+        }
+    }
+
+    // --- Model (multi-submesh group) -----------------------------------------
+    if (ModelGroup* mg = reg.try_get<ModelGroup>(sel)) {
+        const SectionState s = ComponentSection("Model");
+        if (s.open) {
+            u32 parts = 0;
+            for (const entt::entity e : reg.view<Parent>())
+                if (reg.get<Parent>(e).entity == sel) ++parts;
+            ImGui::Text("%u part(s), shown as one row", parts);
+            if (!mg->source.empty()) ImGui::TextDisabled("%s", mg->source.c_str());
+            int mode = mg->modular ? 0 : 1;
+            ImGui::TextUnformatted("Type:");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Modular", &mode, 0)) { PushUndo(scene); mg->modular = true; }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Static", &mode, 1)) { PushUndo(scene); mg->modular = false; }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Modular: the submeshes stay individually swappable parts.\n"
+                                  "Static: they are a locked group. Both collapse to one\n"
+                                  "hierarchy row; the parts stay real entities either way.");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<ModelGroup>(sel); // ungroup: the submesh children reappear in the outliner
         }
     }
 
@@ -8109,6 +8271,149 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
+    if (DecalComponent* dc = reg.try_get<DecalComponent>(sel)) {
+        const SectionState s = ComponentSection("Decal");
+        if (s.open) {
+            ImGui::TextDisabled("Projects textures onto the surfaces it overlaps.");
+            ImGui::TextDisabled("Orient the box so its +Z points INTO the surface.");
+            ImGui::DragFloat3("Box Half Extents##dc", glm::value_ptr(dc->halfExtents), 0.02f,
+                              0.01f, 100.0f);
+            undoOnActivate();
+            ImGui::SliderFloat("Opacity##dc", &dc->opacity, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Angle Fade##dc", &dc->angleFade, 0.0f, 8.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Normal Strength##dc", &dc->normalStrength, 0.0f, 2.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Roughness (no MR map)##dc", &dc->roughness, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Metallic (no MR map)##dc", &dc->metallic, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            std::string dpick;
+            if (AssetPicker("Albedo (.uaf)##dc", dc->albedoTex, ".uaf", uaf::AssetType::Texture,
+                            dpick, "(none)")) {
+                PushUndo(scene);
+                dc->albedoTex = dpick;
+                dc->resolved = false;
+            }
+            if (AssetPicker("Normal (.uaf)##dc", dc->normalTex, ".uaf", uaf::AssetType::Texture,
+                            dpick, "(none)")) {
+                PushUndo(scene);
+                dc->normalTex = dpick;
+                dc->resolved = false;
+            }
+            if (AssetPicker("Metal-Rough (.uaf)##dc", dc->mrTex, ".uaf", uaf::AssetType::Texture,
+                            dpick, "(none)")) {
+                PushUndo(scene);
+                dc->mrTex = dpick;
+                dc->resolved = false;
+            }
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<DecalComponent>(sel);
+        }
+    }
+
+    if (WaterComponent* wc = reg.try_get<WaterComponent>(sel)) {
+        const SectionState s = ComponentSection("Water");
+        if (s.open) {
+            ImGui::TextDisabled("Gerstner-wave water surface (reflective, alpha-blended).");
+            ImGui::TextDisabled("Wave/look params are global; the first water entity wins.");
+            if (ImGui::DragFloat("Size (m)##w", &wc->size, 1.0f, 4.0f, 4000.0f, "%.0f"))
+                wc->dirty = true;
+            undoOnActivate();
+            int res = static_cast<int>(wc->resolution);
+            if (ImGui::SliderInt("Grid Resolution##w", &res, 16, 256)) {
+                wc->resolution = static_cast<u32>(res);
+                wc->dirty = true;
+            }
+            undoOnActivate();
+            ImGui::Separator();
+            ImGui::TextDisabled("Waves (direction / amplitude / wavelength / speed / steepness)");
+            for (int i = 0; i < 4; ++i) {
+                ImGui::PushID(i);
+                ImGui::Text("Wave %d", i + 1);
+                ImGui::DragFloat("Direction (deg)##w", &wc->waveAngle[i], 1.0f, 0.0f, 360.0f, "%.0f");
+                undoOnActivate();
+                ImGui::DragFloat("Amplitude (m)##w", &wc->waveAmplitude[i], 0.01f, 0.0f, 10.0f, "%.2f");
+                undoOnActivate();
+                ImGui::DragFloat("Wavelength (m)##w", &wc->waveLength[i], 0.1f, 0.5f, 300.0f, "%.1f");
+                undoOnActivate();
+                ImGui::DragFloat("Speed##w", &wc->waveSpeed[i], 0.05f, 0.0f, 40.0f, "%.2f");
+                undoOnActivate();
+                ImGui::SliderFloat("Steepness##w", &wc->waveSteepness[i], 0.0f, 1.0f, "%.2f");
+                undoOnActivate();
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+            ImGui::ColorEdit3("Shallow Colour##w", glm::value_ptr(wc->shallowColor));
+            undoOnActivate();
+            ImGui::ColorEdit3("Deep Colour##w", glm::value_ptr(wc->deepColor));
+            undoOnActivate();
+            ImGui::SliderFloat("Fresnel Power##w", &wc->fresnelPower, 1.0f, 12.0f, "%.1f");
+            undoOnActivate();
+            ImGui::SliderFloat("Reflection Roughness##w", &wc->reflectionRoughness, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Foam##w", &wc->foam, 0.0f, 2.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Ripple Strength##w", &wc->rippleStrength, 0.0f, 3.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Ripple Scale##w", &wc->rippleScale, 0.0f, 3.0f, "%.2f");
+            undoOnActivate();
+            ImGui::SliderFloat("Buoyancy##w", &wc->buoyancy, 0.0f, 3.0f, "%.2f");
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Floating strength for rigid bodies over the water\n"
+                                  "(1 = neutral, >1 floats up). Play mode only.");
+
+            ImGui::SeparatorText("Depth-based Water");
+            ImGui::SliderFloat("Absorption Depth##w", &wc->absorptionDepth, 0.1f, 30.0f, "%.1f m");
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Water-column metres to full deep colour + opacity. Shallow\n"
+                                  "water stays see-through; deeper reads bluer/darker + opaque.");
+            ImGui::SliderFloat("Shoreline Foam##w", &wc->shorelineWidth, 0.0f, 8.0f, "%.1f m");
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Width of the foam band where water breaks on a shallow floor.");
+            ImGui::SliderFloat("Edge Fade##w", &wc->edgeFade, 0.0f, 3.0f, "%.2f m");
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Soft depth-fade where the surface meets geometry\n"
+                                  "(hides the hard intersection line).");
+
+            ImGui::SeparatorText("FFT Ocean (Tessendorf)");
+            ImGui::Checkbox("FFT Ocean##w", &wc->fftOcean);
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Replace the Gerstner sum with a real GPU spectral ocean\n"
+                                  "(256x256 FFT). Needs a compute-capable backend; falls back\n"
+                                  "to Gerstner otherwise. Gerstner params still drive buoyancy.");
+            if (wc->fftOcean) {
+                ImGui::SliderFloat("Wind Speed##fft", &wc->fftWindSpeed, 1.0f, 40.0f, "%.1f m/s");
+                undoOnActivate();
+                ImGui::SliderFloat("Wind Dir##fft", &wc->fftWindDir, 0.0f, 360.0f, "%.0f deg");
+                undoOnActivate();
+                ImGui::SliderFloat("Patch Size##fft", &wc->fftPatchSize, 16.0f, 512.0f, "%.0f m");
+                undoOnActivate();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("World metres one FFT tile spans (it repeats). Smaller =\n"
+                                      "finer, choppier detail; larger = broader swells.");
+                ImGui::SliderFloat("Choppiness##fft", &wc->fftChoppiness, 0.0f, 2.5f, "%.2f");
+                undoOnActivate();
+                ImGui::SliderFloat("Amplitude##fft", &wc->fftAmplitude, 0.0f, 20.0f, "%.1f");
+                undoOnActivate();
+                ImGui::SliderFloat("Height Scale##fft", &wc->fftHeightScale, 0.0f, 3.0f, "%.2f");
+                undoOnActivate();
+            }
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<WaterComponent>(sel);
+        }
+    }
+
     // --- Mesh / material ------------------------------------------------------
     if (MeshInstance* mi = reg.try_get<MeshInstance>(sel)) {
         const SectionState s = ComponentSection("Mesh / Material");
@@ -8162,6 +8467,8 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                         mat.emissiveIntensity = mi->emissiveIntensity;
                         mat.subsurfaceColor = mi->subsurfaceColor;
                         mat.subsurfaceRadius = mi->subsurfaceRadius;
+                        mat.clearcoat = mi->clearcoat;
+                        mat.clearcoatRoughness = mi->clearcoatRoughness;
                         mat.flags = mi->materialFlags;
                         assets::SaveMaterial(created, mat);
                         StampNewAsset(created); // CreateMaterialAsset wrote it; re-stamp is a no-op
@@ -8173,6 +8480,9 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 }
                 ImGui::Separator();
             }
+            DrawMaterialPresetCombo(mi->materialFlags, mi->metallic, mi->roughness,
+                                    mi->subsurfaceColor, mi->subsurfaceRadius,
+                                    [&] { PushUndo(scene); });
             ImGui::ColorEdit4("Base Color", glm::value_ptr(mi->baseColor));
             undoOnActivate();
             ImGui::SliderFloat("Metallic", &mi->metallic, 0.0f, 1.0f);
@@ -8198,6 +8508,16 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 ImGui::ColorEdit3("Subsurface Color", glm::value_ptr(mi->subsurfaceColor));
                 undoOnActivate();
                 ImGui::SliderFloat("Scatter radius", &mi->subsurfaceRadius, 0.1f, 4.0f, "%.2f");
+                undoOnActivate();
+            }
+            // Clearcoat: a wet/oily clear layer (sweat, wet skin, wet eyes, varnish).
+            ImGui::SliderFloat("Clearcoat", &mi->clearcoat, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Wet/oily clear layer over the material.\n"
+                                  "0 = dry. Raise for sweat, wet skin, wet eyes, varnish.");
+            if (mi->clearcoat > 0.0f) {
+                ImGui::SliderFloat("Clearcoat roughness", &mi->clearcoatRoughness, 0.02f, 0.5f, "%.2f");
                 undoOnActivate();
             }
             const auto flagToggle = [&](const char* label, u32 bit) {
@@ -9042,43 +9362,6 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         }
     }
 
-    // --- Procedural Building -------------------------------------------------
-    if (ProceduralBuilding* pb = reg.try_get<ProceduralBuilding>(sel)) {
-        const SectionState s = ComponentSection("Procedural Building");
-        if (s.open) {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf), "%s", pb->source.c_str());
-            if (ImGui::InputText("Source (.hbbuild)", buf, sizeof(buf))) {
-                PushUndo(scene);
-                pb->source = buf;
-                ++pb->revision; // the source changed, so the geometry must be rebuilt
-            }
-            if (ImGui::DragFloat("Chunk Size", &pb->chunkSize, 0.25f, 0.5f, 64.0f, "%.2f m")) {
-                PushUndo(scene);
-                ++pb->revision;
-            }
-
-            // REGENERATION IS EXPLICIT, not automatic on edit. The RHI cannot free a mesh, so a
-            // rebuild abandons the previous buffers for the process lifetime - regenerating on
-            // every slider frame would leak an entire building per frame.
-            if (ImGui::Button("Rebuild")) ++pb->revision;
-            ImGui::SameLine();
-            u32 chunkEntities = 0;
-            for (const entt::entity ce : reg.view<BuildChunkTag>())
-                if (reg.get<BuildChunkTag>(ce).owner == sel) ++chunkEntities;
-            ImGui::Text("%u generated chunk mesh(es)", chunkEntities);
-
-            if (pb->source.empty())
-                ImGui::TextDisabled("Set a .hbbuild path, or use the Construction panel to author "
-                                    "one and spawn it.");
-        }
-        if (s.remove) {
-            PushUndo(scene);
-            construction::ClearGenerated(scene, sel);
-            reg.remove<ProceduralBuilding>(sel);
-        }
-    }
-
     // --- Rotator -------------------------------------------------------------
     if (Rotator* ro = reg.try_get<Rotator>(sel)) {
         const SectionState s = ComponentSection("Rotator");
@@ -9644,6 +9927,13 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     }
                     ImGui::SliderFloat("Speed", &an->speed, -2.0f, 3.0f);
                     undoOnActivate();
+                    ImGui::SliderFloat("Blend Time", &an->blendTime, 0.0f, 1.0f, "%.2f s");
+                    undoOnActivate();
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip(
+                            "Crossfade when the clip changes (by hand, MotionMatching,\n"
+                            "or a cutscene marker). 0 = hard cut.");
+                    }
                     ImGui::SliderFloat("Time", &an->time, 0.0f,
                                        glm::max(clip.duration, 0.001f), "%.2f s");
                 } else {
@@ -10888,10 +11178,37 @@ void Editor::DrawPostLookControls(rhi::PostSettings& p, f32* exposure) {
         ImGui::SliderFloat("Max radius##mb", &p.motionBlurMaxRadius, 1.0f, 64.0f, "%.0f px");
     }
 
+    ImGui::SeparatorText("Tonemap");
+    const char* kTonemapOps[] = {"ACES (filmic)", "AgX (neutral)", "Tony McMapface"};
+    int tmOp = static_cast<int>(p.tonemapOperator);
+    if (ImGui::Combo("Operator", &tmOp, kTonemapOps, IM_ARRAYSIZE(kTonemapOps)))
+        p.tonemapOperator = static_cast<u32>(glm::clamp(tmOp, 0, 2));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("SDR display transform for the modular output stage.\n"
+                          "AgX and Tony McMapface are neutral, hue-preserving\n"
+                          "alternatives to ACES. HDR-monitor output is a future phase.");
+
     ImGui::SeparatorText("Color grade");
     ImGui::SliderFloat("Vignette", &p.vignette, 0.0f, 1.0f, "%.2f");
     ImGui::SliderFloat("Saturation", &p.saturation, 0.0f, 2.0f, "%.2f");
     ImGui::SliderFloat("Contrast", &p.contrast, 0.5f, 2.0f, "%.2f");
+
+    bool ge = p.gradeEnabled != 0;
+    if (ImGui::Checkbox("Cinematic grade", &ge)) p.gradeEnabled = ge ? 1u : 0u;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("White balance + lift/gamma/gain colour wheels + film grain.\n"
+                          "The stage that gives the moody warm-fire / cool-night look.");
+    if (p.gradeEnabled) {
+        ImGui::SliderFloat("Temperature", &p.gradeTemperature, -1.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("White balance: - cool (blue) .. + warm (amber)");
+        ImGui::SliderFloat("Tint", &p.gradeTint, -1.0f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("White balance: - green .. + magenta");
+        ImGui::SliderFloat3("Lift (shadows)", &p.gradeLift.x, -0.25f, 0.25f, "%.3f");
+        ImGui::SliderFloat3("Gamma (mids)", &p.gradeGamma.x, 0.5f, 1.5f, "%.3f");
+        ImGui::SliderFloat3("Gain (highlights)", &p.gradeGain.x, 0.5f, 1.5f, "%.3f");
+        ImGui::SliderFloat("Film grain", &p.filmGrain, 0.0f, 0.12f, "%.3f");
+        ImGui::SliderFloat("Chromatic aberration", &p.chromaticAberration, 0.0f, 1.0f, "%.2f");
+    }
 }
 
 // Project-global rendering quality: anti-aliasing + ambient occlusion. These are
@@ -10939,33 +11256,40 @@ void Editor::DrawTimeline(Engine& engine) {
         ImGui::End();
         return;
     }
+    // selectedKey_ is a bare index into THIS entity's keys; drop it when the inspected
+    // entity changes so a stale index can't edit/delete an unrelated key on the new one.
+    if (timelineKeyOwner_ != selected_) { selectedKey_ = -1; timelineKeyOwner_ = selected_; }
 
-    // --- Transport / track controls -----------------------------------------
-    if (ImGui::Button(track->playing ? "Pause" : "Play")) {
-        track->playing = !track->playing;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Stop")) {
-        track->playing = false;
-        track->time = 0.0f;
-        if (transform) anim::Sample(*track, *transform);
-    }
-    ImGui::SameLine();
-    ImGui::Checkbox("Loop", &track->loop);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.0f);
-    ImGui::DragFloat("Speed", &track->speed, 0.05f, -4.0f, 4.0f);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(80.0f);
-    if (ImGui::DragFloat("Length", &track->duration, 0.1f, 0.1f, 600.0f)) {
-        track->time = glm::min(track->time, track->duration);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Add Key") && transform) {
+    ImGuiIO& io = ImGui::GetIO();
+    const f32 fps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
+    const f32 frameDt = 1.0f / glm::max(fps, 1.0f);
+    editor::FrameGrid grid;
+    grid.fps = fps;
+    grid.enabled = timelineSnap_;
+    grid.suspend = io.KeyCtrl;
+    const auto snapT = [&](f32 t) { return editor::SnapClamped(t, track->duration, grid); };
+
+    // Keep keys time-sorted after a drag, returning the moved key's new index.
+    const auto reorder = [&](int idx) -> int {
+        auto& v = track->keys;
+        while (idx > 0 && v[static_cast<usize>(idx)].time < v[static_cast<usize>(idx - 1)].time) {
+            std::swap(v[static_cast<usize>(idx)], v[static_cast<usize>(idx - 1)]); --idx;
+        }
+        while (idx + 1 < static_cast<int>(v.size()) &&
+               v[static_cast<usize>(idx)].time > v[static_cast<usize>(idx + 1)].time) {
+            std::swap(v[static_cast<usize>(idx)], v[static_cast<usize>(idx + 1)]); ++idx;
+        }
+        return idx;
+    };
+    const auto preview = [&]() {
+        if (!track->playing && transform && !track->keys.empty()) anim::Sample(*track, *transform);
+    };
+    // Insert (or overwrite) a key capturing the entity's current pose at time t.
+    const auto addKeyAt = [&](f32 t) {
+        if (!transform) return;
         PushUndo(scene);
-        // Capture the entity's current local pose at the playhead.
         AnimationTrack::Key k;
-        k.time = track->time;
+        k.time = t;
         k.position = transform->position;
         k.rotation = transform->rotation;
         k.scale = transform->scale;
@@ -10974,19 +11298,49 @@ void Editor::DrawTimeline(Engine& engine) {
                                      return std::abs(a.time - k.time) < 0.005f;
                                  });
         if (same != track->keys.end()) {
+            k.ease = same->ease; // keep the existing curve when re-recording in place
             *same = k;
+            selectedKey_ = static_cast<int>(same - track->keys.begin());
         } else {
-            track->keys.insert(std::upper_bound(track->keys.begin(), track->keys.end(),
-                                                k.time,
-                                                [](f32 t, const AnimationTrack::Key& a) {
-                                                    return t < a.time;
-                                                }),
-                               k);
+            auto it = track->keys.insert(
+                std::upper_bound(track->keys.begin(), track->keys.end(), k.time,
+                                 [](f32 tt, const AnimationTrack::Key& a) { return tt < a.time; }),
+                k);
+            selectedKey_ = static_cast<int>(it - track->keys.begin());
         }
-    }
+    };
+
+    // --- Transport / track controls -----------------------------------------
+    if (ImGui::Button(track->playing ? "Pause" : "Play")) track->playing = !track->playing;
     ImGui::SameLine();
-    ImGui::BeginDisabled(selectedKey_ < 0 ||
-                         selectedKey_ >= static_cast<int>(track->keys.size()));
+    if (ImGui::Button("Stop")) { track->playing = false; track->time = 0.0f; preview(); }
+    ImGui::SameLine();
+    if (ImGui::Button("|<")) { track->time = 0.0f; preview(); }
+    ImGui::SameLine();
+    if (ImGui::Button("<|")) { track->time = glm::max(0.0f, track->time - frameDt); preview(); }
+    ImGui::SameLine();
+    if (ImGui::Button("|>")) { track->time = glm::min(track->duration, track->time + frameDt); preview(); }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(66.0f);
+    if (ImGui::DragFloat("##time", &track->time, 0.01f, 0.0f, track->duration, "%.2fs")) preview();
+    ImGui::SameLine();
+    ImGui::Checkbox("Loop", &track->loop);
+    if (ImGui::IsItemActivated()) PushUndo(scene); // snapshot BEFORE the toggle (on press)
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70.0f);
+    ImGui::DragFloat("Speed", &track->speed, 0.05f, -4.0f, 4.0f);
+    if (ImGui::IsItemActivated()) PushUndo(scene);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70.0f);
+    if (ImGui::DragFloat("Length", &track->duration, 0.1f, 0.1f, 600.0f))
+        track->time = glm::min(track->time, track->duration);
+    if (ImGui::IsItemActivated()) PushUndo(scene);
+    ImGui::SameLine();
+    ImGui::Checkbox("Snap", &timelineSnap_);
+    ImGui::SameLine();
+    if (ImGui::Button("Add Key")) addKeyAt(track->time);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(selectedKey_ < 0 || selectedKey_ >= static_cast<int>(track->keys.size()));
     if (ImGui::Button("Delete Key")) {
         PushUndo(scene);
         track->keys.erase(track->keys.begin() + selectedKey_);
@@ -10997,68 +11351,210 @@ void Editor::DrawTimeline(Engine& engine) {
     ImGui::TextDisabled("%.2fs / %.2fs  (%d keys)", track->time, track->duration,
                         static_cast<int>(track->keys.size()));
 
-    // --- Track strip: ruler + keys + playhead --------------------------------
-    const f32 stripH = 44.0f;
+    // --- Track strip: ruler + keys + playhead (zoomable / pannable) ----------
+    const f32 kRulerH = 16.0f;
+    const f32 stripH = kRulerH + 46.0f;
     const ImVec2 avail = ImGui::GetContentRegionAvail();
-    const f32 stripW = glm::max(avail.x, 50.0f);
-    ImGui::InvisibleButton("##strip", ImVec2(stripW, stripH));
+    const f32 stripW = glm::max(avail.x, 60.0f);
+    ImGui::InvisibleButton("##strip", ImVec2(stripW, stripH),
+                           ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
+    const bool canvasHovered = ImGui::IsItemHovered();
     const ImVec2 p0 = ImGui::GetItemRectMin();
     const ImVec2 p1 = ImGui::GetItemRectMax();
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    const ImVec2 mouse = io.MousePos;
 
-    dl->AddRectFilled(p0, p1, IM_COL32(36, 36, 42, 255), 4.0f);
-    // Second ticks (subdivided when zoomed in enough).
-    const f32 pxPerSec = stripW / glm::max(track->duration, 1e-3f);
-    for (f32 t = 0.0f; t <= track->duration + 1e-3f; t += 1.0f) {
-        const f32 x = p0.x + t * pxPerSec;
-        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p0.y + 8.0f), IM_COL32(120, 120, 130, 255));
-        char label[16];
-        std::snprintf(label, sizeof(label), "%.0f", t);
-        dl->AddText(ImVec2(x + 2.0f, p0.y + 2.0f), IM_COL32(120, 120, 130, 255), label);
+    if (timelineZoom_ <= 0.0f) // first use / refit: span the whole track across the strip
+        timelineZoom_ = glm::clamp(stripW / glm::max(track->duration, 1e-3f), 4.0f, 4000.0f);
+    const auto timeToX = [&](f32 t) { return p0.x + (t - timelineScroll_) * timelineZoom_; };
+    const auto xToTime = [&](f32 x) { return timelineScroll_ + (x - p0.x) / timelineZoom_; };
+
+    // Wheel zoom keeps the time under the cursor fixed; middle-drag pans.
+    if (canvasHovered && io.MouseWheel != 0.0f) {
+        const f32 tc = xToTime(mouse.x);
+        timelineZoom_ = glm::clamp(timelineZoom_ * std::pow(1.1f, io.MouseWheel), 4.0f, 4000.0f);
+        timelineScroll_ = glm::max(0.0f, tc - (mouse.x - p0.x) / timelineZoom_);
     }
+    if (canvasHovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle))
+        timelineScroll_ = glm::max(0.0f, timelineScroll_ - io.MouseDelta.x / timelineZoom_);
 
-    // Key diamonds.
-    const f32 keyY = (p0.y + p1.y) * 0.5f + 6.0f;
-    for (int i = 0; i < static_cast<int>(track->keys.size()); ++i) {
-        const f32 x = p0.x + track->keys[i].time * pxPerSec;
-        const f32 r = 5.0f;
-        const ImU32 col = (i == selectedKey_) ? IM_COL32(255, 200, 60, 255)
-                                              : IM_COL32(120, 180, 255, 255);
-        dl->AddQuadFilled(ImVec2(x, keyY - r), ImVec2(x + r, keyY), ImVec2(x, keyY + r),
-                          ImVec2(x - r, keyY), col);
-    }
-
-    // Playhead.
+    dl->AddRectFilled(p0, p1, IM_COL32(30, 31, 36, 255), 4.0f);
+    dl->AddRectFilled(p0, ImVec2(p1.x, p0.y + kRulerH), IM_COL32(38, 40, 46, 255));
+    dl->PushClipRect(p0, p1, true);
     {
-        const f32 x = p0.x + track->time * pxPerSec;
-        dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(255, 90, 90, 255), 2.0f);
-    }
-
-    // Interaction: click near a key selects it; click/drag elsewhere scrubs.
-    if (ImGui::IsItemActivated()) {
-        const f32 mx = ImGui::GetMousePos().x;
-        selectedKey_ = -1;
-        for (int i = 0; i < static_cast<int>(track->keys.size()); ++i) {
-            const f32 kx = p0.x + track->keys[i].time * pxPerSec;
-            if (std::abs(mx - kx) <= 6.0f) {
-                selectedKey_ = i;
-                break;
+        static const f32 kSteps[] = {0.05f, 0.1f, 0.25f, 0.5f, 1.0f, 2.0f, 5.0f, 10.0f, 30.0f, 60.0f};
+        f32 step = kSteps[0];
+        for (f32 s : kSteps) { step = s; if (s * timelineZoom_ >= 60.0f) break; }
+        const f32 first = std::floor(timelineScroll_ / step) * step;
+        for (f32 t = first;; t += step) {
+            const f32 x = timeToX(t);
+            if (x > p1.x) break;
+            if (x >= p0.x && t >= 0.0f) {
+                dl->AddLine(ImVec2(x, p0.y + 3.0f), ImVec2(x, p0.y + kRulerH), IM_COL32(96, 98, 108, 255));
+                char lbl[24];
+                std::snprintf(lbl, sizeof(lbl), "%.2gs", static_cast<double>(t));
+                dl->AddText(ImVec2(x + 2.0f, p0.y + 1.0f), IM_COL32(150, 152, 162, 255), lbl);
+                dl->AddLine(ImVec2(x, p0.y + kRulerH), ImVec2(x, p1.y), IM_COL32(52, 54, 62, 120));
             }
         }
+        const f32 xEnd = timeToX(track->duration);
+        if (xEnd >= p0.x && xEnd <= p1.x)
+            dl->AddLine(ImVec2(xEnd, p0.y + kRulerH), ImVec2(xEnd, p1.y), IM_COL32(120, 80, 80, 160));
     }
-    if (ImGui::IsItemActive() && selectedKey_ < 0) {
-        // Same frame grid as the cutscene NLE - one definition, three timelines, so a
-        // playhead scrubbed here and one scrubbed there cannot disagree.
-        editor::FrameGrid grid;
-        grid.fps = Project::HasActive() ? Project::Active().Settings().timelineFps : 30.0f;
-        grid.enabled = timelineSnap_;
-        grid.suspend = ImGui::GetIO().KeyCtrl;
-        const f32 t = editor::SnapClamped((ImGui::GetMousePos().x - p0.x) / pxPerSec,
-                                          track->duration, grid);
-        track->time = t;
-        if (!track->playing && transform && !track->keys.empty()) {
-            anim::Sample(*track, *transform); // live preview while scrubbing
+    const f32 keyY = p0.y + kRulerH + 24.0f;
+    const auto drawDiamond = [&](f32 x, f32 y, f32 r, ImU32 col, bool sel) {
+        dl->AddQuadFilled(ImVec2(x, y - r), ImVec2(x + r, y), ImVec2(x, y + r), ImVec2(x - r, y), col);
+        if (sel)
+            dl->AddQuad(ImVec2(x, y - r - 2), ImVec2(x + r + 2, y), ImVec2(x, y + r + 2),
+                        ImVec2(x - r - 2, y), IM_COL32(255, 255, 255, 255), 1.5f);
+    };
+    for (int i = 0; i < static_cast<int>(track->keys.size()); ++i) {
+        const f32 x = timeToX(track->keys[i].time);
+        if (x < p0.x - 8.0f || x > p1.x + 8.0f) continue;
+        drawDiamond(x, keyY, 5.0f,
+                    (i == selectedKey_) ? IM_COL32(255, 200, 60, 255) : IM_COL32(120, 180, 255, 255),
+                    i == selectedKey_);
+    }
+    {
+        const f32 x = timeToX(track->time);
+        if (x >= p0.x && x <= p1.x)
+            dl->AddLine(ImVec2(x, p0.y), ImVec2(x, p1.y), IM_COL32(255, 90, 90, 255), 2.0f);
+    }
+    dl->PopClipRect();
+
+    // Nearest key under the cursor (for select / drag / hover cursor).
+    int hitKey = -1;
+    {
+        f32 best = 8.0f;
+        if (canvasHovered && mouse.y > p0.y + kRulerH) {
+            for (int i = 0; i < static_cast<int>(track->keys.size()); ++i) {
+                const f32 dx = std::abs(mouse.x - timeToX(track->keys[i].time));
+                if (dx <= best) { best = dx; hitKey = i; }
+            }
         }
+        if (hitKey >= 0) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+
+    // Interaction: grab a key to select/drag; empty space (or the ruler) scrubs.
+    // Left button only - the canvas also accepts right-clicks (for the context menu),
+    // and a right-drag must NOT scrub the playhead or move a key.
+    if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        if (hitKey >= 0) {
+            selectedKey_ = hitKey;
+            timelineDragArmed_ = true;
+            timelineDragKey_ = false;
+            timelineDragOffset_ = xToTime(mouse.x) - track->keys[hitKey].time;
+        } else {
+            timelineDragArmed_ = false;
+            selectedKey_ = -1;
+            track->time = snapT(xToTime(mouse.x));
+            preview();
+        }
+    }
+    if (ImGui::IsItemActive() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        if (timelineDragArmed_ && !timelineDragKey_ &&
+            ImGui::IsMouseDragging(ImGuiMouseButton_Left, 3.0f)) {
+            timelineDragKey_ = true;
+            PushUndo(scene); // one undo entry for the whole drag
+        }
+        if (timelineDragKey_ && selectedKey_ >= 0 && selectedKey_ < static_cast<int>(track->keys.size())) {
+            track->keys[static_cast<usize>(selectedKey_)].time =
+                snapT(xToTime(mouse.x) - timelineDragOffset_);
+            selectedKey_ = reorder(selectedKey_);
+            preview();
+        } else if (!timelineDragArmed_) {
+            track->time = snapT(xToTime(mouse.x));
+            preview();
+        }
+    }
+    if (ImGui::IsItemDeactivated()) { timelineDragArmed_ = false; timelineDragKey_ = false; }
+    // A right-press selects the key under the cursor so the context menu's Copy/Delete
+    // act on THAT key (Add/Paste use the click position). hitKey is -1 off a key, which
+    // the menu's haveSel gate handles - so right-clicking empty space just deselects.
+    if (ImGui::IsItemActivated() && ImGui::IsMouseDown(ImGuiMouseButton_Right))
+        selectedKey_ = hitKey;
+
+    // Right-click context menu (add-at-cursor / copy / paste / delete).
+    if (ImGui::BeginPopupContextItem("##tlctx")) {
+        const f32 ctxT = snapT(xToTime(io.MouseClickedPos[ImGuiMouseButton_Right].x));
+        if (ImGui::MenuItem("Add key here", nullptr, false, transform != nullptr)) addKeyAt(ctxT);
+        const bool haveSel = selectedKey_ >= 0 && selectedKey_ < static_cast<int>(track->keys.size());
+        if (ImGui::MenuItem("Copy key", nullptr, false, haveSel))
+            timelineClipboard_ = {track->keys[static_cast<usize>(selectedKey_)]};
+        if (ImGui::MenuItem("Paste key here", nullptr, false, !timelineClipboard_.empty())) {
+            PushUndo(scene);
+            AnimationTrack::Key k = timelineClipboard_.front();
+            k.time = ctxT;
+            auto it = track->keys.insert(
+                std::upper_bound(track->keys.begin(), track->keys.end(), k.time,
+                                 [](f32 tt, const AnimationTrack::Key& a) { return tt < a.time; }),
+                k);
+            selectedKey_ = static_cast<int>(it - track->keys.begin());
+        }
+        if (ImGui::MenuItem("Delete key", nullptr, false, haveSel)) {
+            PushUndo(scene);
+            track->keys.erase(track->keys.begin() + selectedKey_);
+            selectedKey_ = -1;
+        }
+        ImGui::EndPopup();
+    }
+
+    // Keyboard shortcuts while the panel is focused (and not typing in a field).
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !io.WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Space)) track->playing = !track->playing;
+        if (ImGui::IsKeyPressed(ImGuiKey_Home)) { track->time = 0.0f; preview(); }
+        if (ImGui::IsKeyPressed(ImGuiKey_End)) { track->time = track->duration; preview(); }
+        const f32 nudge = io.KeyShift ? frameDt * 10.0f : frameDt;
+        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) { track->time = glm::max(0.0f, track->time - nudge); preview(); }
+        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow)) { track->time = glm::min(track->duration, track->time + nudge); preview(); }
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete) && selectedKey_ >= 0 &&
+            selectedKey_ < static_cast<int>(track->keys.size())) {
+            PushUndo(scene);
+            track->keys.erase(track->keys.begin() + selectedKey_);
+            selectedKey_ = -1;
+        }
+    }
+
+    // --- Selected-key inspector ----------------------------------------------
+    if (selectedKey_ >= 0 && selectedKey_ < static_cast<int>(track->keys.size())) {
+        const auto undoOnActivate = [&]() { if (ImGui::IsItemActivated()) PushUndo(scene); };
+        // POINTER, not a reference: a Time edit calls reorder() which swaps slot
+        // contents, so the alias must be re-pointed to the moved key that same frame or
+        // the transform/ease widgets below would read a neighbour's values.
+        AnimationTrack::Key* k = &track->keys[static_cast<usize>(selectedKey_)];
+        ImGui::SeparatorText("Key");
+        if (ImGui::DragFloat("Time##key", &k->time, 0.01f, 0.0f, track->duration, "%.3fs")) {
+            k->time = snapT(k->time);
+            selectedKey_ = reorder(selectedKey_);
+            k = &track->keys[static_cast<usize>(selectedKey_)];
+            preview();
+        }
+        undoOnActivate();
+        ImGui::DragFloat3("Position##key", glm::value_ptr(k->position), 0.05f);
+        undoOnActivate();
+        RotationEulerEditor("Rotation##key", k->rotation, &k->rotation);
+        undoOnActivate();
+        ImGui::DragFloat3("Scale##key", glm::value_ptr(k->scale), 0.02f, 0.001f, 100.0f);
+        undoOnActivate();
+        static const char* kEaseNames[] = {"Linear",   "In Quad",  "Out Quad",   "InOut Quad",
+                                           "In Cubic", "Out Cubic", "InOut Cubic", "Smoothstep"};
+        int ei = static_cast<int>(k->ease);
+        if (ImGui::Combo("Ease (into key)", &ei, kEaseNames, IM_ARRAYSIZE(kEaseNames))) {
+            PushUndo(scene);
+            k->ease = static_cast<ease::Curve>(glm::clamp(ei, 0, static_cast<int>(IM_ARRAYSIZE(kEaseNames)) - 1));
+            preview();
+        }
+        if (transform && ImGui::Button("Recapture pose")) {
+            PushUndo(scene);
+            k->position = transform->position;
+            k->rotation = transform->rotation;
+            k->scale = transform->scale;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Overwrite this key's transform with the entity's\ncurrent pose (keeps its time and ease).");
+    } else {
+        ImGui::TextDisabled("Grab a key to edit it - or scrub the strip, then Add Key. "
+                            "Wheel = zoom, middle-drag = pan.");
     }
 
     ImGui::End();
@@ -11235,931 +11731,6 @@ std::filesystem::path Editor::CreateSchematicAsset(const std::filesystem::path& 
     return p;
 }
 
-
-// ---------------------------------------------------------------------------
-// Procedural construction
-// ---------------------------------------------------------------------------
-
-void Editor::ConstructionRegenerate() {
-    namespace con = construction;
-    conErrors_.clear();
-    con::BuildPreset(conPresetId_.c_str(), conParams_, conDef_);
-    conDef_.Validate(conErrors_);
-    con::BuildChunked(conDef_, nullptr, con::kInvalidComponent, conChunkSize_, conChunks_);
-    conGraph_.Build(conDef_);
-    conDirty_ = false;
-}
-
-
-// --- Direct manipulation of construction components -------------------------
-//
-// THE POINT: a parameter list is not control. These four functions turn every component of a
-// building into a real entity the existing gizmo can move, rotate and scale - so the artist builds
-// the structure they want instead of the one the preset author imagined.
-
-void Editor::ConstructionPushToScene(Scene& scene) {
-    if (Project::Active().Root().empty()) return;
-
-    construction::BuildAsset a;
-    a.presetId = conPresetId_;
-    a.params = conParams_;
-    a.def = conDef_;
-    a.chunkSize = conChunkSize_;
-    std::string err;
-    const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
-    if (!construction::SaveBuild(f, a, err)) {
-        conStatus_ = "Could not save: " + err;
-        return;
-    }
-
-    // Bump every building pointing at this asset. WITHOUT THIS the panel edits nothing the artist
-    // can see: construction::Sync is revision-gated, so a spawned building keeps whatever geometry
-    // it was created with no matter what the parameters say. That gap is why age, seed and every
-    // other dial appeared to do nothing at all.
-    entt::registry& reg = scene.Registry();
-    u32 bumped = 0;
-    for (const entt::entity e : reg.view<ProceduralBuilding>()) {
-        ProceduralBuilding& pb = reg.get<ProceduralBuilding>(e);
-        if (pb.source == conFileName_) {
-            ++pb.revision;
-            ++bumped;
-        }
-    }
-    conStatus_ = bumped ? ("Pushed to " + std::to_string(bumped) + " building(s) in the scene.")
-                        : "Saved. Nothing in the scene references this file yet - use Spawn.";
-}
-
-void Editor::ConstructionClearProxies(Scene& scene) {
-    entt::registry& reg = scene.Registry();
-    std::vector<entt::entity> doomed;
-    for (const entt::entity e : reg.view<BuildComponentProxy>()) doomed.push_back(e);
-    for (const entt::entity e : doomed)
-        if (reg.valid(e)) reg.destroy(e);
-    conEditTarget_ = entt::null;
-}
-
-void Editor::ConstructionSpawnProxies(Scene& scene, entt::entity owner) {
-    ConstructionClearProxies(scene);
-    if (!scene.Registry().valid(owner)) return;
-    entt::registry& reg = scene.Registry();
-    conEditTarget_ = owner;
-
-    for (const construction::ConstructionComponent& c : conDef_.components) {
-        const entt::entity e = scene.CreateEntity(
-            std::string(construction::ToString(c.kind)) + " #" + std::to_string(c.id) +
-            (c.name.empty() ? "" : " - " + c.name));
-        reg.emplace<Parent>(e, owner);
-
-        // THE TRANSFORM *IS* THE DEFINITION. Scale carries the half-extent, so dragging a scale
-        // handle resizes the wall itself rather than stretching a mesh - which is the whole
-        // difference between "a procedural asset" and "a thing I can build with".
-        Transform t;
-        t.position = c.position;
-        t.rotation = c.rotation;
-        t.scale = c.extent;
-        reg.emplace<Transform>(e, t);
-
-        // Unit box scaled by the transform, so viewport picking (Transform + AABB) selects it.
-        reg.emplace<AABB>(e, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)});
-        reg.emplace<BuildComponentProxy>(e, BuildComponentProxy{owner, c.id});
-    }
-    conStatus_ = "Edit mode: drag the handles to move, rotate and SCALE each part.";
-}
-
-bool Editor::ConstructionPullProxies(Scene& scene) {
-    if (conEditTarget_ == entt::null) return false;
-    entt::registry& reg = scene.Registry();
-    bool changed = false;
-
-    for (const entt::entity e : reg.view<BuildComponentProxy, Transform>()) {
-        const BuildComponentProxy& p = reg.get<BuildComponentProxy>(e);
-        const Transform& t = reg.get<Transform>(e);
-        construction::ConstructionComponent* c = conDef_.Find(p.componentId);
-        if (!c) continue;
-
-        // A scale handle dragged to zero would produce a degenerate component that generates
-        // nothing - which reads as "the tool deleted my wall". Clamp instead.
-        const glm::vec3 ext = glm::max(t.scale, glm::vec3(0.01f));
-        if (glm::any(glm::epsilonNotEqual(c->position, t.position, 1e-5f)) ||
-            glm::any(glm::epsilonNotEqual(c->extent, ext, 1e-5f)) ||
-            glm::any(glm::epsilonNotEqual(glm::vec4(c->rotation.x, c->rotation.y, c->rotation.z,
-                                                    c->rotation.w),
-                                          glm::vec4(t.rotation.x, t.rotation.y, t.rotation.z,
-                                                    t.rotation.w),
-                                          1e-5f))) {
-            c->position = t.position;
-            c->rotation = t.rotation;
-            c->extent = ext;
-            // Hand-placed by the artist: a later "Rebuild from preset" must not throw it away.
-            c->locked = true;
-            changed = true;
-        }
-    }
-    return changed;
-}
-
-
-// --- BOX BRUSH --------------------------------------------------------------
-
-void Editor::ConstructionClearHandles(Scene& scene) {
-    entt::registry& reg = scene.Registry();
-    std::vector<entt::entity> doomed;
-    for (const entt::entity e : reg.view<BuildFaceHandle>()) doomed.push_back(e);
-    for (const entt::entity e : reg.view<BuildPathPoint>()) doomed.push_back(e);
-    for (const entt::entity e : doomed)
-        if (reg.valid(e)) reg.destroy(e);
-    conHandleComponent_ = 0;
-}
-
-void Editor::ConstructionSpawnFaceHandles(Scene& scene, u32 componentId) {
-    ConstructionClearHandles(scene);
-    const construction::ConstructionComponent* c = conDef_.Find(componentId);
-    if (!c || conEditTarget_ == entt::null) return;
-    entt::registry& reg = scene.Registry();
-    conHandleComponent_ = componentId;
-
-    static const char* kNames[6] = {"+X", "-X", "+Y", "-Y", "+Z", "-Z"};
-    for (int i = 0; i < 6; ++i) {
-        const u8 axis = static_cast<u8>(i / 2);
-        const i8 sign = (i % 2) ? -1 : 1;
-
-        glm::vec3 offset(0.0f);
-        offset[axis] = static_cast<f32>(sign) * c->extent[axis];
-
-        const entt::entity e = scene.CreateEntity(std::string("Face ") + kNames[i]);
-        reg.emplace<Parent>(e, conEditTarget_);
-        Transform t;
-        t.position = c->position + glm::vec3(glm::mat4_cast(c->rotation) * glm::vec4(offset, 0.0f));
-        // Deliberately a fixed small size rather than proportional: a handle that scales with the
-        // part becomes unusable on both a 20 m wall and a 0.1 m batten.
-        t.scale = glm::vec3(0.09f);
-        reg.emplace<Transform>(e, t);
-        reg.emplace<AABB>(e, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)});
-        reg.emplace<BuildFaceHandle>(e, BuildFaceHandle{conEditTarget_, componentId, axis, sign});
-    }
-    conStatus_ = "Box brush: drag a face handle to push that face. The opposite face stays put.";
-}
-
-bool Editor::ConstructionPullFaceHandles(Scene& scene) {
-    if (conHandleComponent_ == 0) return false;
-    construction::ConstructionComponent* c = conDef_.Find(conHandleComponent_);
-    if (!c) return false;
-    entt::registry& reg = scene.Registry();
-
-    // Work in the part's LOCAL frame, so a rotated wall still pushes along its own length rather
-    // than along a world axis - dragging the end of a rotated wall sideways is the classic way
-    // this feature feels broken.
-    const glm::mat4 inv = glm::inverse(glm::mat4_cast(c->rotation));
-    glm::vec3 mn = -c->extent, mx = c->extent;
-    bool moved = false;
-
-    for (const entt::entity e : reg.view<BuildFaceHandle, Transform>()) {
-        const BuildFaceHandle& h = reg.get<BuildFaceHandle>(e);
-        if (h.componentId != conHandleComponent_) continue;
-        const Transform& t = reg.get<Transform>(e);
-
-        const glm::vec3 local = glm::vec3(inv * glm::vec4(t.position - c->position, 0.0f));
-        const f32 want = local[h.axis];
-        f32& edge = (h.sign > 0) ? mx[h.axis] : mn[h.axis];
-        if (std::fabs(want - edge) > 1e-4f) {
-            edge = want;
-            moved = true;
-        }
-    }
-    if (!moved) return false;
-
-    // A face dragged past its opposite would invert the box - it would render inside out and its
-    // collider would be inverted too. Refuse rather than produce that.
-    for (int a = 0; a < 3; ++a)
-        if (mx[a] - mn[a] < 0.02f) {
-            const f32 mid = (mx[a] + mn[a]) * 0.5f;
-            mn[a] = mid - 0.01f;
-            mx[a] = mid + 0.01f;
-        }
-
-    const glm::vec3 newExtent = (mx - mn) * 0.5f;
-    const glm::vec3 localCentre = (mx + mn) * 0.5f;
-    c->position += glm::vec3(glm::mat4_cast(c->rotation) * glm::vec4(localCentre, 0.0f));
-    c->extent = newExtent;
-    c->locked = true; // hand-shaped: a preset rebuild must not undo it
-    return true;
-}
-
-// --- PATH -------------------------------------------------------------------
-
-void Editor::ConstructionSpawnPathPoints(Scene& scene, entt::entity owner) {
-    entt::registry& reg = scene.Registry();
-    if (!reg.valid(owner) || !reg.all_of<ProceduralBuilding>(owner)) return;
-    const ProceduralBuilding& pb = reg.get<ProceduralBuilding>(owner);
-
-    for (usize i = 0; i < pb.path.size(); ++i) {
-        const entt::entity e = scene.CreateEntity("Path " + std::to_string(i));
-        reg.emplace<Parent>(e, owner);
-        Transform t;
-        t.position = pb.path[i];
-        t.scale = glm::vec3(0.16f);
-        reg.emplace<Transform>(e, t);
-        reg.emplace<AABB>(e, AABB{glm::vec3(-1.0f), glm::vec3(1.0f)});
-        reg.emplace<BuildPathPoint>(e, BuildPathPoint{owner, static_cast<u32>(i)});
-    }
-}
-
-bool Editor::ConstructionPullPathPoints(Scene& scene) {
-    entt::registry& reg = scene.Registry();
-    bool moved = false;
-    for (const entt::entity e : reg.view<BuildPathPoint, Transform>()) {
-        const BuildPathPoint& p = reg.get<BuildPathPoint>(e);
-        if (!reg.valid(p.owner) || !reg.all_of<ProceduralBuilding>(p.owner)) continue;
-        ProceduralBuilding& pb = reg.get<ProceduralBuilding>(p.owner);
-        if (p.index >= pb.path.size()) continue;
-        const glm::vec3 pos = reg.get<Transform>(e).position;
-        if (glm::any(glm::epsilonNotEqual(pb.path[p.index], pos, 1e-4f))) {
-            pb.path[p.index] = pos;
-            moved = true;
-        }
-    }
-    return moved;
-}
-
-void Editor::ConstructionRebuildFromPath(const ProceduralBuilding& pb) {
-    // Drop the walls this path previously produced, keeping everything else the artist placed.
-    // Identified by name rather than by a flag so a hand-renamed wall is left alone - the artist
-    // renaming something is a clear signal they now own it.
-    std::vector<construction::ComponentId> old;
-    for (const construction::ConstructionComponent& c : conDef_.components)
-        if (c.name.rfind("path:", 0) == 0) old.push_back(c.id);
-    for (construction::ComponentId id : old) conDef_.RemoveComponent(id);
-
-    if (pb.path.size() < 2) return;
-
-    // The foundation anchors the whole thing; without it the structural graph reports every
-    // generated wall as unsupported the moment the path is drawn.
-    construction::ComponentId anchor = construction::kInvalidComponent;
-    for (const construction::ConstructionComponent& c : conDef_.components)
-        if (c.role == construction::StructuralRole::Foundation) anchor = c.id;
-
-    const usize segs = pb.pathClosed ? pb.path.size() : pb.path.size() - 1;
-    for (usize i = 0; i < segs; ++i) {
-        const glm::vec3 a = pb.path[i];
-        const glm::vec3 b = pb.path[(i + 1) % pb.path.size()];
-        const glm::vec3 d = b - a;
-        const f32 len = glm::length(glm::vec2(d.x, d.z));
-        if (len < 0.05f) continue; // two points on top of each other make no wall
-
-        construction::ConstructionComponent w;
-        w.kind = construction::ComponentKind::Wall;
-        w.role = construction::StructuralRole::LoadBearing;
-        w.material = static_cast<construction::MaterialKind>(conParams_.exteriorMaterial);
-        w.name = "path:" + std::to_string(i);
-        w.position = glm::vec3((a.x + b.x) * 0.5f, pb.pathWallHeight * 0.5f, (a.z + b.z) * 0.5f);
-        // Rotate the wall to face along the segment - the whole point of a path is that walls
-        // follow it rather than staying axis-aligned.
-        w.rotation = glm::angleAxis(std::atan2(d.x, d.z), glm::vec3(0.0f, 1.0f, 0.0f));
-        w.extent = glm::vec3(len * 0.5f, pb.pathWallHeight * 0.5f, pb.pathWallThickness * 0.5f);
-        w.masonry = conParams_.masonry;
-        w.timber = conParams_.timber;
-        w.plank = conParams_.plank;
-        w.shingle = conParams_.shingle;
-        w.weathering = conParams_.weathering;
-        const construction::ComponentId id = conDef_.AddComponent(w);
-        if (anchor != construction::kInvalidComponent)
-            conDef_.AddEdge(id, anchor, construction::EdgeKind::Bears);
-    }
-}
-
-void Editor::DrawConstructionPanel(Engine& engine) {
-    Scene& sceneRef = engine.GetScene();
-    if (!panelOpen_[Panel_Construction]) return;
-    namespace con = construction;
-
-    ImGui::SetNextWindowSize(ImVec2(380, 640), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Construction", &panelOpen_[Panel_Construction])) {
-        ImGui::End();
-        return;
-    }
-
-    if (conDirty_) {
-        ConstructionRegenerate();
-        // AND PUSH. Regenerating only refreshed this panel's own preview - the spawned building
-        // stayed on whatever geometry it was created with, which is why every slider still looked
-        // dead after the push function existed. Fixing the function was not the same as calling it.
-        if (conLiveScene_) ConstructionPushToScene(sceneRef);
-    }
-
-    // -- BUILD DIRECTLY ------------------------------------------------------
-    //
-    // THIS IS THE PRIMARY WORKFLOW, and the preset picker below it is the shortcut.
-    //
-    // A parameter list cannot make the building someone actually wants - it makes the building the
-    // preset author imagined, and "Window Count = 3, evenly spaced" is not a design. So: start
-    // from nothing, drop parts in, and move and scale them with the ordinary gizmo. Each part is a
-    // real construction component, so it still generates true brickwork or framing, still carries
-    // its structural role into the graph, and still chunks and collides like everything else.
-    if (ImGui::Button("New empty building")) {
-        conDef_ = construction::ConstructionDef{};
-        conDef_.seed = conParams_.seed;
-        conErrors_.clear();
-        conChunks_ = construction::ChunkedSection{};
-        conGraph_.Build(conDef_);
-
-        // A foundation to build on: something to stand parts on so the structural graph has an
-        // anchor from the first part placed, rather than reporting everything unsupported.
-        construction::ConstructionComponent base;
-        base.kind = construction::ComponentKind::Foundation;
-        base.role = construction::StructuralRole::Foundation;
-        base.material = construction::MaterialKind::PouredConcrete;
-        base.position = glm::vec3(0.0f, -0.15f, 0.0f);
-        base.extent = glm::vec3(4.0f, 0.15f, 3.0f);
-        base.locked = true;
-        conDef_.AddComponent(base);
-
-        PushUndo(sceneRef);
-        const entt::entity e = sceneRef.CreateEntity("Building");
-        sceneRef.Registry().emplace<Transform>(e);
-        ProceduralBuilding pb;
-        pb.source = conFileName_;
-        pb.chunkSize = conChunkSize_;
-        sceneRef.Registry().emplace<ProceduralBuilding>(e, pb);
-        selected_ = e;
-        ConstructionPushToScene(sceneRef);
-        ConstructionSpawnProxies(sceneRef, e);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Start from a bare foundation and build it yourself. Parts are still "
-                          "real construction - brick bonds, framing, structure - just placed by "
-                          "hand instead of by a preset.");
-    ImGui::SameLine();
-    ImGui::TextDisabled("or start from a preset:");
-    ImGui::Separator();
-
-    // -- Preset picker, grouped by category ---------------------------------
-    u32 presetCount = 0;
-    const con::PresetDesc* presets = con::Presets(presetCount);
-    const con::PresetDesc* current = con::FindPreset(conPresetId_.c_str());
-
-    ImGui::TextUnformatted("Preset");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(-1.0f);
-    if (ImGui::BeginCombo("##preset", current ? current->name : "(none)")) {
-        const char* lastCategory = nullptr;
-        for (u32 i = 0; i < presetCount; ++i) {
-            const con::PresetDesc& d = presets[i];
-            if (!lastCategory || std::strcmp(lastCategory, d.category) != 0) {
-                if (lastCategory) ImGui::Separator();
-                ImGui::TextDisabled("%s", d.category);
-                lastCategory = d.category;
-            }
-            const bool sel = current == &d;
-            if (ImGui::Selectable(d.name, sel)) {
-                conPresetId_ = d.id;
-                // Defaults on switch: a Wall's parameter ranges are not a House's, and carrying a
-                // 40 m width into a preset that clamps at 20 would silently snap it.
-                conParams_ = con::DefaultParams(d.id);
-                conDirty_ = true;
-            }
-            if (sel) ImGui::SetItemDefaultFocus();
-        }
-        ImGui::EndCombo();
-    }
-    if (current && current->summary && *current->summary) {
-        ImGui::PushTextWrapPos(0.0f);
-        ImGui::TextDisabled("%s", current->summary);
-        ImGui::PopTextWrapPos();
-    }
-    ImGui::Separator();
-
-    if (!current) {
-        ImGui::TextDisabled("No preset selected.");
-        ImGui::End();
-        return;
-    }
-
-    // -- Parameters, grouped -------------------------------------------------
-    //
-    // EVERY WIDGET HERE COMES FROM THE DESCRIPTOR TABLE. Nothing about masonry, framing or roofs
-    // is named in this function. Adding a parameter to a generator makes it appear here with no
-    // edit to this file, which is the whole reason the table exists - the alternative is a widget
-    // per field kept in lockstep by hand, and this codebase has been bitten by that repeatedly.
-    bool changed = false;
-    const char* openGroup = nullptr;
-    bool groupVisible = false;
-
-    for (u32 i = 0; i < current->paramCount; ++i) {
-        const con::ParamDesc& d = current->params[i];
-
-        // Groups are consecutive RUNS in declaration order, not a sort - that gives the preset
-        // author control over both group order and order within a group.
-        if (!openGroup || std::strcmp(openGroup, d.group) != 0) {
-            openGroup = d.group;
-            groupVisible = ImGui::CollapsingHeader(d.group, ImGuiTreeNodeFlags_DefaultOpen);
-        }
-        if (!groupVisible) continue;
-
-        ImGui::PushID(static_cast<int>(i));
-        switch (d.type) {
-            case con::ParamType::Float: {
-                f32 v = con::GetFloat(conParams_, d);
-                const std::string label =
-                    (d.unit && *d.unit) ? (std::string(d.name) + " (" + d.unit + ")") : d.name;
-                if (ImGui::DragFloat(label.c_str(), &v, d.step > 0.0f ? d.step : 0.01f, d.min,
-                                     d.max, "%.3f")) {
-                    con::SetFloat(conParams_, d, v);
-                    changed = true;
-                }
-                break;
-            }
-            case con::ParamType::Int: {
-                int v = con::GetInt(conParams_, d);
-                if (ImGui::DragInt(d.name, &v, 1.0f, static_cast<int>(d.min),
-                                   static_cast<int>(d.max))) {
-                    con::SetInt(conParams_, d, v);
-                    changed = true;
-                }
-                break;
-            }
-            case con::ParamType::Enum: {
-                int v = con::GetInt(conParams_, d);
-                if (v < 0 || v >= static_cast<int>(d.enumCount)) v = 0;
-                if (ImGui::Combo(d.name, &v, d.enumNames, static_cast<int>(d.enumCount))) {
-                    con::SetInt(conParams_, d, v);
-                    changed = true;
-                }
-                break;
-            }
-            case con::ParamType::Bool: {
-                bool v = con::GetBool(conParams_, d);
-                if (ImGui::Checkbox(d.name, &v)) {
-                    con::SetBool(conParams_, d, v);
-                    changed = true;
-                }
-                break;
-            }
-            case con::ParamType::Seed: {
-                int v = static_cast<int>(con::GetSeed(conParams_, d) & 0x7FFFFFFFull);
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 70.0f);
-                if (ImGui::InputInt(d.name, &v)) {
-                    con::SetSeed(conParams_, d, static_cast<u64>(v < 0 ? -v : v));
-                    changed = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Reroll")) {
-                    con::SetSeed(conParams_, d, con::GetSeed(conParams_, d) * 6364136223846793005ull + 1);
-                    changed = true;
-                }
-                break;
-            }
-            default: break;
-        }
-        if (d.tooltip && *d.tooltip && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", d.tooltip);
-        ImGui::PopID();
-    }
-
-    // -- Optimization --------------------------------------------------------
-    if (ImGui::CollapsingHeader("Optimization", ImGuiTreeNodeFlags_DefaultOpen)) {
-        if (ImGui::DragFloat("Chunk Size (m)", &conChunkSize_, 0.25f, 0.5f, 64.0f, "%.2f"))
-            changed = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Smaller chunks cull and invalidate more finely, at the cost of "
-                              "more draw calls.");
-        ImGui::Checkbox("Auto-regenerate", &conAutoRegen_);
-    }
-
-    if (changed && conAutoRegen_) conDirty_ = true;
-
-    // -- Actions -------------------------------------------------------------
-    ImGui::Separator();
-    if (ImGui::Button("Generate")) {
-        conDirty_ = true;
-        if (conLiveScene_) {
-            ConstructionRegenerate();
-            ConstructionPushToScene(sceneRef);
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Reset")) {
-        conParams_ = con::DefaultParams(conPresetId_.c_str());
-        conDirty_ = true;
-    }
-
-    // -- What was actually built --------------------------------------------
-    //
-    // The three counts are shown SEPARATELY on purpose (brief SS8/SS25): logical units, draw
-    // calls and chunks are different things, and a system that reports only "triangles" hides
-    // exactly the number that decides whether a structure is viable on this renderer.
-    ImGui::Separator();
-    u32 units = 0;
-    for (const con::ConstructionChunk& c : conChunks_.chunks) units += c.pieceCount;
-    const u32 draws = conChunks_.DrawCount();
-    const u32 tris = conChunks_.TotalIndices() / 3;
-
-    ImGui::Text("Components  %d", static_cast<int>(conDef_.components.size()));
-    ImGui::Text("Logical units  %u", units);
-    ImGui::Text("Chunks  %d", static_cast<int>(conChunks_.chunks.size()));
-    ImGui::Text("Draw calls  %u", draws);
-    ImGui::Text("Triangles  %u", tris);
-
-    // The frame-wide draw budget is a hard limit that TRUNCATES SILENTLY when exceeded, so it is
-    // surfaced here rather than discovered as missing geometry.
-    if (draws > 500)
-        ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.2f, 1.0f),
-                           "%u draws is a large share of the ~5,400 frame budget - raise the "
-                           "chunk size.", draws);
-
-    if (!conErrors_.empty()) {
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Definition errors:");
-        for (const std::string& e : conErrors_) ImGui::BulletText("%s", e.c_str());
-    }
-
-    // -- Structure (brief SS26/SS27) -----------------------------------------
-    //
-    // The structural graph is the half of this system that a mesh cannot show you. A building can
-    // look finished and still have a roof resting on nothing, and the only way to find that before
-    // a destruction pass does is to ask.
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Structure")) {
-        const auto unsupported = conGraph_.Unsupported();
-        if (unsupported.empty()) {
-            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
-                               "Stands up: every structural component reaches a foundation.");
-        } else {
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
-                               "%d component(s) have NO load path to a foundation:",
-                               static_cast<int>(unsupported.size()));
-            for (construction::ComponentId id : unsupported)
-                if (const construction::ConstructionComponent* c = conDef_.Find(id))
-                    ImGui::BulletText("%s #%u%s", construction::ToString(c->kind),
-                                      static_cast<unsigned>(id),
-                                      c->name.empty() ? "" : (" (" + c->name + ")").c_str());
-        }
-
-        // DESTRUCTION PREVIEW. Answers "what stops standing if I remove this?" WITHOUT mutating
-        // anything - the same hypothetical a future destruction pass will ask on impact.
-        ImGui::Separator();
-        std::vector<const char*> labels;
-        static std::vector<std::string> labelStore;
-        labelStore.clear();
-        for (const construction::ConstructionComponent& c : conDef_.components) {
-            labelStore.push_back(std::string(construction::ToString(c.kind)) + " #" +
-                                 std::to_string(static_cast<unsigned>(c.id)) +
-                                 (c.name.empty() ? "" : " - " + c.name));
-        }
-        for (const std::string& l : labelStore) labels.push_back(l.c_str());
-
-        if (!labels.empty()) {
-            if (conTestRemove_ >= static_cast<int>(labels.size())) conTestRemove_ = -1;
-            int sel = conTestRemove_;
-            ImGui::SetNextItemWidth(-1.0f);
-            if (ImGui::Combo("##testremove", &sel, labels.data(), static_cast<int>(labels.size())))
-                conTestRemove_ = sel;
-
-            if (conTestRemove_ >= 0) {
-                const construction::ComponentId victim =
-                    conDef_.components[static_cast<usize>(conTestRemove_)].id;
-                const auto stranded = conGraph_.UnsupportedIfRemoved({victim});
-                if (stranded.empty()) {
-                    ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.45f, 1.0f),
-                                       "Removing it strands nothing - the load has another path.");
-                } else {
-                    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
-                                       "Removing it would strand %d component(s):",
-                                       static_cast<int>(stranded.size()));
-                    for (construction::ComponentId id : stranded)
-                        if (const construction::ConstructionComponent* c = conDef_.Find(id))
-                            ImGui::BulletText("%s #%u", construction::ToString(c->kind),
-                                              static_cast<unsigned>(id));
-                }
-                ImGui::Text("Integrity of selection: %.2f", conGraph_.Integrity(victim));
-            } else {
-                ImGui::TextDisabled("Pick a component to preview what its loss would strand.");
-            }
-        }
-        ImGui::TextDisabled("%d node(s), %d support edge(s)",
-                            static_cast<int>(conGraph_.NodeCount()),
-                            static_cast<int>(conGraph_.EdgeCount()));
-    }
-
-    // -- Persistence ---------------------------------------------------------
-    ImGui::Separator();
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputText("##buildfile", conFileName_, sizeof(conFileName_));
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Path relative to the project's Assets folder.");
-
-    const bool haveProject = !Project::Active().Root().empty();
-    ImGui::BeginDisabled(!haveProject);
-    if (ImGui::Button("Save")) {
-        construction::BuildAsset a;
-        a.presetId = conPresetId_;
-        a.params = conParams_;
-        a.def = conDef_;
-        a.chunkSize = conChunkSize_;
-        std::string err;
-        const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
-        conStatus_ = construction::SaveBuild(f, a, err) ? ("Saved " + f.filename().string())
-                                                        : ("Save failed: " + err);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Load")) {
-        construction::BuildAsset a;
-        std::string err;
-        const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
-        if (construction::LoadBuild(f, a, err)) {
-            // THE DEFINITION WINS, not the parameters. It is what the artist last saw, and it
-            // carries every manual override. Re-running the preset is a deliberate action
-            // ("Rebuild from preset") that discards them, never something a load does silently.
-            conPresetId_ = a.presetId;
-            conParams_ = a.params;
-            conDef_ = a.def;
-            conChunkSize_ = a.chunkSize;
-            conErrors_.clear();
-            conDef_.Validate(conErrors_);
-            construction::BuildChunked(conDef_, &a.damage, construction::kInvalidComponent,
-                                       conChunkSize_, conChunks_);
-            conDirty_ = false;
-            conStatus_ = err.empty() ? ("Loaded " + f.filename().string()) : err;
-        } else {
-            conStatus_ = "Load failed: " + err;
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Rebuild from preset")) {
-        // Explicit and destructive to overrides - which is why it is its own button with its own
-        // label, rather than something Generate does behind the artist's back.
-        conDirty_ = true;
-        conStatus_ = "Rebuilt from preset parameters (manual overrides discarded).";
-    }
-    ImGui::EndDisabled();
-    if (!haveProject) ImGui::TextDisabled("Open a project to save or load.");
-    if (!conStatus_.empty()) ImGui::TextWrapped("%s", conStatus_.c_str());
-
-    // -- Direct manipulation -------------------------------------------------
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader("Parts", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const bool editing = conEditTarget_ != entt::null;
-        if (!editing) {
-            ImGui::TextDisabled("Select a spawned building and press Edit to get a handle on "
-                                "every part.");
-            const bool canEdit = sceneRef.Registry().valid(selected_) &&
-                                 sceneRef.Registry().all_of<ProceduralBuilding>(selected_);
-            ImGui::BeginDisabled(!canEdit);
-            if (ImGui::Button("Edit parts in viewport")) ConstructionSpawnProxies(sceneRef, selected_);
-            ImGui::EndDisabled();
-        } else {
-            if (ImGui::Button("Done editing")) {
-                ConstructionClearHandles(sceneRef);
-                ConstructionClearProxies(sceneRef);
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("Drag the gizmo. Scale resizes the part itself.");
-
-            // Add a part. Placed at the current selection or the origin, deliberately oversized
-            // enough to be visible and grabbable rather than a speck the artist has to hunt for.
-            const std::pair<const char*, construction::ComponentKind> kinds[] = {
-                {"Wall", construction::ComponentKind::Wall},
-                {"Floor", construction::ComponentKind::Floor},
-                {"Roof", construction::ComponentKind::Roof},
-                {"Column", construction::ComponentKind::Column},
-                {"Beam", construction::ComponentKind::Beam},
-                {"Opening", construction::ComponentKind::Opening},
-            };
-            for (int i = 0; i < 6; ++i) {
-                if (i) ImGui::SameLine();
-                if (ImGui::SmallButton(kinds[i].first)) {
-                    construction::ConstructionComponent nc;
-                    nc.kind = kinds[i].second;
-                    nc.role = kinds[i].second == construction::ComponentKind::Opening
-                                  ? construction::StructuralRole::None
-                                  : construction::StructuralRole::LoadBearing;
-                    nc.material = static_cast<construction::MaterialKind>(conParams_.exteriorMaterial);
-                    nc.extent = glm::vec3(1.5f, 1.2f, 0.15f);
-                    nc.locked = true; // authored by hand; a preset rebuild must not remove it
-                    conDef_.AddComponent(nc);
-                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
-                    ConstructionPushToScene(sceneRef);
-                }
-            }
-
-            // Per-part kind and material. Placing a box is only half of it: the artist has to be
-            // able to say what that box IS, because kind and material together decide whether it
-            // becomes a brick bond, a stud wall or a solid slab.
-            if (sceneRef.Registry().valid(selected_) &&
-                sceneRef.Registry().all_of<BuildComponentProxy>(selected_)) {
-                const u32 pid = sceneRef.Registry().get<BuildComponentProxy>(selected_).componentId;
-                if (construction::ConstructionComponent* pc = conDef_.Find(pid)) {
-                    ImGui::Separator();
-                    ImGui::Text("Part #%u", pid);
-
-                    u32 matCount = 0;
-                    const char* const* matNames = construction::MaterialKindNames(matCount);
-                    int mat = static_cast<int>(pc->material);
-                    ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::Combo("##partmat", &mat, matNames, static_cast<int>(matCount))) {
-                        pc->material = static_cast<construction::MaterialKind>(mat);
-                        conDirty_ = true;
-                    }
-
-                    static const char* kKindNames[] = {"Wall",   "Floor", "Roof",
-                                                       "Column", "Beam",  "Opening"};
-                    static const construction::ComponentKind kKindVals[] = {
-                        construction::ComponentKind::Wall,   construction::ComponentKind::Floor,
-                        construction::ComponentKind::Roof,   construction::ComponentKind::Column,
-                        construction::ComponentKind::Beam,   construction::ComponentKind::Opening};
-                    int kind = 0;
-                    for (int i = 0; i < 6; ++i)
-                        if (kKindVals[i] == pc->kind) kind = i;
-                    ImGui::SetNextItemWidth(-1.0f);
-                    if (ImGui::Combo("##partkind", &kind, kKindNames, 6)) {
-                        pc->kind = kKindVals[kind];
-                        conDirty_ = true;
-                    }
-
-                    // An Opening must be PARENTED to the wall it cuts - a cutter with no host cuts
-                    // nothing, which would read as "the tool ignored me".
-                    if (pc->kind == construction::ComponentKind::Opening &&
-                        pc->parent == construction::kInvalidComponent) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f),
-                                           "This opening cuts nothing until it is attached:");
-                        for (const construction::ConstructionComponent& w : conDef_.components) {
-                            if (w.kind != construction::ComponentKind::Wall) continue;
-                            ImGui::PushID(static_cast<int>(w.id));
-                            if (ImGui::SmallButton(("Cut into wall #" + std::to_string(w.id)).c_str())) {
-                                pc->parent = w.id;
-                                // Openings are authored in the HOST's space, so rebase the
-                                // position the artist dragged it to.
-                                if (const construction::ConstructionComponent* host =
-                                        conDef_.Find(w.id))
-                                    pc->position -= host->position;
-                                conDirty_ = true;
-                                ConstructionSpawnProxies(sceneRef, conEditTarget_);
-                            }
-                            ImGui::PopID();
-                        }
-                    }
-                }
-            }
-
-            // Delete the selected part.
-            if (sceneRef.Registry().valid(selected_) &&
-                sceneRef.Registry().all_of<BuildComponentProxy>(selected_)) {
-                const u32 id = sceneRef.Registry().get<BuildComponentProxy>(selected_).componentId;
-                if (ImGui::Button("Delete selected part")) {
-                    conDef_.RemoveComponent(id);
-                    selected_ = entt::null;
-                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
-                    ConstructionPushToScene(sceneRef);
-                }
-            }
-
-            // BOX BRUSH. Selecting a part offers face handles; selecting a handle keeps them.
-            if (sceneRef.Registry().valid(selected_) &&
-                sceneRef.Registry().all_of<BuildComponentProxy>(selected_)) {
-                const u32 pid = sceneRef.Registry().get<BuildComponentProxy>(selected_).componentId;
-                ImGui::Separator();
-                if (conHandleComponent_ != pid) {
-                    if (ImGui::Button("Box brush this part"))
-                        ConstructionSpawnFaceHandles(sceneRef, pid);
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Puts a handle on each of the six faces. Drag one to "
-                                          "push that face; the opposite face does not move.");
-                } else if (ImGui::Button("Hide face handles")) {
-                    ConstructionClearHandles(sceneRef);
-                }
-            }
-
-            // --- PATH: shape the footprint by dragging points --------------
-            ImGui::Separator();
-            if (sceneRef.Registry().valid(conEditTarget_) &&
-                sceneRef.Registry().all_of<ProceduralBuilding>(conEditTarget_)) {
-                ProceduralBuilding& pb =
-                    sceneRef.Registry().get<ProceduralBuilding>(conEditTarget_);
-                ImGui::Text("Footprint path (%d point(s))", static_cast<int>(pb.path.size()));
-
-                if (ImGui::Button("Add point")) {
-                    // Placed off the end of the run so it is never buried inside the existing
-                    // shape where it cannot be grabbed.
-                    glm::vec3 p(0.0f, 0.0f, 0.0f);
-                    if (pb.path.size() >= 2)
-                        p = pb.path.back() + (pb.path.back() - pb.path[pb.path.size() - 2]);
-                    else if (pb.path.size() == 1)
-                        p = pb.path.back() + glm::vec3(4.0f, 0.0f, 0.0f);
-                    pb.path.push_back(p);
-                    ConstructionRebuildFromPath(pb);
-                    ConstructionClearHandles(sceneRef);
-                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
-                    ConstructionSpawnPathPoints(sceneRef, conEditTarget_);
-                    conDirty_ = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Square") ) {
-                    pb.path = {{-4.0f, 0.0f, -3.0f},
-                               { 4.0f, 0.0f, -3.0f},
-                               { 4.0f, 0.0f,  3.0f},
-                               {-4.0f, 0.0f,  3.0f}};
-                    ConstructionRebuildFromPath(pb);
-                    ConstructionClearHandles(sceneRef);
-                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
-                    ConstructionSpawnPathPoints(sceneRef, conEditTarget_);
-                    conDirty_ = true;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Clear path")) {
-                    pb.path.clear();
-                    ConstructionRebuildFromPath(pb);
-                    ConstructionClearHandles(sceneRef);
-                    ConstructionSpawnProxies(sceneRef, conEditTarget_);
-                    conDirty_ = true;
-                }
-
-                bool pathChanged = false;
-                pathChanged |= ImGui::DragFloat("Wall Height", &pb.pathWallHeight, 0.05f, 0.3f,
-                                                20.0f, "%.2f m");
-                pathChanged |= ImGui::DragFloat("Wall Thickness", &pb.pathWallThickness, 0.01f,
-                                                0.02f, 2.0f, "%.3f m");
-                pathChanged |= ImGui::Checkbox("Closed loop", &pb.pathClosed);
-
-                // Dragging a point is the whole feature: rebuild the run it belongs to as it moves.
-                if (ConstructionPullPathPoints(sceneRef)) pathChanged = true;
-                if (pathChanged) {
-                    ConstructionRebuildFromPath(pb);
-                    conErrors_.clear();
-                    conDef_.Validate(conErrors_);
-                    construction::BuildChunked(conDef_, nullptr, construction::kInvalidComponent,
-                                               conChunkSize_, conChunks_);
-                    conGraph_.Build(conDef_);
-                    ConstructionPushToScene(sceneRef);
-                }
-            }
-
-            // Face handles are read back before the whole-part gizmo, because a handle drag must
-            // not also be interpreted as a move of the part it belongs to.
-            if (ConstructionPullFaceHandles(sceneRef)) {
-                conErrors_.clear();
-                conDef_.Validate(conErrors_);
-                construction::BuildChunked(conDef_, nullptr, construction::kInvalidComponent,
-                                           conChunkSize_, conChunks_);
-                conGraph_.Build(conDef_);
-                ConstructionPushToScene(sceneRef);
-                // Reposition the other five handles onto the resized box.
-                ConstructionSpawnFaceHandles(sceneRef, conHandleComponent_);
-            }
-
-            // Read the gizmo back every frame and regenerate when something actually moved.
-            if (ConstructionPullProxies(sceneRef)) {
-                conErrors_.clear();
-                conDef_.Validate(conErrors_);
-                construction::BuildChunked(conDef_, nullptr, construction::kInvalidComponent,
-                                           conChunkSize_, conChunks_);
-                conGraph_.Build(conDef_);
-                ConstructionPushToScene(sceneRef);
-            }
-        }
-    }
-
-    // -- Spawn ---------------------------------------------------------------
-    ImGui::Separator();
-    ImGui::Checkbox("Live update scene", &conLiveScene_);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Push parameter changes straight to the spawned building. Each push "
-                          "re-uploads its meshes, and this RHI cannot free a mesh, so leave it "
-                          "off while dragging a slider hard.");
-    ImGui::SameLine();
-    if (ImGui::Button("Push to scene")) ConstructionPushToScene(sceneRef);
-    ImGui::BeginDisabled(!haveProject);
-    if (ImGui::Button("Spawn into scene")) {
-        // Save first, unconditionally. The scene entity references the ASSET, not this panel's
-        // in-memory parameters - a spawn that skipped the save would produce a building generated
-        // from whatever was last on disk, silently ignoring every edit made since.
-        construction::BuildAsset a;
-        a.presetId = conPresetId_;
-        a.params = conParams_;
-        a.def = conDef_;
-        a.chunkSize = conChunkSize_;
-        std::string err;
-        const std::filesystem::path f = Project::Active().AssetsDir() / conFileName_;
-        if (!construction::SaveBuild(f, a, err)) {
-            conStatus_ = "Spawn failed - could not save: " + err;
-        } else {
-            PushUndo(sceneRef);
-            const entt::entity e = sceneRef.CreateEntity(
-                conPresetId_ + " (" + std::filesystem::path(conFileName_).stem().string() + ")");
-            sceneRef.Registry().emplace<Transform>(e);
-            ProceduralBuilding pb;
-            pb.source = conFileName_;
-            pb.chunkSize = conChunkSize_;
-            sceneRef.Registry().emplace<ProceduralBuilding>(e, pb);
-            selected_ = e;
-            conStatus_ = "Spawned. Geometry is regenerated from the asset by construction::Sync.";
-        }
-    }
-    ImGui::EndDisabled();
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Saves the .hbbuild, then adds an entity that regenerates its geometry "
-                          "from it. The mesh is never stored in the scene file.");
-
-    ImGui::End();
-}
 
 void Editor::DrawSchematicEditor(Engine& engine) {
     (void)engine;
@@ -13615,6 +13186,34 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
                 cutsceneEditTime_ = glm::max(0.0f, cutsceneEditTime_ - step * mult);
             if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true))
                 cutsceneEditTime_ = glm::min(cs.duration, cutsceneEditTime_ + step * mult);
+            // Space = play/pause the preview; Home/End jump to the ends.
+            if (csPreview_ && ImGui::IsKeyPressed(ImGuiKey_Space, false)) csPlaying_ = !csPlaying_;
+            if (ImGui::IsKeyPressed(ImGuiKey_Home, false)) cutsceneEditTime_ = 0.0f;
+            if (ImGui::IsKeyPressed(ImGuiKey_End, false)) cutsceneEditTime_ = cs.duration;
+            // Delete = remove the selected key/marker (a track is not deleted this way -
+            // too destructive for a single keypress; use its right-click menu).
+            if (ImGui::IsKeyPressed(ImGuiKey_Delete, false) && csSelKind_ >= 0) {
+                const auto eraseAt = [](auto& v, int i) {
+                    if (i >= 0 && i < static_cast<int>(v.size())) v.erase(v.begin() + i);
+                };
+                bool did = true;
+                switch (csSelKind_) {
+                    case 0: eraseAt(cs.camera, csSelIndex_); break;
+                    case 3: eraseAt(cs.dialogue, csSelIndex_); break;
+                    case 5: eraseAt(cs.shakes, csSelIndex_); break;
+                    case 6: eraseAt(cs.subtitles, csSelIndex_); break;
+                    case 1:
+                        if (csSelTrack_ >= 0 && csSelTrack_ < static_cast<int>(cs.animTracks.size()))
+                            eraseAt(cs.animTracks[static_cast<usize>(csSelTrack_)].keys, csSelIndex_);
+                        break;
+                    case 2:
+                        if (csSelTrack_ >= 0 && csSelTrack_ < static_cast<int>(cs.animTracks.size()))
+                            eraseAt(cs.animTracks[static_cast<usize>(csSelTrack_)].clips, csSelIndex_);
+                        break;
+                    default: did = false; break; // 4 = track lane
+                }
+                if (did) { markDirty(); csSelKind_ = csSelTrack_ = csSelIndex_ = -1; }
+            }
         }
         ImGui::SetNextItemWidth(78.0f);
         f32 typed = cutsceneEditTime_;
@@ -13836,13 +13435,27 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
             hit = {kind, track, index, d2, x};
     };
 
+    // Short label drawn to the right of a marker so a lane reads at a glance
+    // (truncated; clipped to the lanes region by the PushClipRect above).
+    const auto markerLabel = [&](float x, float y, ImU32 col, std::string s) {
+        if (s.empty()) return;
+        if (s.size() > 22) s = s.substr(0, 21) + "\xE2\x80\xA6"; // ellipsis
+        dl->AddText(ImVec2(x + 7.0f, y - 7.0f), col, s.c_str());
+    };
+    const auto stemOf = [](const std::string& p) {
+        return p.empty() ? std::string() : std::filesystem::path(p).stem().string();
+    };
+
     // Camera keys.
     for (int i = 0; i < static_cast<int>(cs.camera.size()); ++i) {
-        const float x = timeToX(cs.camera[static_cast<usize>(i)].time);
+        const CutsceneCameraKey& ck = cs.camera[static_cast<usize>(i)];
+        const float x = timeToX(ck.time);
         const float y = laneCenterY(0);
         const bool sel = csSelKind_ == 0 && csSelIndex_ == i;
-        drawDiamond(x, y, cs.camera[static_cast<usize>(i)].cut ? IM_COL32(230, 150, 70, 255)
-                                                               : IM_COL32(230, 200, 110, 255), sel);
+        drawDiamond(x, y, ck.cut ? IM_COL32(230, 150, 70, 255) : IM_COL32(230, 200, 110, 255), sel);
+        // Show what makes this key distinct: a hard cut, or the actor it tracks.
+        markerLabel(x, y, IM_COL32(230, 210, 150, 210),
+                    ck.cut ? std::string("cut") : ck.aimTarget);
         consider(0, -1, i, x, y);
     }
     // Animation tracks: transform keys (diamonds) + clip triggers (circles).
@@ -13860,15 +13473,21 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
             const bool sel = csSelKind_ == 2 && csSelTrack_ == ti && csSelIndex_ == ci;
             dl->AddCircleFilled(ImVec2(x, y + 7.0f), sel ? 5.5f : 4.0f, IM_COL32(120, 210, 130, 255));
             if (sel) dl->AddCircle(ImVec2(x, y + 7.0f), 5.5f, IM_COL32(255, 255, 255, 255), 0, 1.5f);
+            char cl[16];
+            std::snprintf(cl, sizeof(cl), "clip %d", tr.clips[static_cast<usize>(ci)].clip);
+            markerLabel(x, y + 7.0f, IM_COL32(150, 220, 160, 200), cl);
             consider(2, ti, ci, x, y + 7.0f);
         }
     }
     // Dialogue markers.
     for (int i = 0; i < static_cast<int>(cs.dialogue.size()); ++i) {
-        const float x = timeToX(cs.dialogue[static_cast<usize>(i)].time);
+        const CutsceneDialogueMarker& dm = cs.dialogue[static_cast<usize>(i)];
+        const float x = timeToX(dm.time);
         const float y = laneCenterY(laneDialogue);
         const bool sel = csSelKind_ == 3 && csSelIndex_ == i;
         drawDiamond(x, y, IM_COL32(200, 150, 220, 255), sel);
+        const std::string dlbl = !dm.dialogue.empty() ? stemOf(dm.dialogue) : stemOf(dm.voiceline);
+        markerLabel(x, y, IM_COL32(210, 175, 225, 215), dlbl);
         consider(3, -1, i, x, y);
     }
     // Shake impulses: bar height shows trauma, so the lane reads at a glance.
@@ -13898,6 +13517,8 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
         dl->AddRectFilled(ImVec2(x, y - 5.0f), ImVec2(glm::max(x2, x + 2.0f), y + 5.0f),
                           IM_COL32(90, 150, 145, 190), 2.0f);
         drawDiamond(x, y, IM_COL32(150, 220, 210, 255), sel);
+        const std::string slbl = m.speaker.empty() ? m.text : (m.speaker + ": " + m.text);
+        markerLabel(x, y, IM_COL32(200, 235, 228, 220), slbl);
         consider(6, -1, i, x, y);
     }
     dl->PopClipRect();
@@ -14140,10 +13761,7 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
                 bool ed = false;
                 ed |= ImGui::DragFloat("Time", &k.time, 0.02f, 0.0f, dur);
                 ed |= ImGui::DragFloat3("Position", glm::value_ptr(k.position), 0.05f);
-                glm::vec3 euler = glm::degrees(glm::eulerAngles(k.rotation));
-                if (ImGui::DragFloat3("Rotation", glm::value_ptr(euler), 0.5f)) {
-                    k.rotation = glm::quat(glm::radians(euler)); ed = true;
-                }
+                if (RotationEulerEditor("Rotation", k.rotation, &k.rotation)) ed = true;
                 ed |= ImGui::DragFloat3("Scale", glm::value_ptr(k.scale), 0.02f);
                 if (ImGui::Button("Delete key")) {
                     tr.keys.erase(tr.keys.begin() + csSelIndex_); csSelKind_ = 4; markDirty();
@@ -14242,6 +13860,33 @@ void Editor::DrawCutsceneTimeline(Engine& engine) {
                 markDirty();
             if (ImGui::DragFloat("Rate##csb", &rig.breathRate, 0.01f, 0.02f, 2.0f, "%.2f Hz"))
                 markDirty();
+            ImGui::Unindent();
+        }
+        // Framing / composition: offset the look target off dead-centre (thirds,
+        // headroom) with optional lead room. Previously authored-but-never-saved -
+        // now round-trips (SaveCutscene/LoadCutscene) and is exposed here.
+        if (ImGui::Checkbox("Framing##cs", &rig.framing)) markDirty();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Compose the shot: put the subject off-centre (rule of\n"
+                              "thirds, headroom) instead of dead-centre, with lead room.");
+        if (rig.framing) {
+            ImGui::Indent();
+            if (ImGui::SliderFloat("Screen X##csf", &rig.framingX, -1.0f, 1.0f)) markDirty();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Horizontal placement of the subject (+/-0.33 = a thirds line).");
+            if (ImGui::SliderFloat("Screen Y##csf", &rig.framingY, -1.0f, 1.0f)) markDirty();
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Vertical placement (>0 = headroom).");
+            if (ImGui::SliderFloat("Lead room##csf", &rig.leadAmount, 0.0f, 1.0f)) markDirty();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Shift framing OPPOSITE the target's motion so it has\n"
+                                  "space to move into. 0 = off.");
+            if (rig.leadAmount > 0.0f)
+                if (ImGui::DragFloat("Lead speed##csf", &rig.leadSpeed, 0.05f, 0.1f, 30.0f, "%.1f m/s"))
+                    markDirty();
+            if (ImGui::DragFloat("Damping##csf", &rig.framingDamping, 0.05f, 0.0f, 20.0f, "%.1f"))
+                markDirty();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How fast the framing offset eases (0 = instant).");
             ImGui::Unindent();
         }
         ImGui::Separator();
@@ -15057,6 +14702,108 @@ bool Editor::AssetPicker(const char* label, const std::string& current, const ch
         ImGui::EndPopup();
     }
     ImGui::PopID();
+    return changed;
+}
+
+bool Editor::SearchableStringCombo(const char* label, const std::string& current,
+                                   const std::vector<std::string>& options, std::string& out,
+                                   const char* tooltip, const char* noneLabel) {
+    bool changed = false;
+    ImGui::PushID(label);
+    const std::string preview =
+        current.empty() ? (noneLabel ? noneLabel : "(none)") : current;
+    if (ImGui::Button(preview.c_str(), ImVec2(220.0f, 0.0f))) {
+        assetPickerSearch_[0] = '\0';
+        ImGui::OpenPopup("##strcombo");
+    }
+    if (tooltip && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(label);
+
+    if (ImGui::BeginPopup("##strcombo")) {
+        ImGui::SetNextItemWidth(240.0f);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        ImGui::InputTextWithHint("##search", "search...", assetPickerSearch_,
+                                 sizeof(assetPickerSearch_));
+        ImGui::Separator();
+        if (ImGui::BeginChild("##list", ImVec2(280.0f, 240.0f))) {
+            if (noneLabel && ImGui::Selectable(noneLabel, current.empty())) {
+                out.clear();
+                changed = true;
+                ImGui::CloseCurrentPopup();
+            }
+            bool any = false;
+            for (const std::string& opt : options) {
+                if (opt.empty() || !AssetSearchMatch(opt)) continue;
+                any = true;
+                if (ImGui::Selectable(opt.c_str(), opt == current)) {
+                    out = opt;
+                    changed = true;
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            if (!any && assetPickerSearch_[0] == '\0')
+                ImGui::TextDisabled("(nothing to choose from)");
+        }
+        ImGui::EndChild();
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
+    return changed;
+}
+
+bool Editor::RotationEulerEditor(const char* label, glm::quat& rot, const void* id) {
+    // Re-seed the cached Euler ONLY when the target field changed or the quaternion was
+    // changed by something other than this editor (the gizmo, undo, a new selection). The
+    // |dot| test treats q and -q (same orientation) as equal and tolerates float drift,
+    // so a value we just wrote does not trigger a re-derive (which is what flipped axes).
+    if (rotEulerId_ != id || std::abs(glm::dot(rot, rotEulerQuat_)) < 0.99999f) {
+        rotEuler_ = glm::degrees(glm::eulerAngles(rot));
+        rotEulerQuat_ = rot;
+        rotEulerId_ = id;
+    }
+    const bool changed = ImGui::DragFloat3(label, glm::value_ptr(rotEuler_), 0.5f);
+    if (changed) {
+        rot = glm::normalize(glm::quat(glm::radians(rotEuler_)));
+        rotEulerQuat_ = rot; // remember our own write so it is not re-derived next frame
+    }
+    return changed;
+}
+
+bool Editor::DrawMaterialPresetCombo(u32& flags, f32& metallic, f32& roughness,
+                                     glm::vec3& sss, f32& sssRadius,
+                                     const std::function<void()>& onApply) {
+    struct P { const char* name; u32 flag; f32 metallic; f32 roughness;
+               glm::vec3 sss; f32 sssRadius; bool setSss; };
+    static const P kPresets[] = {
+        {"Standard",  rhi::MaterialFlag_None,       0.0f, 0.50f, {0, 0, 0},              1.0f, false},
+        {"Skin",      rhi::MaterialFlag_Subsurface, 0.0f, 0.42f, {0.85f, 0.20f, 0.16f}, 1.2f, true},
+        {"Cloth",     rhi::MaterialFlag_Cloth,      0.0f, 0.72f, {0, 0, 0},              1.0f, false},
+        {"Eye",       rhi::MaterialFlag_Eye,        0.0f, 0.12f, {0, 0, 0},              1.0f, false},
+        {"Hair",      rhi::MaterialFlag_Hair,       0.0f, 0.40f, {0, 0, 0},              1.0f, false},
+    };
+    const u32 kFamily = rhi::MaterialFlag_Subsurface | rhi::MaterialFlag_Cloth |
+                        rhi::MaterialFlag_Eye | rhi::MaterialFlag_Hair;
+    int cur = 0;
+    for (int i = 0; i < IM_ARRAYSIZE(kPresets); ++i)
+        if ((flags & kFamily) == kPresets[i].flag) { cur = i; break; }
+    bool changed = false;
+    if (ImGui::BeginCombo("Preset", kPresets[cur].name)) {
+        for (int i = 0; i < IM_ARRAYSIZE(kPresets); ++i) {
+            if (ImGui::Selectable(kPresets[i].name, i == cur)) {
+                if (onApply) onApply();
+                flags = (flags & ~kFamily) | kPresets[i].flag; // keep orthogonal flags
+                metallic = kPresets[i].metallic;
+                roughness = kPresets[i].roughness;
+                if (kPresets[i].setSss) { sss = kPresets[i].sss; sssRadius = kPresets[i].sssRadius; }
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Sets the shading type + sensible metallic/roughness (and the\n"
+                          "SSS tint/radius for Skin). Leaves base color + textures alone.");
     return changed;
 }
 
@@ -17108,6 +16855,9 @@ void Editor::DrawAssetViewer(Engine& engine) {
             editedMat_.name = nameBuf;
             edited = true;
         }
+        if (DrawMaterialPresetCombo(editedMat_.flags, editedMat_.metallic, editedMat_.roughness,
+                                    editedMat_.subsurfaceColor, editedMat_.subsurfaceRadius))
+            edited = true;
         edited |= ImGui::ColorEdit4("Base Color", glm::value_ptr(editedMat_.baseColor));
         edited |= ImGui::SliderFloat("Metallic", &editedMat_.metallic, 0.0f, 1.0f);
         edited |= ImGui::SliderFloat("Roughness", &editedMat_.roughness, 0.04f, 1.0f);
@@ -17126,6 +16876,11 @@ void Editor::DrawAssetViewer(Engine& engine) {
             edited |= ImGui::SliderFloat("Scatter radius", &editedMat_.subsurfaceRadius,
                                          0.1f, 4.0f, "%.2f");
         }
+        // Clearcoat (wet/oily clear layer: sweat, wet skin, wet eyes, varnish).
+        edited |= ImGui::SliderFloat("Clearcoat", &editedMat_.clearcoat, 0.0f, 1.0f, "%.2f");
+        if (editedMat_.clearcoat > 0.0f)
+            edited |= ImGui::SliderFloat("Clearcoat roughness", &editedMat_.clearcoatRoughness,
+                                         0.02f, 0.5f, "%.2f");
         const auto matFlag = [&](const char* label, u32 bit) {
             bool on = (editedMat_.flags & bit) != 0u;
             if (ImGui::Checkbox(label, &on)) {
@@ -17464,6 +17219,8 @@ void Editor::DrawAssetViewer(Engine& engine) {
                     item.emissiveIntensity = mi.emissiveIntensity;
                     item.subsurfaceColor = mi.subsurfaceColor;
                     item.subsurfaceRadius = mi.subsurfaceRadius;
+                    item.clearcoat = mi.clearcoat;
+                    item.clearcoatRoughness = mi.clearcoatRoughness;
                     item.thicknessTexture = mi.thicknessTexture;
                     item.materialFlags = mi.materialFlags;
                     previewDraw_.push_back(item);
@@ -17695,32 +17452,47 @@ void Editor::DrawSceneManager(Engine& engine) {
                 "it is a no-trace bind: no area visit, no state captures - the menu\n"
                 "always shows the AUTHORED world and never touches a save.");
         if (project.Settings().menuWorld) {
-            char tagBuf[128];
-            std::snprintf(tagBuf, sizeof(tagBuf), "%s",
-                          project.Settings().menuTag.c_str());
-            ImGui::SetNextItemWidth(220.0f);
-            if (ImGui::InputText("Menu Tag", tagBuf, sizeof(tagBuf)))
-                project.Settings().menuTag = tagBuf;
-            if (ImGui::IsItemDeactivatedAfterEdit()) project.Save();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
+            // Menu Tag: a searchable dropdown over the project's streaming tags
+            // (tags::All() skipping index 0 "Untagged"; "(none)" clears it).
+            std::vector<std::string> tagOpts;
+            {
+                const std::vector<std::string>& all = tags::All();
+                for (usize i = 1; i < all.size(); ++i) // 0 = Untagged (the "(none)" case)
+                    if (!all[i].empty()) tagOpts.push_back(all[i]);
+            }
+            std::string tagPick;
+            if (SearchableStringCombo(
+                    "Menu Tag", project.Settings().menuTag, tagOpts, tagPick,
                     "TAG carrying the menu's 3D set. Its shards are forced RESIDENT\n"
                     "while the menu is up, so the set is there regardless of where the\n"
                     "menu camera sits, and it loads BEHIND THE STUDIO SPLASH.\n"
-                    "Empty = only untagged / alwaysLoaded content is resident.\n"
-                    "The shard table is baked on SAVE - tag, then save the scene.");
-            char camBuf[128];
-            std::snprintf(camBuf, sizeof(camBuf), "%s",
-                          project.Settings().menuCamera.c_str());
-            ImGui::SetNextItemWidth(220.0f);
-            if (ImGui::InputText("Menu Camera", camBuf, sizeof(camBuf)))
-                project.Settings().menuCamera = camBuf;
-            if (ImGui::IsItemDeactivatedAfterEdit()) project.Save();
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip(
+                    "(none) = only untagged / alwaysLoaded content is resident.\n"
+                    "The shard table is baked on SAVE - tag, then save the scene.")) {
+                project.Settings().menuTag = tagPick;
+                project.Save();
+            }
+
+            // Menu Camera: a searchable dropdown over the named CameraComponent
+            // entities in the loaded scene ("(none)" = the scene's primary camera).
+            std::vector<std::string> camOpts;
+            {
+                entt::registry& reg = scene.Registry();
+                for (const entt::entity e : reg.view<CameraComponent, Name>()) {
+                    const std::string& nm = reg.get<Name>(e).value;
+                    if (!nm.empty()) camOpts.push_back(nm);
+                }
+                std::sort(camOpts.begin(), camOpts.end());
+                camOpts.erase(std::unique(camOpts.begin(), camOpts.end()), camOpts.end());
+            }
+            std::string camPick;
+            if (SearchableStringCombo(
+                    "Menu Camera", project.Settings().menuCamera, camOpts, camPick,
                     "Entity NAME of the CameraComponent that frames the menu.\n"
-                    "Empty = the scene's primary camera. A missing name falls back\n"
-                    "to the primary camera with a warning, never a black screen.");
+                    "(none) = the scene's primary camera. A missing name falls back\n"
+                    "to the primary camera with a warning, never a black screen.")) {
+                project.Settings().menuCamera = camPick;
+                project.Save();
+            }
         }
     }
     ImGui::Separator();

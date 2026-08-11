@@ -10,6 +10,8 @@
 #include "Dialogue/DialogueGraph.h" // active dialogue graph the conversation player walks
 #include "Navigation/GridNav.h" // real-time A* pathfinder (agents path on this)
 #include "Scene/ParticleGpuSim.h" // GPU particle simulation context (compute-driven)
+#include "Scene/PrecipSystem.h"   // precip::PrecipField (camera-following rain/snow)
+#include "Scene/OceanFFT.h"       // ocean::GpuOcean (GPU FFT ocean, compute-driven)
 #include "Scene/TagStreaming.h"   // stream::Streamer (distance streaming of baked shards)
 #include "RHI/RHI.h"
 #include "Core/UserSettings.h" // per-user volume/graphics/brightness/captions
@@ -172,6 +174,14 @@ struct EngineConfig {
     f32 forceTimeOfDay = -1.0f;
     f32 forceDayLength = -1.0f;
     f32 forceClouds = -1.0f;
+    f32 forceWetness = -1.0f; // --wetness: force ground wetness each frame
+    f32 forceSnow = -1.0f;    // --snow: force snow accumulation each frame
+    f32 forceRain = -1.0f;    // --rain: rain at this intensity (wets ground, pools)
+    bool forceVolClouds = false; // --volclouds: force volumetric clouds on
+    bool spawnWater = false;     // --water: spawn a test Gerstner water plane at the origin
+    bool fftOcean = false;       // --fftocean: drive the spawned test water with the GPU FFT
+    bool forceDynIBL = false;    // --dynibl: dynamic IBL re-bake + dynamic sky
+    bool forceLightning = false; // --lightning: enable lightning + set a storm
 
     // --tagstreamtest [objects]: TAG STREAMING demo + measurement, on a SYNTHETIC
     // world. It exists because the reference project has nothing to stream - 17 of its
@@ -424,6 +434,8 @@ private:
     // buffer - the compute pass writes it and the vertex shader reads the same bytes,
     // so nothing is uploaded per frame at all. Created lazily too.
     particle::GpuSim gpuSim_;
+    precip::PrecipField precip_; // runtime camera-following rain/snow (not serialized)
+    ocean::GpuOcean ocean_;      // runtime GPU FFT ocean (compute buffers/pipelines; lazy)
 
 public:
     // Exposed for --test-vfxsim (it reads the simulation buffer back).
@@ -520,6 +532,14 @@ private:
     f32       forceTimeOfDay_ = -1.0f; // --time: hold the sky at this hour each frame
     f32       forceDayLength_ = -1.0f; // --daynight: auto-cycle seconds each frame
     f32       forceClouds_ = -1.0f;    // --clouds: force cloud coverage each frame
+    f32       iblRebakeTimer_ = 0.0f;  // throttle accumulator for the dynamic-IBL re-bake
+    glm::vec3 iblLastSunDir_{0.0f};    // sun direction at the last dynamic-IBL re-bake
+    f32       forceWetness_ = -1.0f;   // --wetness: force ground wetness each frame
+    f32       forceSnow_ = -1.0f;      // --snow: force snow accumulation each frame
+    f32       forceRain_ = -1.0f;      // --rain: rain intensity each frame
+    bool      forceVolClouds_ = false; // --volclouds: force volumetric clouds on
+    bool      forceDynIBL_ = false;    // --dynibl: dynamic IBL re-bake + dynamic sky
+    bool      forceLightning_ = false; // --lightning: enable lightning + a storm
     GameState gameState_ = GameState::None;
     f32       loadTimer_ = 0.0f;
     LoadPhase loadPhase_ = LoadPhase::Begin; // fade sub-phase within GameState::Loading

@@ -3,7 +3,6 @@
 // Material maps (base color / normal / metallic-roughness / AO) are sampled from
 // the bindless texture array by per-object index (0 = use the constant factor).
 #include "Common.hlsli"
-#include "Construction.hlsli"
 #include "BRDF.hlsli"
 
 struct VSInput
@@ -147,7 +146,7 @@ float3 ApplyNormalMap(float3 N, float4 T, float2 uv)
 // colored wrapped diffuse (light bleeds past the terminator, red furthest).
 float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
                    float metallic, float roughness, float3 F0, float NdotV,
-                   float curvature, float thickness)
+                   float curvature, float thickness, float3 tangentWS)
 {
     float3 Hv = normalize(V + L);
     float  rawNdotL = dot(N, L);
@@ -161,6 +160,12 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     // scattering darkens F90), so fade F90 toward F0 with roughness: smooth surfaces
     // keep full Fresnel, rough surfaces (e.g. terrain at max roughness) read matte.
     float  f90s = 1.0f - roughness * roughness;
+    // Skin / eyes: a single dielectric lobe flashes a HARD Fresnel rim at grazing
+    // angles - plasticky on a face, and a bright ring around the sclera. Real skin's
+    // oil layer is a broad, DIM grazing response, so cap F90 for these materials. This
+    // also lets more of the reddened SSS diffuse survive at the silhouette (kdDirect
+    // below is 1-Ft), where skin should redden most.
+    if ((gMaterialFlags & (HBE_MAT_SUBSURFACE | HBE_MAT_EYE)) != 0u) f90s = min(f90s, 0.5f);
     float3 F90  = max(f90s.xxx, F0);
     float3 Ft   = F0 + (F90 - F0) * pow(saturate(1.0f - VdotH), 5.0f);
     float3 specular;
@@ -171,11 +176,43 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
         specular = D_Charlie(roughness, NdotH) * V_Neubelt(NdotV, NdotL)
                  * (0.3f * radiance * NdotL);
     }
+    else if ((gMaterialFlags & HBE_MAT_HAIR) != 0u)
+    {
+        // Kajiya-Kay anisotropic HAIR: the highlight is a STREAK across the strand
+        // direction, not a round dot. Two shifted specular lobes - a sharp, white
+        // PRIMARY shifted toward the root and a broad, subsurface-tinted SECONDARY
+        // shifted toward the tip - are what read as glossy hair. Tangent = strand
+        // direction (hair-card U axis). No textures/extra samples; safe on a GTX 660.
+        float3 Th = normalize(tangentWS - N * dot(tangentWS, N)); // strand dir on the surface
+        const float shiftP = -0.04f, shiftS = 0.10f;
+        float3 t1 = normalize(Th + shiftP * N);
+        float3 t2 = normalize(Th + shiftS * N);
+        const float dp = dot(t1, Hv), ds = dot(t2, Hv);
+        const float expP = lerp(16.0f, 160.0f, saturate(1.0f - roughness)); // sharp primary
+        const float sP = pow(sqrt(saturate(1.0f - dp * dp)), expP);
+        const float sS = pow(sqrt(saturate(1.0f - ds * ds)), expP * 0.25f);  // broad secondary
+        const float3 primary = sP.xxx;                    // white oil highlight (R lobe)
+        const float3 secondary = sS * albedo * 0.6f;      // TRT lobe, tinted by hair colour
+        specular = (primary + secondary) * Ft * radiance * NdotL;
+    }
     else
     {
         float Dt = DistributionGGX(NdotH, roughness);
         float Gt = GeometrySmith(NdotV, NdotL, roughness);
         specular = (Dt * Gt * Ft) / max(4.0f * NdotV * NdotL, EPSILON) * radiance * NdotL;
+        if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u)
+        {
+            // Skin has a DUAL specular lobe: a tight highlight sitting on a broad, soft
+            // oily sheen. A single GGX dot reads plasticky ("weird highlight"); adding a
+            // wider second lobe and blending (not adding - energy-preserving) makes the
+            // highlight read wet and alive. One extra NDF/G eval, no new textures/samples
+            // - safe down to a GTX 660.
+            float rBroad = saturate(roughness * 2.0f + 0.18f);
+            float Db = DistributionGGX(NdotH, rBroad);
+            float Gb = GeometrySmith(NdotV, NdotL, rBroad);
+            float3 broad = (Db * Gb * Ft) / max(4.0f * NdotV * NdotL, EPSILON) * radiance * NdotL;
+            specular = lerp(specular, broad, 0.35f);
+        }
     }
 
     float3 diffuseResponse = NdotL.xxx;
@@ -185,18 +222,41 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
         // Pre-integrated subsurface scattering: the LUT gives the soft, reddened
         // wrap of light around the terminator (curvature drives how far it
         // bleeds). Falls back to a wrapped diffuse if the LUT is unavailable.
-        diffuseResponse = (gSkinLUTIndex != 0)
-            ? SampleBindless(gSkinLUTIndex, float2(rawNdotL * 0.5f + 0.5f, curvature)).rgb
-            : saturate((rawNdotL.xxx + gSubsurfaceColor * 0.5f) / (1.0f + gSubsurfaceColor * 0.5f));
-        // Translucency: light transported through thin, back-lit regions
-        // (Frostbite-style transmission), strongest where thickness is low.
-        float3 transL = normalize(L + N * 0.25f);
-        float  transDot = pow(saturate(dot(V, -transL)), 4.0f);
-        transmission = gSubsurfaceColor * (transDot * (1.0f - thickness)) * radiance;
+        // Wrapped, reddened subsurface diffuse. Light bleeds a LITTLE past the terminator
+        // (the soft skin look) and the transition band picks up the blood-scatter tint -
+        // but the FORM is kept (the dark side stays dark). This is a pre-integrated wrap,
+        // NOT a wash: the LUT path over-scattered at every curvature and flattened the
+        // sphere, so this analytic model replaces it. The wrap width is driven by the
+        // UNIFORM material radius (NOT screen-space fwidth curvature) so it can't speckle
+        // per-facet at the terminator the way the derivative-based curvature did.
+        const float sWrap = 0.20f + gSubsurfaceRadius * 0.10f;
+        float wrapped = saturate((rawNdotL + sWrap) / (1.0f + sWrap));
+        float band = saturate((sWrap - abs(rawNdotL)) / sWrap) * saturate(rawNdotL + sWrap);
+        diffuseResponse = wrapped.xxx * lerp(1.0f.xxx, gSubsurfaceColor, saturate(band * 0.8f));
+        // Subtle back-scatter on edge/thin regions (thickness map gates it; 0.5 default).
+        float3 transL = normalize(L + N * 0.3f);
+        float transDot = pow(saturate(dot(V, -transL)), 3.0f);
+        transmission = gSubsurfaceColor * (transDot * (1.0f - thickness) * 0.35f) * radiance;
     }
     float3 kdDirect = (1.0f - Ft) * (1.0f - metallic);
     float3 diffuse = kdDirect * albedo / PI * diffuseResponse * radiance;
-    return diffuse + specular + transmission;
+    float3 result = diffuse + specular + transmission;
+
+    // Clearcoat: a thin CLEAR dielectric layer over the whole material (wet skin,
+    // sweat, wet eyes, blood sheen, varnish). A second GGX lobe with a fixed 0.04 F0
+    // and its own (usually low) roughness. It also attenuates the layers beneath it by
+    // its Fresnel so the surface can't gain energy - the base just dims where the wet
+    // sheen takes over. Gated on gClearcoat, so a dry material pays nothing.
+    if (gClearcoat > 0.0f)
+    {
+        const float ccF = (0.04f + 0.96f * pow(saturate(1.0f - VdotH), 5.0f)) * saturate(gClearcoat);
+        const float ccRough = max(gClearcoatRoughness, 0.02f);
+        const float ccD = DistributionGGX(NdotH, ccRough);
+        const float ccG = GeometrySmith(NdotV, NdotL, ccRough);
+        const float ccSpec = (ccD * ccG * ccF) / max(4.0f * NdotV * NdotL, EPSILON) * NdotL;
+        result = result * (1.0f - ccF) + (ccSpec * radiance);
+    }
+    return result;
 }
 
 // Windowed inverse-square falloff (UE4-style): physically-based near the
@@ -213,6 +273,39 @@ float DistanceAttenuation(float dist, float range)
 // normal + roughness/metalness) and screen-space motion vectors. The latter two
 // targets are only bound for the main HDR scene pass; preview/legacy passes use
 // a single-RT pipeline and these extra outputs are discarded.
+// --- Weather surface-response noise -------------------------------------
+// Cheap 2D value noise + 3-octave fBm, used to break up puddle coverage and snow
+// accumulation across world-XZ so neither reads as a uniform coat. World-anchored
+// (fed world position / a metre scale) so the pattern is stable as the camera moves.
+float Wx_Hash(float2 p)
+{
+    p = frac(p * float2(123.34f, 345.45f));
+    p += dot(p, p + 34.345f);
+    return frac(p.x * p.y);
+}
+float Wx_Noise(float2 p)
+{
+    float2 i = floor(p);
+    float2 f = frac(p);
+    f = f * f * (3.0f - 2.0f * f);
+    float a = Wx_Hash(i);
+    float b = Wx_Hash(i + float2(1.0f, 0.0f));
+    float c = Wx_Hash(i + float2(0.0f, 1.0f));
+    float d = Wx_Hash(i + float2(1.0f, 1.0f));
+    return lerp(lerp(a, b, f.x), lerp(c, d, f.x), f.y);
+}
+float Wx_Fbm(float2 p)
+{
+    // Wrap the domain to a large integer period so fp32 keeps full precision near the
+    // wrap origin: at raw world coordinates the pre-hash multiply pushes magnitudes into
+    // low-ULP territory within a few km, banding the break-up. The pattern then repeats
+    // every 1024 * scale metres (kilometres) - imperceptibly far.
+    p -= 1024.0f * floor(p / 1024.0f);
+    float v = 0.0f, a = 0.5f;
+    [unroll] for (int i = 0; i < 3; ++i) { v += a * Wx_Noise(p); p *= 2.0f; a *= 0.5f; }
+    return v; // ~[0, 0.875]
+}
+
 struct PSOutput
 {
     float4 color    : SV_Target0;
@@ -314,20 +407,6 @@ PSOutput PSMain(VSOutput input)
         metallic  *= mr.b;
         roughness *= mr.g;
     }
-    // --- PROCEDURAL CONSTRUCTION SURFACE ------------------------------------
-    // Applied AFTER the MR sample so an authored map still wins, and BEFORE lighting so the
-    // varied albedo/roughness feed the BRDF like any other material. Driven by WORLD position, so
-    // a pattern runs continuously across two walls meeting at a corner and tiles at any wall size
-    // without a UV unwrap. Costs no texture memory and no ObjectCB space - the material id rides
-    // in the spare high bits of gMaterialFlags.
-    {
-        const uint procKind = (gMaterialFlags >> HBE_PROC_SHIFT) & HBE_PROC_MASK;
-        if (procKind != HBE_PROC_NONE) {
-            albedo = HbConstructionSurface(procKind, albedo, input.positionWS,
-                                           normalize(input.normalWS), input.tangentWS.xyz,
-                                           input.uv, roughness, metallic);
-        }
-    }
 
     // Splat roughness = the blended layer-material roughness, but FLOORED by the terrain's
     // own roughness factor (gRoughnessFactor = the terrain Roughness slider). So cranking
@@ -336,9 +415,10 @@ PSOutput PSMain(VSOutput input)
     if (splat) { metallic = splatMRrm.x; roughness = max(splatMRrm.y, gRoughnessFactor); }
     metallic  = saturate(metallic);
     roughness = clamp(roughness, 0.04f, 1.0f);
-    // The cornea is a smooth, wet refractive layer: force a sharp specular so
-    // eyes get a crisp catchlight.
-    if ((gMaterialFlags & HBE_MAT_EYE) != 0u) roughness = min(roughness, 0.06f);
+    // The cornea is a smooth, wet refractive layer: keep a crisp catchlight, but not
+    // the near-mirror r=0.06 that made a SINGULAR, aliasing pinpoint. 0.12 is still
+    // sharp and stops the shimmer.
+    if ((gMaterialFlags & HBE_MAT_EYE) != 0u) roughness = min(roughness, 0.12f);
 
     float ao = (gAOIndex != 0 && !splat) ? SampleBindless(gAOIndex, uv).r : 1.0f;
 
@@ -372,8 +452,18 @@ PSOutput PSMain(VSOutput input)
     // Subsurface inputs (consumed by ShadeDirect when the subsurface flag is on):
     // screen-space curvature drives how far light wraps; a thickness map gates
     // back-lit transmission.
-    float curvature = saturate(length(fwidth(N)) /
-                               max(length(fwidth(input.positionWS)), 1e-4f) * gSubsurfaceRadius);
+    //
+    // fwidth() is a per-2x2-quad derivative. On a smooth, dense mesh that reads real
+    // surface curvature - but on a low-poly / hard-normal skin mesh it is roughly
+    // CONSTANT within each triangle and DIFFERENT per triangle (and spikes at the
+    // creases), so the LUT paints each facet a slightly different scatter = the blotchy,
+    // triangular patches on un-smoothed skin. Cap the raw ratio and ease its strength so
+    // a facet can only ever NUDGE the wrap, never slam it to the deep-scatter end:
+    // smoothly-curved skin keeps its soft terminator (its curvature already sits under
+    // the cap), faceted skin stops blotching. gSubsurfaceRadius still scales it, so the
+    // material's "SSS Radius" dials the effect up without bringing the blotches back.
+    float rawCurv = length(fwidth(N)) / max(length(fwidth(input.positionWS)), 1e-4f);
+    float curvature = saturate(min(rawCurv, 1.0f) * gSubsurfaceRadius * 0.15f);
     float thickness = (gThicknessIndex != 0) ? SampleBindless(gThicknessIndex, uv).r : 0.5f;
 
     // --- Art Editor surface paint -------------------------------------------
@@ -433,15 +523,173 @@ PSOutput PSMain(VSOutput input)
         }
     }
 
+    // --- Forward projected decals -------------------------------------------
+    // Each decal box projects its albedo/normal/MR onto the surfaces it overlaps, blended
+    // into the material BEFORE lighting (correctly lit, conforms to any geometry) and
+    // BEFORE the weather block (so snow/wet sit on top of a decal). Uniform branch on the
+    // decal count keeps it free when there are none.
+    [branch] if (gDecalCount > 0u)
+    {
+        float3 geoN = normalize(input.normalWS);
+        // World-position derivatives taken in UNIFORM flow (the branch is on a frame
+        // constant), so the per-decal loop below - which `continue`s divergently - can
+        // sample with EXPLICIT gradients instead of undefined implicit ones.
+        float3 dPwx = ddx(input.positionWS);
+        float3 dPwy = ddy(input.positionWS);
+        for (uint di = 0; di < gDecalCount; ++di)
+        {
+            Decal dc = gDecals[di];
+            float facing = dot(geoN, -dc.forwardWS); // surface must face the projector
+            if (facing <= 0.0f) continue;
+            float3 lp = mul(dc.invWorld, float4(input.positionWS, 1.0f)).xyz;
+            float3 al = abs(lp);
+            if (al.x > 0.5f || al.y > 0.5f || al.z > 0.5f) continue; // outside the box
+            float2 duv = lp.xy + 0.5f;                               // project along local Z
+            // Explicit UV gradients: d(lp) = invWorld * d(Pw) (w=0, translation drops out).
+            float2 duvDx = mul(dc.invWorld, float4(dPwx, 0.0f)).xy;
+            float2 duvDy = mul(dc.invWorld, float4(dPwy, 0.0f)).xy;
+            float4 dalb = (dc.albedoIndex != 0u)
+                              ? SampleBindlessGrad(dc.albedoIndex, duv, duvDx, duvDy)
+                              : float4(1.0f, 1.0f, 1.0f, 1.0f);
+            float edge = saturate((0.5f - max(al.x, al.y)) * 8.0f);  // soft UV border
+            float cov = dalb.a * dc.opacity * pow(saturate(facing), dc.angleFade) * edge;
+            if (cov <= 0.001f) continue;
+            if (dc.albedoIndex != 0u) albedo = lerp(albedo, dalb.rgb, cov);
+            if (dc.normalIndex != 0u)
+            {
+                float3 nts = SampleBindlessGrad(dc.normalIndex, duv, duvDx, duvDy).xyz * 2.0f - 1.0f;
+                // Right-handed frame matching the mesh convention (ApplyNormalMap uses
+                // b = cross(n, t)): with N = -forwardWS, B = cross(tangentWS, forwardWS)
+                // gives cross(T, B) = +N, so a decal normal map's green channel is not
+                // inverted relative to the same map on a mesh surface.
+                float3 B = cross(dc.tangentWS, dc.forwardWS);
+                float3 dN = normalize(nts.x * dc.tangentWS + nts.y * B + nts.z * (-dc.forwardWS));
+                N = normalize(lerp(N, dN, cov * dc.params.x));
+            }
+            if (dc.mrIndex != 0u)
+            {
+                float3 mr = SampleBindlessGrad(dc.mrIndex, duv, duvDx, duvDy).rgb; // b=metal g=rough
+                metallic  = lerp(metallic, mr.b, cov);
+                roughness = lerp(roughness, mr.g, cov);
+            }
+            else
+            {
+                roughness = lerp(roughness, dc.params.y, cov);
+                metallic  = lerp(metallic, dc.params.z, cov);
+            }
+        }
+        roughness = clamp(roughness, 0.02f, 1.0f);
+        metallic  = saturate(metallic);
+    }
+
+    // --- Weather surface response (wet / puddles / snow) --------------------
+    // Global ground response driven by the weather state (gWeather2/gWeather3),
+    // written into albedo/roughness/metallic/N BEFORE lighting so the wet gloss and
+    // the puddle mirrors flow through the sun, punctual lights, IBL AND - via the
+    // G-buffer (roughness/normal) - the screen-space reflections. Skipped entirely
+    // when the scene is dry and snowless, so clear weather costs one compare.
+    {
+        float wetAmt    = gWeather2.x;
+        float puddleAmt = gWeather2.y;
+        float snowAmt   = gWeather2.z;
+        [branch] if (wetAmt > 0.001f || puddleAmt > 0.001f || snowAmt > 0.001f)
+        {
+            float3 Pw  = input.positionWS;
+            float  up  = normalize(input.normalWS).y; // geometric up-facing-ness
+            float  puddleScale = max(gWeather3.x, 0.5f);
+            float  snowScale   = max(gWeather3.y, 0.5f);
+
+            // Environmental weather is a WORLD-SURFACE effect, not a character one:
+            // standing water on skin or snow on a cornea reads wrong (and the snow
+            // block would otherwise stomp the deliberate HBE_MAT_EYE roughness cap).
+            // Skip snow/puddles on eye/skin/hair; wet darkening still applies to
+            // skin/hair/cloth (wet hair and a wet coat are realistic) but not the eye
+            // (its wet cornea is already modelled by clearcoat / the eye path).
+            const bool wxEye  = (gMaterialFlags & HBE_MAT_EYE) != 0u;
+            const bool wxChar = (gMaterialFlags &
+                                 (HBE_MAT_EYE | HBE_MAT_SUBSURFACE | HBE_MAT_HAIR)) != 0u;
+
+            // Wetness (porosity darkening): a wet surface is darker and glossier
+            // everywhere, not just in the puddles. Disney's wet approximation.
+            if (wetAmt > 0.001f && !wxEye)
+            {
+                float w = saturate(wetAmt);
+                albedo   *= lerp(1.0f, 0.62f, w);
+                roughness = lerp(roughness, roughness * 0.35f + 0.03f, w);
+            }
+
+            // Puddles: standing water collects in flat, up-facing, "low" spots picked
+            // by a world-XZ fBm thresholded against the coverage. Where it floods, the
+            // surface becomes a near-mirror dark dielectric with an up normal, so the
+            // existing SSR pass reflects the scene in it. The +Y epsilon keeps the
+            // lerp->normalize non-zero at the measure-zero N == -Y, puddle == 0.5 case.
+            if (puddleAmt > 0.001f && !wxChar)
+            {
+                float flat   = saturate((up - 0.55f) / 0.35f);
+                float pn     = Wx_Fbm(Pw.xz / puddleScale);
+                float puddle = flat * saturate((puddleAmt - pn) * 4.0f);
+                if (puddle > 0.001f)
+                {
+                    albedo    = lerp(albedo, float3(0.02f, 0.03f, 0.035f), puddle);
+                    roughness = lerp(roughness, 0.03f, puddle);
+                    metallic  = lerp(metallic, 0.0f, puddle);
+                    N = normalize(lerp(N, float3(0.0f, 1.0f, 0.0f), puddle) + float3(0.0f, 1e-4f, 0.0f));
+                    // Rain ripples: while it is actively raining (precip intensity in
+                    // gWeather2.w), animate the puddle surface with a couple of moving
+                    // noise taps so standing water reads as rained-on, not glass.
+                    float rip = gWeather2.w * puddle;
+                    if (rip > 0.001f)
+                    {
+                        float  t  = gWeather.w;               // seconds
+                        float2 rp = Pw.xz * 6.0f;
+                        const float e = 0.15f;
+                        float h0 = Wx_Noise(rp + t * 1.3f) + Wx_Noise(rp * 2.1f - t * 1.7f) * 0.5f;
+                        float hx = Wx_Noise(rp + float2(e, 0.0f) + t * 1.3f) +
+                                   Wx_Noise((rp + float2(e, 0.0f)) * 2.1f - t * 1.7f) * 0.5f;
+                        float hy = Wx_Noise(rp + float2(0.0f, e) + t * 1.3f) +
+                                   Wx_Noise((rp + float2(0.0f, e)) * 2.1f - t * 1.7f) * 0.5f;
+                        float2 g = float2(hx - h0, hy - h0) / e;
+                        N = normalize(N + float3(g.x, 0.0f, g.y) * (rip * 0.15f));
+                    }
+                }
+            }
+
+            // Snow accumulation: settles on up-facing surfaces (steep slopes shed it),
+            // broken up by noise so it patches in rather than a uniform white coat.
+            // Sits on TOP of wet/puddles - snow is the last thing to land.
+            if (snowAmt > 0.001f && !wxChar)
+            {
+                float slope = saturate((up - 0.30f) / 0.5f);
+                float sn    = Wx_Fbm(Pw.xz / snowScale);
+                float cov   = slope * saturate((snowAmt * 1.4f - 0.2f - (sn - 0.4f) * 0.6f) * 3.0f);
+                cov = saturate(cov) * saturate(snowAmt * 4.0f);
+                if (cov > 0.001f)
+                {
+                    albedo    = lerp(albedo, float3(0.90f, 0.92f, 0.96f), cov);
+                    roughness = lerp(roughness, 0.82f, cov);
+                    metallic  = lerp(metallic, 0.0f, cov);
+                    N = normalize(lerp(N, float3(0.0f, 1.0f, 0.0f), cov * 0.6f) + float3(0.0f, 1e-4f, 0.0f));
+                }
+            }
+
+            roughness = clamp(roughness, 0.02f, 1.0f);
+            metallic  = saturate(metallic);
+        }
+    }
+
     // --- Direct lighting ----------------------------------------------------
     float  NdotV = max(dot(N, V), EPSILON);
     float3 F0 = lerp(0.04f.xxx, albedo, metallic);
+    // Skin's IOR (~1.4) gives a LOWER base reflectance than the 0.04 dielectric
+    // default; the extra 0.012 reads as a bright, waxy sheen on a face.
+    if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u) F0 = lerp(0.028f.xxx, albedo, metallic);
 
     // Sun (one directional light, shadowed).
     float3 L = normalize(gLightDirWS);
     float  shadow = ShadowFactor(input.positionWS, max(dot(N, L), 0.0f));
     float3 Lo = ShadeDirect(N, V, L, gLightColor * gLightIntensity, albedo,
-                            metallic, roughness, F0, NdotV, curvature, thickness) * shadow;
+                            metallic, roughness, F0, NdotV, curvature, thickness,
+                            input.tangentWS.xyz) * shadow;
 
     // Punctual lights: point (0), spot (1), rect/area (2).
     for (uint li = 0; li < gPunctualCount; ++li)
@@ -493,7 +741,8 @@ PSOutput PSMain(VSOutput input)
         if (atten <= 0.0f)
             continue;
         Lo += ShadeDirect(N, V, Lp, light.color * light.intensity * atten, albedo,
-                          metallic, roughness, F0, NdotV, curvature, thickness);
+                          metallic, roughness, F0, NdotV, curvature, thickness,
+                          input.tangentWS.xyz);
     }
 
     // --- Ambient: image-based lighting (local probes over a global sky) ----
@@ -583,6 +832,21 @@ PSOutput PSMain(VSOutput input)
     else
     {
         ambient = kD * albedo * gAmbientIntensity * ao;
+    }
+
+    // Clearcoat environment reflection: the wet/oily sheen mirrors the sky + bright
+    // sources. A thin Fresnel-weighted lobe over the ambient result, sampling the
+    // prefiltered sky at the clear layer's (usually low) roughness. Fresnel here uses
+    // NdotV so the sheen rims the silhouette - exactly where wet skin catches light.
+    if (gClearcoat > 0.0f)
+    {
+        const float ccFa =
+            (0.04f + 0.96f * pow(saturate(1.0f - NdotV), 5.0f)) * saturate(gClearcoat);
+        float3 ccEnv = (gPrefilteredIndex != 0)
+            ? SampleBindlessLod(gPrefilteredIndex, uvR,
+                                max(gClearcoatRoughness, 0.02f) * gPrefilteredMaxLod).rgb
+            : 0.0f;
+        ambient = ambient * (1.0f - ccFa) + ccEnv * (ccFa * gAmbientIntensity * ao);
     }
 
     // --- Emissive (self-illumination, unaffected by lighting) --------------

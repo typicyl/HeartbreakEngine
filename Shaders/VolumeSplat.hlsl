@@ -31,26 +31,33 @@ struct Blob {
 // blob falloff, so every blob deforms coherently into billowing cauliflower shapes
 // (and the self-shadow march, which samples this same baked field, matches). The
 // finer analytic detail is added on top at raymarch time.
-float VS_Hash13(float3 p) {
-    p = frac(p * 0.1031f);
-    p += dot(p, p.yzx + 33.33f);
-    return frac((p.x + p.y) * p.z);
+//
+// The warp uses GRADIENT (Perlin) noise, not value noise: value noise interpolates
+// random VALUES on a lattice, so its gradient carries an axis-aligned grid signature
+// (the same artifact that made the water read as a checkerboard) - visible here as
+// boxy billows. Gradient noise interpolates random GRADIENTS, so the field is
+// direction-neutral.
+float3 VS_Hash33(float3 p) {
+    p = frac(p * float3(0.1031f, 0.1030f, 0.0973f));
+    p += dot(p, p.yxz + 33.33f);
+    return frac((p.xxy + p.yzz) * p.zyx) * 2.0f - 1.0f;
 }
-float VS_ValueNoise(float3 p) {
+float VS_GradNoise(float3 p) {
     const float3 i = floor(p);
-    float3 f = frac(p);
-    f = f * f * (3.0f - 2.0f * f);
-    const float n000 = VS_Hash13(i + float3(0, 0, 0)), n100 = VS_Hash13(i + float3(1, 0, 0));
-    const float n010 = VS_Hash13(i + float3(0, 1, 0)), n110 = VS_Hash13(i + float3(1, 1, 0));
-    const float n001 = VS_Hash13(i + float3(0, 0, 1)), n101 = VS_Hash13(i + float3(1, 0, 1));
-    const float n011 = VS_Hash13(i + float3(0, 1, 1)), n111 = VS_Hash13(i + float3(1, 1, 1));
-    const float nx00 = lerp(n000, n100, f.x), nx10 = lerp(n010, n110, f.x);
-    const float nx01 = lerp(n001, n101, f.x), nx11 = lerp(n011, n111, f.x);
-    return lerp(lerp(nx00, nx10, f.y), lerp(nx01, nx11, f.y), f.z);
+    const float3 f = frac(p);
+    const float3 u = f * f * (3.0f - 2.0f * f);
+    #define VSG(o) dot(VS_Hash33(i + o), f - o)
+    const float n =
+        lerp(lerp(lerp(VSG(float3(0, 0, 0)), VSG(float3(1, 0, 0)), u.x),
+                  lerp(VSG(float3(0, 1, 0)), VSG(float3(1, 1, 0)), u.x), u.y),
+             lerp(lerp(VSG(float3(0, 0, 1)), VSG(float3(1, 0, 1)), u.x),
+                  lerp(VSG(float3(0, 1, 1)), VSG(float3(1, 1, 1)), u.x), u.y), u.z);
+    #undef VSG
+    return n * 0.5f + 0.5f; // -> [0,1]
 }
 float VS_FBM(float3 p) {
     float s = 0.0f, a = 0.5f;
-    [unroll] for (int i = 0; i < 3; ++i) { s += a * VS_ValueNoise(p); p *= 2.03f; a *= 0.5f; }
+    [unroll] for (int i = 0; i < 3; ++i) { s += a * VS_GradNoise(p); p = p * 2.03f + 19.19f; a *= 0.5f; }
     return s;
 }
 

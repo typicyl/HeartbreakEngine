@@ -233,11 +233,24 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         env.timeOfDay = it->value("timeOfDay", env.timeOfDay);
         env.dayLengthSeconds = it->value("dayLengthSeconds", env.dayLengthSeconds);
         env.dynamicSky = it->value("dynamicSky", env.dynamicSky);
+        env.dynamicIBL = it->value("dynamicIBL", env.dynamicIBL);
         env.cloudCoverage = it->value("cloudCoverage", env.cloudCoverage);
         env.cloudDensity = it->value("cloudDensity", env.cloudDensity);
         env.overcast = it->value("overcast", env.overcast);
         env.windAngle = it->value("windAngle", env.windAngle);
         env.windSpeed = it->value("windSpeed", env.windSpeed);
+        env.wetness = it->value("wetness", env.wetness);
+        env.puddles = it->value("puddles", env.puddles);
+        env.snowAmount = it->value("snowAmount", env.snowAmount);
+        env.precipType = it->value("precipType", env.precipType);
+        env.precipIntensity = it->value("precipIntensity", env.precipIntensity);
+        env.dynamicWeather = it->value("dynamicWeather", env.dynamicWeather);
+        env.puddleScale = it->value("puddleScale", env.puddleScale);
+        env.snowScale = it->value("snowScale", env.snowScale);
+        env.volumetricClouds = it->value("volumetricClouds", env.volumetricClouds);
+        env.cloudQuality = it->value("cloudQuality", env.cloudQuality);
+        env.lightning = it->value("lightning", env.lightning);
+        env.thunderSound = it->value("thunderSound", env.thunderSound);
         if (const auto pit = it->find("post"); pit != it->end() && pit->is_object())
             scene::PostFromJson(*pit, env.post);
     }
@@ -469,11 +482,24 @@ bool Project::Save() const {
             {"timeOfDay", env.timeOfDay},
             {"dayLengthSeconds", env.dayLengthSeconds},
             {"dynamicSky", env.dynamicSky},
+            {"dynamicIBL", env.dynamicIBL},
             {"cloudCoverage", env.cloudCoverage},
             {"cloudDensity", env.cloudDensity},
             {"overcast", env.overcast},
             {"windAngle", env.windAngle},
             {"windSpeed", env.windSpeed},
+            {"wetness", env.wetness},
+            {"puddles", env.puddles},
+            {"snowAmount", env.snowAmount},
+            {"precipType", env.precipType},
+            {"precipIntensity", env.precipIntensity},
+            {"dynamicWeather", env.dynamicWeather},
+            {"puddleScale", env.puddleScale},
+            {"snowScale", env.snowScale},
+            {"volumetricClouds", env.volumetricClouds},
+            {"cloudQuality", env.cloudQuality},
+            {"lightning", env.lightning},
+            {"thunderSound", env.thunderSound},
             {"post", scene::PostToJson(env.post)}};
     }
 

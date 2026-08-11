@@ -121,6 +121,33 @@ float FBM(float2 p)
     return v;
 }
 
+// 3D value noise + fBm (for the volumetric cloud density field).
+float Noise3(float3 p)
+{
+    float3 i = floor(p), f = frac(p);
+    f = f * f * (3.0f - 2.0f * f);
+    float n000 = Hash13(i), n100 = Hash13(i + float3(1, 0, 0));
+    float n010 = Hash13(i + float3(0, 1, 0)), n110 = Hash13(i + float3(1, 1, 0));
+    float n001 = Hash13(i + float3(0, 0, 1)), n101 = Hash13(i + float3(1, 0, 1));
+    float n011 = Hash13(i + float3(0, 1, 1)), n111 = Hash13(i + float3(1, 1, 1));
+    float nx00 = lerp(n000, n100, f.x), nx10 = lerp(n010, n110, f.x);
+    float nx01 = lerp(n001, n101, f.x), nx11 = lerp(n011, n111, f.x);
+    return lerp(lerp(nx00, nx10, f.y), lerp(nx01, nx11, f.y), f.z);
+}
+float FBM3(float3 p)
+{
+    float v = 0.0f, a = 0.5f;
+    [unroll] for (int i = 0; i < 4; ++i) { v += a * Noise3(p); p *= 2.03f; a *= 0.5f; }
+    return v; // ~[0, 0.9375]
+}
+
+// Henyey-Greenstein phase (bounded peak, like the fog shader).
+float HGphase(float c, float g)
+{
+    float gg = g * g;
+    return (1.0f - gg) / (4.0f * SKY_PI * pow(abs(1.0f + gg - 2.0f * g * c), 1.5f));
+}
+
 // --- Stars: tiny, sharp, sparse points (most faint, a few bright) -------------
 float StarLayer(float3 dir, float freq, float density, float sharp, float seed)
 {
@@ -202,6 +229,84 @@ float3 Clouds(float3 dir, float3 sunDir, float coverage, float density, float ti
     return col;
 }
 
+// --- Volumetric clouds: raymarched density slab, sun light-marched --------------
+// The cloud density field at world position `p`, shaped by a height profile (rounded
+// cumulus), a coverage threshold, and wind drift, eroded by higher-frequency detail.
+float CloudDensity(float3 p, float coverage, float density, float time, float2 wind,
+                   float base, float top)
+{
+    float h = (p.y - base) / max(top - base, 1.0f); // 0..1 within the slab
+    if (h < 0.0f || h > 1.0f) return 0.0f;
+    // Height profile: rises fast off the base, tapers to the top (rounded tops).
+    float heightGrad = saturate(h * 4.0f) * saturate((1.0f - h) * 2.0f);
+    float2 drift = wind * time * 120.0f; // world-metre drift (windSpeed is tiny UV/sec)
+    float3 wp = float3(p.x + drift.x, p.y, p.z + drift.y);
+    float shape = FBM3(wp * 0.0016f); // low-freq base structure (~600 m cells)
+    float cov = saturate(coverage);
+    float d = saturate(shape - (1.0f - cov) * 0.9f) * heightGrad;
+    if (d > 0.0f)
+    {
+        float detail = FBM3(wp * 0.011f); // erode edges into wisps (~90 m cells)
+        d = saturate(d - (1.0f - detail) * 0.28f);
+    }
+    return d * density * 1.6f;
+}
+
+// Marches the cloud slab along the view ray from the camera, accumulating in-scattered
+// sun + ambient with Beer-Lambert transmittance and a short sun light-march self-shadow.
+// Returns the in-scattered radiance; `transmittance` is how much sky shows through.
+float3 VolumetricClouds(float3 ro, float3 rd, float3 sunDir, float coverage, float density,
+                        float time, float2 wind, float quality, out float transmittance)
+{
+    transmittance = 1.0f;
+    const float base = 900.0f, top = 2200.0f;
+    if (coverage <= 0.001f || rd.y < 0.03f) return 0.0f; // clear, or looking down/horizon
+    float t0 = (base - ro.y) / rd.y;
+    float t1 = (top - ro.y) / rd.y;
+    if (t1 <= 0.0f) return 0.0f;
+    t0 = max(t0, 0.0f);
+    float marchLen = min(t1 - t0, 6000.0f); // near-horizon rays would be enormous
+    int steps = (int)clamp(lerp(28.0f, 96.0f, saturate(quality)), 16.0f, 128.0f);
+    float dt = marchLen / (float)steps;
+
+    float elev = sunDir.y;
+    float day = saturate(elev * 4.0f + 0.1f);
+    float3 sunCol = lerp(float3(0.45f, 0.50f, 0.62f), float3(1.0f, 0.95f, 0.85f), day) *
+                    (2.6f * day + 0.15f);
+    // Golden-hour warmth: near the horizon the light through the clouds turns orange
+    // (mirrors the 2D layer's warmTint), so dawn/dusk clouds glow instead of reading grey.
+    float warmth = saturate(1.0f - abs(elev) * 6.0f);
+    sunCol = lerp(sunCol, float3(1.0f, 0.50f, 0.28f) * (2.6f * day + 0.15f), warmth * 0.75f);
+    float3 ambCol = lerp(float3(0.10f, 0.13f, 0.20f), float3(0.55f, 0.62f, 0.75f), day);
+    float mu = dot(rd, sunDir);
+    float phase = HGphase(mu, 0.5f) * 0.7f + HGphase(mu, -0.15f) * 0.3f; // dual-lobe
+
+    float3 scatter = 0.0f;
+    [loop] for (int i = 0; i < steps; ++i)
+    {
+        if (transmittance < 0.02f) break;
+        float3 p = ro + rd * (t0 + ((float)i + 0.5f) * dt);
+        float d = CloudDensity(p, coverage, density, time, wind, base, top);
+        if (d > 0.001f)
+        {
+            float lt = 0.0f; // optical depth toward the sun (self-shadow)
+            [unroll] for (int j = 1; j <= 4; ++j)
+                lt += CloudDensity(p + sunDir * ((float)j * 90.0f), coverage, density, time,
+                                   wind, base, top) * 90.0f;
+            float3 lightE = sunCol * exp(-lt) * phase + ambCol;
+            float dtrans = exp(-d * dt * 1.2f);
+            scatter += transmittance * (1.0f - dtrans) * lightE;
+            transmittance *= dtrans;
+        }
+    }
+    // Feather the low-elevation cutoff so clouds ramp in over a few degrees rather than
+    // snapping on at the horizon (matching the smooth fade the 2D layer had).
+    float horizon = saturate((rd.y - 0.03f) * 8.0f);
+    scatter *= horizon;
+    transmittance = lerp(1.0f, transmittance, horizon);
+    return scatter;
+}
+
 float3 SkyRadiance(float3 dir, float3 sunDir, float coverage, float density,
                    float overcast, float time)
 {
@@ -234,10 +339,21 @@ float3 SkyRadiance(float3 dir, float3 sunDir, float coverage, float density,
         coverage = max(coverage, overcast); // overcast implies cloud cover
     }
 
-    // Clouds composited over the sky (hide the stars/sun where opaque).
-    float cloudA;
-    float3 cloud = Clouds(dir, sunDir, coverage, density, time, cloudA);
-    sky = lerp(sky, cloud, cloudA);
+    // Clouds: a raymarched VOLUMETRIC slab (gWeather3.z on) with real depth + sun
+    // self-shadow, or the cheap 2D sky-plane layer. Both composite over the sky.
+    if (gWeather3.z > 0.5f)
+    {
+        float tr;
+        float3 cloudScatter = VolumetricClouds(gCameraPosWS, dir, sunDir, coverage, density,
+                                               time, gWeather1.xy, gWeather3.w, tr);
+        sky = sky * tr + cloudScatter;
+    }
+    else
+    {
+        float cloudA;
+        float3 cloud = Clouds(dir, sunDir, coverage, density, time, cloudA);
+        sky = lerp(sky, cloud, cloudA);
+    }
     return sky;
 }
 

@@ -99,7 +99,13 @@ bool SaveCutscene(const std::filesystem::path& path, const CutsceneAsset& c) {
                       {"handheldSharpness", c.cinematic.handheldSharpness},
                       {"breathing", c.cinematic.breathing},
                       {"breathAmount", c.cinematic.breathAmount},
-                      {"breathRate", c.cinematic.breathRate}};
+                      {"breathRate", c.cinematic.breathRate},
+                      {"framing", c.cinematic.framing},
+                      {"framingX", c.cinematic.framingX},
+                      {"framingY", c.cinematic.framingY},
+                      {"leadAmount", c.cinematic.leadAmount},
+                      {"leadSpeed", c.cinematic.leadSpeed},
+                      {"framingDamping", c.cinematic.framingDamping}};
 
     json tracks = json::array();
     for (const CutsceneAnimTrack& t : c.animTracks) {
@@ -197,6 +203,12 @@ std::optional<CutsceneAsset> LoadCutscene(const std::filesystem::path& path) {
         cs.breathing = it->value("breathing", cs.breathing);
         cs.breathAmount = it->value("breathAmount", cs.breathAmount);
         cs.breathRate = it->value("breathRate", cs.breathRate);
+        cs.framing = it->value("framing", cs.framing);
+        cs.framingX = it->value("framingX", cs.framingX);
+        cs.framingY = it->value("framingY", cs.framingY);
+        cs.leadAmount = it->value("leadAmount", cs.leadAmount);
+        cs.leadSpeed = it->value("leadSpeed", cs.leadSpeed);
+        cs.framingDamping = it->value("framingDamping", cs.framingDamping);
     }
     if (const auto it = j.find("animTracks"); it != j.end() && it->is_array()) {
         for (const json& jt : *it) {

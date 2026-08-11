@@ -83,9 +83,6 @@ const std::vector<EngineAsset> kEngineAssets = {
      "branching conversation graph"},
     {".hbcutscene", "Cutscene",         true,  RefScan::JsonScan, nullptr, ""},
     {".hbmusic",    "Music Graph",      true,  RefScan::JsonScan, nullptr, "adaptive music"},
-    {".hbbuild",    "Procedural Build", true,  RefScan::JsonScan, nullptr,
-     "procedural construction: preset + parameters + the construction graph; JsonScan finds any "
-     "material path an override names"},
     {".hbchar",     "Character",        true,  RefScan::JsonScan, nullptr,
      "modular rig; CharacterSystem loads it via the VFS"},
     {".hbprefab",   "Prefab",           true,  RefScan::JsonScan, nullptr,

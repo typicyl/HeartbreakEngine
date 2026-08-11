@@ -116,20 +116,143 @@ float3 WarmCoolGrade(float3 c, float s)
     return c;
 }
 
+// --- Cinematic color grade -------------------------------------------------
+// White balance as a simple per-channel gain (von-Kries-ish): temp warms (R up /
+// B down), tint pushes green<->magenta (G). Applied in LINEAR before the tone curve
+// so it reads like a camera white-balance, not a paint-over.
+float3 WhiteBalance(float3 c, float temp, float tint)
+{
+    const float3 g = float3(1.0f + 0.25f * temp, 1.0f - 0.20f * tint, 1.0f - 0.25f * temp);
+    return c * g;
+}
+
+// Lift / Gamma / Gain - the ASC-CDL shadows / midtones / highlights wheels, applied
+// in DISPLAY space after tone-mapping. Neutral (lift 0, gamma 1, gain 1) = identity.
+float3 LiftGammaGain(float3 c, float3 lift, float3 gamma, float3 gain)
+{
+    c = c * gain;                       // highlights (multiply)
+    c = c + lift * (1.0f - c);          // shadows (lift the darks)
+    c = pow(max(c, 0.0f), 1.0f / max(gamma, 1e-3f)); // midtones (power)
+    return c;
+}
+
+// Animated film grain: hashed per-pixel luminance noise, scrolled by time so it
+// shimmers like real grain instead of a fixed dither. `amt` ~0.02-0.05 is filmic.
+float3 FilmGrain(float3 c, float2 uv, float amt, float time)
+{
+    const float2 p = uv * float2(1920.0f, 1080.0f) + frac(time) * 137.0f;
+    const float n = frac(sin(dot(p, float2(12.9898f, 78.233f))) * 43758.5453f) - 0.5f;
+    // A touch stronger in the mids/shadows than the highlights (where grain reads worst).
+    const float w = 1.0f - Luma(c) * 0.7f;
+    return c + n * amt * w;
+}
+
+// --- Selectable tone-mapping operators (SDR) -------------------------------
+// The output stage is modular: pick the operator with gPostParams3.x (set from
+// PostSettings::tonemapOperator). Each operator maps exposed HDR-linear colour to
+// DISPLAY-LINEAR [0,1]; the shared grade + LinearToSRGB below then encode to the
+// 8-bit sRGB back buffer, so adding an operator is a localized change here.
+// True HDR-display output (HDR10/PQ, scRGB) is a deliberately separate future
+// phase - these are all SDR display transforms.
+#define TM_ACES 0u
+#define TM_AGX  1u
+#define TM_TONY 2u
+
+// AgX (Troy Sobotka) - minimal RGB approximation (Benjamin Wrensch). The matrix
+// literals are copied verbatim from the reference GLSL (column-major there); using
+// mul(vector, matrix) here reproduces GLSL's `mat * vec` without transposing.
+float3 AgxContrastApprox(float3 x)
+{
+    const float3 x2 = x * x;
+    const float3 x4 = x2 * x2;
+    return 15.5f * x4 * x2 - 40.14f * x4 * x + 31.96f * x4 - 6.868f * x2 * x +
+           0.4298f * x2 + 0.1191f * x - 0.00232f;
+}
+float3 TonemapAgX(float3 val)
+{
+    const float3x3 agxMat = float3x3(
+        0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+        0.0784335999999992, 0.878468636469772, 0.0784336,
+        0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+    const float3x3 agxMatInv = float3x3(
+        1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+        -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+        -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+    const float minEv = -12.47393f;
+    const float maxEv = 4.026069f;
+
+    val = mul(val, agxMat);
+    val = clamp(log2(max(val, 1e-10f)), minEv, maxEv);
+    val = (val - minEv) / (maxEv - minEv);
+    val = AgxContrastApprox(val);   // sigmoid -> display-encoded [0,1]
+    val = mul(val, agxMatInv);      // outset
+    // EOTF back to display-LINEAR so the shared LinearToSRGB re-encodes it (rather
+    // than baking a second gamma). Net back-buffer value == canonical AgX output.
+    val = pow(max(val, 0.0f), 2.2f);
+    return saturate(val);
+}
+
+// Tony McMapface (Tomasz Stachowiak) ships as a 48^3 display-transform LUT; this
+// is an ANALYTIC reconstruction of its character - neutral, hue-preserving, with
+// highlights desaturating gracefully toward white instead of clipping to a
+// saturated primary. A real LUT can be dropped in later (the operator select makes
+// that a localized change).
+float3 TonemapTony(float3 c)
+{
+    c = max(c, 0.0f);
+    // Per-channel extended Reinhard with a white point: filmic compression that
+    // preserves hue better than a luminance-only curve (the "notorious six").
+    const float white = 4.0f;
+    const float3 toned = (c * (1.0f + c / (white * white))) / (1.0f + c);
+    // Bleach highlights toward their own luminance as the scene gets bright.
+    const float lum = dot(toned, float3(0.2126f, 0.7152f, 0.0722f));
+    const float peak = max(max(c.r, c.g), c.b);
+    const float bleach = smoothstep(1.0f, 6.0f, peak) * 0.7f;
+    return saturate(lerp(toned, lum.xxx, bleach));
+}
+
+float3 ApplyTonemap(uint op, float3 x)
+{
+    if (op == TM_AGX) return TonemapAgX(x);
+    if (op == TM_TONY) return TonemapTony(x);
+    return TonemapACES(x); // TM_ACES (default / unknown)
+}
+
 float4 PSMain(FSOutput input) : SV_Target
 {
     const float2 uv = input.positionCS.xy * gOutTexel;
     const float strokeSize = gPostParams2.x;
     const bool painterly = strokeSize > 0.5f;
 
+    // Chromatic aberration: split the RGB fetch radially toward the frame edges
+    // (a lens effect, so it scales with distance from centre). Only pays the extra
+    // taps when dialed in.
+    const bool gradeOn = gGrade1.w > 0.5f;
+    float3 hdr;
+    if (gradeOn && gGrade0.w > 0.0001f)
+    {
+        const float2 caOff = (uv - 0.5f) * gGrade0.w * 0.02f;
+        hdr.r = SamplePost(gInput0, uv + caOff).r;
+        hdr.g = SamplePost(gInput0, uv).g;
+        hdr.b = SamplePost(gInput0, uv - caOff).b;
+    }
+    else
+    {
+        hdr = SamplePost(gInput0, uv).rgb;
+    }
     // The painterly smear is a BLEND over the original by `strength`, so it can be
     // a light finish over hand-painted detail rather than abstracting everything.
-    float3 hdr = SamplePost(gInput0, uv).rgb;
     if (painterly)
     {
         const float3 k = AnisoKuwahara(gInput0, uv, strokeSize, gPostParams2.z);
         hdr = lerp(hdr, k, saturate(gPostParams2.w));
     }
+
+    // White balance (temperature / tint) in LINEAR, before the tone curve. Applied
+    // AFTER the painterly blend on purpose: AnisoKuwahara re-samples the raw gInput0,
+    // so white-balancing earlier would be cancelled at high stroke strength.
+    if (gradeOn)
+        hdr = WhiteBalance(hdr, gGrade0.x, gGrade0.y);
 
     // Screen-space AO darkens indirect light; applied to the full signal here
     // (cheap post-multiply, standard for forward pipelines without a G-buffer).
@@ -148,12 +271,22 @@ float4 PSMain(FSOutput input) : SV_Target
         const float adapted = SamplePost(gInput3, float2(0.5f, 0.5f)).r;
         exposure *= clamp(gPostParams1.y / max(adapted, 1e-4f), gPostParams1.z, gPostParams1.w);
     }
-    float3 color = TonemapACES(hdr * exposure);
+    const uint tmOp = (uint)(gPostParams3.x + 0.5f);
+    float3 color = ApplyTonemap(tmOp, hdr * exposure);
 
     // Light grade: saturation and contrast around mid-gray.
     const float luma = Luma(color);
     color = lerp(luma.xxx, color, gPostParams0.w);
     color = saturate((color - 0.18f) * gPostParams1.x + 0.18f);
+
+    // Cinematic grade: lift/gamma/gain colour wheels + film grain (display space).
+    if (gradeOn)
+    {
+        color = LiftGammaGain(color, gGrade1.rgb, gGrade2.rgb, gGrade3.rgb);
+        if (gGrade0.z > 0.0001f)
+            color = FilmGrain(color, uv, gGrade0.z, gGrade2.w);
+        color = saturate(color);
+    }
 
     // Painterly finish: warm/cool grade; photographic vignette is skipped.
     if (painterly)

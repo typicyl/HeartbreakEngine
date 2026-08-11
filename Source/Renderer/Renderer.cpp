@@ -242,9 +242,9 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         rhi::SceneView view = scene.MakeView(camera_);
         view.exposure *= userExposureScale_; // player brightness (view-level only)
         view.deltaTime = dt; // for temporal post effects (auto-exposure)
-        static f32 s_skyTime = 0.0f; // accumulated time for sky animation
-        s_skyTime += dt;
-        view.timeSeconds = s_skyTime;
+        // view.timeSeconds is the scene's shared animation clock (advanced by water::Update,
+        // written by MakeView) so the GPU waves/sky/ripples and CPU water buoyancy use ONE
+        // time source and floating objects sit exactly on the rendered surface.
         drawItems_.clear();
         scene.CollectDrawItems(drawItems_);
         const u32 itemCount = static_cast<u32>(drawItems_.size());

@@ -5,28 +5,29 @@
 // use a uniform buffer; per-draw constants use a dynamic uniform buffer arena
 // addressed with dynamic offsets.
 #include "RHI/Vulkan/VulkanDevice.h"
+#include "RHI/Vulkan/VulkanSurface.h" // OS-abstracted VkSurfaceKHR creation - the ONE Win32 seam
 #include "Core/Platform.h"
 #include "Assets/Mesh.h"
 #include "Assets/StrokeGen.h"
 #include "Core/Log.h"
 
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#  define NOMINMAX
-#endif
-#include <windows.h>
-
-#ifndef VK_USE_PLATFORM_WIN32_KHR
-#  define VK_USE_PLATFORM_WIN32_KHR
-#endif
-#include <vulkan/vulkan.h>
+#include <vulkan/vulkan.h> // core only: the platform macro lives in VulkanSurface_Win32.cpp now
 
 #if HBE_EDITOR
-#include <imgui.h>
-#include <imgui_impl_win32.h>
-#include <imgui_impl_vulkan.h>
+// The editor's ImGui PLATFORM backend is still Win32 (ImGui_ImplWin32_*) - a SEPARATE port
+// blocker from the swapchain surface, which is now abstracted behind VulkanSurface.h. That
+// backend is the ONLY reason this file still pulls in <windows.h>, and it does so ONLY in an
+// editor build: the shipped RUNTIME compiles this Vulkan device with no Win32 dependency at all.
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <imgui.h>
+#  include <imgui_impl_win32.h>
+#  include <imgui_impl_vulkan.h>
 #endif
 
 #include <glm/glm.hpp>
@@ -133,11 +134,11 @@ struct FrameUBO {
     glm::vec3 lightColor; f32 ambient;
     u32 irradianceIndex; u32 prefilteredIndex; u32 brdfLUTIndex; f32 prefilteredMaxLod;
     glm::mat4 invViewProj;
-    u32 skyIndex; u32 outputLinear; u32 _padF[2];
+    u32 skyIndex; u32 outputLinear; f32 screenTexel[2]; // (1/w, 1/h) for SV_Position->UV
     glm::mat4 cascadeViewProj[kMaxShadowCascades];
     glm::vec4 cascadeSplits;
     u32 shadowMapIndex; u32 cascadeCount; u32 _padF2[2];
-    u32 punctualCount; u32 skinLUTIndex; u32 _padF3[2];
+    u32 punctualCount; u32 skinLUTIndex; u32 taaActive; u32 _padF3;
     PunctualLight punctualLights[kMaxPunctualLights]; // rhi layout is GPU-ready
     glm::mat4 prevViewProj; // previous frame's view-proj (TAA; D3D12 path uses it)
     glm::vec4 stroke0{0.0f}; // 3D painterly: (sizeWorld, widthFrac, sharpness, flow)
@@ -149,6 +150,19 @@ struct FrameUBO {
     glm::ivec3 giDims{0}; u32 _padGi1 = 0;
     glm::vec4 weather{0.0f};  // x=coverage, y=density, z=overcast, w=time
     glm::vec4 weather1{0.0f}; // xy = wind velocity (cloud-UV/sec)
+    glm::vec4 weather2{0.0f}; // x=wetness, y=puddles, z=snow, w=precipIntensity
+    glm::vec4 weather3{6.0f, 4.0f, 0.0f, 0.0f}; // x=puddleScale(m), y=snowScale(m)
+    u32 decalCount = 0; u32 _padDecal[3] = {};
+    DecalData decals[kMaxDecals];
+    glm::vec4 waveA[4]{};
+    glm::vec4 waveB[4]{};
+    glm::vec4 waterShallow{0.10f, 0.30f, 0.42f, 5.0f};
+    glm::vec4 waterDeep{0.02f, 0.08f, 0.13f, 0.10f};
+    glm::vec4 waterParams{0.5f, 1.0f, 1.0f, 0.0f}; // .w = FFT-on flag
+    u32 rippleCount = 0; f32 fftParams[3] = {128.0f, 1.0f, 0.0f}; // (tilePatch m, heightScale, _)
+    glm::vec4 ripples[kMaxRipples]{};
+    // Depth-based water (see Common.hlsli tail). sceneDepthIndex 0 = skip depth grading.
+    u32 sceneDepthIndex = 0; f32 absorptionDepth = 6.0f; f32 shorelineWidth = 1.5f; f32 edgeFade = 0.5f;
 };
 
 // Per-pass constants of the post stack (Shaders/PostCommon.hlsli).
@@ -166,6 +180,11 @@ struct PostUBO {
     glm::vec4 censorStrength{0.0f}; // per-censor strength (.x=censor0 ... .w=censor3)
     glm::vec4 censorFeather{0.0f};  // per-censor feather fraction (.x..w)
     glm::uvec4 censorCount{0u};     // .x = active censor count
+    // Cinematic color grade (Tonemap pass; appended, must match PostCommon.hlsli).
+    glm::vec4 grade0{0.0f};             // (temperature, tint, filmGrain, chromAberration)
+    glm::vec4 grade1{0.0f, 0.0f, 0.0f, 0.0f}; // (lift.rgb, gradeEnabled)
+    glm::vec4 grade2{1.0f, 1.0f, 1.0f, 0.0f}; // (gamma.rgb, timeSeconds)
+    glm::vec4 grade3{1.0f, 1.0f, 1.0f, 0.0f}; // (gain.rgb, -)
 };
 
 // One offscreen color target of the post chain (image + view + framebuffer).
@@ -204,6 +223,12 @@ struct ObjectUBO {
     u32 morphTexIndex = 0; u32 morphCount = 0; u32 _padMorph0 = 0; u32 _padMorph1 = 0;
     glm::uvec4 morphTargets[2] = {glm::uvec4(0), glm::uvec4(0)};
     glm::vec4  morphWeights[2] = {glm::vec4(0.0f), glm::vec4(0.0f)};
+    // Clearcoat lobe (wet skin / sweat / wet eyes / varnish). Must match ObjectConstants
+    // in Common.hlsli. Zero-init = off.
+    f32 clearcoat = 0.0f;
+    f32 clearcoatRoughness = 0.08f;
+    f32 _padCc0 = 0.0f;
+    f32 _padCc1 = 0.0f;
 };
 
 // Copies a DrawItem's blendshape fields into the object UBO (bindless atlas index +
@@ -393,6 +418,7 @@ private:
     VkPipelineLayout      pipelineLayout_ = VK_NULL_HANDLE;
     VkPipeline            meshPipeline_ = VK_NULL_HANDLE;       // main MRT pass
     VkPipeline            meshPipelineTransparent_ = VK_NULL_HANDLE; // alpha-blended pass
+    VkPipeline            waterPipeline_ = VK_NULL_HANDLE; // Gerstner water surface
     VkPipeline            meshPipelineTransparentDepth_ = VK_NULL_HANDLE; // solid transparent (depth+vel)
     VkPipeline            skyPipeline_ = VK_NULL_HANDLE;        // background pass
     VkPipeline            meshPipelineSingle_ = VK_NULL_HANDLE; // editor preview (single color)
@@ -581,6 +607,10 @@ private:
     u32  sceneW_ = 0, sceneH_ = 0;    // size the post targets were built for
 
     VkRenderPass hdrRenderPass_ = VK_NULL_HANDLE;     // color+gbuffer+velocity+D32, sampled after
+    // Depth-graded water reopens the HDR targets with the depth attachment READ-ONLY, so the
+    // water PS can SAMPLE scene depth (via slotDepthRO_) while still depth-TESTING against it -
+    // the Vulkan twin of D3D12's read-only DSV. LOAD variant; leaves everything SHADER_READ_ONLY.
+    VkRenderPass hdrWaterRenderPass_ = VK_NULL_HANDLE;
     VkRenderPass previewRenderPass_ = VK_NULL_HANDLE; // single color + D32 (editor preview)
     VkRenderPass postPass16_ = VK_NULL_HANDLE;        // RGBA16F, discard -> sampled
     VkRenderPass postPass16Load_ = VK_NULL_HANDLE;    // RGBA16F, load (additive) -> sampled
@@ -612,6 +642,7 @@ private:
     u32 bloomCount_ = 0;
 
     u32 slotHdr_ = 0, slotDepth_ = 0, slotSsaoRaw_ = 0, slotSsaoBlur_ = 0, slotLdr_ = 0;
+    u32 slotDepthRO_ = 0; // 2nd depth SRV declared DEPTH_STENCIL_READ_ONLY_OPTIMAL (water pass)
     u32 slotGbuffer_ = 0, slotVelocity_ = 0;
     u32 slotTaaHistory_[2] = {};
     u32 slotDof_ = 0;
@@ -784,6 +815,10 @@ private:
     VkDescriptorPool      vsBufferPool_ = VK_NULL_HANDLE;
     GpuBufferHandle vsBuffer_{};
     u32 vsBufferFirstElement_ = 0;
+    // Never-read placeholder bound to set 2 when no real vsBuffer_ is set: the water pipeline
+    // statically uses set 2 (Water.hlsl gOceanDisp), so it must be bound for EVERY water draw
+    // even on the Gerstner path (VUID-vkCmdDraw-None-08600). Created lazily.
+    GpuBufferHandle dummyVsBuffer_{};
     bool vsBufferAlignWarned_ = false;
     GpuBufferVk* ResolveGpuBuffer(GpuBufferHandle h);
     bool CreateVsBufferSetLayout();
@@ -840,8 +875,11 @@ private:
     bool frameActive_ = false;
     bool renderPassActive_ = false;
     VkClearColorValue clearColor_{{0, 0, 0, 1}};
-    HWND hwnd_ = nullptr;
-    HINSTANCE hinstance_ = nullptr;
+    // The native window handles kept OPAQUE (HWND/HINSTANCE on Windows): stored as void* and
+    // handed to vk_surface::CreateWindowSurface, so no Win32 type appears in this device. Only
+    // used to create the surface at init.
+    void* windowHandle_ = nullptr;
+    void* windowInstance_ = nullptr;
 
     std::string adapterName_ = "Unknown Vulkan Device";
 
@@ -850,9 +888,8 @@ private:
 };
 
 bool VulkanDevice::Initialize(const RenderDeviceDesc& desc) {
-    hwnd_ = static_cast<HWND>(desc.windowHandle);
-    hinstance_ = static_cast<HINSTANCE>(desc.windowInstance);
-    if (!hinstance_) hinstance_ = ::GetModuleHandleW(nullptr);
+    windowHandle_ = desc.windowHandle;      // opaque; the surface backend casts + resolves the
+    windowInstance_ = desc.windowInstance;  // module handle (nullptr -> current module) itself
     width_ = desc.width;
     height_ = desc.height;
     validation_ = desc.enableValidation;
@@ -872,10 +909,8 @@ bool VulkanDevice::Initialize(const RenderDeviceDesc& desc) {
     if (!CreateInstance(validation_)) return false;
     if (validation_) SetupDebugMessenger();
 
-    VkWin32SurfaceCreateInfoKHR sci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-    sci.hinstance = hinstance_;
-    sci.hwnd = hwnd_;
-    VK_CHECK(vkCreateWin32SurfaceKHR(instance_, &sci, nullptr, &surface_), "vkCreateWin32SurfaceKHR");
+    VK_CHECK(vk_surface::CreateWindowSurface(instance_, windowHandle_, windowInstance_, &surface_),
+             "vk_surface::CreateWindowSurface");
 
     if (!PickPhysicalDevice()) return false;
     if (!CreateLogicalDevice()) return false;
@@ -910,10 +945,9 @@ bool VulkanDevice::CreateInstance(bool validation) {
     app.engineVersion = VK_MAKE_VERSION(0, 1, 0);
     app.apiVersion = VK_API_VERSION_1_2;
 
-    std::vector<const char*> extensions = {
-        VK_KHR_SURFACE_EXTENSION_NAME,
-        VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
-    };
+    // The surface extensions are whatever THIS platform's surface needs (VK_KHR_surface + the
+    // OS-specific one); the backend owns that list so this file names no Win32 extension.
+    std::vector<const char*> extensions = vk_surface::RequiredInstanceExtensions();
     std::vector<const char*> layers;
     if (validation) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
@@ -2148,6 +2182,29 @@ bool VulkanDevice::CreateMeshPipeline() {
             HBE_WARN("[Vulkan] Transparent mesh pipeline failed; transparency disabled.");
             meshPipelineTransparent_ = VK_NULL_HANDLE;
         }
+
+        // Gerstner water surface: the mesh vertex input (via tp/vi) + the transparent
+        // blend/depth state (tcb/tds are still in their depth-LE-no-write form here) +
+        // its own Water VS/PS. Two-sided (rs). Built before tds/tcba are mutated for the
+        // depth-writing transparent variant below.
+        {
+            VkShaderModule wvs = LoadShaderModule(dir + L"Water.vs.spv");
+            VkShaderModule wps = LoadShaderModule(dir + L"Water.ps.spv");
+            if (wvs != VK_NULL_HANDLE && wps != VK_NULL_HANDLE) {
+                VkPipelineShaderStageCreateInfo wst[2] = {stages[0], stages[1]};
+                wst[0].module = wvs;
+                wst[1].module = wps;
+                VkGraphicsPipelineCreateInfo wpci = tp;
+                wpci.pStages = wst;
+                if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &wpci, nullptr,
+                                              &waterPipeline_) != VK_SUCCESS) {
+                    HBE_WARN("[Vulkan] Water pipeline failed to create.");
+                    waterPipeline_ = VK_NULL_HANDLE;
+                }
+            }
+            if (wvs != VK_NULL_HANDLE) vkDestroyShaderModule(device_, wvs, nullptr);
+            if (wps != VK_NULL_HANDLE) vkDestroyShaderModule(device_, wps, nullptr);
+        }
         // "Solid transparent" variant (MaterialFlag_DepthWrite, e.g. paint strokes):
         // same alpha blend but WRITES depth + velocity so DoF/TAA treat the stroke as a
         // real in-focus surface (no off-surface blur). G-buffer (tcba[1]) stays masked.
@@ -2888,6 +2945,76 @@ bool VulkanDevice::CreatePostRenderPasses() {
     // Editor preview mini-pass: single colour + depth (no G-buffer/velocity).
     const VkFormat prevFormats[1] = {VK_FORMAT_R16G16B16A16_SFLOAT};
     if (!makeScenePass(1, prevFormats, previewRenderPass_)) return false;
+
+    // Depth-graded water pass: the same colour+G-buffer+velocity+depth attachments as
+    // hdrRenderPass_ (so hdr_.framebuffer is compatible), but LOADED (the lit scene is
+    // preserved) and with the depth attachment in DEPTH_STENCIL_READ_ONLY_OPTIMAL. That
+    // lets the water PS sample the scene depth (slotDepthRO_) while depth-TESTING against
+    // it in the same subpass - water + particles write no depth, so read-only is safe.
+    // Ends by handing colour + depth back SHADER_READ_ONLY, exactly like hdrRenderPass_,
+    // so RunPostStack (which ends this pass) and its slotDepth_ sampling are unchanged.
+    {
+        VkAttachmentDescription atts[4]{};
+        VkAttachmentReference colorRefs[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            atts[i].format = hdrFormats[i];
+            atts[i].samples = VK_SAMPLE_COUNT_1_BIT;
+            atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;   // preserve the lit HDR scene
+            atts[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            atts[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            atts[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            atts[i].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; // where hdrRenderPass_ left it
+            atts[i].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;   // hand back to post
+            colorRefs[i] = {i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        }
+        VkAttachmentDescription& depth = atts[3];
+        depth = atts[0];
+        depth.format = depthFormat_;
+        depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;   // preserve the scene depth for testing + sampling
+        depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE; // post stack samples it (slotDepth_)
+        // Read-only: usable as a read-only depth attachment AND a sampled image at once.
+        VkAttachmentReference depthRef{3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 3;
+        sub.pColorAttachments = colorRefs;
+        sub.pDepthStencilAttachment = &depthRef;
+
+        // External deps: the prior HDR pass left everything SHADER_READ_ONLY; make it available
+        // for colour blend (read+write), read-only depth-test, and depth sampling; then hand it
+        // back for the post stack's fragment-shader reads.
+        VkSubpassDependency wdeps[2]{};
+        wdeps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        wdeps[0].dstSubpass = 0;
+        wdeps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        wdeps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        wdeps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        wdeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        wdeps[1].srcSubpass = 0;
+        wdeps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        wdeps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        wdeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        wdeps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        wdeps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ci.attachmentCount = 4;
+        ci.pAttachments = atts;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        ci.dependencyCount = 2;
+        ci.pDependencies = wdeps;
+        VK_CHECK(vkCreateRenderPass(device_, &ci, nullptr, &hdrWaterRenderPass_),
+                 "vkCreateRenderPass(hdrWater)");
+    }
     return true;
 }
 
@@ -3123,9 +3250,10 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
 
     // Reserve the bindless slots once; resizes rewrite the same descriptors.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 23 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 24 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
+        slotDepthRO_ = bindlessNextSlot_++; // depth sampled during the read-only-depth water pass
         slotGbuffer_ = bindlessNextSlot_++;
         slotVelocity_ = bindlessNextSlot_++;
         slotVol_ = bindlessNextSlot_++;
@@ -3195,6 +3323,16 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
         wds.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         wds.pImageInfo = &ii;
         vkUpdateDescriptorSets(device_, 1, &wds, 0, nullptr);
+
+        // Second view of the SAME depth image, declared DEPTH_STENCIL_READ_ONLY_OPTIMAL to match
+        // the layout the image is in during the read-only-depth water pass (hdrWaterRenderPass_).
+        // The post stack keeps sampling slotDepth_ (SHADER_READ_ONLY); only the water PS reads this.
+        VkDescriptorImageInfo iiRo = ii;
+        iiRo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet wdsRo = wds;
+        wdsRo.dstArrayElement = slotDepthRO_;
+        wdsRo.pImageInfo = &iiRo;
+        vkUpdateDescriptorSets(device_, 1, &wdsRo, 0, nullptr);
 
         // Thin G-buffer + velocity, written by the forward pass alongside the
         // colour. No own framebuffer; they are attachments 1/2 of the HDR pass.
@@ -3761,6 +3899,12 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
         cb.params0 = {bloomMix, 1.0f, paint ? 0.0f : ps.vignette, ps.saturation};
         cb.params1 = {ps.contrast, ps.autoExposureKey, ps.autoExposureMin, ps.autoExposureMax};
         cb.params2 = {0.0f, 0.0f, 0.0f, 0.0f}; // tonemap's built-in smear off
+        cb.params3.x = static_cast<f32>(ps.tonemapOperator); // 0=ACES 1=AgX 2=Tony
+        cb.grade0 = {ps.gradeTemperature, ps.gradeTint, ps.filmGrain, ps.chromaticAberration};
+        cb.grade1 = {ps.gradeLift.x, ps.gradeLift.y, ps.gradeLift.z,
+                     static_cast<f32>(ps.gradeEnabled)};
+        cb.grade2 = {ps.gradeGamma.x, ps.gradeGamma.y, ps.gradeGamma.z, view.timeSeconds};
+        cb.grade3 = {ps.gradeGain.x, ps.gradeGain.y, ps.gradeGain.z, 0.0f};
         DrawPostPass(tonemapPipe_, postPass8_, ldr_, cb);
     }
     GpuMark("tonemap");
@@ -5026,6 +5170,8 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     // General VS-visible structured buffer (set 2). The per-batch base rides in
     // the DYNAMIC OFFSET - never in a firstInstance - which is the exact twin of
     // D3D12 adding it to root param 6's GPU virtual address.
+    VkDescriptorSet vsBindSet = VK_NULL_HANDLE;
+    u32 vsBindDyn = 0;
     if (GpuBufferVk* vb = ResolveGpuBuffer(vsBuffer_)) {
         const u32 s = frameIndex_ % vb->slots;
         const VkDeviceSize off = static_cast<VkDeviceSize>(vsBufferFirstElement_) * vb->stride;
@@ -5041,9 +5187,8 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
             }
         } else if (vb->vsSet[s] != VK_NULL_HANDLE && off < vb->bytes &&
                    (align == 0 || (off % align) == 0)) {
-            const u32 dyn = static_cast<u32>(off);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1,
-                                    &vb->vsSet[s], 1, &dyn);
+            vsBindSet = vb->vsSet[s];
+            vsBindDyn = static_cast<u32>(off);
         } else if (vb->vsSet[s] != VK_NULL_HANDLE && off < vb->bytes && !vsBufferAlignWarned_) {
             // Deterministic + loud rather than a silent per-backend divergence:
             // D3D12 root SRVs take any byte offset, Vulkan dynamic storage-buffer
@@ -5054,6 +5199,26 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
                       static_cast<u64>(off), static_cast<u64>(align));
         }
     }
+    // Set 2 MUST be bound for every water draw (the water pipeline statically uses it); when no
+    // real vsBuffer_ was set (or its bind was skipped), fall back to a persistent never-read
+    // dummy so the Gerstner path does not draw with set 2 unbound (VUID-vkCmdDraw-None-08600).
+    if (vsBindSet == VK_NULL_HANDLE) {
+        if (!dummyVsBuffer_.IsValid()) {
+            GpuBufferDesc dd{};
+            dd.elementCount = 1;
+            dd.elementStride = 16;
+            dd.usage = GpuBufferUsage::ShaderRead;
+            dd.debugName = "VsBufferDummy";
+            dummyVsBuffer_ = CreateGpuBuffer(dd);
+        }
+        if (GpuBufferVk* dvb = ResolveGpuBuffer(dummyVsBuffer_)) {
+            const u32 ds = frameIndex_ % dvb->slots;
+            if (dvb->vsSet[ds] != VK_NULL_HANDLE) vsBindSet = dvb->vsSet[ds];
+        }
+    }
+    if (vsBindSet != VK_NULL_HANDLE)
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1,
+                                &vsBindSet, 1, &vsBindDyn);
     vsBuffer_ = {}; // one frame only, like SetParticles
 
     // Temporal AA: jitter the camera sub-pixel each frame (matches D3D12); the
@@ -5081,6 +5246,19 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         ++taaFrame_;
     }
 
+    // Depth-graded water samples the scene depth during the water draw, which needs a
+    // read-only-depth render pass (below). Detect water up front so the frame UBO can point
+    // gSceneDepthIndex at the read-only depth SRV; only on the HDR path (matches D3D12's
+    // roDsvValid_ gate). The preview path leaves gSceneDepthIndex 0, exactly like D3D12.
+    bool waterDepthGrade = false;
+    if (postReady_ && waterPipeline_ != VK_NULL_HANDLE && hdrWaterRenderPass_ != VK_NULL_HANDLE &&
+        slotDepthRO_ != 0 && items) {
+        const u32 md = static_cast<u32>(kObjectArenaSize / objectStride_);
+        const u32 dc = std::min(count, md);
+        for (u32 i = 0; i < dc; ++i)
+            if (items[i].materialFlags & MaterialFlag_Water) { waterDepthGrade = true; break; }
+    }
+
     // Per-frame constants (the post passes read this UBO too).
     FrameUBO fcb;
     fcb.viewProj = curVP;
@@ -5095,6 +5273,7 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     fcb.brdfLUTIndex = view.brdfLUTIndex;
     fcb.prefilteredMaxLod = view.prefilteredMaxLod;
     fcb.skinLUTIndex = view.skinLUTIndex;
+    fcb.taaActive = taaOn ? 1u : 0u; // gates the temporal shadow-dither in ShadowFactor
     fcb.invViewProj = curInvVP;
     fcb.prevViewProj = taaOn ? prevVP : curVP;
     fcb.skyIndex = view.skyIndex;
@@ -5109,11 +5288,33 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     std::memcpy(fcb.punctualLights, view.punctualLights, sizeof(fcb.punctualLights));
     fcb.probeCount = std::min(view.probeCount, kMaxProbes);
     std::memcpy(fcb.probes, view.probes, sizeof(fcb.probes));
+    fcb.decalCount = std::min(view.decalCount, kMaxDecals);
+    std::memcpy(fcb.decals, view.decals, sizeof(fcb.decals));
+    std::memcpy(fcb.waveA, view.waterWaveA, sizeof(fcb.waveA));
+    std::memcpy(fcb.waveB, view.waterWaveB, sizeof(fcb.waveB));
+    fcb.waterShallow = view.waterShallow;
+    fcb.waterDeep = view.waterDeep;
+    fcb.waterParams = view.waterParams;
+    fcb.fftParams[0] = view.fftPatch;
+    fcb.fftParams[1] = view.fftHeight;
+    // gScreenTexel = 1 / RENDER size (sceneW_/sceneH_), NOT the swapchain (width_): the
+    // editor 3D viewport renders smaller than the window, and Water.hlsl samples scene depth
+    // at SV_Position * gScreenTexel, so a swapchain-scaled UV mis-taps depth. (W2 depth water)
+    fcb.screenTexel[0] = sceneW_ ? 1.0f / static_cast<f32>(sceneW_) : 0.0f;
+    fcb.screenTexel[1] = sceneH_ ? 1.0f / static_cast<f32>(sceneH_) : 0.0f;
+    fcb.absorptionDepth = view.waterAbsorptionDepth;
+    fcb.shorelineWidth = view.waterShorelineWidth;
+    fcb.edgeFade = view.waterEdgeFade;
+    fcb.sceneDepthIndex = waterDepthGrade ? slotDepthRO_ : 0u; // read-only depth SRV; 0 = skip grading
+    fcb.rippleCount = std::min(view.rippleCount, kMaxRipples);
+    std::memcpy(fcb.ripples, view.ripples, sizeof(fcb.ripples));
     fcb.giOrigin = view.giOrigin;
     fcb.giInvSpacing = view.giInvSpacing;
     fcb.giDims = view.giDims;
     fcb.weather = {view.cloudCoverage, view.cloudDensity, view.overcast, view.timeSeconds};
     fcb.weather1 = {view.windVelX, view.windVelZ, 0.0f, 0.0f};
+    fcb.weather2 = {view.wetness, view.puddles, view.snowAmount, view.precipIntensity};
+    fcb.weather3 = {view.puddleScale, view.snowScale, view.cloudVolumetric, view.cloudQuality};
     fcb.giShIndex = view.giShIndex;
     fcb.giDepthIndex = view.giDepthIndex;
     {
@@ -5151,6 +5352,8 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         ocb.subsurfaceColor = it.subsurfaceColor;
         ocb.subsurfaceRadius = it.subsurfaceRadius;
         ocb.thicknessIndex = it.thicknessTexture.index;
+        ocb.clearcoat = it.clearcoat;
+        ocb.clearcoatRoughness = it.clearcoatRoughness;
         ocb.emissiveColor = it.emissiveColor;
         ocb.emissiveIntensity = it.emissiveIntensity;
         ocb.emissiveIndex = it.emissiveTexture.index;
@@ -5247,7 +5450,9 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     if (meshPipelineTransparent_ != VK_NULL_HANDLE) {
         std::vector<u32> tlist;
         for (u32 i = 0; i < drawCount; ++i)
-            if (items[i].materialFlags & MaterialFlag_Transparent) tlist.push_back(i);
+            if ((items[i].materialFlags & MaterialFlag_Transparent) &&
+                !(items[i].materialFlags & MaterialFlag_Water))
+                tlist.push_back(i);
         if (!tlist.empty()) {
             std::sort(tlist.begin(), tlist.end(), [&](u32 a, u32 b) {
                 const f32 da = glm::distance(glm::vec3(items[a].transform[3]), view.cameraPos);
@@ -5273,6 +5478,47 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         }
     }
 
+    // Depth-graded water: end the main HDR pass (its finalLayouts leave colour + depth
+    // SHADER_READ_ONLY), then reopen the SAME targets LOADED with the depth attachment
+    // READ-ONLY so the water PS can sample scene depth (slotDepthRO_) while depth-testing.
+    // Water + particles write no depth, so read-only is safe. renderPassActive_ stays true;
+    // RunPostStack's vkCmdEndRenderPass ends THIS pass (its finalLayouts match hdrRenderPass_).
+    if (waterDepthGrade) {
+        vkCmdEndRenderPass(cmd);
+        VkRenderPassBeginInfo wrp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        wrp.renderPass = hdrWaterRenderPass_;
+        wrp.framebuffer = hdr_.framebuffer; // compatible: same 4 attachments
+        wrp.renderArea.extent = VkExtent2D{sceneW_, sceneH_};
+        wrp.clearValueCount = 0; // LOAD - nothing cleared
+        vkCmdBeginRenderPass(cmd, &wrp, VK_SUBPASS_CONTENTS_INLINE);
+        // Descriptor/pipeline/dynamic-state bindings persist across a render-pass boundary
+        // (same pipelineLayout_), but rebind set 1 + reset the negative-height viewport/scissor
+        // defensively - mirrors RunPostStack's post-pass rebind. Set 2 (water VS buffer) and the
+        // per-draw set 0 are re-applied by the draws themselves.
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+                                &bindlessSet_, 0, nullptr);
+        VkViewport wvp{0.0f, static_cast<f32>(sceneH_), static_cast<f32>(sceneW_),
+                       -static_cast<f32>(sceneH_), 0.0f, 1.0f};
+        VkRect2D wsc{{0, 0}, {sceneW_, sceneH_}};
+        vkCmdSetViewport(cmd, 0, 1, &wvp);
+        vkCmdSetScissor(cmd, 0, 1, &wsc);
+    }
+
+    // Water surfaces: Gerstner-wave reflective water (own pipeline), after the transparent
+    // meshes. Frame CB carries the wave/ripple/colour params; drawItem supplies each
+    // plane's transform via the shared object UBO path.
+    if (waterPipeline_ != VK_NULL_HANDLE) {
+        bool waterBound = false;
+        for (u32 i = 0; i < drawCount; ++i) {
+            if (!(items[i].materialFlags & MaterialFlag_Water)) continue;
+            if (!waterBound) {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, waterPipeline_);
+                waterBound = true;
+            }
+            drawItem(i);
+        }
+    }
+
     GpuMark("scene"); // delta shadow->here = the HDR forward pass (geo+sky+transparent)
 
     // Particle billboards: depth-tested into the HDR colour (no write), alpha then
@@ -5280,6 +5526,15 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     if (particlePipeline_ != VK_NULL_HANDLE &&
         (particleAlphaCount_ + particleAddCount_) > 0) {
         const u32 maxV = static_cast<u32>(kParticleVertexBufferSize / sizeof(ParticleVertex));
+        if ((particleAlphaCount_ + particleAddCount_) > maxV) {
+            static bool s_warnedParticleOverflow = false;
+            if (!s_warnedParticleOverflow) {
+                s_warnedParticleOverflow = true;
+                HBE_WARN("Particles: CPU vertex budget exceeded ({} > {} verts); dropping the "
+                         "tail. Lower emitter/precip counts or opt into GPU expansion.",
+                         particleAlphaCount_ + particleAddCount_, maxV);
+            }
+        }
         const u32 aN = std::min(particleAlphaCount_, maxV);
         const u32 addN = std::min(particleAddCount_, maxV - aN);
         u8* dst = particleVertexCpu_[frameIndex_];
@@ -5782,13 +6037,13 @@ bool VulkanDevice::InitUI(void* nativeWindowHandle) {
     if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
         ImGui::GetPlatformIO().Platform_CreateVkSurface =
             [](ImGuiViewport* vp, ImU64 vkInst, const void* alloc, ImU64* outSurface) -> int {
-            VkWin32SurfaceCreateInfoKHR ci{VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
-            ci.hinstance = ::GetModuleHandleW(nullptr);
-            ci.hwnd = static_cast<HWND>(vp->PlatformHandleRaw);
+            // vp->PlatformHandleRaw is the secondary window's HWND (an opaque void* here). No
+            // HINSTANCE from ImGui -> pass nullptr and let the backend resolve the module.
+            // Forward ImGui's allocator so this surface's create/destroy stay symmetric.
             VkSurfaceKHR surf = VK_NULL_HANDLE;
-            const VkResult r = vkCreateWin32SurfaceKHR(reinterpret_cast<VkInstance>(vkInst), &ci,
-                                                       static_cast<const VkAllocationCallbacks*>(alloc),
-                                                       &surf);
+            const VkResult r = vk_surface::CreateWindowSurface(
+                reinterpret_cast<VkInstance>(vkInst), vp->PlatformHandleRaw, nullptr, &surf,
+                static_cast<const VkAllocationCallbacks*>(alloc));
             *outSurface = reinterpret_cast<ImU64>(surf);
             return static_cast<int>(r);
         };
@@ -6259,11 +6514,29 @@ void VulkanDevice::DrawPreviewScene(const SceneView& view, const DrawItem* items
         std::memcpy(fcb.punctualLights, view.punctualLights, sizeof(fcb.punctualLights));
         fcb.probeCount = std::min(view.probeCount, kMaxProbes);
         std::memcpy(fcb.probes, view.probes, sizeof(fcb.probes));
+        fcb.decalCount = std::min(view.decalCount, kMaxDecals);
+        std::memcpy(fcb.decals, view.decals, sizeof(fcb.decals));
+        std::memcpy(fcb.waveA, view.waterWaveA, sizeof(fcb.waveA));
+        std::memcpy(fcb.waveB, view.waterWaveB, sizeof(fcb.waveB));
+        fcb.waterShallow = view.waterShallow;
+        fcb.waterDeep = view.waterDeep;
+        fcb.waterParams = view.waterParams;
+        fcb.fftParams[0] = view.fftPatch;
+        fcb.fftParams[1] = view.fftHeight;
+        fcb.screenTexel[0] = sceneW_ ? 1.0f / static_cast<f32>(sceneW_) : 0.0f;
+        fcb.screenTexel[1] = sceneH_ ? 1.0f / static_cast<f32>(sceneH_) : 0.0f;
+        fcb.absorptionDepth = view.waterAbsorptionDepth;
+        fcb.shorelineWidth = view.waterShorelineWidth;
+        fcb.edgeFade = view.waterEdgeFade;
+        fcb.rippleCount = std::min(view.rippleCount, kMaxRipples);
+        std::memcpy(fcb.ripples, view.ripples, sizeof(fcb.ripples));
         fcb.giOrigin = view.giOrigin;
         fcb.giInvSpacing = view.giInvSpacing;
         fcb.giDims = view.giDims;
         fcb.weather = {view.cloudCoverage, view.cloudDensity, view.overcast, view.timeSeconds};
     fcb.weather1 = {view.windVelX, view.windVelZ, 0.0f, 0.0f};
+        fcb.weather2 = {view.wetness, view.puddles, view.snowAmount, view.precipIntensity};
+        fcb.weather3 = {view.puddleScale, view.snowScale, view.cloudVolumetric, view.cloudQuality};
         fcb.giShIndex = view.giShIndex;
         fcb.giDepthIndex = view.giDepthIndex;
         std::memcpy(previewFrameUBOMapped_[frameIndex_], &fcb, sizeof(fcb));
@@ -6319,6 +6592,9 @@ void VulkanDevice::DrawPreviewScene(const SceneView& view, const DrawItem* items
         ocb.aoIndex = it.aoTexture.index;
         ocb.flags = it.materialFlags;
         ocb.subsurfaceColor = it.subsurfaceColor;
+        ocb.subsurfaceRadius = it.subsurfaceRadius;
+        ocb.clearcoat = it.clearcoat;
+        ocb.clearcoatRoughness = it.clearcoatRoughness;
         ocb.emissiveColor = it.emissiveColor;
         ocb.emissiveIntensity = it.emissiveIntensity;
         ocb.emissiveIndex = it.emissiveTexture.index;
@@ -6479,6 +6755,7 @@ VulkanDevice::~VulkanDevice() {
     if (applyPipe_) vkDestroyPipeline(device_, applyPipe_, nullptr);
     if (compositePipe_) vkDestroyPipeline(device_, compositePipe_, nullptr);
     if (hdrRenderPass_) vkDestroyRenderPass(device_, hdrRenderPass_, nullptr);
+    if (hdrWaterRenderPass_) vkDestroyRenderPass(device_, hdrWaterRenderPass_, nullptr);
     if (previewRenderPass_) vkDestroyRenderPass(device_, previewRenderPass_, nullptr);
     if (postPass16_) vkDestroyRenderPass(device_, postPass16_, nullptr);
     if (postPass16Load_) vkDestroyRenderPass(device_, postPass16Load_, nullptr);
@@ -6487,6 +6764,7 @@ VulkanDevice::~VulkanDevice() {
     if (skyPipeline_) vkDestroyPipeline(device_, skyPipeline_, nullptr);
     if (meshPipeline_) vkDestroyPipeline(device_, meshPipeline_, nullptr);
     if (meshPipelineTransparent_) vkDestroyPipeline(device_, meshPipelineTransparent_, nullptr);
+    if (waterPipeline_) vkDestroyPipeline(device_, waterPipeline_, nullptr);
     if (meshPipelineTransparentDepth_)
         vkDestroyPipeline(device_, meshPipelineTransparentDepth_, nullptr);
     if (skyPipelineSingle_) vkDestroyPipeline(device_, skyPipelineSingle_, nullptr);

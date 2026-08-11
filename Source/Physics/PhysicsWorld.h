@@ -11,6 +11,7 @@
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
 
+#include <functional>
 #include <memory>
 
 namespace hbe {
@@ -55,6 +56,14 @@ public:
     // tumble, whereas a centre-of-mass impulse makes debris slide out flatly.
     void AddImpulseAtPoint(Scene& scene, entt::entity e, const glm::vec3& impulse,
                            const glm::vec3& worldPoint);
+
+    // Water buoyancy: for every DYNAMIC rigid body, sample the fluid surface height under it
+    // via surfaceHeightAt(worldX, worldZ) and apply Jolt's buoyancy impulse (float + drag) to
+    // the submerged part. `buoyancy` > 1 floats; the surface normal is world-up. Call once per
+    // frame before the step. No Jolt types cross this header (surfaceHeightAt is plain floats).
+    void ApplyBuoyancy(Scene& scene, f32 dt,
+                       const std::function<f32(f32 x, f32 z)>& surfaceHeightAt,
+                       f32 buoyancy, f32 linearDrag, f32 angularDrag);
 
     // Closest world hit along `origin + dir * maxDist` (dir need not be unit).
     // Returns the hit distance, or `maxDist` when nothing is hit. Used for

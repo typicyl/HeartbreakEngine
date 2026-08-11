@@ -31,22 +31,6 @@ set(HBE_CORE_SOURCES
     "Source/Core/Input.cpp"
     $<$<BOOL:${WIN32}>:Source/Core/Input_Win32.cpp>)
 
-# PROCEDURAL CONSTRUCTION. The definition + structural graph; geometry generation arrives in
-# later phases. Pure CPU, no RHI and no scene dependency - which is what lets --test-construction
-# run headless and what will let generation move onto a job worker later.
-set(HBE_CONSTRUCTION_SOURCES
-    "Source/Construction/ConstructionDef.cpp"
-    "Source/Construction/ConstructionGraph.cpp"
-    "Source/Construction/ConstructionGeometry.cpp"
-    "Source/Construction/ConstructionMasonry.cpp"
-    "Source/Construction/ConstructionWood.cpp"
-    "Source/Construction/ConstructionOpenings.cpp"
-    "Source/Construction/ConstructionParams.cpp"
-    "Source/Construction/ConstructionPreset.cpp"
-    "Source/Construction/ConstructionIO.cpp"
-    "Source/Construction/ConstructionSystem.cpp"
-    "Source/Construction/ConstructionTest.cpp")
-
 set(HBE_ASSET_SOURCES
     "Source/Assets/AssetFormats.cpp"
     "Source/Assets/AssetRefs.cpp"
@@ -87,6 +71,12 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/TerrainSystem.cpp"
     "Source/Scene/PaintSystem.cpp"
     "Source/Scene/ParticleSystem.cpp"
+    "Source/Scene/WeatherSystem.cpp"
+    "Source/Scene/PrecipSystem.cpp"
+    "Source/Scene/DecalSystem.cpp"
+    "Source/Scene/WaterSystem.cpp"
+    "Source/Scene/OceanFFT.cpp"
+    "Source/Scene/LightningSystem.cpp"
     "Source/Scene/ParticleGpuSim.cpp"
     "Source/Scene/SceneSerializer.cpp"
     "Source/Scene/SceneStreamer.cpp"
@@ -163,7 +153,11 @@ set(HBE_ENGINE_SOURCES
     "Source/Engine/Engine.cpp")
 
 set(HBE_D3D12_SOURCES  "Source/RHI/D3D12/D3D12Device.cpp")
-set(HBE_VULKAN_SOURCES "Source/RHI/Vulkan/VulkanDevice.cpp")
+set(HBE_VULKAN_SOURCES "Source/RHI/Vulkan/VulkanDevice.cpp"
+    # The Win32 VkSurfaceKHR backend - the ONLY Vulkan TU that includes <windows.h> and defines
+    # VK_USE_PLATFORM_WIN32_KHR (locally). Selected by OS like every other backend; a port adds
+    # VulkanSurface_Linux.cpp beside it. See Source/RHI/Vulkan/VulkanSurface.h.
+    $<$<BOOL:${WIN32}>:Source/RHI/Vulkan/VulkanSurface_Win32.cpp>)
 set(HBE_GL_SOURCES     "Source/RHI/GL/GLDevice.cpp"
                        "Source/RHI/GL/GLApi.cpp")
 
@@ -250,10 +244,15 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/stb_image_impl.cpp"
     "Source/Editor/stb_image_write_impl.cpp")
 
+# NanoVDB volumetric foundation (baker / asset / cache / runtime). Header-only NanoVDB,
+# zero external runtime deps. OpenVDB (editor-only, vcpkg) is a later optional addition.
+set(HBE_VOLUME_SOURCES
+    "Source/Volume/VolumeNano.cpp")
+
 # Core sources common to both the runtime and editor libraries.
 set(HBE_RUNTIME_SOURCES
     ${HBE_CORE_SOURCES}
-    ${HBE_CONSTRUCTION_SOURCES}
+    ${HBE_VOLUME_SOURCES}
     ${HBE_ASSET_SOURCES}
     ${HBE_SCENE_SOURCES}
     ${HBE_PHYSICS_SOURCES}
@@ -321,6 +320,10 @@ function(hbe_configure_engine_lib tgt is_editor)
     # external nav dependency.
     # miniaudio playback (Source/Audio wraps it; header-only).
     target_link_libraries(${tgt} PRIVATE miniaudio_header)
+    # NanoVDB - header-only sparse-volume representation + PNanoVDB GPU reader. The
+    # volumetric foundation (Source/Volume wraps it; no NanoVDB types cross into the RHI).
+    # Zero external deps here; OpenVDB stays an optional editor-only add-on (vcpkg) later.
+    target_link_libraries(${tgt} PRIVATE nanovdb)
     target_compile_definitions(${tgt} PUBLIC
         GLM_FORCE_DEPTH_ZERO_TO_ONE  # match D3D12/Vulkan [0,1] clip-space depth
         GLM_FORCE_RADIANS
@@ -344,7 +347,10 @@ function(hbe_configure_engine_lib tgt is_editor)
         find_package(Vulkan REQUIRED)
         target_sources(${tgt} PRIVATE ${HBE_VULKAN_SOURCES})
         target_compile_definitions(${tgt} PUBLIC HBE_ENABLE_VULKAN=1)
-        target_compile_definitions(${tgt} PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+        # VK_USE_PLATFORM_WIN32_KHR is deliberately NOT defined engine-wide anymore: it pulls
+        # vulkan_win32.h (and thus a need for <windows.h>) into every Vulkan TU. It now lives
+        # ONLY in VulkanSurface_Win32.cpp, so the rest of the Vulkan backend - and the whole
+        # shipped runtime - sees core vulkan.h with no Win32 dependency.
         target_link_libraries(${tgt} PUBLIC Vulkan::Vulkan)
     else()
         target_compile_definitions(${tgt} PUBLIC HBE_ENABLE_VULKAN=0)

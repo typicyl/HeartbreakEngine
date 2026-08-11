@@ -224,11 +224,11 @@ struct FrameCB {
     glm::vec3 lightColor; f32 ambient;
     u32 irradianceIndex; u32 prefilteredIndex; u32 brdfLUTIndex; f32 prefilteredMaxLod;
     glm::mat4 invViewProj;
-    u32 skyIndex; u32 outputLinear; u32 _padF[2];
+    u32 skyIndex; u32 outputLinear; f32 screenTexel[2]; // (1/w, 1/h) for SV_Position->UV
     glm::mat4 cascadeViewProj[kMaxShadowCascades];
     glm::vec4 cascadeSplits;
     u32 shadowMapIndex; u32 cascadeCount; u32 _padF2[2];
-    u32 punctualCount; u32 skinLUTIndex; u32 _padF3[2];
+    u32 punctualCount; u32 skinLUTIndex; u32 taaActive; u32 _padF3;
     PunctualLight punctualLights[kMaxPunctualLights]; // rhi layout is GPU-ready
     glm::mat4 prevViewProj; // previous frame's jittered view-proj (TAA)
     glm::vec4 stroke0{0.0f}; // 3D painterly: (sizeWorld, widthFrac, sharpness, flow)
@@ -240,6 +240,19 @@ struct FrameCB {
     glm::ivec3 giDims{0}; u32 _padGi1 = 0;
     glm::vec4 weather{0.0f};  // x=coverage, y=density, z=overcast, w=time
     glm::vec4 weather1{0.0f}; // xy = wind velocity (cloud-UV/sec)
+    glm::vec4 weather2{0.0f}; // x=wetness, y=puddles, z=snow, w=precipIntensity
+    glm::vec4 weather3{6.0f, 4.0f, 0.0f, 0.0f}; // x=puddleScale(m), y=snowScale(m)
+    u32 decalCount = 0; u32 _padDecal[3] = {};
+    DecalData decals[kMaxDecals];
+    glm::vec4 waveA[4]{};
+    glm::vec4 waveB[4]{};
+    glm::vec4 waterShallow{0.10f, 0.30f, 0.42f, 5.0f};
+    glm::vec4 waterDeep{0.02f, 0.08f, 0.13f, 0.10f};
+    glm::vec4 waterParams{0.5f, 1.0f, 1.0f, 0.0f}; // .w = FFT-on flag
+    u32 rippleCount = 0; f32 fftParams[3] = {128.0f, 1.0f, 0.0f}; // (tilePatch m, heightScale, _)
+    glm::vec4 ripples[kMaxRipples]{};
+    // Depth-based water (see Common.hlsli tail). sceneDepthIndex 0 = skip depth grading.
+    u32 sceneDepthIndex = 0; f32 absorptionDepth = 6.0f; f32 shorelineWidth = 1.5f; f32 edgeFade = 0.5f;
 };
 
 // Per-pass constants of the post stack (Shaders/PostCommon.hlsli).
@@ -257,6 +270,11 @@ struct PostCB {
     glm::vec4 censorStrength{0.0f}; // per-censor strength (.x=censor0 ... .w=censor3)
     glm::vec4 censorFeather{0.0f};  // per-censor feather fraction (.x..w)
     glm::uvec4 censorCount{0u};     // .x = active censor count
+    // Cinematic color grade (Tonemap pass; appended, must match PostCommon.hlsli).
+    glm::vec4 grade0{0.0f};             // (temperature, tint, filmGrain, chromAberration)
+    glm::vec4 grade1{0.0f, 0.0f, 0.0f, 0.0f}; // (lift.rgb, gradeEnabled)
+    glm::vec4 grade2{1.0f, 1.0f, 1.0f, 0.0f}; // (gamma.rgb, timeSeconds)
+    glm::vec4 grade3{1.0f, 1.0f, 1.0f, 0.0f}; // (gain.rgb, -)
 };
 
 struct ObjectCB {
@@ -286,6 +304,12 @@ struct ObjectCB {
     u32 morphTexIndex = 0; u32 morphCount = 0; u32 _padMorph0 = 0; u32 _padMorph1 = 0;
     glm::uvec4 morphTargets[2] = {glm::uvec4(0), glm::uvec4(0)};
     glm::vec4  morphWeights[2] = {glm::vec4(0.0f), glm::vec4(0.0f)};
+    // Clearcoat lobe (wet skin / sweat / wet eyes / varnish). Must match ObjectConstants
+    // in Common.hlsli. Zero-init = off.
+    f32 clearcoat = 0.0f;
+    f32 clearcoatRoughness = 0.08f;
+    f32 _padCc0 = 0.0f;
+    f32 _padCc1 = 0.0f;
 };
 
 // Copies a DrawItem's blendshape fields into the object CB (bindless atlas index +
@@ -317,6 +341,8 @@ inline void FillObjectMaterial(ObjectCB& ocb, const DrawItem& it) {
     ocb.subsurfaceColor = it.subsurfaceColor;
     ocb.subsurfaceRadius = it.subsurfaceRadius;
     ocb.thicknessIndex = it.thicknessTexture.index;
+    ocb.clearcoat = it.clearcoat;
+    ocb.clearcoatRoughness = it.clearcoatRoughness;
     ocb.emissiveColor = it.emissiveColor;
     ocb.emissiveIntensity = it.emissiveIntensity;
     ocb.emissiveIndex = it.emissiveTexture.index;
@@ -395,6 +421,7 @@ public:
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
     void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
+    void SetVolumeGrid(const void* bytes, usize byteSize, const VolumeRenderParams& params) override;
     bool SupportsGpuCompute() const override { return true; }
     GpuBufferHandle CreateGpuBuffer(const GpuBufferDesc& desc) override;
     void* MapGpuBuffer(GpuBufferHandle handle) override;
@@ -611,6 +638,8 @@ private:
     // -- 3D painterly surface strokes (instanced cards, PBR-lit) ---------------
     ComPtr<ID3D12PipelineState> strokeSurfacePSO_; // depth-test LE, no write, alpha-over
     bool strokeSurfaceReady_ = false;
+    ComPtr<ID3D12PipelineState> waterPSO_; // Gerstner water surface (alpha-over, depth-LE)
+    bool waterReady_ = false;
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
     ComPtr<ID3D12PipelineState> uiPSO_; // uses meshRootSig_ (bindless table)
@@ -747,6 +776,10 @@ private:
     u32 bloomCount_ = 0;
     u32 ssaoW_ = 0, ssaoH_ = 0;
     bool hdrDepthInSrv_ = false;
+    // Read-only DSV for hdrDepth_ (postDsvHeap_ slot 1): lets the water pass depth-TEST while
+    // hdrDepth_ is simultaneously PIXEL_SHADER_RESOURCE for the depth-graded water PS to sample.
+    D3D12_CPU_DESCRIPTOR_HANDLE roDsvHandle_{};
+    bool roDsvValid_ = false;
 
     ComPtr<ID3D12PipelineState> ssaoPSO_, ssaoBlurPSO_, bloomDownPSO_, bloomUpPSO_,
                                 tonemapPSO_, fxaaPSO_, taaPSO_, dofPSO_, motionBlurPSO_,
@@ -764,7 +797,20 @@ private:
     bool ssrReady_ = false;          // SSR PSO built
     bool exposureReady_ = false;     // auto-exposure PSO built
     bool volReady_ = false;          // volumetric fog PSO built
-    ComPtr<ID3D12PipelineState> volPartPSO_; // volumetric-particles raymarch PSO
+    ComPtr<ID3D12PipelineState> volPartPSO_; // volumetric-particles raymarch PSO (LEGACY splat)
+    // NanoVDB baked-volume raymarch (the runtime volume path). The raw NanoVDB blob is uploaded
+    // to a per-frame StructuredBuffer<uint> (volGridBuffer_ + its bindless SRV slotVolGrid_);
+    // volRaymarchPSO_ (VolumeRaymarch.hlsl) PNanoVDB-samples it. Grows on demand.
+    ComPtr<ID3D12PipelineState> volRaymarchPSO_;
+    bool volRaymarchReady_ = false;
+    ComPtr<ID3D12Resource> volGridBuffer_[kMaxBackBuffers];
+    u8* volGridCpu_[kMaxBackBuffers] = {};
+    u64 volGridCapacity_[kMaxBackBuffers] = {};
+    u32 slotVolGrid_[kMaxBackBuffers] = {};
+    const void* volGridBytes_ = nullptr;
+    usize volGridSize_ = 0;
+    VolumeRenderParams volRenderParams_;
+    bool EnsureVolumeGridBuffer(usize size); // (re)alloc this frame's grid buffer + SRV
     bool volPartReady_ = false;      // volumetric-particles raymarch PSO built
     bool ssgiReady_ = false;         // screen-space GI PSO built
     bool painterlyReady_ = false;    // painterly stroke PSO built
@@ -2075,6 +2121,38 @@ bool D3D12Device::CreateMeshPipeline() {
         }
     }
 
+    // Gerstner water surface: reflective, alpha-blended, VS-displaced. Same MRT/depth
+    // base as the mesh PSO (keeps the standard vertex input layout) + transparent blend +
+    // depth-LE-no-write, G-buffer/velocity preserved. Two-sided (waves can face away).
+    {
+        const std::vector<u8> wvs = ReadBinaryFile(dir + L"Water.vs.dxil");
+        const std::vector<u8> wps = ReadBinaryFile(dir + L"Water.ps.dxil");
+        if (!wvs.empty() && !wps.empty()) {
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC wp = pso;
+            wp.VS = {wvs.data(), wvs.size()};
+            wp.PS = {wps.data(), wps.size()};
+            wp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            D3D12_RENDER_TARGET_BLEND_DESC& wrt = wp.BlendState.RenderTarget[0];
+            wrt.BlendEnable = TRUE;
+            wrt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+            wrt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            wrt.BlendOp = D3D12_BLEND_OP_ADD;
+            wrt.SrcBlendAlpha = D3D12_BLEND_ONE;
+            wrt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            wrt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            if (postPipelinesReady_) {
+                wp.BlendState.IndependentBlendEnable = TRUE;
+                wp.BlendState.RenderTarget[1].RenderTargetWriteMask = 0; // keep G-buffer
+                wp.BlendState.RenderTarget[2].RenderTargetWriteMask = 0; // keep velocity
+            }
+            wp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            wp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            waterReady_ =
+                SUCCEEDED(device_->CreateGraphicsPipelineState(&wp, IID_PPV_ARGS(&waterPSO_)));
+            if (!waterReady_) HBE_WARN("[D3D12] Water pipeline failed to create.");
+        }
+    }
+
     // Single-RT variant for the editor preview / asset-viewer mini-pass, which
     // renders into one HDR target (no G-buffer/velocity). The shared PS still
     // outputs SV_Target1/2; D3D12 discards outputs past NumRenderTargets.
@@ -2524,6 +2602,10 @@ bool D3D12Device::CreatePostPipelines() {
                         DXGI_FORMAT_UNKNOWN, volPSO_); // composites in HDR
     volPartReady_ = makePso(L"VolumetricParticles", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                             DXGI_FORMAT_UNKNOWN, volPartPSO_); // raymarch -> half-res, then ApplyHalfRes
+    // NanoVDB raymarch PSO (the runtime volume path): same half-res target/blend as the splat
+    // raymarch, but samples a StructuredBuffer<uint> grid via PNanoVDB instead of a Texture3D.
+    volRaymarchReady_ = makePso(L"VolumeRaymarch", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
+                                DXGI_FORMAT_UNKNOWN, volRaymarchPSO_);
     ssgiReady_ = makePso(L"SSGI", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
                          DXGI_FORMAT_UNKNOWN, ssgiPSO_); // composites in HDR
     painterlyReady_ = makePso(L"Painterly", DXGI_FORMAT_R16G16B16A16_FLOAT, false,
@@ -2585,14 +2667,15 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     if (!postDsvHeap_) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-        hd.NumDescriptors = 1;
+        hd.NumDescriptors = 2; // slot 0 = read/write DSV, slot 1 = read-only DSV (water pass)
         HR_CHECK(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&postDsvHeap_)),
                  "CreateDescriptorHeap(postDSV)");
     }
     // Reserve the bindless slots once; resizes rewrite the same descriptors so
     // shader-visible indices stay stable.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 22 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 22 + kMaxBackBuffers + kBloomMaxMips > kMaxBindlessTextures)
+            return false;
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
@@ -2601,6 +2684,9 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         slotVolHalf_ = bindlessNextSlot_++;
         slotVolPart_ = bindlessNextSlot_++;
         slotVolPartHalf_ = bindlessNextSlot_++;
+        // NanoVDB grid StructuredBuffer<uint> SRV, one per frame-in-flight (the blob differs
+        // per frame). The SRV is (re)created when the per-frame buffer grows.
+        for (u32 i = 0; i < kMaxBackBuffers; ++i) slotVolGrid_[i] = bindlessNextSlot_++;
         slotSsgi_ = bindlessNextSlot_++;
         slotSsgiHalf_ = bindlessNextSlot_++;
         slotPainterly_ = bindlessNextSlot_++;
@@ -2676,6 +2762,14 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
         dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
         device_->CreateDepthStencilView(hdrDepth_.Get(), &dv,
                                         postDsvHeap_->GetCPUDescriptorHandleForHeapStart());
+        // Read-only DSV at slot 1: identical, plus READ_ONLY_DEPTH so the same image can be a
+        // depth attachment (for the water depth-test) AND a shader resource (sampled) at once.
+        dv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
+        const u32 dsvInc = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        roDsvHandle_ = postDsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        roDsvHandle_.ptr += static_cast<SIZE_T>(dsvInc);
+        device_->CreateDepthStencilView(hdrDepth_.Get(), &dv, roDsvHandle_);
+        roDsvValid_ = true;
         D3D12_CPU_DESCRIPTOR_HANDLE srv = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
         srv.ptr += static_cast<SIZE_T>(slotDepth_) * bindlessDescSize_;
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
@@ -2944,10 +3038,48 @@ void D3D12Device::RunPostStack(const SceneView& view) {
     }
     GpuMark("fog");
 
+    // --- NanoVDB baked volume: the RUNTIME volume path. Upload the raw NanoVDB blob to a
+    //     per-frame StructuredBuffer<uint>, bind it at the volume SRV table (root param 5), and
+    //     PNanoVDB-raymarch it (half res) + composite over the HDR - same shape as fog/splat.
+    //     Takes precedence over the legacy splat (below); the two never both draw. -----------
+    bool nanoVolumeDrawn = false;
+    if (volGridSize_ > 0 && volGridBytes_ && volRaymarchReady_ &&
+        EnsureVolumeGridBuffer(volGridSize_)) {
+        std::memcpy(volGridCpu_[frameIndex_], volGridBytes_, volGridSize_);
+        D3D12_GPU_DESCRIPTOR_HANDLE gridSrv = bindlessHeap_->GetGPUDescriptorHandleForHeapStart();
+        gridSrv.ptr += static_cast<UINT64>(slotVolGrid_[frameIndex_]) * bindlessDescSize_;
+        cmdList_->SetGraphicsRootDescriptorTable(5, gridSrv); // StructuredBuffer<uint> t0 space6
+        const u32 hw = (sceneW_ + 1u) / 2u, hh = (sceneH_ + 1u) / 2u;
+        const glm::vec2 vTexel(1.0f / hw, 1.0f / hh);
+        const VolumeRenderParams& rp = volRenderParams_;
+        PostCB cb;
+        cb.input2 = slotDepth_;
+        cb.outTexel = vTexel;
+        cb.inTexel = sceneTexel;
+        cb.params0 = {rp.boundsMin.x, rp.boundsMin.y, rp.boundsMin.z, static_cast<f32>(rp.stepCount)};
+        cb.params1 = {rp.boundsMax.x, rp.boundsMax.y, rp.boundsMax.z, rp.densityScale};
+        cb.params2 = {rp.emission, static_cast<f32>(rp.shadowSteps), rp.extinction,
+                      ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
+        cb.params3 = {0.0f, 0.0f, 0.0f, 0.0f};
+        DrawPostPass(volRaymarchPSO_.Get(), volPartHalf_.Get(), rtvAt(20 + kBloomMaxMips), hw, hh, cb);
+        PostCB ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotVolPartHalf_;
+        ap.input2 = slotDepth_;
+        ap.outTexel = sceneTexel;
+        ap.inTexel = vTexel;
+        ap.params0 = {1.0f, 0.0f, 0.0f, 0.0f};
+        DrawPostPass(applyPSO_.Get(), volPartScatter_.Get(), rtvAt(19 + kBloomMaxMips), sceneW_,
+                     sceneH_, ap);
+        hdrInput = slotVolPart_;
+        nanoVolumeDrawn = true;
+    }
+
     // --- Volumetric particles: raymarch the density/temperature volume (half res),
     //     lit + self-shadowed + blackbody-emissive, then composite over the HDR
-    //     (scene*transmittance + inscatter), same shape as the fog pass. ------------
-    if (volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
+    //     (scene*transmittance + inscatter), same shape as the fog pass. LEGACY splat path -
+    //     runs only when no NanoVDB grid was drawn above. ------------
+    if (!nanoVolumeDrawn && volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
         slotTextures_.count(volTex_.index)) {
         ID3D12Resource* volRes = slotTextures_[volTex_.index].resource;
         // The splat wrote the volume as a UAV; make it sampleable for the raymarch.
@@ -3206,6 +3338,12 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.params0 = {bloomMix, 1.0f, paint ? 0.0f : ps.vignette, ps.saturation};
         cb.params1 = {ps.contrast, ps.autoExposureKey, ps.autoExposureMin, ps.autoExposureMax};
         cb.params2 = {0.0f, 0.0f, 0.0f, 0.0f}; // tonemap's built-in smear off
+        cb.params3.x = static_cast<f32>(ps.tonemapOperator); // 0=ACES 1=AgX 2=Tony
+        cb.grade0 = {ps.gradeTemperature, ps.gradeTint, ps.filmGrain, ps.chromaticAberration};
+        cb.grade1 = {ps.gradeLift.x, ps.gradeLift.y, ps.gradeLift.z,
+                     static_cast<f32>(ps.gradeEnabled)};
+        cb.grade2 = {ps.gradeGamma.x, ps.gradeGamma.y, ps.gradeGamma.z, view.timeSeconds};
+        cb.grade3 = {ps.gradeGain.x, ps.gradeGain.y, ps.gradeGain.z, 0.0f};
         DrawPostPass(tonemapPSO_.Get(), ldr_.Get(), rtvAt(3), sceneW_, sceneH_, cb);
     }
     GpuMark("tonemap");
@@ -3718,6 +3856,43 @@ void D3D12Device::SetVolumeParticles(const VolumeBlob* blobs, u32 count,
     volParams_ = params;
 }
 
+void D3D12Device::SetVolumeGrid(const void* bytes, usize byteSize,
+                                const VolumeRenderParams& params) {
+    // Store the pointer + size; the upload + SRV happen in RunPostStack (like SetVolumeParticles
+    // defers to DispatchVolumeSplat). Pointer must stay valid through the frame.
+    volGridBytes_ = (bytes && byteSize > 0) ? bytes : nullptr;
+    volGridSize_ = volGridBytes_ ? byteSize : 0u;
+    volRenderParams_ = params;
+}
+
+// (Re)allocate this frame's NanoVDB upload buffer to hold `size` bytes and (re)create its
+// StructuredBuffer<uint> SRV in the bindless heap. Grows on demand; the SRV covers the whole
+// capacity (PNanoVDB only reads addresses within the grid, so trailing slack is never touched).
+bool D3D12Device::EnsureVolumeGridBuffer(usize size) {
+    if (slotHdr_ == 0) return false; // post targets (and thus the bindless slots) not set up
+    if (volGridBuffer_[frameIndex_] && volGridCapacity_[frameIndex_] >= size) return true;
+    const u64 cap = (static_cast<u64>(size) + 0xFFFFFull) & ~0xFFFFFull; // round up to 1 MiB
+    volGridBuffer_[frameIndex_] = CreateUploadBuffer(device_.Get(), cap);
+    if (!volGridBuffer_[frameIndex_]) return false;
+    void* m = nullptr;
+    D3D12_RANGE noRead{0, 0};
+    volGridBuffer_[frameIndex_]->Map(0, &noRead, &m);
+    volGridCpu_[frameIndex_] = static_cast<u8*>(m);
+    volGridCapacity_[frameIndex_] = cap;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_UNKNOWN;
+    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Buffer.FirstElement = 0;
+    srv.Buffer.NumElements = static_cast<UINT>(cap / 4u);
+    srv.Buffer.StructureByteStride = 4u; // StructuredBuffer<uint>
+    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<SIZE_T>(slotVolGrid_[frameIndex_]) * bindlessDescSize_;
+    device_->CreateShaderResourceView(volGridBuffer_[frameIndex_].Get(), &srv, h);
+    return true;
+}
+
 void D3D12Device::DispatchVolumeSplat() {
     if (volBlobCount_ == 0 || volFailed_) return; // data-driven: no blobs -> no volume
     if (!EnsureVolumeResources()) return;
@@ -4120,15 +4295,20 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
     // General VS-visible structured buffer (root param 6, t2 space1). The
     // per-batch base is folded into the GPU virtual address, NOT into a
     // firstInstance - see the SetVertexShaderBuffer contract in RHI.h.
+    // Root param 6 is bound UNCONDITIONALLY: the water VS (Water.hlsl gOceanDisp) statically
+    // references it, so a root SRV left unbound is undefined and the debug layer flags it even
+    // on the Gerstner path where the uniform-false branch never reads it. Fall back to an
+    // always-valid structured buffer (the instance arena) as a never-read placeholder.
+    D3D12_GPU_VIRTUAL_ADDRESS vsAddr = instanceArenas_[frameIndex_]->GetGPUVirtualAddress();
     if (GpuBufferD3D12* vb = ResolveGpuBuffer(vsBuffer_)) {
         const u32 s = frameIndex_ % vb->slots;
         const u64 off = static_cast<u64>(vsBufferFirstElement_) * vb->stride;
         if (off < vb->bytes) {
             TransitionGpuBuffer(*vb, s, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            cmdList_->SetGraphicsRootShaderResourceView(
-                6, vb->res[s]->GetGPUVirtualAddress() + off);
+            vsAddr = vb->res[s]->GetGPUVirtualAddress() + off;
         }
     }
+    cmdList_->SetGraphicsRootShaderResourceView(6, vsAddr);
     vsBuffer_ = {}; // one frame only, like SetParticles
 
     // Temporal AA: jitter the camera sub-pixel each frame so successive frames
@@ -4174,10 +4354,14 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         fcb.brdfLUTIndex = view.brdfLUTIndex;
         fcb.prefilteredMaxLod = view.prefilteredMaxLod;
         fcb.skinLUTIndex = view.skinLUTIndex;
+        fcb.taaActive = taaOn ? 1u : 0u; // gates the temporal shadow-dither in ShadowFactor
         fcb.invViewProj = curInvVP;
         fcb.prevViewProj = taaOn ? prevVP : curVP;
         fcb.skyIndex = view.skyIndex;
         fcb.outputLinear = postReady_ ? 1u : 0u;
+        // Depth-graded water reads scene depth via slotDepth_; only valid when the read-only DSV
+        // exists (the water loop below re-exposes hdrDepth_ read-only). 0 = skip depth grading.
+        fcb.sceneDepthIndex = roDsvValid_ ? slotDepth_ : 0u;
         for (u32 c = 0; c < kMaxShadowCascades; ++c) {
             fcb.cascadeViewProj[c] = view.cascadeViewProj[c];
         }
@@ -4188,11 +4372,32 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         std::memcpy(fcb.punctualLights, view.punctualLights, sizeof(fcb.punctualLights));
         fcb.probeCount = std::min(view.probeCount, kMaxProbes);
         std::memcpy(fcb.probes, view.probes, sizeof(fcb.probes));
+        fcb.decalCount = std::min(view.decalCount, kMaxDecals);
+        std::memcpy(fcb.decals, view.decals, sizeof(fcb.decals));
+        std::memcpy(fcb.waveA, view.waterWaveA, sizeof(fcb.waveA));
+        std::memcpy(fcb.waveB, view.waterWaveB, sizeof(fcb.waveB));
+        fcb.waterShallow = view.waterShallow;
+        fcb.waterDeep = view.waterDeep;
+        fcb.waterParams = view.waterParams;
+        fcb.fftParams[0] = view.fftPatch;
+        fcb.fftParams[1] = view.fftHeight;
+        // gScreenTexel = 1 / RENDER size (sceneW_/sceneH_), NOT the swapchain (width_): the
+        // editor 3D viewport renders smaller than the window, and Water.hlsl samples scene depth
+        // at SV_Position * gScreenTexel, so a swapchain-scaled UV mis-taps depth. (W2 depth water)
+        fcb.screenTexel[0] = sceneW_ ? 1.0f / static_cast<f32>(sceneW_) : 0.0f;
+        fcb.screenTexel[1] = sceneH_ ? 1.0f / static_cast<f32>(sceneH_) : 0.0f;
+        fcb.absorptionDepth = view.waterAbsorptionDepth;
+        fcb.shorelineWidth = view.waterShorelineWidth;
+        fcb.edgeFade = view.waterEdgeFade;
+        fcb.rippleCount = std::min(view.rippleCount, kMaxRipples);
+        std::memcpy(fcb.ripples, view.ripples, sizeof(fcb.ripples));
         fcb.giOrigin = view.giOrigin;
         fcb.giInvSpacing = view.giInvSpacing;
         fcb.giDims = view.giDims;
         fcb.weather = {view.cloudCoverage, view.cloudDensity, view.overcast, view.timeSeconds};
         fcb.weather1 = {view.windVelX, view.windVelZ, 0.0f, 0.0f};
+        fcb.weather2 = {view.wetness, view.puddles, view.snowAmount, view.precipIntensity};
+        fcb.weather3 = {view.puddleScale, view.snowScale, view.cloudVolumetric, view.cloudQuality};
         fcb.giShIndex = view.giShIndex;
         fcb.giDepthIndex = view.giDepthIndex;
         {
@@ -4249,6 +4454,8 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
             ocb.subsurfaceColor = it.subsurfaceColor;
             ocb.subsurfaceRadius = it.subsurfaceRadius;
             ocb.thicknessIndex = it.thicknessTexture.index;
+            ocb.clearcoat = it.clearcoat;
+            ocb.clearcoatRoughness = it.clearcoatRoughness;
             ocb.emissiveColor = it.emissiveColor;
             ocb.emissiveIntensity = it.emissiveIntensity;
             ocb.emissiveIndex = it.emissiveTexture.index;
@@ -4355,7 +4562,9 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
     if (meshPSOTransparent_) {
         std::vector<u32> tlist;
         for (u32 i = 0; i < count; ++i)
-            if (items[i].materialFlags & MaterialFlag_Transparent) tlist.push_back(i);
+            if ((items[i].materialFlags & MaterialFlag_Transparent) &&
+                !(items[i].materialFlags & MaterialFlag_Water))
+                tlist.push_back(i);
         if (!tlist.empty()) {
             std::sort(tlist.begin(), tlist.end(), [&](u32 a, u32 b) {
                 const f32 da = glm::distance(glm::vec3(items[a].transform[3]), view.cameraPos);
@@ -4380,6 +4589,43 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         }
     }
 
+    // Water surfaces: Gerstner-wave reflective water (own PSO), drawn after the transparent
+    // meshes. The frame CB already carries the wave/ripple/colour params; each item's b1
+    // ObjectCB supplies its plane transform via the shared drawItem path.
+    bool depthReadOnlyForWater = false;
+    if (waterReady_) {
+        bool waterBound = false;
+        for (u32 i = 0; i < count; ++i) {
+            if (!(items[i].materialFlags & MaterialFlag_Water)) continue;
+            if (!waterBound) {
+                // First water item: expose hdrDepth_ read-only so the water PS can SAMPLE the
+                // scene depth (floor) for depth-graded absorption/foam/soft edges while still
+                // depth-TESTING against it. Rebind the 3 HDR RTVs with the READ-ONLY DSV. Depth
+                // is restored to DEPTH_WRITE after the particle draw, so RunPostStack's own
+                // DEPTH_WRITE->SRV transition (and the frame-start reset) stay untouched.
+                if (roDsvValid_) {
+                    auto b = TransitionBarrier(
+                        hdrDepth_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                        D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                    cmdList_->ResourceBarrier(1, &b);
+                    const auto pRtv = [&](u32 index) {
+                        D3D12_CPU_DESCRIPTOR_HANDLE h =
+                            postRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+                        h.ptr += static_cast<SIZE_T>(index) * postRtvSize_;
+                        return h;
+                    };
+                    const D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3] = {
+                        pRtv(0), pRtv(11 + kBloomMaxMips), pRtv(12 + kBloomMaxMips)};
+                    cmdList_->OMSetRenderTargets(3, rtvs, FALSE, &roDsvHandle_);
+                    depthReadOnlyForWater = true;
+                }
+                cmdList_->SetPipelineState(waterPSO_.Get());
+                waterBound = true;
+            }
+            drawItem(i);
+        }
+    }
+
     GpuMark("scene"); // GPU profiler: delta shadow->here = the HDR forward pass (geo+sky+transparent)
 
     // Particle billboards: depth-tested against the scene (no write), into the HDR
@@ -4387,6 +4633,15 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
     // stay bound; only the PSO + VB change.
     if (particlePSO_ && (particleAlphaCount_ + particleAddCount_) > 0) {
         const u32 maxV = static_cast<u32>(kParticleVertexBufferSize / sizeof(ParticleVertex));
+        if ((particleAlphaCount_ + particleAddCount_) > maxV) {
+            static bool s_warnedParticleOverflow = false;
+            if (!s_warnedParticleOverflow) {
+                s_warnedParticleOverflow = true;
+                HBE_WARN("Particles: CPU vertex budget exceeded ({} > {} verts); dropping the "
+                         "tail. Lower emitter/precip counts or opt into GPU expansion.",
+                         particleAlphaCount_ + particleAddCount_, maxV);
+            }
+        }
         const u32 aN = std::min(particleAlphaCount_, maxV);
         const u32 addN = std::min(particleAddCount_, maxV - aN);
         u8* dst = particleVertexCpu_[frameIndex_];
@@ -4428,6 +4683,15 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
     // Vulkan emits the same label at the same point in its own DrawScene, so the two
     // backends' "particles" buckets measure the same work and are comparable.
     GpuMark("particles");
+    // Restore hdrDepth_ to DEPTH_WRITE so RunPostStack's DEPTH_WRITE->SRV transition and the
+    // frame-start reset stay unchanged - the read-only exposure above was local to water+particles.
+    if (depthReadOnlyForWater) {
+        auto b = TransitionBarrier(
+            hdrDepth_.Get(),
+            D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE);
+        cmdList_->ResourceBarrier(1, &b);
+    }
     // HDR resolve: SSAO -> bloom -> tonemap -> FXAA into the final target.
     // (Per-pass GpuMarks inside break the post cost down: ssr/ssgi/fog/kuwahara/...)
     if (postReady_) {
@@ -5179,11 +5443,32 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
         std::memcpy(fcb.punctualLights, view.punctualLights, sizeof(fcb.punctualLights));
         fcb.probeCount = std::min(view.probeCount, kMaxProbes);
         std::memcpy(fcb.probes, view.probes, sizeof(fcb.probes));
+        fcb.decalCount = std::min(view.decalCount, kMaxDecals);
+        std::memcpy(fcb.decals, view.decals, sizeof(fcb.decals));
+        std::memcpy(fcb.waveA, view.waterWaveA, sizeof(fcb.waveA));
+        std::memcpy(fcb.waveB, view.waterWaveB, sizeof(fcb.waveB));
+        fcb.waterShallow = view.waterShallow;
+        fcb.waterDeep = view.waterDeep;
+        fcb.waterParams = view.waterParams;
+        fcb.fftParams[0] = view.fftPatch;
+        fcb.fftParams[1] = view.fftHeight;
+        // gScreenTexel = 1 / RENDER size (sceneW_/sceneH_), NOT the swapchain (width_): the
+        // editor 3D viewport renders smaller than the window, and Water.hlsl samples scene depth
+        // at SV_Position * gScreenTexel, so a swapchain-scaled UV mis-taps depth. (W2 depth water)
+        fcb.screenTexel[0] = sceneW_ ? 1.0f / static_cast<f32>(sceneW_) : 0.0f;
+        fcb.screenTexel[1] = sceneH_ ? 1.0f / static_cast<f32>(sceneH_) : 0.0f;
+        fcb.absorptionDepth = view.waterAbsorptionDepth;
+        fcb.shorelineWidth = view.waterShorelineWidth;
+        fcb.edgeFade = view.waterEdgeFade;
+        fcb.rippleCount = std::min(view.rippleCount, kMaxRipples);
+        std::memcpy(fcb.ripples, view.ripples, sizeof(fcb.ripples));
         fcb.giOrigin = view.giOrigin;
         fcb.giInvSpacing = view.giInvSpacing;
         fcb.giDims = view.giDims;
         fcb.weather = {view.cloudCoverage, view.cloudDensity, view.overcast, view.timeSeconds};
         fcb.weather1 = {view.windVelX, view.windVelZ, 0.0f, 0.0f};
+        fcb.weather2 = {view.wetness, view.puddles, view.snowAmount, view.precipIntensity};
+        fcb.weather3 = {view.puddleScale, view.snowScale, view.cloudVolumetric, view.cloudQuality};
         fcb.giShIndex = view.giShIndex;
         fcb.giDepthIndex = view.giDepthIndex;
         std::memcpy(dst, &fcb, sizeof(fcb));
@@ -5209,6 +5494,9 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
             ocb.aoIndex = it.aoTexture.index;
             ocb.flags = it.materialFlags;
             ocb.subsurfaceColor = it.subsurfaceColor;
+            ocb.subsurfaceRadius = it.subsurfaceRadius;
+            ocb.clearcoat = it.clearcoat;
+            ocb.clearcoatRoughness = it.clearcoatRoughness;
             ocb.emissiveColor = it.emissiveColor;
             ocb.emissiveIntensity = it.emissiveIntensity;
             ocb.emissiveIndex = it.emissiveTexture.index;

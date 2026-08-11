@@ -312,6 +312,8 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         item.subsurfaceColor = instance.subsurfaceColor;
         item.subsurfaceRadius = instance.subsurfaceRadius;
         item.thicknessTexture = instance.thicknessTexture;
+        item.clearcoat = instance.clearcoat;
+        item.clearcoatRoughness = instance.clearcoatRoughness;
         item.materialFlags = instance.materialFlags;
         // Facial blendshapes: fill the top-8 active channels from a resolved MorphState
         // (channel name -> atlas row via targetNames; weights from the driver/schematic).
@@ -426,6 +428,7 @@ static void OverlayPostLook(rhi::PostSettings& d, const rhi::PostSettings& s) {
     d.vignette = s.vignette;
     d.saturation = s.saturation;
     d.contrast = s.contrast;
+    d.tonemapOperator = s.tonemapOperator;
     d.dofEnabled = s.dofEnabled;
     d.dofFocusDistance = s.dofFocusDistance;
     d.dofFocusRange = s.dofFocusRange;
@@ -561,7 +564,10 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         const DayNight dn = EvalDayNight(env_.timeOfDay);
         v.light.color *= dn.tint;
         v.light.intensity *= dn.day;                 // dims to ~0 at night
-        v.ambientIntensity *= glm::mix(0.12f, 1.0f, dn.day); // dim moonlit floor at night
+        // Night ambient floor. With dynamicIBL the re-baked irradiance ALREADY encodes the
+        // sun's night falloff (+ the SkyColor night glow), so the 0.12 daytime-calibrated
+        // floor would double-dim it - use a 1.0 floor there and let the map carry the night.
+        v.ambientIntensity *= glm::mix(env_.dynamicIBL != 0u ? 1.0f : 0.12f, 1.0f, dn.day);
         // Auto-exposure (even from a Post Volume above) would adapt a dark starry
         // night back into looking like daylight, so force a deterministic exposure.
         v.post.autoExposureEnabled = 0;
@@ -573,6 +579,18 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         // down) - keeps a dark night dark.
         v.post.fogDensity *= glm::mix(0.10f, 1.0f, dn.day);
         v.post.fogSunIntensity *= dn.day;
+    }
+    // Lightning: a brief weather-driven flash boosts scene light + ambient + exposure so the
+    // world lights up under a storm (independent of the day/night cycle). lightningFlash_ is
+    // driven by lightning::Update; 0 when not flashing = no cost.
+    if (lightningFlash_ > 0.001f) {
+        const f32 fl = lightningFlash_;
+        v.ambientIntensity *= (1.0f + fl * 4.0f);
+        // ADDITIVE directional boost (a lightning key light) so the flash is not nullified
+        // at night, where the day/night curve has already multiplied v.light.intensity to ~0.
+        v.light.intensity += fl * 2.0f;
+        v.light.color = glm::mix(v.light.color, glm::vec3(0.82f, 0.86f, 1.0f), fl * 0.4f);
+        v.exposure *= (1.0f + fl * 0.5f);
     }
     v.irradianceIndex = env_.irradiance.index;
     v.prefilteredIndex = env_.prefiltered.index;
@@ -587,6 +605,55 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
     const f32 windRad = glm::radians(env_.windAngle);
     v.windVelX = std::cos(windRad) * env_.windSpeed;
     v.windVelZ = std::sin(windRad) * env_.windSpeed;
+    v.wetness = env_.wetness;
+    v.puddles = env_.puddles;
+    v.snowAmount = env_.snowAmount;
+    // gWeather2.w drives the puddle RAIN ripples in MeshPBR, so carry rain intensity
+    // specifically (0 for snow/none) - a snowy scene with authored puddles must not ripple.
+    v.precipIntensity = (env_.precipType == 1u) ? env_.precipIntensity : 0.0f;
+    v.puddleScale = env_.puddleScale;
+    v.snowScale = env_.snowScale;
+    v.cloudVolumetric = env_.volumetricClouds ? 1.0f : 0.0f;
+    v.cloudQuality = env_.cloudQuality;
+    v.timeSeconds = time_; // shared animation clock (waves/sky/ripples + CPU buoyancy)
+
+    // Water surface: the FIRST WaterComponent drives the GLOBAL scene water look; the
+    // interactive ripple ring buffer rides waterRipples_ (aged/spawned by water::Update).
+    v.rippleCount = 0;
+    for (const glm::vec4& r : waterRipples_) {
+        if (v.rippleCount >= rhi::kMaxRipples) break;
+        v.ripples[v.rippleCount++] = r;
+    }
+    // Pick the scene ocean: the first fftOcean water if any (MATCHING ocean::UpdateForScene),
+    // else the first water of any kind for Gerstner. The two selectors must agree or the driven
+    // GPU ocean and the rendered surface diverge (FFT would silently degrade to Gerstner).
+    const WaterComponent* chosenWater = nullptr;
+    for (const entt::entity e : registry_.view<const WaterComponent>()) {
+        const WaterComponent& w = registry_.get<const WaterComponent>(e);
+        if (!chosenWater) chosenWater = &w;           // fallback: first water
+        if (w.fftOcean) { chosenWater = &w; break; }  // prefer the first FFT water
+    }
+    if (chosenWater) {
+        const WaterComponent& w = *chosenWater;
+        for (int i = 0; i < 4; ++i) {
+            const f32 a = glm::radians(w.waveAngle[i]);
+            v.waterWaveA[i] =
+                glm::vec4(std::cos(a), std::sin(a), w.waveAmplitude[i], w.waveLength[i]);
+            v.waterWaveB[i] = glm::vec4(w.waveSpeed[i], w.waveSteepness[i], 0.0f, 0.0f);
+        }
+        v.waterShallow = glm::vec4(w.shallowColor, w.fresnelPower);
+        v.waterDeep = glm::vec4(w.deepColor, w.reflectionRoughness);
+        // FFT is active only when the GPU ocean is actually bound this frame (oceanActive_),
+        // so the water VS never reads an unbound displacement buffer. .w carries the flag.
+        const bool fftOn = w.fftOcean && oceanActive_;
+        v.waterParams = glm::vec4(w.foam, w.rippleStrength, w.rippleScale, fftOn ? 1.0f : 0.0f);
+        v.fftOcean = fftOn ? 1u : 0u;
+        v.fftPatch = w.fftPatchSize;
+        v.fftHeight = w.fftHeightScale;
+        v.waterAbsorptionDepth = w.absorptionDepth;
+        v.waterShorelineWidth = w.shorelineWidth;
+        v.waterEdgeFade = w.edgeFade;
+    }
 
     // Local light/reflection probes: upload every baked probe; the PBR shader
     // blends them per-pixel (box-weighted) and falls back to the global sky IBL
@@ -610,6 +677,41 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         out.irradianceIndex = rp.irradiance.index;
         out.prefilteredIndex = rp.prefiltered.index;
         out.prefilteredMaxLod = rp.prefilteredMaxLod;
+    }
+
+    // Forward projected decals: each DecalComponent box is uploaded so MeshPBR can
+    // project its albedo/normal/MR onto the surfaces it overlaps. invWorld maps a world
+    // position into the box's unit cube; forwardWS/tangentWS are its world axes.
+    v.decalCount = 0;
+    for (const entt::entity e : registry_.view<const Transform, const DecalComponent>()) {
+        if (v.decalCount >= rhi::kMaxDecals) break;
+        const auto& dcp = registry_.get<const DecalComponent>(e);
+        const glm::mat4 world = WorldMatrix(e);
+        const glm::vec3 fwd = glm::vec3(world[2]); // box local +Z (projection axis)
+        const glm::vec3 tan = glm::vec3(world[0]); // box local +X (decal U axis)
+        // Skip a degenerate box: if the Transform (or a parent) has a zero-scale axis, a
+        // basis column is null, boxWorld is singular, and glm::inverse would produce
+        // NaN/Inf invWorld that the shader's |lp|>0.5 reject CANNOT cull (NaN > 0.5 is
+        // false) - one such decal would smear garbage over the whole screen.
+        if (glm::length(fwd) <= 1e-6f || glm::length(tan) <= 1e-6f ||
+            glm::length(glm::vec3(world[1])) <= 1e-6f)
+            continue;
+        glm::mat4 boxWorld = world;
+        const glm::vec3 he = glm::max(dcp.halfExtents, glm::vec3(1e-3f)) * 2.0f; // full box size
+        boxWorld[0] *= he.x; // scale the basis so the unit cube maps to the box
+        boxWorld[1] *= he.y;
+        boxWorld[2] *= he.z;
+        rhi::DecalData& out = v.decals[v.decalCount++];
+        out.invWorld = glm::inverse(boxWorld);
+        out.forwardWS = glm::normalize(fwd);
+        out.tangentWS = glm::normalize(tan);
+        out.opacity = dcp.opacity;
+        out.angleFade = glm::max(dcp.angleFade, 0.0f);
+        out.albedoIndex = dcp.albedo.index;
+        out.normalIndex = dcp.normal.index;
+        out.mrIndex = dcp.mr.index;
+        out.flags = 0;
+        out.params = glm::vec4(dcp.normalStrength, dcp.roughness, dcp.metallic, 0.0f);
     }
 
     // Baked SH-L1 irradiance volume (smooth directional diffuse GI; overrides the
@@ -845,6 +947,22 @@ ProceduralSkyParams ProjectSkyParams() {
     return sky;
 }
 
+void RebakeSkyLive(Scene& scene, Renderer& renderer) {
+    // Dynamic IBL cohesion: regenerate the ambient (irradiance) + reflection (prefiltered)
+    // maps IN PLACE from the LIVE day/night sun so ambient light and reflections (incl.
+    // water) follow the sun + weather instead of the stale boot bake. Leak-free (reuses the
+    // existing bindless handles). Throttled by the caller; a no-op before the boot bake.
+    if (!renderer.SupportsScene()) return;
+    SceneEnvironment& se = scene.Environment();
+    if (!se.irradiance.IsValid() || !se.prefiltered.IsValid()) return;
+    ProceduralSkyParams p = ProjectSkyParams();
+    p.sunDir = -se.sun.direction; // env.sun points FROM the sun; params.sunDir points TO it
+    IBLMaps m;
+    m.irradiance = se.irradiance;
+    m.prefiltered = se.prefiltered;
+    RebakeProceduralIBLInto(renderer, p, m); // UpdateTexture reuses the handles - no writeback
+}
+
 void SetupSky(Scene& scene, Renderer& renderer) {
     if (!renderer.SupportsScene()) return;
     // Derive the procedural sky from the project's environment settings (custom
@@ -877,11 +995,24 @@ void SetupSky(Scene& scene, Renderer& renderer) {
         se.dayLengthSeconds = env.dayLengthSeconds;
         se.dynamicSky = env.dynamicSky;
     }
+    se.dynamicIBL = env.dynamicIBL;
     se.cloudCoverage = env.cloudCoverage;
     se.cloudDensity = env.cloudDensity;
     se.overcast = env.overcast;
     se.windAngle = env.windAngle;
     se.windSpeed = env.windSpeed;
+    se.wetness = env.wetness;
+    se.puddles = env.puddles;
+    se.snowAmount = env.snowAmount;
+    se.precipType = env.precipType;
+    se.precipIntensity = env.precipIntensity;
+    se.dynamicWeather = env.dynamicWeather;
+    se.puddleScale = env.puddleScale;
+    se.snowScale = env.snowScale;
+    se.volumetricClouds = env.volumetricClouds;
+    se.cloudQuality = env.cloudQuality;
+    se.lightning = env.lightning;
+    se.thunderSound = env.thunderSound;
 }
 
 void ApplyProjectLookDefaults(Scene& scene) {

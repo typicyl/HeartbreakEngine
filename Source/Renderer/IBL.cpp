@@ -124,13 +124,22 @@ glm::vec3 SkyColor(const glm::vec3& d, const ProceduralSkyParams& p) {
     const f32 iSun = 22.0f * glm::max(p.sunIntensity / 40.0f, 0.0f);
     const f32 skyScale = glm::max(p.skyIntensity, 0.0f);
 
+    // Night floor: the pure single-scatter atmosphere trends to ~0 once the sun drops
+    // below the horizon, but a real night sky keeps a deep-blue glow (matches Sky.hlsl
+    // NightSky). Add it so the dynamic-IBL re-bake's ambient/reflections aren't black at
+    // night while the visible sky is a lit starfield. Zero during the day, so the boot
+    // bake (static daytime sun) is unaffected.
+    const f32 night = glm::clamp(-sunDir.y * 6.0f + 0.10f, 0.0f, 1.0f);
+    const glm::vec3 nightGlow = glm::vec3(0.028f, 0.05f, 0.10f) *
+                                (0.55f + 0.45f * glm::clamp(dir.y, 0.0f, 1.0f)) * night * skyScale;
+
     if (dir.y < 0.0f) {
         // Below the horizon: dim ground bounce of the horizon sky, tinted by the
         // ground albedo so the lower IBL hemisphere isn't pitch black.
         const glm::vec3 horizon =
             Atmosphere(glm::normalize(glm::vec3(dir.x, 0.03f, dir.z)), r0, sunDir, iSun,
                        rPlanet, rAtmos, kRlh, kMie, shRlh, shMie, gMie);
-        return horizon * p.ground * skyScale;
+        return horizon * p.ground * skyScale + nightGlow;
     }
 
     glm::vec3 col = Atmosphere(dir, r0, sunDir, iSun, rPlanet, rAtmos, kRlh, kMie, shRlh,
@@ -141,7 +150,7 @@ glm::vec3 SkyColor(const glm::vec3& d, const ProceduralSkyParams& p) {
     const f32 cosSun = glm::dot(dir, sunDir);
     const f32 disc = glm::smoothstep(0.99975f, 0.99995f, cosSun);
     col += p.sunTint * (disc * iSun * 6.0f);
-    return col * skyScale;
+    return col * skyScale + nightGlow;
 }
 
 // --- Low-discrepancy sampling ---------------------------------------------
@@ -423,6 +432,65 @@ IBLMaps GenerateProceduralIBL(Renderer& renderer, const ProceduralSkyParams& par
     HBE_INFO("IBL: generated atmosphere environment in {:.1f} ms (irr={}, pre={}, lut={})",
              ms, maps.irradiance.index, maps.prefiltered.index, maps.brdfLUT.index);
     return maps;
+}
+
+void RebakeProceduralIBLInto(Renderer& renderer, const ProceduralSkyParams& params, IBLMaps& maps) {
+    // LEAK-FREE dynamic re-bake: only the sun-dependent AMBIENT maps (irradiance +
+    // prefiltered specular) are regenerated and written IN PLACE via UpdateTexture (which
+    // reuses the same GPU resource + bindless slot - the RHI has no DestroyTexture, so a
+    // fresh UploadTexture would leak a slot every call). The uploaded maps keep their BOOT
+    // resolution (so UpdateTexture's size/mip match check passes); only the internal sky
+    // SOURCE is marched at a lower res, which is plenty for these low-res convolutions and
+    // makes the dynamic bake ~10x cheaper than the full boot bake. The sky background is
+    // analytic (already tracks the sun) and the BRDF/skin LUTs are sun-independent, so
+    // neither is touched here.
+    if (!renderer.SupportsScene() || !maps.irradiance.IsValid() || !maps.prefiltered.IsValid())
+        return;
+
+    // Low-res atmosphere source for the convolutions (NOT uploaded).
+    constexpr u32 kSkyW = 256, kSkyH = 128;
+    std::vector<glm::vec4> skyPx(static_cast<usize>(kSkyW) * kSkyH);
+    jobs::ParallelFor(kSkyH, 8, [&](u32 yBegin, u32 yEnd) {
+        for (u32 y = yBegin; y < yEnd; ++y)
+            for (u32 x = 0; x < kSkyW; ++x)
+                skyPx[y * kSkyW + x] =
+                    glm::vec4(SkyColor(DirFromUV((x + 0.5f) / kSkyW, (y + 0.5f) / kSkyH), params),
+                              1.0f);
+    });
+
+    // Irradiance - SAME resolution as the boot bake so UpdateTexture reuses the handle.
+    constexpr u32 kIrrW = 64, kIrrH = 32;
+    {
+        std::vector<glm::vec4> px = GenerateIrradiance(kIrrW, kIrrH, skyPx, kSkyW, kSkyH);
+        rhi::TextureDesc d;
+        d.width = kIrrW; d.height = kIrrH;
+        d.format = rhi::Format::R32G32B32A32_FLOAT;
+        d.pixels = px.data();
+        d.debugName = "ibl_irradiance";
+        renderer.UpdateTexture(maps.irradiance, d);
+    }
+
+    // Prefiltered specular - SAME resolution + mip count as the boot bake.
+    constexpr u32 kPreW = 128, kPreH = 64, kMips = 5;
+    {
+        std::vector<glm::vec4> packed;
+        for (u32 mip = 0; mip < kMips; ++mip) {
+            const u32 mw = glm::max(1u, kPreW >> mip);
+            const u32 mh = glm::max(1u, kPreH >> mip);
+            const f32 roughness = static_cast<f32>(mip) / (kMips - 1);
+            const u32 samples = mip == 0 ? 1u : 96u;
+            std::vector<glm::vec4> level =
+                GeneratePrefilteredMip(mw, mh, roughness, samples, skyPx, kSkyW, kSkyH);
+            packed.insert(packed.end(), level.begin(), level.end());
+        }
+        rhi::TextureDesc d;
+        d.width = kPreW; d.height = kPreH;
+        d.format = rhi::Format::R32G32B32A32_FLOAT;
+        d.pixels = packed.data();
+        d.mipCount = kMips;
+        d.debugName = "ibl_prefiltered";
+        renderer.UpdateTexture(maps.prefiltered, d);
+    }
 }
 
 // --- Local environment probe bake ------------------------------------------

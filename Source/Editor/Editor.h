@@ -10,10 +10,6 @@
 #include "Assets/MaterialAsset.h"
 #include "Assets/SeamWeld.h"
 #include "Assets/UAF.h"
-#include "Construction/ConstructionChunk.h"
-#include "Construction/ConstructionIO.h"
-#include "Construction/ConstructionGraph.h"
-#include "Construction/ConstructionPreset.h"
 #include "Editor/MovieRender.h"
 #include "Editor/CollabSession.h" // peer-to-peer sessions + this scene's history
 #include "Editor/SaveDispatch.h" // Ctrl+S: which focused surface owns the chord
@@ -372,6 +368,17 @@ private:
 
     entt::entity selected_ = entt::null;
     int  selectedKey_ = -1;    // timeline keyframe selection
+    // Plain Timeline (AnimationTrack) view state: zoom (px/s, 0 = refit to width),
+    // scroll (seconds), the key-drag gesture, and a one-key clipboard.
+    f32  timelineZoom_ = 0.0f;
+    f32  timelineScroll_ = 0.0f;
+    bool timelineDragArmed_ = false; // pressed a key, not yet past the drag threshold
+    bool timelineDragKey_ = false;   // actively dragging the selected key's time
+    f32  timelineDragOffset_ = 0.0f; // grab offset in seconds (key.time - cursorTime)
+    std::vector<AnimationTrack::Key> timelineClipboard_;
+    // Which entity selectedKey_ indexes into. selectedKey_ is a bare index, so it
+    // must be cleared when the inspected entity changes or it points at a stranger's key.
+    entt::entity timelineKeyOwner_ = entt::null;
     int  gizmoMode_ = 0;       // 0 = translate, 1 = rotate, 2 = scale
     // Grid snapping for the transform gizmo: round translation to gizmoSnapStep_
     // metres, rotation to gizmoSnapAngle_ degrees, scale to gizmoSnapScale_.
@@ -410,6 +417,11 @@ private:
 
     // Viewport panel rect (screen space) + per-frame image input state.
     f32  vpX_ = 0, vpY_ = 0, vpW_ = 1280, vpH_ = 720;
+    // When false, the Scene viewport FILLS its panel at any aspect (per monitor); when
+    // true it letterboxes to the game's target aspect (WYSIWYG). The dedicated "Game"
+    // view stays locked regardless, so it remains the true export preview. Default off:
+    // the user wants the scene preview to use the whole panel.
+    bool lockViewportAspect_ = false;
     bool vpHovered_ = false; // mouse over the rendered image item
     bool vpClicked_ = false; // LMB pressed on the image this frame
     bool vpVisible_ = false; // the Viewport image was actually drawn this frame
@@ -551,6 +563,36 @@ private:
     // Case-insensitive test of `rel` against the shared assetPickerSearch_ (empty
     // filter matches all). Used by AssetPicker + the "open asset" list popups.
     bool AssetSearchMatch(const std::string& rel) const;
+
+    // A searchable dropdown over an arbitrary string list (button preview + a
+    // filter-box popup), modelled on AssetPicker and sharing its search buffer.
+    // Returns true and writes `out` when a choice is made; `noneLabel` (nullptr to
+    // hide) offers a clear-to-empty entry. For fields that pick an existing NAME
+    // (a scene tag, a camera entity) rather than free text.
+    bool SearchableStringCombo(const char* label, const std::string& current,
+                               const std::vector<std::string>& options, std::string& out,
+                               const char* tooltip = nullptr,
+                               const char* noneLabel = "(none)");
+
+    // STABLE Euler-degrees editor for a quaternion. Editing Euler naively re-derives all
+    // three axes from the quaternion every frame, but glm::eulerAngles is multivalued, so
+    // dragging one axis makes the others flip and the object oscillates. This caches the
+    // Euler between frames and only re-seeds it from `rot` when the edited FIELD changes
+    // (`id`, e.g. a stable pointer to the field) or when `rot` is changed by something
+    // else (the gizmo, undo, a new selection). Returns true on the frames it edits `rot`.
+    bool RotationEulerEditor(const char* label, glm::quat& rot, const void* id);
+
+    // Material shading PRESET combo (Standard / Skin / Cloth / Eye / Hair). Detects the
+    // current preset from the shading-family flag bits and, on selection, sets that flag
+    // plus sensible metallic/roughness (and SSS tint/radius for Skin) - leaving baseColor
+    // and texture slots untouched. `onApply` (optional) fires right BEFORE the mutation,
+    // so an inspector caller can PushUndo. Returns true when it changed something.
+    bool DrawMaterialPresetCombo(u32& flags, f32& metallic, f32& roughness,
+                                 glm::vec3& subsurfaceColor, f32& subsurfaceRadius,
+                                 const std::function<void()>& onApply = {});
+    const void* rotEulerId_ = nullptr;  // which field the cached Euler belongs to
+    glm::vec3 rotEuler_{0.0f};           // cached Euler DEGREES being edited
+    glm::quat rotEulerQuat_{1.0f, 0.0f, 0.0f, 0.0f}; // the quat those Euler produced
 
     std::filesystem::path viewedAsset_;
     std::string viewedTypeName_;
@@ -1024,50 +1066,6 @@ private:
     // Node-graph editor for the project's .hbschem assets.
     void DrawSchematicEditor(Engine& engine);
 
-    // PROCEDURAL CONSTRUCTION ("Construction" panel). The whole inspector is driven by the
-    // parameter DESCRIPTOR TABLE rather than by hardcoded widgets - which is the entire reason
-    // that table exists. Adding a parameter to a generator makes it appear here with no edit to
-    // this file, and adding a preset makes it appear in the picker with no edit either.
-    void DrawConstructionPanel(Engine& engine);
-    void ConstructionRegenerate();
-    // Saves the .hbbuild and bumps every ProceduralBuilding referencing it, so an edit in the
-    // panel actually reaches the geometry in the viewport.
-    void ConstructionPushToScene(Scene& scene);
-    void ConstructionSpawnProxies(Scene& scene, entt::entity owner);
-    void ConstructionClearProxies(Scene& scene);
-    // Reads gizmo-edited proxy transforms back into the definition. Returns true if anything moved.
-    bool ConstructionPullProxies(Scene& scene);
-
-    // BOX BRUSH: six draggable face handles on one part. Dragging one moves that face's plane and
-    // leaves the opposite face where it is - which is what makes box modelling feel direct.
-    void ConstructionSpawnFaceHandles(Scene& scene, u32 componentId);
-    bool ConstructionPullFaceHandles(Scene& scene);
-    void ConstructionClearHandles(Scene& scene);
-
-    // PATH: drag the footprint points; walls regenerate along the segments.
-    void ConstructionSpawnPathPoints(Scene& scene, entt::entity owner);
-    bool ConstructionPullPathPoints(Scene& scene);
-    // Rebuilds the wall components that follow a building's path.
-    void ConstructionRebuildFromPath(const ProceduralBuilding& pb);
-
-    u32 conHandleComponent_ = 0; // which part currently shows face handles
-
-    std::string conPresetId_ = "wall";
-    construction::PresetParams conParams_{};
-    construction::ConstructionDef conDef_{};
-    construction::ChunkedSection conChunks_{};
-    std::vector<std::string> conErrors_;
-    f32 conChunkSize_ = 4.0f;
-    bool conAutoRegen_ = true;   // regenerate on every parameter edit
-    bool conDirty_ = true;
-    f64 conGenMs_ = 0.0;
-    char conFileName_[128] = "Buildings/untitled.hbbuild";
-    std::string conStatus_;
-    construction::ConstructionGraph conGraph_{};
-    int conTestRemove_ = -1;   // index into conDef_.components; -1 = nothing selected
-    bool conShowStructure_ = false;
-    entt::entity conEditTarget_ = entt::null; // the building whose components are manipulable
-    bool conLiveScene_ = true;                // push panel edits through to the spawned building
     void DrawSchematicCanvas();        // the node canvas (links/nodes/interaction)
     void OpenSchematic(const std::filesystem::path& path);
     // Returns whether a file was WRITTEN. A failed write must not be reported as a
@@ -1585,7 +1583,6 @@ private:
         Panel_Collaborate,
         Panel_People,
         Panel_Review,
-        Panel_Construction,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

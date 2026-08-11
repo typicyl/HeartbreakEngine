@@ -300,20 +300,6 @@ struct Exclusion {
 };
 
 constexpr Exclusion kExclusions[] = {
-    {[](const entt::registry& r, entt::entity e) {
-         return r.any_of<BuildFaceHandle, BuildPathPoint>(e);
-     },
-     "BuildFaceHandle/BuildPathPoint",
-     "editor-only box-brush and path handles; the Construction panel respawns them whenever a "
-     "part is selected and destroys them when edit mode ends"},
-    {[](const entt::registry& r, entt::entity e) { return r.all_of<BuildComponentProxy>(e); },
-     "BuildComponentProxy",
-     "editor-only handles for direct manipulation of a ProceduralBuilding's components; the "
-     "Construction panel respawns them when edit mode is entered and destroys them when it ends"},
-    {[](const entt::registry& r, entt::entity e) { return r.all_of<BuildChunkTag>(e); },
-     "BuildChunkTag",
-     "construction::Sync regenerates every chunk entity from ProceduralBuilding::source, which "
-     "IS serialized; a loaded building has builtRevision 0 so it always rebuilds once"},
     {[](const entt::registry& r, entt::entity e) { return r.all_of<TerrainChunk>(e); },
      "TerrainChunk",
      "terrain::Update destroys and rebuilds every chunk from TerrainComponent::heights, "
@@ -475,8 +461,8 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const CameraSpline>()) add(e);
     for (const entt::entity e : reg.view<const TerrainComponent>()) add(e);
     for (const entt::entity e : reg.view<const MotionMatching>()) add(e);
-    for (const entt::entity e : reg.view<const ProceduralBuilding>()) add(e);
     for (const entt::entity e : reg.view<const Rotator>()) add(e);
+    for (const entt::entity e : reg.view<const ModelGroup>()) add(e);
     for (const entt::entity e : reg.view<const CensorComponent>()) add(e);
     for (const entt::entity e : reg.view<const IKConstraint>()) add(e);
     for (const entt::entity e : reg.view<const UIElement>()) add(e);
@@ -486,6 +472,8 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const NavmeshInput>()) add(e);
     for (const entt::entity e : reg.view<const PostVolume>()) add(e);
     for (const entt::entity e : reg.view<const ReflectionProbe>()) add(e);
+    for (const entt::entity e : reg.view<const DecalComponent>()) add(e);
+    for (const entt::entity e : reg.view<const WaterComponent>()) add(e);
     for (const entt::entity e : reg.view<const ParticleEmitter>()) add(e);
     for (const entt::entity e : reg.view<const SchematicComponent>()) add(e);
     for (const entt::entity e : reg.view<const Checkpoint>()) add(e);
@@ -670,6 +658,8 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                           {"flags", mi->materialFlags},
                           {"subsurfaceColor", ToJson(mi->subsurfaceColor)},
                           {"subsurfaceRadius", mi->subsurfaceRadius},
+                          {"clearcoat", mi->clearcoat},
+                          {"clearcoatRoughness", mi->clearcoatRoughness},
                           {"emissiveColor", ToJson(mi->emissiveColor)},
                           {"emissiveIntensity", mi->emissiveIntensity}};
             if (const MaterialRef* mat = reg.try_get<MaterialRef>(e)) {
@@ -988,22 +978,13 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                     {"useNavVelocity", mm->useNavVelocity},
                                     {"enabled", mm->enabled}};
         }
-        if (const ProceduralBuilding* pb = reg.try_get<ProceduralBuilding>(e)) {
-            // Source and chunk size only. The geometry is derived and the revision counters are
-            // runtime bookkeeping - writing either would make the file lie about what it contains.
-            json path = json::array();
-            for (const glm::vec3& p : pb->path) path.push_back(ToJson(p));
-            je["building"] = {{"source", pb->source},
-                              {"chunkSize", pb->chunkSize},
-                              {"path", path},
-                              {"pathHeight", pb->pathWallHeight},
-                              {"pathThickness", pb->pathWallThickness},
-                              {"pathClosed", pb->pathClosed}};
-        }
         if (const Rotator* ro = reg.try_get<Rotator>(e)) {
             je["rotator"] = {{"axis", ToJson(ro->axis)},
                              {"speed", ro->speed},
                              {"enabled", ro->enabled}};
+        }
+        if (const ModelGroup* mg = reg.try_get<ModelGroup>(e)) {
+            je["modelGroup"] = {{"modular", mg->modular}, {"source", mg->source}};
         }
         if (const CensorComponent* ce = reg.try_get<CensorComponent>(e)) {
             je["censor"] = {{"radius", ce->radius},
@@ -1149,13 +1130,55 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                      {"priority", rp->priority},
                                      {"source", rp->source}};
         }
+        if (const DecalComponent* dc = reg.try_get<DecalComponent>(e)) {
+            je["decal"] = {{"halfExtents", ToJson(dc->halfExtents)},
+                           {"opacity", dc->opacity},
+                           {"angleFade", dc->angleFade},
+                           {"normalStrength", dc->normalStrength},
+                           {"roughness", dc->roughness},
+                           {"metallic", dc->metallic},
+                           {"albedo", dc->albedoTex},
+                           {"normal", dc->normalTex},
+                           {"mr", dc->mrTex}};
+        }
+        if (const WaterComponent* wc = reg.try_get<WaterComponent>(e)) {
+            je["water"] = {
+                {"size", wc->size},
+                {"resolution", wc->resolution},
+                {"waveAngle", {wc->waveAngle[0], wc->waveAngle[1], wc->waveAngle[2], wc->waveAngle[3]}},
+                {"waveAmplitude",
+                 {wc->waveAmplitude[0], wc->waveAmplitude[1], wc->waveAmplitude[2], wc->waveAmplitude[3]}},
+                {"waveLength", {wc->waveLength[0], wc->waveLength[1], wc->waveLength[2], wc->waveLength[3]}},
+                {"waveSpeed", {wc->waveSpeed[0], wc->waveSpeed[1], wc->waveSpeed[2], wc->waveSpeed[3]}},
+                {"waveSteepness",
+                 {wc->waveSteepness[0], wc->waveSteepness[1], wc->waveSteepness[2], wc->waveSteepness[3]}},
+                {"shallowColor", ToJson(wc->shallowColor)},
+                {"fresnelPower", wc->fresnelPower},
+                {"deepColor", ToJson(wc->deepColor)},
+                {"reflectionRoughness", wc->reflectionRoughness},
+                {"foam", wc->foam},
+                {"rippleStrength", wc->rippleStrength},
+                {"rippleScale", wc->rippleScale},
+                {"buoyancy", wc->buoyancy},
+                {"fftOcean", wc->fftOcean},
+                {"fftWindSpeed", wc->fftWindSpeed},
+                {"fftWindDir", wc->fftWindDir},
+                {"fftPatchSize", wc->fftPatchSize},
+                {"fftChoppiness", wc->fftChoppiness},
+                {"fftAmplitude", wc->fftAmplitude},
+                {"fftHeightScale", wc->fftHeightScale},
+                {"absorptionDepth", wc->absorptionDepth},
+                {"shorelineWidth", wc->shorelineWidth},
+                {"edgeFade", wc->edgeFade}};
+        }
         if (const Animator* an = reg.try_get<Animator>(e)) {
             je["animator"] = {{"source", an->sourceAsset},
                               {"clip", an->clip},
                               {"speed", an->speed},
                               {"loop", an->loop},
                               {"playing", an->playing},
-                              {"rootMotion", an->rootMotion}};
+                              {"rootMotion", an->rootMotion},
+                              {"blendTime", an->blendTime}};
         }
         // Modular-character root: the .hbchar + active loadout. Parts are NOT
         // serialized (regenerated on load). Key is "characterRig" to avoid the
@@ -1178,7 +1201,8 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                 keys.push_back({{"t", k.time},
                                 {"p", ToJson(k.position)},
                                 {"r", ToJson(k.rotation)},
-                                {"s", ToJson(k.scale)}});
+                                {"s", ToJson(k.scale)},
+                                {"e", static_cast<int>(k.ease)}});
             }
             je["animation"] = {{"duration", a->duration},
                                {"speed", a->speed},
@@ -1434,6 +1458,8 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.subsurfaceColor = Vec3(it->value("subsurfaceColor", json()),
                                      glm::vec3(1.0f, 0.3f, 0.2f));
             d.subsurfaceRadius = it->value("subsurfaceRadius", 1.0f);
+            d.clearcoat = it->value("clearcoat", 0.0f);
+            d.clearcoatRoughness = it->value("clearcoatRoughness", 0.08f);
             d.emissiveColor = Vec3(it->value("emissiveColor", json()), glm::vec3(0.0f));
             d.emissiveIntensity = it->value("emissiveIntensity", 1.0f);
             d.materialAsset = it->value("material", "");
@@ -1787,24 +1813,17 @@ void ParseSceneJson(const json& root, SceneData& out) {
             mm.useNavVelocity = it->value("useNavVelocity", mm.useNavVelocity);
             mm.enabled = it->value("enabled", mm.enabled);
         }
-        if (auto it = je.find("building"); it != je.end()) {
-            d.hasBuilding = true;
-            d.building.source = it->value("source", std::string());
-            d.building.chunkSize = it->value("chunkSize", d.building.chunkSize);
-            d.building.pathWallHeight = it->value("pathHeight", d.building.pathWallHeight);
-            d.building.pathWallThickness =
-                it->value("pathThickness", d.building.pathWallThickness);
-            d.building.pathClosed = it->value("pathClosed", d.building.pathClosed);
-            if (auto pit = it->find("path"); pit != it->end() && pit->is_array())
-                for (const json& jp : *pit)
-                    d.building.path.push_back(Vec3(jp, glm::vec3(0.0f)));
-        }
         if (auto it = je.find("rotator"); it != je.end()) {
             d.hasRotator = true;
             Rotator& ro = d.rotator;
             ro.axis = Vec3(it->value("axis", json()), ro.axis);
             ro.speed = it->value("speed", ro.speed);
             ro.enabled = it->value("enabled", ro.enabled);
+        }
+        if (auto it = je.find("modelGroup"); it != je.end()) {
+            d.hasModelGroup = true;
+            d.modelGroup.modular = it->value("modular", true);
+            d.modelGroup.source = it->value("source", std::string());
         }
         if (auto it = je.find("censor"); it != je.end()) {
             d.hasCensor = true;
@@ -2026,6 +2045,52 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.probe.priority = it->value("priority", 0);
             d.probe.source = it->value("source", std::string());
         }
+        if (auto it = je.find("decal"); it != je.end()) {
+            d.hasDecal = true;
+            d.decal.halfExtents =
+                Vec3(it->value("halfExtents", json()), glm::vec3(0.5f, 0.5f, 0.15f));
+            d.decal.opacity = it->value("opacity", 1.0f);
+            d.decal.angleFade = it->value("angleFade", 2.0f);
+            d.decal.normalStrength = it->value("normalStrength", 1.0f);
+            d.decal.roughness = it->value("roughness", 0.8f);
+            d.decal.metallic = it->value("metallic", 0.0f);
+            d.decal.albedoTex = it->value("albedo", std::string());
+            d.decal.normalTex = it->value("normal", std::string());
+            d.decal.mrTex = it->value("mr", std::string());
+        }
+        if (auto it = je.find("water"); it != je.end()) {
+            d.hasWater = true;
+            WaterComponent& wc = d.water;
+            wc.size = it->value("size", wc.size);
+            wc.resolution = it->value("resolution", wc.resolution);
+            const auto rd4 = [&](const char* k, f32* out) {
+                if (auto a = it->find(k); a != it->end() && a->is_array() && a->size() >= 4)
+                    for (int i = 0; i < 4; ++i) out[i] = (*a)[i].get<f32>();
+            };
+            rd4("waveAngle", wc.waveAngle);
+            rd4("waveAmplitude", wc.waveAmplitude);
+            rd4("waveLength", wc.waveLength);
+            rd4("waveSpeed", wc.waveSpeed);
+            rd4("waveSteepness", wc.waveSteepness);
+            wc.shallowColor = Vec3(it->value("shallowColor", json()), wc.shallowColor);
+            wc.fresnelPower = it->value("fresnelPower", wc.fresnelPower);
+            wc.deepColor = Vec3(it->value("deepColor", json()), wc.deepColor);
+            wc.reflectionRoughness = it->value("reflectionRoughness", wc.reflectionRoughness);
+            wc.foam = it->value("foam", wc.foam);
+            wc.rippleStrength = it->value("rippleStrength", wc.rippleStrength);
+            wc.rippleScale = it->value("rippleScale", wc.rippleScale);
+            wc.buoyancy = it->value("buoyancy", wc.buoyancy);
+            wc.fftOcean = it->value("fftOcean", wc.fftOcean);
+            wc.fftWindSpeed = it->value("fftWindSpeed", wc.fftWindSpeed);
+            wc.fftWindDir = it->value("fftWindDir", wc.fftWindDir);
+            wc.fftPatchSize = it->value("fftPatchSize", wc.fftPatchSize);
+            wc.fftChoppiness = it->value("fftChoppiness", wc.fftChoppiness);
+            wc.fftAmplitude = it->value("fftAmplitude", wc.fftAmplitude);
+            wc.fftHeightScale = it->value("fftHeightScale", wc.fftHeightScale);
+            wc.absorptionDepth = it->value("absorptionDepth", wc.absorptionDepth);
+            wc.shorelineWidth = it->value("shorelineWidth", wc.shorelineWidth);
+            wc.edgeFade = it->value("edgeFade", wc.edgeFade);
+        }
         // Runtime tags written only into in-memory snapshots (see SaveSceneToString).
         if (auto it = je.find("sceneSrc"); it != je.end() && it->is_string()) {
             d.hasSceneSourceTag = true;
@@ -2064,6 +2129,7 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.animator.loop = it->value("loop", true);
             d.animator.playing = it->value("playing", true);
             d.animator.rootMotion = it->value("rootMotion", false);
+            d.animator.blendTime = it->value("blendTime", d.animator.blendTime);
         }
         if (auto it = je.find("animation"); it != je.end()) {
             d.hasAnim = true;
@@ -2077,6 +2143,7 @@ void ParseSceneJson(const json& root, SceneData& out) {
                 k.position = Vec3(jk.value("p", json()));
                 k.rotation = Quat(jk.value("r", json()));
                 k.scale = Vec3(jk.value("s", json()), glm::vec3(1.0f));
+                k.ease = static_cast<ease::Curve>(jk.value("e", 0)); // default Linear for old files
                 d.anim.keys.push_back(k);
             }
         }
@@ -2850,6 +2917,8 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             mi.materialFlags = d.materialFlags;
             mi.subsurfaceColor = d.subsurfaceColor;
             mi.subsurfaceRadius = d.subsurfaceRadius;
+            mi.clearcoat = d.clearcoat;
+            mi.clearcoatRoughness = d.clearcoatRoughness;
             mi.emissiveColor = d.emissiveColor;
             mi.emissiveIntensity = d.emissiveIntensity;
 
@@ -3082,8 +3151,8 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             }
         }
         if (d.hasMotionMatching) reg.emplace<MotionMatching>(e, d.motionMatching);
-        if (d.hasBuilding) reg.emplace<ProceduralBuilding>(e, d.building);
         if (d.hasRotator) reg.emplace<Rotator>(e, d.rotator);
+        if (d.hasModelGroup) reg.emplace<ModelGroup>(e, d.modelGroup);
         if (d.hasCensor) reg.emplace<CensorComponent>(e, d.censor);
         if (d.hasCharacter) reg.emplace<CharacterController>(e, d.character);
         if (d.hasIK) reg.emplace<IKConstraint>(e, d.ik);
@@ -3114,6 +3183,8 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         }
         if (d.hasDialogueActor) reg.emplace<DialogueActor>(e, d.dialogueActor);
         if (d.hasParticles) reg.emplace<ParticleEmitter>(e, d.particles);
+        if (d.hasDecal) reg.emplace<DecalComponent>(e, d.decal);
+        if (d.hasWater) reg.emplace<WaterComponent>(e, d.water);
         if (d.hasNavAgent) reg.emplace<NavigationAgent>(e, d.navAgent);
         if (d.hasNavObstacle) reg.emplace<NavigationObstacle>(e, d.navObstacle);
         if (d.hasNavmeshInput) reg.emplace<NavmeshInput>(e, d.navmeshInput);
@@ -4807,6 +4878,7 @@ HBE_PLAIN_DELTA(NavAg, "navAgent", hasNavAgent, navAgent, NavigationAgent)
 HBE_PLAIN_DELTA(NavObs, "navObstacle", hasNavObstacle, navObstacle, NavigationObstacle)
 HBE_PLAIN_DELTA(NavIn, "navmeshInput", hasNavmeshInput, navmeshInput, NavmeshInput)
 HBE_PLAIN_DELTA(Rot, "rotator", hasRotator, rotator, Rotator)
+HBE_PLAIN_DELTA(ModelGrp, "modelGroup", hasModelGroup, modelGroup, ModelGroup)
 HBE_PLAIN_DELTA(Cens, "censor", hasCensor, censor, CensorComponent)
 HBE_PLAIN_DELTA(CharCtl, "character", hasCharacter, character, CharacterController)
 HBE_PLAIN_DELTA(Ik, "ik", hasIK, ik, IKConstraint)
@@ -4842,6 +4914,7 @@ const DeltaApplier kAppliers[] = {
     {"navObstacle", &NavObsApply, &NavObsRemove},
     {"navmeshInput", &NavInApply, &NavInRemove},
     {"rotator", &RotApply, &RotRemove},
+    {"modelGroup", &ModelGrpApply, &ModelGrpRemove},
     {"censor", &CensApply, &CensRemove},
     {"character", &CharCtlApply, &CharCtlRemove},
     {"ik", &IkApply, &IkRemove},
