@@ -77,8 +77,12 @@ float VR_SampleDensity(pnanovdb_buf_t buf, pnanovdb_grid_handle_t grid,
 
 float4 PSMain(FSOutput input) : SV_Target {
     const float2 uv = input.positionCS.xy * gOutTexel;
-    const float3 bmin = gPostParams0.xyz;
-    const float3 bmax = gPostParams1.xyz;
+    // worldOffset (p3.xyz) places the baked grid at the entity's world position: the RayBox clip is
+    // offset BY +worldOffset, and each sample position is un-offset BY -worldOffset before the grid's
+    // baked (local) transform maps it to index space. The two signs MUST stay opposite.
+    const float3 worldOffset = gPostParams3.xyz;
+    const float3 bmin = gPostParams0.xyz + worldOffset;
+    const float3 bmax = gPostParams1.xyz + worldOffset;
     const int   steps = max(1, (int)gPostParams0.w);
     const float densityMul = gPostParams1.w;
     const float emissionMul = gPostParams2.x;
@@ -119,7 +123,7 @@ float4 PSMain(FSOutput input) : SV_Target {
     for (int i = 0; i < steps; ++i) {
         const float t = box.x + (i + dither) * stepLen;
         const float3 pos = ro + rd * t;
-        float d = VR_SampleDensity(buf, grid, acc, pos) * densityMul;
+        float d = VR_SampleDensity(buf, grid, acc, pos - worldOffset) * densityMul; // -offset: back to grid local
         d *= saturate((sceneDist - t) * 2.857f); // soft contact with geometry
         if (d < 1e-4f) continue;
 
@@ -132,7 +136,8 @@ float4 PSMain(FSOutput input) : SV_Target {
             float od = 0.0f;
             [loop]
             for (int j = 0; j < shadowSteps; ++j)
-                od += VR_SampleDensity(buf, grid, acc, pos + L * ((j + 0.5f) * ls)) * densityMul * ls;
+                od += VR_SampleDensity(buf, grid, acc, pos + L * ((j + 0.5f) * ls) - worldOffset) *
+                      densityMul * ls;
             shadow = exp(-od * extinction);
         }
 

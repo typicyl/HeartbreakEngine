@@ -1445,6 +1445,24 @@ struct PointLightComponent {
     f32 range = 10.0f;
 };
 
+// Runtime playback of a baked `.hbvol` density volume (smoke/fire/etc), placed at the entity's
+// world position. The loaded asset + resolved grid are runtime-only (owned by volume::VolumeCache);
+// only the source path + playback + look knobs serialize. The runtime renders ONE volume at a time
+// (the RHI volume feed is single-grid), so with several VolumeComponents only the first eligible one
+// renders - the rest still advance their playhead. Placement is translation only (no rotation/scale).
+struct VolumeComponent {
+    std::string             source;              // ".hbvol" asset path (serialized)
+    bool                    playing = true;      // serialized
+    bool                    loop = true;         // serialized
+    f32                     time = 0.0f;         // playhead seconds (serialized; resumes)
+    f32                     speed = 1.0f;        // serialized
+    rhi::VolumeRenderParams render{};            // density/emission/extinction/steps (serialized;
+                                                 // boundsMin/Max + worldOffset are drive-owned each frame)
+    // Runtime-only (never serialized):
+    u32                     cacheHandle = 0xFFFFFFFFu; // volume::VolumeCache handle (invalid = unassigned)
+    i32                     resolvedFrame = -1;        // last frame the drive selected (inspector/debug)
+};
+
 // A cone light at the entity's world position. The cone axis is the entity's
 // local -Y rotated into world space (points "down" by default); inner/outer
 // angles (degrees, half-angle) shape the falloff between full and zero.

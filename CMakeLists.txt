@@ -247,7 +247,16 @@ set(HBE_EDITOR_SOURCES
 # NanoVDB volumetric foundation (baker / asset / cache / runtime). Header-only NanoVDB,
 # zero external runtime deps. OpenVDB (editor-only, vcpkg) is a later optional addition.
 set(HBE_VOLUME_SOURCES
-    "Source/Volume/VolumeNano.cpp")
+    "Source/Volume/VolumeNano.cpp"
+    "Source/Volume/VolumeRasterize.cpp"
+    "Source/Volume/VolumeSimRegistry.cpp"
+    "Source/Volume/VolumeSimController.cpp"
+    "Source/Volume/EulerianSmokeSimulation.cpp"
+    "Source/Volume/GpuEulerianSmokeSimulation.cpp"
+    "Source/Volume/ProceduralVolumeSimulation.cpp"
+    "Source/Volume/VolumeBaker.cpp"
+    "Source/Volume/VolumeAsset.cpp"
+    "Source/Volume/VolumeCache.cpp")
 
 # Core sources common to both the runtime and editor libraries.
 set(HBE_RUNTIME_SOURCES

@@ -752,6 +752,10 @@ struct VolumeRenderParams {
     f32 extinction = 1.5f; // absorption (denser/darker smoke)
     i32 stepCount = 96;    // raymarch steps
     i32 shadowSteps = 4;   // self-shadow march steps (0 = none)
+    // Translation placing the baked grid in the world (the entity's world position). boundsMin/Max
+    // stay the grid's LOCAL AABB; the raymarch offsets the RayBox by this and un-offsets before
+    // sampling. Translation only - rotation/scale of the volume are not supported.
+    glm::vec3 worldOffset{0.0f};
 };
 
 // ---------------------------------------------------------------------------
@@ -833,8 +837,13 @@ inline constexpr u32 kMaxComputeSrvs = 4;
 // Root/uniform constant block per dispatch. Copied at QueueCompute time, so the
 // caller's pointer does not have to outlive the call.
 inline constexpr u32 kMaxComputeConstantBytes = 256;
-// Dispatches that may be queued in one frame.
-inline constexpr u32 kMaxQueuedComputeDispatches = 16;
+// Dispatches that may be queued in one frame. Raised from 16 to 128 for the GPU
+// Eulerian fluid solver, whose one-substep dispatch chain is 10 + pressureIterations
+// (~49 at the default 40 iters). Both backends size only fixed C-arrays / a per-pipeline
+// descriptor-pool + CB ring by this (a few hundred KB total across all compute pipelines);
+// nothing else assumes <= 16. A substep must fit in ONE drain so the inter-dispatch barriers
+// serialize its whole read-after-write chain.
+inline constexpr u32 kMaxQueuedComputeDispatches = 128;
 
 // A compute pipeline built from a precompiled kernel. `shaderName` names the
 // product cmake/ShaderCompile.cmake emits: "Foo" loads shaders/Foo.cs.dxil on

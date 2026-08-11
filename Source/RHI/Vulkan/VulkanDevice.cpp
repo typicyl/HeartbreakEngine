@@ -295,6 +295,7 @@ public:
     TextureHandle CreateTexture(const TextureDesc& desc) override;
     TextureHandle CreateVolumeTexture(const TextureDesc& desc) override;
     void SetVolumeParticles(const VolumeBlob* blobs, u32 count, const VolumeParams& params) override;
+    void SetVolumeGrid(const void* bytes, usize byteSize, const VolumeRenderParams& params) override;
     bool SupportsGpuCompute() const override { return true; }
     GpuBufferHandle CreateGpuBuffer(const GpuBufferDesc& desc) override;
     void* MapGpuBuffer(GpuBufferHandle handle) override;
@@ -669,7 +670,8 @@ private:
                ssgiPipe_ = VK_NULL_HANDLE, painterlyPipe_ = VK_NULL_HANDLE,
                brushStrokesPipe_ = VK_NULL_HANDLE,
                compositePipe_ = VK_NULL_HANDLE, applyPipe_ = VK_NULL_HANDLE,
-               volPartPipe_ = VK_NULL_HANDLE; // volumetric-particles raymarch
+               volPartPipe_ = VK_NULL_HANDLE,     // volumetric-particles raymarch (LEGACY splat)
+               volRaymarchPipe_ = VK_NULL_HANDLE; // NanoVDB baked-volume raymarch (runtime)
 
     // Temporal AA: jittered camera + reprojected history accumulation (mirrors D3D12).
     bool taaReady_ = false;
@@ -682,7 +684,8 @@ private:
     bool ssrReady_ = false;
     bool exposureReady_ = false;
     bool volReady_ = false;  // volumetric fog pipeline built
-    bool volPartReady_ = false; // volumetric-particles raymarch pipeline built
+    bool volPartReady_ = false; // volumetric-particles raymarch pipeline built (LEGACY splat)
+    bool volRaymarchReady_ = false; // NanoVDB baked-volume raymarch pipeline built (runtime)
     bool ssgiReady_ = false; // screen-space GI pipeline built
     bool painterlyReady_ = false; // painterly repaint pipeline built
     bool brushStrokesReady_ = false; // brush-stroke splat pipeline built
@@ -759,6 +762,16 @@ private:
     VolumeParams volParams_{};
     bool EnsureVolumeResources();
     void DispatchVolumeSplat();
+    // NanoVDB baked-volume raymarch (RUNTIME volume path). Per-frame host-visible SSBO holding the
+    // raw NanoVDB blob (grow-on-demand); the PNanoVDB raymarch samples it via post-set binding 6.
+    VkBuffer        volGridBuf_[kMaxFramesInFlight]{};
+    VkDeviceMemory  volGridMem_[kMaxFramesInFlight]{};
+    void*           volGridMapped_[kMaxFramesInFlight]{};
+    VkDeviceSize    volGridCapacity_[kMaxFramesInFlight]{};
+    const void*     volGridBytes_ = nullptr;
+    usize           volGridSize_ = 0;
+    VolumeRenderParams volRenderParams_{};
+    bool EnsureVolumeGridBuffer(usize size);
 
     // --- General GPU compute + GPU-writable structured buffers ----------------
     // The generalisation of the volumetric path above. D3D12 twin:
@@ -1361,7 +1374,7 @@ bool VulkanDevice::CreateDescriptorResources() {
     // immutable clamp sampler (binding 2) + the joint-palette storage buffer
     // (binding 3, vertex skinning) + the instance-transform storage buffer
     // (binding 4, GPU instancing).
-    VkDescriptorSetLayoutBinding bindings[6]{};
+    VkDescriptorSetLayoutBinding bindings[7]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     bindings[0].descriptorCount = 1;
@@ -1392,9 +1405,17 @@ bool VulkanDevice::CreateDescriptorResources() {
     bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     bindings[5].descriptorCount = 1;
     bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    // NanoVDB baked-volume raymarch: the grid blob as a readonly StructuredBuffer<uint>. Like
+    // binding 5, only the NanoVDB volume pass writes it into its post set; every other pass /
+    // set leaves it unbound (never sampled). Distinct from binding 5 because a sampled image
+    // and a storage buffer cannot share one binding in this shared layout.
+    bindings[6].binding = 6;
+    bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    bindings[6].descriptorCount = 1;
+    bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    lci.bindingCount = 6;
+    lci.bindingCount = 7;
     lci.pBindings = bindings;
     VK_CHECK(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &descriptorLayout_),
              "vkCreateDescriptorSetLayout");
@@ -1410,7 +1431,7 @@ bool VulkanDevice::CreateDescriptorResources() {
     sizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;
     sizes[2].descriptorCount = framesInFlight_ * setsPerFrame;
     sizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    sizes[3].descriptorCount = framesInFlight_ * setsPerFrame * 2; // bones + instances
+    sizes[3].descriptorCount = framesInFlight_ * setsPerFrame * 3; // bones + instances + volume grid (b6)
     sizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     sizes[4].descriptorCount = framesInFlight_ * setsPerFrame; // binding 5 volume (post sets)
     VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -3131,6 +3152,9 @@ bool VulkanDevice::CreatePostPipelines() {
     exposureReady_ = makePipe(L"Exposure", postPass16_, false, exposurePipe_); // 1x1 HDR
     volReady_ = makePipe(L"VolumetricFog", postPass16_, false, volPipe_); // HDR composite
     volPartReady_ = makePipe(L"VolumetricParticles", postPass16_, false, volPartPipe_); // raymarch
+    // NanoVDB baked-volume raymarch (the runtime volume path): same half-res target/blend as the
+    // splat raymarch, but samples a StructuredBuffer<uint> grid via PNanoVDB (post-set binding 6).
+    volRaymarchReady_ = makePipe(L"VolumeRaymarch", postPass16_, false, volRaymarchPipe_);
     ssgiReady_ = makePipe(L"SSGI", postPass16_, false, ssgiPipe_);        // HDR composite
     painterlyReady_ = makePipe(L"Painterly", postPass16_, false, painterlyPipe_); // HDR repaint
     // Brush-stroke splat: alpha-over, drawn into the painterly target with LOAD so
@@ -3639,11 +3663,54 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
     }
     GpuMark("fog");
 
+    // --- NanoVDB baked volume: the RUNTIME volume path. Upload the raw NanoVDB blob to this
+    //     frame's storage buffer, bind it at post-set binding 6, and PNanoVDB-raymarch it (half
+    //     res) + composite. Takes precedence over the legacy splat below; never both draw. ----
+    bool nanoVolumeDrawn = false;
+    if (volGridSize_ > 0 && volGridBytes_ && volRaymarchReady_ &&
+        EnsureVolumeGridBuffer(volGridSize_)) {
+        std::memcpy(volGridMapped_[frameIndex_], volGridBytes_, volGridSize_);
+        // Bind the grid SSBO into THIS frame's post set at binding 6 (safe: BeginFrame waited on
+        // this slot's fence; only the raymarch pass, bound after, reads binding 6).
+        VkDescriptorBufferInfo bi{volGridBuf_[frameIndex_], 0, VK_WHOLE_SIZE};
+        VkWriteDescriptorSet bw{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        bw.dstSet = postSets_[frameIndex_];
+        bw.dstBinding = 6;
+        bw.descriptorCount = 1;
+        bw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bw.pBufferInfo = &bi;
+        vkUpdateDescriptorSets(device_, 1, &bw, 0, nullptr);
+
+        const glm::vec2 vTexel(1.0f / volPartHalf_.width, 1.0f / volPartHalf_.height);
+        const VolumeRenderParams& rp = volRenderParams_;
+        PostUBO cb;
+        cb.input2 = slotDepth_;
+        cb.outTexel = vTexel;
+        cb.inTexel = sceneTexel;
+        cb.params0 = {rp.boundsMin.x, rp.boundsMin.y, rp.boundsMin.z, static_cast<f32>(rp.stepCount)};
+        cb.params1 = {rp.boundsMax.x, rp.boundsMax.y, rp.boundsMax.z, rp.densityScale};
+        cb.params2 = {rp.emission, static_cast<f32>(rp.shadowSteps), rp.extinction,
+                      ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
+        cb.params3 = {rp.worldOffset.x, rp.worldOffset.y, rp.worldOffset.z, 0.0f}; // volume placement
+        DrawPostPass(volRaymarchPipe_, postPass16_, volPartHalf_, cb);
+        PostUBO ap;
+        ap.input0 = hdrInput;
+        ap.input1 = slotVolPartHalf_;
+        ap.input2 = slotDepth_;
+        ap.outTexel = sceneTexel;
+        ap.inTexel = vTexel;
+        ap.params0 = {1.0f, 0.0f, 0.0f, 0.0f};
+        DrawPostPass(applyPipe_, postPass16_, volPart_, ap);
+        hdrInput = slotVolPart_;
+        nanoVolumeDrawn = true;
+    }
+
     // --- Volumetric particles: raymarch the density/temperature volume (half res),
     //     lit + self-shadowed + blackbody-emissive, composited over the HDR. Mirrors
     //     the D3D12 path; the volume stays in GENERAL (sampled read + storage write),
-    //     ordered by the compute->fragment barrier the splat recorded in BeginFrame. ---
-    if (volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
+    //     ordered by the compute->fragment barrier the splat recorded in BeginFrame.
+    //     LEGACY splat path - runs only when no NanoVDB grid was drawn above. ---
+    if (!nanoVolumeDrawn && volBlobCount_ > 0 && volPartReady_ && volTex_.IsValid() &&
         slotViews_.count(volTex_.index)) {
         // Bind the 3D volume into THIS frame's post set at binding 5. Safe to update:
         // BeginFrame waited on this slot's fence, so the set isn't in flight; only the
@@ -4561,6 +4628,38 @@ void VulkanDevice::SetVolumeParticles(const VolumeBlob* blobs, u32 count,
     volParams_ = params;
 }
 
+void VulkanDevice::SetVolumeGrid(const void* bytes, usize byteSize,
+                                 const VolumeRenderParams& params) {
+    // Store ptr/size; the upload + descriptor write happen in RunPostStack (the pointer must stay
+    // valid through the frame, like SetVolumeParticles).
+    volGridBytes_ = (bytes && byteSize > 0) ? bytes : nullptr;
+    volGridSize_ = volGridBytes_ ? byteSize : 0u;
+    volRenderParams_ = params;
+}
+
+// (Re)allocate this frame-in-flight's NanoVDB grid SSBO to hold `size` bytes (host-visible,
+// mapped). Grows on demand; safe to free+recreate here because BeginFrame already waited on this
+// frame slot's fence, so the previous buffer is no longer in flight.
+bool VulkanDevice::EnsureVolumeGridBuffer(usize size) {
+    const u32 f = frameIndex_;
+    if (volGridBuf_[f] != VK_NULL_HANDLE && volGridCapacity_[f] >= size) return true;
+    if (volGridBuf_[f] != VK_NULL_HANDLE) {
+        if (volGridMapped_[f]) { vkUnmapMemory(device_, volGridMem_[f]); volGridMapped_[f] = nullptr; }
+        vkDestroyBuffer(device_, volGridBuf_[f], nullptr);
+        vkFreeMemory(device_, volGridMem_[f], nullptr);
+        volGridBuf_[f] = VK_NULL_HANDLE;
+        volGridMem_[f] = VK_NULL_HANDLE;
+    }
+    const VkDeviceSize cap = (static_cast<VkDeviceSize>(size) + 0xFFFFFull) & ~0xFFFFFull; // 1 MiB round
+    const VkMemoryPropertyFlags hostVis =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!CreateBuffer(cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, hostVis, volGridBuf_[f], volGridMem_[f]))
+        return false;
+    vkMapMemory(device_, volGridMem_[f], 0, cap, 0, &volGridMapped_[f]);
+    volGridCapacity_[f] = cap;
+    return true;
+}
+
 void VulkanDevice::DispatchVolumeSplat() {
     if (volBlobCount_ == 0 || volFailed_ || !frameActive_) return; // data-driven
     if (!EnsureVolumeResources()) return;
@@ -5025,18 +5124,29 @@ void VulkanDevice::ExecuteQueuedCompute() {
     if (computeQueueCount_ == 0 || !frameActive_) { computeQueueCount_ = 0; return; }
     VkCommandBuffer cmd = commandBuffers_[frameIndex_];
 
-    // Cross-frame write-after-read guard, the buffer twin of the volume splat's
-    // image barrier: a device-local buffer is ONE allocation shared by every frame
-    // in flight, so this frame's compute write must not begin before the previous
-    // frame's vertex read finished. A barrier's first scope spans everything
-    // already submitted on this (single) queue.
+    // Cross-frame guard, the buffer twin of the volume splat's image barrier: a device-local
+    // buffer is ONE allocation shared by every frame in flight, so this frame's compute must not
+    // begin before the previous frame's accesses to it finished. A barrier's first scope spans
+    // everything already submitted on this (single) queue.
+    //
+    // The source scope covers BOTH the previous frame's vertex READ (compute->vertex->compute
+    // round-trips: ocean/particle displacement fed to a draw) AND the previous frame's compute
+    // WRITE. The latter is REQUIRED by the GPU fluid solver, whose state persists across frames as
+    // a compute WRITE (frame f) -> compute READ/WRITE (frame f+1): without COMPUTE_SHADER in the
+    // source scope, frame f+1's solver dispatches could observe frame f's writes only partially
+    // (nondeterministic corruption). D3D12's twin is the UNCONDITIONAL trailing per-dispatch UAV
+    // barrier after every dispatch in ExecuteQueuedCompute - it fires even after the frame's LAST
+    // dispatch, so it orders the previous frame's final write against this frame's read. (Note
+    // TransitionGpuBuffer no-ops for these buffers: they stay in UNORDERED_ACCESS frame to frame.)
     {
         VkMemoryBarrier war{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        war.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        war.srcAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT;
         war.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd,
                              VK_PIPELINE_STAGE_VERTEX_INPUT_BIT |
-                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &war, 0, nullptr, 0,
                              nullptr);
     }
@@ -6701,7 +6811,8 @@ VulkanDevice::~VulkanDevice() {
     if (ssrPipe_) vkDestroyPipeline(device_, ssrPipe_, nullptr);
     if (exposurePipe_) vkDestroyPipeline(device_, exposurePipe_, nullptr);
     if (volPipe_) vkDestroyPipeline(device_, volPipe_, nullptr);
-    if (volPartPipe_) vkDestroyPipeline(device_, volPartPipe_, nullptr); // raymarch pipeline
+    if (volPartPipe_) vkDestroyPipeline(device_, volPartPipe_, nullptr); // raymarch pipeline (splat)
+    if (volRaymarchPipe_) vkDestroyPipeline(device_, volRaymarchPipe_, nullptr); // NanoVDB raymarch
 
     // Volumetric compute-splat resources (EnsureVolumeResources). The volume image /
     // backing memory / sampled view live in textures_ (already freed above); only the
@@ -6715,6 +6826,8 @@ VulkanDevice::~VulkanDevice() {
         if (volParamsMem_[i]) vkFreeMemory(device_, volParamsMem_[i], nullptr); // implicitly unmaps
         if (volBlobBuf_[i]) vkDestroyBuffer(device_, volBlobBuf_[i], nullptr);
         if (volBlobMem_[i]) vkFreeMemory(device_, volBlobMem_[i], nullptr); // implicitly unmaps
+        if (volGridBuf_[i]) vkDestroyBuffer(device_, volGridBuf_[i], nullptr); // NanoVDB grid SSBO
+        if (volGridMem_[i]) vkFreeMemory(device_, volGridMem_[i], nullptr);    // implicitly unmaps
     }
     if (volDescPool_) vkDestroyDescriptorPool(device_, volDescPool_, nullptr);
     if (volSplatPipeline_) vkDestroyPipeline(device_, volSplatPipeline_, nullptr);

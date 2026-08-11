@@ -451,6 +451,7 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const PointLightComponent>()) add(e);
     for (const entt::entity e : reg.view<const SpotLightComponent>()) add(e);
     for (const entt::entity e : reg.view<const RectLightComponent>()) add(e);
+    for (const entt::entity e : reg.view<const VolumeComponent>()) add(e);
     for (const entt::entity e : reg.view<const RigidBody>()) add(e);
     for (const entt::entity e : reg.view<const AnimationTrack>()) add(e);
     for (const entt::entity e : reg.view<const AudioSource>()) add(e);
@@ -712,6 +713,18 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
             je["pointLight"] = {{"color", ToJson(l->color)},
                                 {"intensity", l->intensity},
                                 {"range", l->range}};
+        }
+        if (const VolumeComponent* v = reg.try_get<VolumeComponent>(e)) {
+            je["volume"] = {{"source", v->source},
+                            {"playing", v->playing},
+                            {"loop", v->loop},
+                            {"time", v->time},
+                            {"speed", v->speed},
+                            {"densityScale", v->render.densityScale},
+                            {"emission", v->render.emission},
+                            {"extinction", v->render.extinction},
+                            {"stepCount", v->render.stepCount},
+                            {"shadowSteps", v->render.shadowSteps}};
         }
         if (const SpotLightComponent* l = reg.try_get<SpotLightComponent>(e)) {
             je["spotLight"] = {{"color", ToJson(l->color)},
@@ -1492,6 +1505,20 @@ void ParseSceneJson(const json& root, SceneData& out) {
             d.light.direction = Vec3(it->value("direction", json()), {-0.5f, -1.0f, -0.4f});
             d.light.color = Vec3(it->value("color", json()), glm::vec3(1.0f));
             d.light.intensity = it->value("intensity", 4.0f);
+        }
+        if (auto it = je.find("volume"); it != je.end()) {
+            d.hasVolume = true;
+            VolumeComponent& v = d.volume;
+            v.source = it->value("source", std::string());
+            v.playing = it->value("playing", v.playing);
+            v.loop = it->value("loop", v.loop);
+            v.time = it->value("time", v.time);
+            v.speed = it->value("speed", v.speed);
+            v.render.densityScale = it->value("densityScale", v.render.densityScale);
+            v.render.emission = it->value("emission", v.render.emission);
+            v.render.extinction = it->value("extinction", v.render.extinction);
+            v.render.stepCount = glm::clamp(it->value("stepCount", v.render.stepCount), 4, 512);
+            v.render.shadowSteps = glm::clamp(it->value("shadowSteps", v.render.shadowSteps), 0, 32);
         }
         if (auto it = je.find("pointLight"); it != je.end()) {
             d.hasPointLight = true;
@@ -3027,6 +3054,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         }
         if (d.hasLight) reg.emplace<DirectionalLightComponent>(e, d.light);
         if (d.hasPointLight) reg.emplace<PointLightComponent>(e, d.pointLight);
+        if (d.hasVolume) reg.emplace<VolumeComponent>(e, d.volume);
         if (d.hasSpotLight) reg.emplace<SpotLightComponent>(e, d.spotLight);
         if (d.hasRectLight) reg.emplace<RectLightComponent>(e, d.rectLight);
         if (d.hasSchematic) {
@@ -4857,6 +4885,7 @@ bool ParseOneComponent(const char* key, const json& v, EntityData& out) {
 
 HBE_PLAIN_DELTA(DirLight, "light", hasLight, light, DirectionalLightComponent)
 HBE_PLAIN_DELTA(PointLight, "pointLight", hasPointLight, pointLight, PointLightComponent)
+HBE_PLAIN_DELTA(Vol, "volume", hasVolume, volume, VolumeComponent)
 HBE_PLAIN_DELTA(SpotLight, "spotLight", hasSpotLight, spotLight, SpotLightComponent)
 HBE_PLAIN_DELTA(RectLight, "rectLight", hasRectLight, rectLight, RectLightComponent)
 HBE_PLAIN_DELTA(Cam, "camera", hasCamera, camera, CameraComponent)
@@ -4893,6 +4922,7 @@ const DeltaApplier kAppliers[] = {
     {"transform", &ApplyTransformComp, &RemoveTransformComp},
     {"light", &DirLightApply, &DirLightRemove},
     {"pointLight", &PointLightApply, &PointLightRemove},
+    {"volume", &VolApply, &VolRemove},
     {"spotLight", &SpotLightApply, &SpotLightRemove},
     {"rectLight", &RectLightApply, &RectLightRemove},
     {"camera", &CamApply, &CamRemove},

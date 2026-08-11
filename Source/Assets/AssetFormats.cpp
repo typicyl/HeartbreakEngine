@@ -98,6 +98,8 @@ const std::vector<EngineAsset> kEngineAssets = {
      "silently failed to ship (SceneSerializer just skips an invalid bake)"},
     {".hbfrac",     "Fracture",         true,  RefScan::Hook,     &CollectRefsFracture,
      "pre-fractured destructible chunks + adjacency; header names an interior .hbmat"},
+    {".hbvol",      "Volume Cache",     true,  RefScan::Leaf,     nullptr,
+     "baked NanoVDB volume frames (VolumeComponent.source); binary grid blobs, names no other asset"},
     // NOT packed by extension - each for a specific reason. Do not "fix" these to
     // true: .hbproj IS read at runtime through the VFS, but it ships via the
     // separate uap::ExtraFile path (BuildShipping packs it under the virtual name

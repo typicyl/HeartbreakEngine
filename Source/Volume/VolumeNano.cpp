@@ -63,4 +63,70 @@ bool BuildTestVolumeBlob(std::vector<std::uint8_t>& outBytes, glm::vec3& outMin,
     return true;
 }
 
+bool BuildScalarGridBlob(const VolumeField& field, const VolumeBounds& b,
+                         std::vector<std::uint8_t>& outBytes, GridBuildStats& stats,
+                         float threshold) {
+    stats = GridBuildStats{};
+    if (field.type != FieldType::Scalar) return false; // only scalar fields become float grids
+    const std::size_t count = b.voxelCount();
+    if (count == 0 || field.data.size() < count) return false;
+
+    const glm::vec3 vs = b.voxelSize();
+    if (vs.x <= 0.0f || vs.y <= 0.0f || vs.z <= 0.0f) return false;
+    // NanoVDB's build::Grid transform here is a UNIFORM scale (setTransform takes one double), so only
+    // near-cubic voxels map correctly. A non-cubic domain would silently bake wrong world geometry
+    // into the shipped .hbvol (every off-axis sample reads the wrong world position) - refuse it.
+    // (Anisotropic voxels would need a full nanovdb::Map; a documented follow-up.)
+    const float vMax = std::fmax(vs.x, std::fmax(vs.y, vs.z));
+    const float vMin = std::fmin(vs.x, std::fmin(vs.y, vs.z));
+    if (vMax > vMin * 1.01f) return false;
+    const double    scale = static_cast<double>(vs.x);        // cubic (guarded above)
+    const glm::vec3 tr = b.worldMin + 0.5f * vs;              // index 0 -> centre of voxel 0
+    const float     bg = field.background;
+
+    nanovdb::tools::build::Grid<float> builder(bg, field.name.empty() ? "field" : field.name.c_str());
+    builder.setTransform(scale, nanovdb::Vec3d(tr.x, tr.y, tr.z));
+    auto acc = builder.getAccessor();
+    bool any = false;
+    for (int z = 0; z < b.dim.z; ++z)
+        for (int y = 0; y < b.dim.y; ++y)
+            for (int x = 0; x < b.dim.x; ++x) {
+                const float v = field.data[VoxelIndex(b, x, y, z)];
+                if (std::fabs(v - bg) <= threshold) continue; // prune to sparsity
+                acc.setValue(nanovdb::Coord(x, y, z), v);
+                ++stats.activeVoxels;
+                if (!any) { stats.vmin = stats.vmax = v; any = true; }
+                else { stats.vmin = std::fmin(stats.vmin, v); stats.vmax = std::fmax(stats.vmax, v); }
+            }
+
+    auto handle = nanovdb::tools::createNanoGrid(builder);
+    const std::size_t bytes = static_cast<std::size_t>(handle.bufferSize());
+    if (bytes == 0 || handle.data() == nullptr) return false;
+    outBytes.resize(bytes);
+    std::memcpy(outBytes.data(), handle.data(), bytes);
+    return true;
+}
+
+bool BuildDensityGridBlob(const VolumeFrame& frame, std::vector<std::uint8_t>& outBytes,
+                          glm::vec3& outMin, glm::vec3& outMax, float threshold) {
+    const VolumeField* d = frame.field("density");
+    if (d == nullptr || d->data.empty()) return false;
+    GridBuildStats stats;
+    if (!BuildScalarGridBlob(*d, frame.bounds, outBytes, stats, threshold)) return false;
+    outMin = frame.bounds.worldMin;
+    outMax = frame.bounds.worldMax;
+    return true;
+}
+
+float SampleScalarGridBlob(const void* bytes, std::size_t byteSize, int x, int y, int z) {
+    if (bytes == nullptr || byteSize < sizeof(nanovdb::GridData)) return 0.0f;
+    // The blob is untrusted at runtime (streamed from a pack). Bound the grid to the buffer before
+    // traversing its interior tree offsets, so a truncated/garbage blob cannot walk out of bounds.
+    const auto* gd = static_cast<const nanovdb::GridData*>(bytes);
+    if (gd->mGridSize < sizeof(nanovdb::GridData) || gd->mGridSize > byteSize) return 0.0f;
+    const auto* grid = static_cast<const nanovdb::FloatGrid*>(bytes);
+    if (grid->gridType() != nanovdb::GridType::Float) return 0.0f; // guards against non-float blobs
+    return grid->getAccessor().getValue(nanovdb::Coord(x, y, z));
+}
+
 } // namespace hbe::volume

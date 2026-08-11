@@ -7813,209 +7813,271 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             PushUndo(scene);
             reg.emplace<Transform>(sel);
         }
-        if (!reg.all_of<MeshInstance>(sel) && ImGui::BeginMenu("Mesh")) {
-            const char* chosen = nullptr;
-            for (const char* p : mesh::kPrimitiveNames) {
-                std::string label = p;
-                label[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label[0])));
-                if (ImGui::MenuItem(label.c_str())) chosen = p;
+        ImGui::Separator();
+
+        // Components are grouped into category submenus so this menu stays scannable as the
+        // component set grows. Each item keeps its own already-present gate, so a fully-populated
+        // category simply shows an empty submenu.
+        if (ImGui::BeginMenu("Rendering")) {
+            if (!reg.all_of<MeshInstance>(sel) && ImGui::BeginMenu("Mesh")) {
+                const char* chosen = nullptr;
+                for (const char* p : mesh::kPrimitiveNames) {
+                    std::string label = p;
+                    label[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(label[0])));
+                    if (ImGui::MenuItem(label.c_str())) chosen = p;
+                }
+                if (chosen) {
+                    PushUndo(scene);
+                    MeshData md = mesh::GeneratePrimitive(chosen);
+                    MeshInstance mi;
+                    mi.mesh = renderer.UploadMesh(md);
+                    mi.baseColor = {0.8f, 0.8f, 0.82f, 1.0f};
+                    reg.emplace<MeshInstance>(sel, mi);
+                    reg.emplace_or_replace<MeshRef>(sel, MeshRef{std::string("prim:") + chosen});
+                    glm::vec3 bmin, bmax;
+                    ComputeBounds(md, bmin, bmax);
+                    reg.emplace_or_replace<AABB>(sel, AABB{bmin, bmax});
+                    if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+                }
+                ImGui::EndMenu();
             }
-            if (chosen) {
+            if (!reg.all_of<DecalComponent>(sel) && ImGui::MenuItem("Decal")) {
                 PushUndo(scene);
-                MeshData md = mesh::GeneratePrimitive(chosen);
-                MeshInstance mi;
-                mi.mesh = renderer.UploadMesh(md);
-                mi.baseColor = {0.8f, 0.8f, 0.82f, 1.0f};
-                reg.emplace<MeshInstance>(sel, mi);
-                reg.emplace_or_replace<MeshRef>(sel, MeshRef{std::string("prim:") + chosen});
-                glm::vec3 bmin, bmax;
-                ComputeBounds(md, bmin, bmax);
-                reg.emplace_or_replace<AABB>(sel, AABB{bmin, bmax});
+                reg.emplace<DecalComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<TerrainComponent>(sel) && ImGui::MenuItem("Terrain")) {
+                PushUndo(scene);
+                reg.emplace<TerrainComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<WaterComponent>(sel) && ImGui::MenuItem("Water (Gerstner)")) {
+                PushUndo(scene);
+                reg.emplace<WaterComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<WorldText>(sel) && ImGui::MenuItem("World Text (3D)")) {
+                PushUndo(scene);
+                reg.emplace<WorldText>(sel);
                 if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
             }
             ImGui::EndMenu();
         }
-        if (!reg.all_of<RigidBody>(sel) && ImGui::MenuItem("Rigid Body")) {
-            PushUndo(scene);
-            RigidBody rb;
-            if (const AABB* box = reg.try_get<AABB>(sel)) {
-                rb.halfExtents = glm::max((box->max - box->min) * 0.5f, glm::vec3(0.01f));
-                rb.centerOffset = (box->min + box->max) * 0.5f;
-                rb.radius = glm::max(rb.halfExtents.x,
-                                     glm::max(rb.halfExtents.y, rb.halfExtents.z));
+        if (ImGui::BeginMenu("Effects")) {
+            if (!reg.all_of<ParticleEmitter>(sel) && ImGui::BeginMenu("Particle Emitter")) {
+                const auto addEmitter = [&](ParticleEmitter em) {
+                    PushUndo(scene);
+                    reg.emplace<ParticleEmitter>(sel, std::move(em));
+                    if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+                };
+                if (ImGui::MenuItem("Default")) addEmitter(ParticleEmitter{});
+                ImGui::Separator();
+                for (u32 i = 0; i < static_cast<u32>(particle::Template::Count); ++i) {
+                    const particle::Template tmpl = static_cast<particle::Template>(i);
+                    if (ImGui::MenuItem(particle::TemplateName(tmpl)))
+                        addEmitter(particle::MakeTemplate(tmpl));
+                }
+                ImGui::EndMenu();
             }
-            reg.emplace<RigidBody>(sel, rb);
-        }
-        if (!reg.all_of<DirectionalLightComponent>(sel) &&
-            ImGui::MenuItem("Directional Light")) {
-            PushUndo(scene);
-            reg.emplace<DirectionalLightComponent>(sel);
-        }
-        if (!reg.all_of<PointLightComponent>(sel) && ImGui::MenuItem("Point Light")) {
-            PushUndo(scene);
-            reg.emplace<PointLightComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<SpotLightComponent>(sel) && ImGui::MenuItem("Spot Light")) {
-            PushUndo(scene);
-            reg.emplace<SpotLightComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<AnimationTrack>(sel) && ImGui::MenuItem("Animation")) {
-            PushUndo(scene);
-            reg.emplace<AnimationTrack>(sel);
-        }
-        if (!reg.all_of<AudioSource>(sel) && ImGui::MenuItem("Audio Source")) {
-            PushUndo(scene);
-            reg.emplace<AudioSource>(sel);
-        }
-        if (!reg.all_of<DialogueActor>(sel) && ImGui::MenuItem("Dialogue Actor")) {
-            PushUndo(scene);
-            reg.emplace<DialogueActor>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<SchematicComponent>(sel) && ImGui::MenuItem("Schematic (Visual Script)")) {
-            PushUndo(scene);
-            reg.emplace<SchematicComponent>(sel);
-        }
-        if (!reg.all_of<Checkpoint>(sel) && ImGui::MenuItem("Checkpoint")) {
-            PushUndo(scene);
-            reg.emplace<Checkpoint>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<Interactable>(sel) && ImGui::MenuItem("Interactable")) {
-            PushUndo(scene);
-            reg.emplace<Interactable>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<TriggerVolume>(sel) && ImGui::MenuItem("Trigger Volume")) {
-            PushUndo(scene);
-            reg.emplace<TriggerVolume>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<Spawner>(sel) && ImGui::MenuItem("Spawner")) {
-            PushUndo(scene);
-            reg.emplace<Spawner>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<Encounter>(sel) && ImGui::MenuItem("Encounter")) {
-            PushUndo(scene);
-            reg.emplace<Encounter>(sel);
-        }
-        if (!reg.all_of<Character>(sel) && ImGui::MenuItem("Character (Modular Rig)")) {
-            PushUndo(scene);
-            reg.emplace<Character>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<MorphState>(sel) && ImGui::MenuItem("Morph State (Blendshapes)")) {
-            PushUndo(scene);
-            reg.emplace<MorphState>(sel);
-        }
-        if (!reg.all_of<FacialAnimator>(sel) && ImGui::MenuItem("Facial Animator")) {
-            PushUndo(scene);
-            reg.emplace<FacialAnimator>(sel);
-        }
-        if (!reg.all_of<DecalComponent>(sel) && ImGui::MenuItem("Decal")) {
-            PushUndo(scene);
-            reg.emplace<DecalComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<WaterComponent>(sel) && ImGui::MenuItem("Water (Gerstner)")) {
-            PushUndo(scene);
-            reg.emplace<WaterComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<ParticleEmitter>(sel) && ImGui::BeginMenu("Particle Emitter")) {
-            const auto addEmitter = [&](ParticleEmitter em) {
+            if (!reg.all_of<VolumeComponent>(sel) && ImGui::MenuItem("Volume (Baked Smoke/Fire)")) {
                 PushUndo(scene);
-                reg.emplace<ParticleEmitter>(sel, std::move(em));
+                reg.emplace<VolumeComponent>(sel);
                 if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-            };
-            if (ImGui::MenuItem("Default")) addEmitter(ParticleEmitter{});
-            ImGui::Separator();
-            for (u32 i = 0; i < static_cast<u32>(particle::Template::Count); ++i) {
-                const particle::Template tmpl = static_cast<particle::Template>(i);
-                if (ImGui::MenuItem(particle::TemplateName(tmpl)))
-                    addEmitter(particle::MakeTemplate(tmpl));
+            }
+            if (!reg.all_of<CensorComponent>(sel) && ImGui::MenuItem("Painterly Censor")) {
+                PushUndo(scene);
+                reg.emplace<CensorComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
             }
             ImGui::EndMenu();
         }
-        if (!reg.all_of<CameraComponent>(sel) && ImGui::MenuItem("Camera")) {
-            PushUndo(scene);
-            reg.emplace<CameraComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        if (ImGui::BeginMenu("Lighting")) {
+            if (!reg.all_of<DirectionalLightComponent>(sel) &&
+                ImGui::MenuItem("Directional Light")) {
+                PushUndo(scene);
+                reg.emplace<DirectionalLightComponent>(sel);
+            }
+            if (!reg.all_of<PointLightComponent>(sel) && ImGui::MenuItem("Point Light")) {
+                PushUndo(scene);
+                reg.emplace<PointLightComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<SpotLightComponent>(sel) && ImGui::MenuItem("Spot Light")) {
+                PushUndo(scene);
+                reg.emplace<SpotLightComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
-        if (!reg.all_of<CameraZone>(sel) && ImGui::MenuItem("Camera Zone")) {
-            PushUndo(scene);
-            reg.emplace<CameraZone>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        if (ImGui::BeginMenu("Camera")) {
+            if (!reg.all_of<CameraComponent>(sel) && ImGui::MenuItem("Camera")) {
+                PushUndo(scene);
+                reg.emplace<CameraComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<CameraZone>(sel) && ImGui::MenuItem("Camera Zone")) {
+                PushUndo(scene);
+                reg.emplace<CameraZone>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<CameraSpline>(sel) && ImGui::MenuItem("Camera Spline")) {
+                PushUndo(scene);
+                reg.emplace<CameraSpline>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
-        if (!reg.all_of<MusicZone>(sel) && ImGui::MenuItem("Music Zone")) {
-            PushUndo(scene);
-            reg.emplace<MusicZone>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        if (ImGui::BeginMenu("Audio")) {
+            if (!reg.all_of<AudioSource>(sel) && ImGui::MenuItem("Audio Source")) {
+                PushUndo(scene);
+                reg.emplace<AudioSource>(sel);
+            }
+            if (!reg.all_of<MusicZone>(sel) && ImGui::MenuItem("Music Zone")) {
+                PushUndo(scene);
+                reg.emplace<MusicZone>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
-        if (!reg.all_of<CameraSpline>(sel) && ImGui::MenuItem("Camera Spline")) {
-            PushUndo(scene);
-            reg.emplace<CameraSpline>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        if (ImGui::BeginMenu("Animation & Rigging")) {
+            if (!reg.all_of<AnimationTrack>(sel) && ImGui::MenuItem("Animation")) {
+                PushUndo(scene);
+                reg.emplace<AnimationTrack>(sel);
+            }
+            if (!reg.all_of<Animator>(sel) && ImGui::MenuItem("Animator")) {
+                PushUndo(scene);
+                reg.emplace<Animator>(sel);
+            }
+            if (!reg.all_of<MotionMatching>(sel) && ImGui::MenuItem("Motion Matching")) {
+                PushUndo(scene);
+                reg.emplace<MotionMatching>(sel);
+                if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // MM drives an Animator
+            }
+            if (!reg.all_of<IKConstraint>(sel) && ImGui::MenuItem("IK Constraint")) {
+                PushUndo(scene);
+                reg.emplace<IKConstraint>(sel);
+                if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // IK poses an Animator
+            }
+            if (!reg.all_of<Character>(sel) && ImGui::MenuItem("Character (Modular Rig)")) {
+                PushUndo(scene);
+                reg.emplace<Character>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<MorphState>(sel) && ImGui::MenuItem("Morph State (Blendshapes)")) {
+                PushUndo(scene);
+                reg.emplace<MorphState>(sel);
+            }
+            if (!reg.all_of<FacialAnimator>(sel) && ImGui::MenuItem("Facial Animator")) {
+                PushUndo(scene);
+                reg.emplace<FacialAnimator>(sel);
+            }
+            if (!reg.all_of<Rotator>(sel) && ImGui::MenuItem("Rotator")) {
+                PushUndo(scene);
+                reg.emplace<Rotator>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
-        if (!reg.all_of<TerrainComponent>(sel) && ImGui::MenuItem("Terrain")) {
-            PushUndo(scene);
-            reg.emplace<TerrainComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+        if (ImGui::BeginMenu("Physics")) {
+            if (!reg.all_of<RigidBody>(sel) && ImGui::MenuItem("Rigid Body")) {
+                PushUndo(scene);
+                RigidBody rb;
+                if (const AABB* box = reg.try_get<AABB>(sel)) {
+                    rb.halfExtents = glm::max((box->max - box->min) * 0.5f, glm::vec3(0.01f));
+                    rb.centerOffset = (box->min + box->max) * 0.5f;
+                    rb.radius = glm::max(rb.halfExtents.x,
+                                         glm::max(rb.halfExtents.y, rb.halfExtents.z));
+                }
+                reg.emplace<RigidBody>(sel, rb);
+            }
+            if (!reg.all_of<CharacterController>(sel) && ImGui::MenuItem("Character Controller")) {
+                PushUndo(scene);
+                reg.emplace<CharacterController>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
-        if (!reg.all_of<MotionMatching>(sel) && ImGui::MenuItem("Motion Matching")) {
-            PushUndo(scene);
-            reg.emplace<MotionMatching>(sel);
-            if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // MM drives an Animator
+        if (ImGui::BeginMenu("Gameplay & Logic")) {
+            if (!reg.all_of<Checkpoint>(sel) && ImGui::MenuItem("Checkpoint")) {
+                PushUndo(scene);
+                reg.emplace<Checkpoint>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<Interactable>(sel) && ImGui::MenuItem("Interactable")) {
+                PushUndo(scene);
+                reg.emplace<Interactable>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<TriggerVolume>(sel) && ImGui::MenuItem("Trigger Volume")) {
+                PushUndo(scene);
+                reg.emplace<TriggerVolume>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<Spawner>(sel) && ImGui::MenuItem("Spawner")) {
+                PushUndo(scene);
+                reg.emplace<Spawner>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<Encounter>(sel) && ImGui::MenuItem("Encounter")) {
+                PushUndo(scene);
+                reg.emplace<Encounter>(sel);
+            }
+            if (!reg.all_of<Health>(sel) && ImGui::MenuItem("Health (Combat)")) {
+                PushUndo(scene);
+                reg.emplace<Health>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel); // needs a world spot to be hit
+            }
+            if (!reg.all_of<Weapon>(sel) && ImGui::MenuItem("Weapon (Combat)")) {
+                PushUndo(scene);
+                reg.emplace<Weapon>(sel);
+            }
+            if (!reg.all_of<SchematicComponent>(sel) &&
+                ImGui::MenuItem("Schematic (Visual Script)")) {
+                PushUndo(scene);
+                reg.emplace<SchematicComponent>(sel);
+            }
+            if (!reg.all_of<DialogueActor>(sel) && ImGui::MenuItem("Dialogue Actor")) {
+                PushUndo(scene);
+                reg.emplace<DialogueActor>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
-        if (!reg.all_of<Rotator>(sel) && ImGui::MenuItem("Rotator")) {
-            PushUndo(scene);
-            reg.emplace<Rotator>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<CensorComponent>(sel) && ImGui::MenuItem("Painterly Censor")) {
-            PushUndo(scene);
-            reg.emplace<CensorComponent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<CharacterController>(sel) && ImGui::MenuItem("Character Controller")) {
-            PushUndo(scene);
-            reg.emplace<CharacterController>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<Health>(sel) && ImGui::MenuItem("Health (Combat)")) {
-            PushUndo(scene);
-            reg.emplace<Health>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel); // needs a world spot to be hit
-        }
-        if (!reg.all_of<Weapon>(sel) && ImGui::MenuItem("Weapon (Combat)")) {
-            PushUndo(scene);
-            reg.emplace<Weapon>(sel);
-        }
-        if (!reg.all_of<AIPerception>(sel) && ImGui::MenuItem("AI Perception")) {
-            PushUndo(scene);
-            reg.emplace<AIPerception>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<AIBehavior>(sel) && ImGui::MenuItem("AI Behavior")) {
-            PushUndo(scene);
-            reg.emplace<AIBehavior>(sel);
-            if (!reg.all_of<NavigationAgent>(sel)) reg.emplace<NavigationAgent>(sel); // AI drives nav
-            if (!reg.all_of<AIPerception>(sel)) reg.emplace<AIPerception>(sel);        // + senses
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<IKConstraint>(sel) && ImGui::MenuItem("IK Constraint")) {
-            PushUndo(scene);
-            reg.emplace<IKConstraint>(sel);
-            if (!reg.all_of<Animator>(sel)) reg.emplace<Animator>(sel); // IK poses an Animator
+        if (ImGui::BeginMenu("AI & Navigation")) {
+            if (!reg.all_of<AIPerception>(sel) && ImGui::MenuItem("AI Perception")) {
+                PushUndo(scene);
+                reg.emplace<AIPerception>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<AIBehavior>(sel) && ImGui::MenuItem("AI Behavior")) {
+                PushUndo(scene);
+                reg.emplace<AIBehavior>(sel);
+                if (!reg.all_of<NavigationAgent>(sel)) reg.emplace<NavigationAgent>(sel); // AI drives nav
+                if (!reg.all_of<AIPerception>(sel)) reg.emplace<AIPerception>(sel);        // + senses
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<NavigationAgent>(sel) && ImGui::MenuItem("Navigation Agent")) {
+                PushUndo(scene);
+                reg.emplace<NavigationAgent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<NavigationObstacle>(sel) && ImGui::MenuItem("Navigation Obstacle")) {
+                PushUndo(scene);
+                reg.emplace<NavigationObstacle>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<NavmeshInput>(sel) && ImGui::MenuItem("Navmesh Input")) {
+                PushUndo(scene);
+                reg.emplace<NavmeshInput>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            ImGui::EndMenu();
         }
         // CREATION-TIME SEPARATION GUARD, component half. A UI component may only
         // be added to an entity that is already inside a `.hbui` document - the
         // same rule as the create menu, applied where the other half of the hole
-        // was. (World Text below is NOT gated: it is level signage, not screen UI.)
-        {
+        // was.
+        if (ImGui::BeginMenu("UI")) {
             const bool inDoc = reg.all_of<UIDocMember>(sel);
             if (!inDoc) ImGui::BeginDisabled();
             if (!reg.all_of<UIElement>(sel) && ImGui::MenuItem("UI Element")) {
@@ -8049,30 +8111,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                       "Create the element from Hierarchy > + Create > UI\n"
                                       "with a document open.");
             }
-        }
-        if (!reg.all_of<WorldText>(sel) && ImGui::MenuItem("World Text (3D)")) {
-            PushUndo(scene);
-            reg.emplace<WorldText>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<Animator>(sel) && ImGui::MenuItem("Animator")) {
-            PushUndo(scene);
-            reg.emplace<Animator>(sel);
-        }
-        if (!reg.all_of<NavigationAgent>(sel) && ImGui::MenuItem("Navigation Agent")) {
-            PushUndo(scene);
-            reg.emplace<NavigationAgent>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<NavigationObstacle>(sel) && ImGui::MenuItem("Navigation Obstacle")) {
-            PushUndo(scene);
-            reg.emplace<NavigationObstacle>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
-        }
-        if (!reg.all_of<NavmeshInput>(sel) && ImGui::MenuItem("Navmesh Input")) {
-            PushUndo(scene);
-            reg.emplace<NavmeshInput>(sel);
-            if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            ImGui::EndMenu();
         }
         ImGui::EndPopup();
     }
@@ -10879,6 +10918,60 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<PointLightComponent>(sel);
+        }
+    }
+
+    // --- Volume (baked .hbvol playback) ------------------------------------------
+    if (VolumeComponent* vc = reg.try_get<VolumeComponent>(sel)) {
+        const SectionState s = ComponentSection("Volume");
+        if (s.open) {
+            char buf[300];
+            std::snprintf(buf, sizeof(buf), "%s", vc->source.c_str());
+            if (ImGui::InputText("Source (.hbvol)", buf, sizeof(buf))) vc->source = buf;
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                PushUndo(scene);
+                vc->cacheHandle = 0xFFFFFFFFu; // re-acquire on a path change
+            }
+            if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("HBE_ASSET_PATH")) {
+                    const std::filesystem::path src(static_cast<const char*>(p->Data));
+                    if (src.extension() == ".hbvol") {
+                        PushUndo(scene);
+                        vc->source = src.string();
+                        vc->cacheHandle = 0xFFFFFFFFu;
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            ImGui::Checkbox("Playing", &vc->playing);
+            undoOnActivate();
+            ImGui::SameLine();
+            ImGui::Checkbox("Loop", &vc->loop);
+            undoOnActivate();
+            ImGui::DragFloat("Speed", &vc->speed, 0.02f, 0.0f, 10.0f);
+            undoOnActivate();
+            ImGui::Separator();
+            ImGui::DragFloat("Density", &vc->render.densityScale, 0.02f, 0.0f, 20.0f);
+            undoOnActivate();
+            ImGui::DragFloat("Extinction", &vc->render.extinction, 0.02f, 0.01f, 20.0f);
+            undoOnActivate();
+            ImGui::DragFloat("Emission", &vc->render.emission, 0.02f, 0.0f, 20.0f);
+            undoOnActivate();
+            ImGui::DragInt("March Steps", &vc->render.stepCount, 1.0f, 4, 512);
+            undoOnActivate();
+            ImGui::DragInt("Shadow Steps", &vc->render.shadowSteps, 1.0f, 0, 32);
+            undoOnActivate();
+            if (vc->source.empty())
+                ImGui::TextDisabled("Drop or type a baked .hbvol path.");
+            else if (vc->resolvedFrame >= 0)
+                ImGui::TextDisabled("Playing frame %d.", vc->resolvedFrame);
+            else
+                ImGui::TextDisabled("Loading / not found. Plays in Game mode.");
+            ImGui::TextDisabled("Placed at the entity position (translation only).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<VolumeComponent>(sel);
         }
     }
 

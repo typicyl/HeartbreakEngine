@@ -3060,7 +3060,7 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.params1 = {rp.boundsMax.x, rp.boundsMax.y, rp.boundsMax.z, rp.densityScale};
         cb.params2 = {rp.emission, static_cast<f32>(rp.shadowSteps), rp.extinction,
                       ps.taaEnabled ? glm::mod(glm::floor(view.timeSeconds * 120.0f), 64.0f) : 0.0f};
-        cb.params3 = {0.0f, 0.0f, 0.0f, 0.0f};
+        cb.params3 = {rp.worldOffset.x, rp.worldOffset.y, rp.worldOffset.z, 0.0f}; // volume placement
         DrawPostPass(volRaymarchPSO_.Get(), volPartHalf_.Get(), rtvAt(20 + kBloomMaxMips), hw, hh, cb);
         PostCB ap;
         ap.input0 = hdrInput;

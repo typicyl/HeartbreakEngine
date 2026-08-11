@@ -24,6 +24,7 @@
 #include "Scene/CameraSystem.h"
 #include "Scene/CharacterController.h"
 #include "Scene/ParticleSystem.h"
+#include "Volume/VolumeCache.h" // baked .hbvol playback for VolumeComponent
 #include "Scene/WeatherSystem.h"
 #include "Scene/DecalSystem.h"
 #include "Scene/WaterSystem.h"
@@ -3153,6 +3154,39 @@ int Engine::Run(const EngineConfig& configIn) {
                 }
             }
             renderer.SetVolumeParticles(volumeBlobs, vp); // before RenderScene (Vulkan splats in BeginFrame)
+        }
+
+        // Baked volume playback (VolumeComponent -> .hbvol). Advance every component's playhead, and
+        // feed the ONE active volume's current-frame density grid to the renderer (the RHI volume feed
+        // is single-grid). Runs before RenderScene like SetVolumeParticles, and SUPERSEDES it: a fed
+        // grid takes precedence over the legacy splat, while feeding a null grid lets the splat draw.
+        {
+            auto& vcache = volume::GlobalVolumeCache();
+            bool fedVolume = false;
+            for (const entt::entity e : scene.Registry().view<Transform, VolumeComponent>()) {
+                VolumeComponent& vc = scene.Registry().get<VolumeComponent>(e);
+                if (vc.cacheHandle == volume::VolumeCache::kInvalid && !vc.source.empty())
+                    vc.cacheHandle = vcache.Acquire(vc.source); // non-blocking; kicks async load
+                // Advance the (serialized) playhead only when the sim is RUNNING (play mode / shipped
+                // runtime). In editor EDIT mode physics is stopped, so this stays frozen - otherwise
+                // idle editing + Save All would bake a non-deterministic vc.time into the .hbscene
+                // (the "authoring view must not write runtime state" rule).
+                if (vc.playing && GetPhysics().IsRunning()) vc.time += dt * vc.speed;
+                if (fedVolume) continue;                         // single-volume limit: first eligible only
+                if (vcache.GetState(vc.cacheHandle) != volume::VolumeCache::State::Ready) continue;
+                const i32 frame = vcache.TimeToFrame(vc.cacheHandle, vc.time, vc.loop);
+                vc.resolvedFrame = frame;
+                const volume::VolumeAsset::GridView g = vcache.DensityGrid(vc.cacheHandle, frame);
+                if (!g.valid()) continue;
+                const volume::VolumeBounds b = vcache.Bounds(vc.cacheHandle);
+                rhi::VolumeRenderParams rp = vc.render;
+                rp.boundsMin = b.worldMin; // grid's baked LOCAL AABB
+                rp.boundsMax = b.worldMax;
+                rp.worldOffset = glm::vec3(scene.WorldMatrix(e)[3]); // place at entity world position
+                renderer.SetVolumeGrid(g.bytes, g.size, rp);
+                fedVolume = true;
+            }
+            if (!fedVolume) renderer.SetVolumeGrid(nullptr, 0, {}); // no active volume -> allow the splat
         }
 
         // FFT ocean (Tessendorf): drive the GPU compute FFT for any fftOcean water and bind its

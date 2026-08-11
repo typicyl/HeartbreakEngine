@@ -165,6 +165,8 @@ struct EntityData {
     AudioSource audio;
     bool hasParticles = false;
     ParticleEmitter particles;
+    bool hasVolume = false;
+    VolumeComponent volume;
     bool hasSchematic = false;
     std::string schematicAsset;
     bool hasDestructible = false;

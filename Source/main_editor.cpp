@@ -36,6 +36,13 @@
 #include "Dialogue/DialogueGraph.h" // --test-graphfanin (node-graph reconvergence)
 #include "Scene/OceanFFT.h"         // --test-oceanfft (Tessendorf FFT reference/oracle)
 #include "Volume/VolumeNano.h"      // --test-nanovdb (header-only NanoVDB build gate)
+#include "Volume/VolumeSimController.h" // --test-volsim (volume sim framework gate)
+#include "Volume/VolumeBaker.h"         // --test-hbvol (bake -> .hbvol)
+#include "Volume/VolumeAsset.h"         // --test-hbvol (.hbvol load)
+#include "Volume/VolumeCache.h"         // --test-volume-timing (playback cache)
+#include "Volume/EulerianSmokeSimulation.h" // --test-eulersim (CPU fluid solver gate)
+#include "Volume/GpuEulerianSmokeSimulation.h" // --test-gpusolver (GPU solver golden-diff)
+#include "Volume/VolumeSimRegistry.h"   // --volume-sim-preview (create a solver by model id)
 #include "Editor/Editor.h"
 #include "Editor/Importer.h"
 #include "Editor/MovieRender.h"
@@ -137,6 +144,167 @@ int main(int argc, char** argv) {
             const bool ok = hbe::volume::SelfTestNanoVDB(report);
             std::printf("nanovdb %s: %s\n", ok ? "PASS" : "FAIL", report.c_str());
             return ok ? 0 : 1;
+        }
+        // --test-volsim: drive the built-in procedural-plume sim through VolumeSimController into a
+        // sink and assert frame count, fixed-dt timing, deterministic re-record, and that scrubbing
+        // reproduces recorded frames - the Phase-0 gate for the volume SIMULATION framework
+        // (registry -> IVolumeSimulation -> controller -> VolumeFrame -> sink). Pure CPU: no GPU/window.
+        if (std::strcmp(argv[i], "--test-volsim") == 0) {
+            std::string report;
+            const bool ok = hbe::volume::SelfTestVolumeController(report);
+            std::printf("volsim %s: %s\n", ok ? "PASS" : "FAIL", report.c_str());
+            return ok ? 0 : 1;
+        }
+        // --test-eulersim: run the CPU Eulerian smoke solver headless and assert it produces density,
+        // that a hot plume's centre of mass RISES (buoyancy + projection), no NaN/Inf, and that a
+        // re-run is bit-identical (determinism). The Phase-1 solver correctness gate. Pure CPU.
+        if (std::strcmp(argv[i], "--test-eulersim") == 0) {
+            std::string report;
+            const bool ok = hbe::volume::SelfTestEulerianSmoke(report);
+            std::printf("eulersim %s: %s\n", ok ? "PASS" : "FAIL", report.c_str());
+            return ok ? 0 : 1;
+        }
+        // --test-hbvol: the BAKE round-trip gate. Simulate -> VolumeBaker -> .hbvol bytes -> VolumeAsset
+        // load -> sample the baked NanoVDB grids and diff against the CPU field (within the sparsity
+        // prune threshold), plus determinism (a re-bake is byte-identical) + file save/load. Pure CPU,
+        // no GPU/window - proves the baker + format + reader are correct, source-agnostically.
+        if (std::strcmp(argv[i], "--test-hbvol") == 0) {
+            using namespace hbe::volume;
+            VolumeSimConfig cfg;
+            cfg.model = "eulerian-smoke";
+            cfg.bounds.worldMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+            cfg.bounds.worldMax = glm::vec3(1.0f, 4.0f, 1.0f);
+            cfg.bounds.dim = glm::ivec3(24, 48, 24);
+            cfg.frameRate = 30.0f;
+            cfg.substeps = 2;
+            cfg.pressureIterations = 15;
+            cfg.bakeFields = {"density", "temperature"};
+            {
+                VolumeEmitter em;
+                em.shape.kind = VolumeShapeKind::Sphere;
+                em.shape.center = glm::vec3(0.0f, 0.35f, 0.0f);
+                em.shape.halfExtents = glm::vec3(0.4f);
+                em.densityRate = 4.0f;
+                em.temperatureRate = 6.0f;
+                em.temperatureTarget = 1.0f;
+                cfg.emitters.push_back(em);
+            }
+            const hbe::u32 N = 16;
+            const hbe::f32 dt = 1.0f / (cfg.frameRate * static_cast<hbe::f32>(cfg.substeps));
+            const float prune = 0.005f;
+
+            EulerianSmokeSimulation cpu(cfg);
+            std::vector<hbe::u8> hbvol;
+            const bool baked = BakeSimulation(cpu, cfg, 0, N - 1, hbvol, prune);
+            VolumeAsset asset;
+            const bool loaded = baked && asset.Load(hbvol);
+            const bool structOk = loaded && asset.FrameCount() == N &&
+                                  asset.FieldIndex("density") >= 0 &&
+                                  asset.FieldIndex("temperature") >= 0;
+
+            // Round-trip frame M: re-simulate to it, sample the baked grids, diff.
+            double maxErrD = 0.0, maxErrT = 0.0;
+            hbe::u32 activeD = 0;
+            if (structOk) {
+                const hbe::u32 M = N / 2;
+                EulerianSmokeSimulation cpu2(cfg);
+                cpu2.Reset();
+                for (hbe::u32 f = 0; f < M; ++f)
+                    for (int s = 0; s < cfg.substeps; ++s) cpu2.Step(dt);
+                VolumeFrame fr;
+                cpu2.ReadbackFrame(fr);
+                const VolumeField* dCpu = fr.field("density");
+                const VolumeField* tCpu = fr.field("temperature");
+                const VolumeAsset::GridView dG = asset.Grid(M, "density");
+                const VolumeAsset::GridView tG = asset.Grid(M, "temperature");
+                activeD = dG.activeVoxels;
+                const VolumeBounds& b = fr.bounds;
+                for (int z = 0; z < b.dim.z; ++z)
+                    for (int y = 0; y < b.dim.y; ++y)
+                        for (int x = 0; x < b.dim.x; ++x) {
+                            const hbe::usize idx = VoxelIndex(b, x, y, z);
+                            const float gD =
+                                dG.valid() ? SampleScalarGridBlob(dG.bytes, dG.size, x, y, z) : 0.0f;
+                            const float gT = tG.valid()
+                                                 ? SampleScalarGridBlob(tG.bytes, tG.size, x, y, z)
+                                                 : cfg.ambientTemperature;
+                            if (dCpu) maxErrD = std::max(maxErrD, std::abs((double)gD - dCpu->data[idx]));
+                            if (tCpu) maxErrT = std::max(maxErrT, std::abs((double)gT - tCpu->data[idx]));
+                        }
+            }
+
+            // Determinism: a second bake is byte-identical.
+            EulerianSmokeSimulation cpu3(cfg);
+            std::vector<hbe::u8> hbvol2;
+            const bool baked2 = BakeSimulation(cpu3, cfg, 0, N - 1, hbvol2, prune);
+            const bool deterministic = baked2 && hbvol == hbvol2;
+
+            // File save/load round-trip.
+            const auto tmp = std::filesystem::temp_directory_path() / "hbe_test.hbvol";
+            VolumeAsset assetFile;
+            const bool fileOk = WriteHbvolFile(tmp.string(), hbvol) &&
+                                assetFile.LoadFile(tmp.string()) && assetFile.FrameCount() == N;
+
+            const bool pass = structOk && maxErrD <= 0.006 && maxErrT <= 0.006 && deterministic &&
+                              fileOk && activeD > 0;
+            std::printf("hbvol %s: %zu bytes, %u frames, maxErr density=%.4f temp=%.4f, active=%u, "
+                        "deterministic=%d, file=%d\n",
+                        pass ? "PASS" : "FAIL", hbvol.size(), asset.FrameCount(), maxErrD, maxErrT,
+                        activeD, static_cast<int>(deterministic), static_cast<int>(fileOk));
+            return pass ? 0 : 1;
+        }
+        // --test-volume-timing: the VolumeCache playback gate (headless). Bake a .hbvol to disk, load
+        // it through VolumeCache (synchronous fallback since the job system isn't running here), and
+        // assert time->frame mapping (start/end/loop-wrap/clamp) + that every frame's grid is valid.
+        if (std::strcmp(argv[i], "--test-volume-timing") == 0) {
+            using namespace hbe::volume;
+            VolumeSimConfig cfg;
+            cfg.model = "eulerian-smoke";
+            cfg.bounds.worldMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+            cfg.bounds.worldMax = glm::vec3(1.0f, 4.0f, 1.0f);
+            cfg.bounds.dim = glm::ivec3(24, 48, 24);
+            cfg.frameRate = 30.0f;
+            cfg.substeps = 2;
+            cfg.pressureIterations = 12;
+            {
+                VolumeEmitter em;
+                em.shape.kind = VolumeShapeKind::Sphere;
+                em.shape.center = glm::vec3(0.0f, 0.35f, 0.0f);
+                em.shape.halfExtents = glm::vec3(0.4f);
+                em.densityRate = 4.0f;
+                cfg.emitters.push_back(em);
+            }
+            const hbe::u32 N = 12;
+            const float fps = cfg.frameRate;
+            EulerianSmokeSimulation sim(cfg);
+            std::vector<hbe::u8> hbvol;
+            const auto path = (std::filesystem::temp_directory_path() / "hbe_timing.hbvol").string();
+            const bool ok = BakeSimulation(sim, cfg, 0, N - 1, hbvol) && WriteHbvolFile(path, hbvol);
+
+            VolumeCache cache;
+            const hbe::u32 h = cache.Acquire(path);
+            const bool ready = ok && cache.GetState(h) == VolumeCache::State::Ready &&
+                               cache.FrameCount(h) == static_cast<hbe::i32>(N);
+
+            auto tf = [&](float t, bool loop) { return cache.TimeToFrame(h, t, loop); };
+            const bool t0 = tf(0.0f, true) == 0;
+            const bool tEnd = tf((N - 0.5f) / fps, false) == static_cast<hbe::i32>(N) - 1;
+            const bool tWrap = tf(N / fps, true) == 0;                       // loop wraps to 0
+            const bool tWrap2 = tf((N + 2.5f) / fps, true) == 2;             // wraps to 2
+            const bool tClamp = tf(10.0f * N / fps, false) == static_cast<hbe::i32>(N) - 1; // clamps
+            bool allGridsValid = ready;
+            for (hbe::u32 f = 0; ready && f < N; ++f)
+                if (!cache.DensityGrid(h, static_cast<hbe::i32>(f)).valid()) allGridsValid = false;
+            const bool unassigned = cache.GetState(VolumeCache::kInvalid) != VolumeCache::State::Ready;
+
+            const bool pass = ready && t0 && tEnd && tWrap && tWrap2 && tClamp && allGridsValid &&
+                              unassigned;
+            std::printf("volume-timing %s: ready=%d start=%d end=%d wrap=%d wrap2=%d clamp=%d "
+                        "grids=%d\n",
+                        pass ? "PASS" : "FAIL", static_cast<int>(ready), static_cast<int>(t0),
+                        static_cast<int>(tEnd), static_cast<int>(tWrap), static_cast<int>(tWrap2),
+                        static_cast<int>(tClamp), static_cast<int>(allGridsValid));
+            return pass ? 0 : 1;
         }
         // --test-bodyshape: the character sliders resolve from joint NAMES alone, and
         // length/girth split on a bone axis derived from the rig. Headless - it proves the
@@ -1737,6 +1905,294 @@ int main(int argc, char** argv) {
         return vpEngine.Run(config);
     }
 
+    // --volume-sim-preview: run the CPU Eulerian smoke SOLVER for a couple of seconds, bridge the
+    // resulting density VolumeFrame to a NanoVDB grid, and render it headless to a PNG via the same
+    // runtime PNanoVDB raymarch - so the SOLVER's look (a real rising, rolling plume) can be
+    // eyeballed and DX12 vs Vulkan compared. The Phase-1 visual gate. Per-backend filename.
+    bool volumeSimPreview = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--volume-sim-preview") == 0) volumeSimPreview = true;
+    if (volumeSimPreview) {
+        static hbe::Editor vspEditor;
+        static int vspFrame = 0;
+        static std::vector<std::uint8_t> vspBlob;
+        static glm::vec3 vspMin(-2.0f, 0.0f, -2.0f), vspMax(2.0f, 8.0f, 2.0f);
+        hbe::Engine vspEngine;
+        vspEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+            e.GetScene().SetEditorView(true);
+            e.GetRenderer().SetOrbitEnabled(false);
+            if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                hbe::Editor::ApplyTheme();
+            hbe::Scene& scene = e.GetScene();
+            auto& reg = scene.Registry();
+            // Ground plane at the base of the volume box (y=0) for real scene depth behind the smoke.
+            const hbe::MeshData pm = hbe::mesh::GeneratePlane(400.0f, 1);
+            const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
+            hbe::MeshInstance gi;
+            gi.mesh = plane;
+            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.roughness = 0.9f;
+            const entt::entity g = scene.CreateEntity("Ground");
+            hbe::Transform gt;
+            gt.position = {0.0f, -0.02f, 0.0f};
+            reg.emplace<hbe::Transform>(g, gt);
+            reg.emplace<hbe::MeshInstance>(g, gi);
+            reg.emplace<hbe::AABB>(g, hbe::AABB{glm::vec3(-200.0f, -1.0f, -200.0f),
+                                                glm::vec3(200.0f, 1.0f, 200.0f)});
+            auto& env = scene.Environment();
+            env.exposure = 1.0f;
+            env.ambientIntensity = 0.5f;
+            env.post.ssgiEnabled = 0;
+            env.post.ssaoEnabled = 0;
+
+            // Run the SOLVER (once) for ~2.5s of sim time; the job system is up so passes parallelize.
+            const hbe::volume::VolumeSimTypeInfo* t =
+                hbe::volume::VolumeSimRegistry::Get().Find("eulerian-smoke");
+            if (t != nullptr) {
+                hbe::volume::VolumeSimConfig cfg = t->defaultConfig;
+                auto sim = hbe::volume::VolumeSimRegistry::Get().Create(cfg);
+                if (sim) {
+                    sim->Reset();
+                    const float dt = 1.0f / (cfg.frameRate * static_cast<float>(cfg.substeps));
+                    const int total = 75 * cfg.substeps; // ~2.5 s
+                    for (int s = 0; s < total; ++s) sim->Step(dt);
+                    hbe::volume::VolumeFrame fr;
+                    sim->ReadbackFrame(fr);
+                    hbe::volume::BuildDensityGridBlob(fr, vspBlob, vspMin, vspMax, 0.01f);
+                }
+            }
+        });
+        vspEngine.SetOnFrame([](hbe::Engine& e) {
+            vspEditor.BuildUI(e);
+            constexpr hbe::u32 kW = 1280, kH = 720;
+            e.GetRenderer().SetViewportSize(kW, kH);
+            auto& cam = e.GetRenderer().GetCamera();
+            cam.SetPerspective(40.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 1000.0f);
+            cam.LookAt({0.0f, 4.5f, 15.0f}, {0.0f, 4.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+            if (!vspBlob.empty()) {
+                hbe::rhi::VolumeRenderParams rp;
+                rp.boundsMin = vspMin;
+                rp.boundsMax = vspMax;
+                rp.densityScale = 1.8f;
+                rp.emission = 0.0f; // density-only smoke (temperature grid is not uploaded yet)
+                rp.extinction = 1.1f;
+                rp.stepCount = 192;
+                rp.shadowSteps = 10;
+                e.GetRenderer().SetVolumeGrid(vspBlob.data(), vspBlob.size(), rp);
+            }
+            if (++vspFrame >= 40) { // TAA convergence on the static (already-simulated) volume
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                const std::string api = ReadbackTag(e.GetRenderer().API());
+                const auto out = std::filesystem::temp_directory_path() /
+                                 ("hbe_volume_sim_preview_" + api + ".png");
+                if (e.GetRenderer().ReadbackViewportColor(px, w, h))
+                    hbe::movie::WritePng(out, w, h, px);
+                std::printf("volume-sim-preview -> %s (grid %zu bytes)\n",
+                            out.string().c_str(), vspBlob.size());
+                e.Quit();
+            }
+        });
+        return vspEngine.Run(config);
+    }
+
+    // --hbvol-preview: the END-TO-END capstone - bake the CPU solver to a `.hbvol` cache, LOAD it back
+    // through VolumeAsset, and render a frame's baked NanoVDB density grid via the runtime PNanoVDB
+    // raymarch. Proves the whole author->bake->load->render pipeline (not just the CPU round-trip).
+    bool hbvolPreview = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--hbvol-preview") == 0) hbvolPreview = true;
+    if (hbvolPreview) {
+        static hbe::Editor hvEditor;
+        static int hvFrame = 0;
+        static hbe::volume::VolumeAsset hvAsset;
+        static hbe::u32 hvShowFrame = 0;
+        static glm::vec3 hvMin(-2.0f, 0.0f, -2.0f), hvMax(2.0f, 8.0f, 2.0f);
+        hbe::Engine hvEngine;
+        hvEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+            e.GetScene().SetEditorView(true);
+            e.GetRenderer().SetOrbitEnabled(false);
+            if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                hbe::Editor::ApplyTheme();
+            hbe::Scene& scene = e.GetScene();
+            auto& reg = scene.Registry();
+            const hbe::MeshData pm = hbe::mesh::GeneratePlane(400.0f, 1);
+            const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
+            hbe::MeshInstance gi;
+            gi.mesh = plane;
+            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.roughness = 0.9f;
+            const entt::entity g = scene.CreateEntity("Ground");
+            hbe::Transform gt;
+            gt.position = {0.0f, -0.02f, 0.0f};
+            reg.emplace<hbe::Transform>(g, gt);
+            reg.emplace<hbe::MeshInstance>(g, gi);
+            reg.emplace<hbe::AABB>(g, hbe::AABB{glm::vec3(-200.0f, -1.0f, -200.0f),
+                                                glm::vec3(200.0f, 1.0f, 200.0f)});
+            auto& env = scene.Environment();
+            env.exposure = 1.0f;
+            env.ambientIntensity = 0.5f;
+            env.post.ssgiEnabled = 0;
+            env.post.ssaoEnabled = 0;
+
+            // Bake the default smoke config to a .hbvol, then load it back (the shipping path).
+            const hbe::volume::VolumeSimTypeInfo* t =
+                hbe::volume::VolumeSimRegistry::Get().Find("eulerian-smoke");
+            if (t != nullptr) {
+                hbe::volume::VolumeSimConfig cfg = t->defaultConfig;
+                cfg.bakeFields = {"density", "temperature"};
+                auto sim = hbe::volume::VolumeSimRegistry::Get().Create(cfg);
+                if (sim) {
+                    const hbe::u32 frames = 60; // ~2s: enough for the plume to develop a column
+                    std::vector<hbe::u8> hbvol;
+                    if (hbe::volume::BakeSimulation(*sim, cfg, 0, frames - 1, hbvol) &&
+                        hvAsset.Load(hbvol)) {
+                        hvShowFrame = frames - 1;
+                        hvMin = hvAsset.Bounds().worldMin;
+                        hvMax = hvAsset.Bounds().worldMax;
+                        std::printf("hbvol-preview: baked+loaded %u frames, %zu bytes\n",
+                                    hvAsset.FrameCount(), hbvol.size());
+                    }
+                }
+            }
+        });
+        hvEngine.SetOnFrame([](hbe::Engine& e) {
+            hvEditor.BuildUI(e);
+            constexpr hbe::u32 kW = 1280, kH = 720;
+            e.GetRenderer().SetViewportSize(kW, kH);
+            auto& cam = e.GetRenderer().GetCamera();
+            cam.SetPerspective(40.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 1000.0f);
+            cam.LookAt({0.0f, 4.5f, 15.0f}, {0.0f, 4.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+            const hbe::volume::VolumeAsset::GridView g = hvAsset.Grid(hvShowFrame, "density");
+            if (g.valid()) {
+                hbe::rhi::VolumeRenderParams rp;
+                rp.boundsMin = hvMin;
+                rp.boundsMax = hvMax;
+                rp.densityScale = 1.8f;
+                rp.emission = 0.0f;
+                rp.extinction = 1.1f;
+                rp.stepCount = 192;
+                rp.shadowSteps = 10;
+                e.GetRenderer().SetVolumeGrid(g.bytes, g.size, rp);
+            }
+            if (++hvFrame >= 40) {
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                const std::string api = ReadbackTag(e.GetRenderer().API());
+                const auto out = std::filesystem::temp_directory_path() /
+                                 ("hbe_hbvol_preview_" + api + ".png");
+                if (e.GetRenderer().ReadbackViewportColor(px, w, h))
+                    hbe::movie::WritePng(out, w, h, px);
+                std::printf("hbvol-preview -> %s (grid %zu bytes)\n", out.string().c_str(), g.size);
+                e.Quit();
+            }
+        });
+        return hvEngine.Run(config);
+    }
+
+    // --test-volume-component: the full RUNTIME path - a VolumeComponent placed in a scene at a
+    // NON-ORIGIN transform, loaded async via VolumeCache and driven+rendered by the Engine's own
+    // per-frame volume drive (NOT hand-fed). Proves component -> cache(async) -> drive -> SetVolumeGrid
+    // -> raymarch WITH worldOffset placement. Asserts the chain ran (resolvedFrame advanced) + dumps a
+    // PNG showing the plume offset to the entity position (eyeball placement; both backends).
+    bool volComponent = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-volume-component") == 0) volComponent = true;
+    if (volComponent) {
+        static hbe::Editor tcEditor;
+        static int tcFrame = 0;
+        static entt::entity tcEntity = entt::null;
+        static bool tcReadOk = false;
+        static int tcResolved = -1;
+        hbe::Engine tcEngine;
+        tcEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(true); // play mode: the volume drive advances the playhead
+            e.SetGameCameraEnabled(false);
+            e.GetScene().SetEditorView(true);
+            e.GetRenderer().SetOrbitEnabled(false);
+            if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                hbe::Editor::ApplyTheme();
+            hbe::Scene& scene = e.GetScene();
+            auto& reg = scene.Registry();
+            const hbe::MeshData pm = hbe::mesh::GeneratePlane(400.0f, 1);
+            const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
+            hbe::MeshInstance gi;
+            gi.mesh = plane;
+            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.roughness = 0.9f;
+            const entt::entity g = scene.CreateEntity("Ground");
+            hbe::Transform gt;
+            gt.position = {0.0f, -0.02f, 0.0f};
+            reg.emplace<hbe::Transform>(g, gt);
+            reg.emplace<hbe::MeshInstance>(g, gi);
+            reg.emplace<hbe::AABB>(g, hbe::AABB{glm::vec3(-200.0f, -1.0f, -200.0f),
+                                                glm::vec3(200.0f, 1.0f, 200.0f)});
+            auto& env = scene.Environment();
+            env.exposure = 1.0f;
+            env.ambientIntensity = 0.5f;
+            env.post.ssgiEnabled = 0;
+            env.post.ssaoEnabled = 0;
+
+            // Bake a plume to a temp .hbvol, then place a VolumeComponent at a NON-ORIGIN position.
+            const hbe::volume::VolumeSimTypeInfo* t =
+                hbe::volume::VolumeSimRegistry::Get().Find("eulerian-smoke");
+            std::string path;
+            if (t != nullptr) {
+                hbe::volume::VolumeSimConfig cfg = t->defaultConfig;
+                auto sim = hbe::volume::VolumeSimRegistry::Get().Create(cfg);
+                std::vector<hbe::u8> hbvol;
+                path = (std::filesystem::temp_directory_path() / "hbe_component.hbvol").string();
+                if (!(sim && hbe::volume::BakeSimulation(*sim, cfg, 0, 47, hbvol) &&
+                      hbe::volume::WriteHbvolFile(path, hbvol)))
+                    path.clear();
+            }
+            tcEntity = scene.CreateEntity("Smoke");
+            hbe::Transform vt;
+            vt.position = {3.0f, 1.0f, -2.0f}; // NON-ORIGIN: proves worldOffset placement
+            reg.emplace<hbe::Transform>(tcEntity, vt);
+            hbe::VolumeComponent vc;
+            vc.source = path;
+            vc.playing = true;
+            vc.loop = true;
+            vc.render.densityScale = 1.8f;
+            vc.render.extinction = 1.1f;
+            vc.render.stepCount = 160;
+            vc.render.shadowSteps = 8;
+            reg.emplace<hbe::VolumeComponent>(tcEntity, vc);
+        });
+        tcEngine.SetOnFrame([](hbe::Engine& e) {
+            tcEditor.BuildUI(e);
+            constexpr hbe::u32 kW = 1280, kH = 720;
+            e.GetRenderer().SetViewportSize(kW, kH);
+            auto& cam = e.GetRenderer().GetCamera();
+            cam.SetPerspective(45.0f, static_cast<float>(kW) / static_cast<float>(kH), 0.05f, 1000.0f);
+            // Look at the ORIGIN so a plume placed at x=+3 appears clearly RIGHT of center.
+            cam.LookAt({0.0f, 4.5f, 20.0f}, {0.0f, 4.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+            if (++tcFrame >= 90) { // allow async load + playback to settle
+                if (tcEntity != entt::null)
+                    if (const auto* vc = e.GetScene().Registry().try_get<hbe::VolumeComponent>(tcEntity))
+                        tcResolved = vc->resolvedFrame;
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                const std::string api = ReadbackTag(e.GetRenderer().API());
+                const auto out = std::filesystem::temp_directory_path() /
+                                 ("hbe_volume_component_" + api + ".png");
+                tcReadOk = e.GetRenderer().ReadbackViewportColor(px, w, h);
+                if (tcReadOk) hbe::movie::WritePng(out, w, h, px);
+                std::printf("volume-component %s: resolvedFrame=%d, readback=%d -> %s\n",
+                            (tcResolved >= 0 && tcReadOk) ? "PASS" : "FAIL", tcResolved,
+                            static_cast<int>(tcReadOk), out.string().c_str());
+                e.Quit();
+            }
+        });
+        const int rc = tcEngine.Run(config);
+        return (tcResolved >= 0 && tcReadOk) ? 0 : (rc != 0 ? rc : 1);
+    }
+
     // --test-readback-compare: the D3D12 <-> Vulkan parity gate. Reads the raw
     // frames --test-readback left in temp for each backend and compares them.
     //
@@ -2001,6 +2457,154 @@ int main(int argc, char** argv) {
         oEngine.Run(config);
         std::printf("oceanfft-gpu %s (%s)\n", ot.pass ? "PASS" : "FAIL", ot.why.c_str());
         return ot.pass ? 0 : 1;
+    }
+
+    // --test-gpusolver: prove the GPU Eulerian smoke solver matches the CPU oracle. Runs the CPU
+    // reference and the GPU solver with an IDENTICAL config for several substeps (each GPU substep is
+    // its own BeginFrame drain, so this also exercises the cross-frame compute->compute barrier), then
+    // ReadGpuBuffer-diffs density + temperature. Needs a real device (short engine session). This is
+    // what stops a blind GPU fluid solver from being delivered on "it booted".
+    bool testGpuSolver = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-gpusolver") == 0) testGpuSolver = true;
+    if (testGpuSolver) {
+        // Shared config (small, characterized - matches the --test-eulersim fixture).
+        static hbe::volume::VolumeSimConfig scfg = [] {
+            hbe::volume::VolumeSimConfig c;
+            c.model = "eulerian-smoke";
+            c.bounds.worldMin = glm::vec3(-1.0f, 0.0f, -1.0f);
+            c.bounds.worldMax = glm::vec3(1.0f, 4.0f, 1.0f);
+            c.bounds.dim = glm::ivec3(24, 48, 24);
+            c.frameRate = 30.0f;
+            c.substeps = 2;
+            c.pressureIterations = 20;
+            hbe::volume::VolumeEmitter em;
+            em.name = "base";
+            em.shape.kind = hbe::volume::VolumeShapeKind::Sphere;
+            em.shape.center = glm::vec3(0.0f, 0.35f, 0.0f);
+            em.shape.halfExtents = glm::vec3(0.4f);
+            em.densityRate = 4.0f;
+            em.temperatureRate = 6.0f;
+            em.temperatureTarget = 1.0f;
+            c.emitters.push_back(em);
+            // Bake velocity too: it carries the closed-box wall handling + the gradient-subtract
+            // sign that the smooth scalar plume barely stresses, so the diff certifies that surface.
+            c.bakeFields = {"density", "temperature", "velocity"};
+            return c;
+        }();
+        static constexpr int kSub = 6;
+        static const hbe::f32 kDt = 1.0f / (scfg.frameRate * static_cast<hbe::f32>(scfg.substeps));
+
+        // CPU oracle (no GPU): run kSub substeps, capture density + temperature.
+        static hbe::volume::VolumeFrame frCpu = [] {
+            hbe::volume::EulerianSmokeSimulation cpu(scfg);
+            cpu.Reset();
+            for (int s = 0; s < kSub; ++s) cpu.Step(kDt);
+            hbe::volume::VolumeFrame f;
+            cpu.ReadbackFrame(f);
+            return f;
+        }();
+
+        struct GpuSolverTest {
+            std::unique_ptr<hbe::volume::GpuEulerianSmokeSimulation> gpu;
+            int frame = 0, steps = 0, pump = 0;
+            bool inited = false, done = false, pass = false;
+            std::string why = "no result";
+        };
+        static GpuSolverTest gt;
+        hbe::Engine gEngine;
+        gEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+        });
+        gEngine.SetOnFrame([](hbe::Engine& e) {
+            auto& r = e.GetRenderer();
+            if (gt.done) return;
+            if (gt.frame == 1) {
+                if (!r.SupportsGpuCompute()) {
+                    gt.why = "backend has no compute";
+                    gt.done = true;
+                    e.Quit();
+                    return;
+                }
+                gt.gpu = std::make_unique<hbe::volume::GpuEulerianSmokeSimulation>(scfg, r);
+                if (!gt.gpu->Valid()) {
+                    gt.why = "GPU solver resources/pipelines failed";
+                    gt.done = true;
+                    e.Quit();
+                    return;
+                }
+                gt.gpu->Reset();
+                gt.inited = true;
+            }
+            // One substep per frame (each its own drain), then pump frames so the last drain submits.
+            if (gt.inited && gt.steps < kSub) {
+                gt.gpu->Step(kDt);
+                ++gt.steps;
+            } else if (gt.inited && gt.steps == kSub) {
+                if (++gt.pump >= 5) {
+                    hbe::volume::VolumeFrame frGpu;
+                    gt.gpu->ReadbackFrame(frGpu);
+                    auto relL2 = [](const std::vector<hbe::f32>& g,
+                                    const std::vector<hbe::f32>& c) -> double {
+                        const size_t n = std::min(g.size(), c.size());
+                        double num = 0.0, den = 0.0;
+                        for (size_t i = 0; i < n; ++i) {
+                            const double d = static_cast<double>(g[i]) - static_cast<double>(c[i]);
+                            num += d * d;
+                            den += static_cast<double>(c[i]) * static_cast<double>(c[i]);
+                        }
+                        return std::sqrt(num) / std::max(std::sqrt(den), 1e-8);
+                    };
+                    const hbe::volume::VolumeField* dC = frCpu.field("density");
+                    const hbe::volume::VolumeField* tC = frCpu.field("temperature");
+                    const hbe::volume::VolumeField* vC = frCpu.field("velocity");
+                    const hbe::volume::VolumeField* dG = frGpu.field("density");
+                    const hbe::volume::VolumeField* tG = frGpu.field("temperature");
+                    const hbe::volume::VolumeField* vG = frGpu.field("velocity");
+                    if (!dC || !tC || !vC || !dG || !tG || !vG || dG->data.empty() ||
+                        vG->data.empty()) {
+                        gt.why = "missing fields / empty GPU readback";
+                        gt.done = true;
+                        e.Quit();
+                        return;
+                    }
+                    bool finite = true;
+                    double dTot = 0.0;
+                    for (hbe::f32 v : dG->data) {
+                        if (!std::isfinite(v)) finite = false;
+                        dTot += v;
+                    }
+                    for (hbe::f32 v : vG->data)
+                        if (!std::isfinite(v)) finite = false;
+                    const double relD = relL2(dG->data, dC->data);
+                    const double relT = relL2(tG->data, tC->data);
+                    const double relV = relL2(vG->data, vC->data); // wall/projection surface
+                    // Measured ~2.7e-7 (near fp32 epsilon) on RTX 3060, both backends, both configs.
+                    // 5e-4 keeps a wide cross-vendor margin while still catching any real defect (a
+                    // wrong coefficient / missing pass gives relL2 >= ~1e-2).
+                    gt.pass = finite && dTot > 0.0 && relD < 5e-4 && relT < 5e-4 && relV < 5e-4;
+                    char b[224];
+                    std::snprintf(
+                        b, sizeof(b),
+                        "relL2 density=%.3e temp=%.3e vel=%.3e, densTotal=%.2f, finite=%d", relD,
+                        relT, relV, dTot, static_cast<int>(finite));
+                    gt.why = b;
+                    gt.done = true;
+                    e.Quit();
+                    return;
+                }
+            }
+            if (gt.frame > 200) {
+                gt.why = "timed out";
+                gt.done = true;
+                e.Quit();
+            }
+            ++gt.frame;
+        });
+        gEngine.Run(config);
+        std::printf("gpusolver %s (%s)\n", gt.pass ? "PASS" : "FAIL", gt.why.c_str());
+        return gt.pass ? 0 : 1;
     }
 
     // --test-uidoc-invariants <file.hbui>: the P3 STRUCTURAL contract. Every
