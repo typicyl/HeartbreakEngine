@@ -130,7 +130,8 @@ set(HBE_VFX_SOURCES
     "Source/Vfx/VfxLegacy.cpp")
 
 set(HBE_AUDIO_SOURCES
-    "Source/Audio/AudioSystem.cpp")
+    "Source/Audio/AudioSystem.cpp"
+    "Source/Audio/SpatializerResonance.cpp")
 
 set(HBE_PROJECT_SOURCES
     "Source/Project/Project.cpp")
@@ -367,6 +368,18 @@ function(hbe_configure_engine_lib tgt is_editor)
     # runs the optimize passes at import, and the runtime keeps the decoders for a future
     # compressed-.uaf path. Tiny, zero-dep static lib.
     target_link_libraries(${tgt} PRIVATE meshoptimizer)
+    # HDS Resonance Audio spatial renderer (our engine-agnostic fork; see
+    # cmake/Dependencies.cmake + docs/Design-ResonanceAudio.md). Optional: linked only when
+    # the fork + its deps are prepared. Source/Audio/SpatializerResonance wraps the vraudio
+    # API (pimpl); no vraudio type crosses into an engine header. Ships in BOTH libraries so
+    # the runtime spatializes too. HBE_HAVE_RESONANCE gates the engine-side code.
+    if(HBE_HAVE_RESONANCE)
+        target_link_libraries(${tgt} PRIVATE ResonanceAudioStatic)
+        target_include_directories(${tgt} PRIVATE "${CMAKE_SOURCE_DIR}/HDSResonance-Audio")
+        target_compile_definitions(${tgt} PRIVATE HBE_HAVE_RESONANCE=1)
+    else()
+        target_compile_definitions(${tgt} PRIVATE HBE_HAVE_RESONANCE=0)
+    endif()
     # NanoVDB - header-only sparse-volume representation + PNanoVDB GPU reader. The
     # volumetric foundation (Source/Volume wraps it; no NanoVDB types cross into the RHI).
     # Zero external deps here; OpenVDB stays an optional editor-only add-on (vcpkg) later.
