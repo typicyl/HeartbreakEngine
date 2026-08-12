@@ -953,6 +953,12 @@ struct UIElement {
         TextInput = 9,   // editable text box; `text` is the buffer
     };
     Type type = Type::Label;
+    // Optional STABLE, author-chosen id (P5, D2). Unique within a document by
+    // convention (like `action`); empty = none. A stable handle that future data-
+    // binding, localization, animation-targeting and accessibility can reference an
+    // element by, instead of abusing the non-unique `name`/`action`. NOT an identity
+    // for persistence - a `.hbui` entity still carries no guid.
+    std::string id;
     std::string text;            // Label / Button / ProgressBar caption (authoring)
     // Runtime-resolved caption: when non-empty the UI renderer shows this instead
     // of `text`. The engine fills it on screens that use {token}s ({backend}/{gpu}/
@@ -980,6 +986,15 @@ struct UIElement {
     // Fit to parent: the element always covers its entire parent rect (the
     // whole canvas for top-level elements); the RectTransform is ignored.
     bool fullscreen = false;
+
+    // --- Layout constraints (P6) ---------------------------------------------
+    // Clamp the laid-out SIZE (post-RectTransform, resized about the pivot in place).
+    // 0 on an axis = unconstrained (default = no-op, byte-identical to pre-P6).
+    // `aspectRatio` (width/height; 0 = off) then fits the height to the width. Applied
+    // to both free elements and layout-group-placed children. Skipped for fullscreen.
+    glm::vec2 minSize{0.0f};
+    glm::vec2 maxSize{0.0f};
+    f32 aspectRatio = 0.0f;
 
     // Image / textured Panel: a texture .uaf (relative to Assets/).
     std::string texture;
@@ -1033,6 +1048,16 @@ struct UIElement {
     glm::vec4 hoverColor{0.0f};
     glm::vec4 pressedColor{0.0f};
     glm::vec4 disabledColor{0.0f};
+    // Focused/selected are the two visual states the U5 skin lacked. Same alpha-0
+    // "unset" sentinel, but with NO legacy auto-multiply fallback: unset = the state
+    // simply does not recolor (backward-compatible - old widgets never had them).
+    // `focusedColor` recolors the keyboard/gamepad-focused widget; `selectedColor`
+    // an "on" widget (a toggled Toggle). NOTE (P4 scope): both are applied through the
+    // interactive state-fill path, which today only the Button case uses - a Toggle/
+    // Selector still paints its on-state via `fillColor`, so a selectedColor on one of
+    // those is currently inert. Broadening per-widget state theming is a follow-up.
+    glm::vec4 focusedColor{0.0f};
+    glm::vec4 selectedColor{0.0f};
     bool enabled = true;                  // false = inert + disabled look
     std::string hoverSound;               // `.uaf` Audio, played on hover-enter
     std::string clickSound;               // `.uaf` Audio, played on click
@@ -1057,6 +1082,28 @@ struct UIElement {
     // Word-wrap the caption to the element width (Label/Button/Panel/TextInput).
     bool wrap = false;
 
+    // --- Style reference (P4: reusable themes) -------------------------------
+    // A `.hbtheme` asset + a named style within it. When set, ui::style::ApplyStyle
+    // fills THIS element's UNSET skin fields (the alpha-0 / empty-string sentinels
+    // above) from the named style at emit time, so a whole set of widgets share one
+    // editable look. The element's own set fields always win (per-element override).
+    // Empty theme = no styling (every field stays exactly as authored).
+    std::string styleTheme;
+    std::string styleName;
+
+    // Per-element render EFFECT (P7 custom UI materials): 0 = normal; 1 = grayscale/
+    // desaturate. Stamped into every vertex of the element (background, text, parts);
+    // the UI shader branches on it - no blend-state or pipeline change, so the whole UI
+    // is still one bindless draw. Extensible (add ids + a shader branch). 0 = identical.
+    u32 effect = 0;
+
+    // --- Focus graph (P8): authored directional-navigation overrides ---------
+    // Each names a target element `id` (P5) to focus when the keyboard/gamepad moves
+    // that way from this widget; empty = fall back to the geometric nearest-in-
+    // direction pick. The designer wires the flow (Play -> Settings -> Quit) instead
+    // of trusting geometry, and an unresolvable id also falls back to geometric.
+    std::string navUp, navDown, navLeft, navRight;
+
     bool hovered = false;            // runtime state (UISystem)
     bool clicked = false;            // pressed this frame (runtime state)
     // HELD for as long as the pointer's button is DOWN over this element - the
@@ -1070,6 +1117,13 @@ struct UIElement {
     bool prevHovered = false;        // runtime: hover-enter edge (drives hoverSound)
     u32 textureIndexCache = 0;       // resolved bindless index (runtime)
     bool textureResolved = false;    // reset to re-resolve `texture`
+    // --- Dirty flags (P5 foundation; NOT serialized) -------------------------
+    // Per-element invalidation set by ui::MarkElementDirty at mutation points. The
+    // full layout/emit walk still runs today and clears layoutDirty each frame (so
+    // it is observable via UIFrameStats.layoutDirty); P11's incremental layout is the
+    // CONSUMER that will skip clean elements. styleDirty forces a style re-resolve.
+    bool layoutDirty = true;
+    bool styleDirty = true;
 };
 
 // Runtime-only tag on a dialogue Choice button the conversation player spawns while
@@ -1184,6 +1238,15 @@ struct UICanvasGroup {
 struct UIPanel {
     std::string name;           // screen id: "MainMenu" / "Settings" / "HUD" / "Pause" / ...
     bool startVisible = false;  // active when the UI scene first loads
+    // P8 focus graph: element `id` that takes focus when keyboard/gamepad navigation
+    // FIRST begins on this screen (empty = geometric reading-order first). NOTE: it is
+    // applied on the first nav press while focus is null, not eagerly on Show - eager
+    // focus-on-activate would need UIManager<->UIContext wiring (a follow-up). `modal`:
+    // while active AND shown, pointer hit-testing AND keyboard/gamepad focus are TRAPPED
+    // to this panel's subtree - widgets behind it become inert, the dialog barrier. No
+    // active modal = no change.
+    std::string firstFocus;
+    bool modal = false;
     bool active = false;        // runtime: manager-controlled visibility (NOT serialized)
 };
 

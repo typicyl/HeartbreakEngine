@@ -632,7 +632,7 @@ private:
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
     ComPtr<ID3D12PipelineState> uiPSO_; // uses meshRootSig_ (bindless table)
-    static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~40k verts @ 52 B)
+    static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~37449 verts @ 56 B)
     ComPtr<ID3D12Resource> uiVertexBuffers_[kMaxBackBuffers];
     u8* uiVertexCpu_[kMaxBackBuffers] = {};
 
@@ -2236,6 +2236,8 @@ bool D3D12Device::CreateMeshPipeline() {
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
                 {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 36,
                  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // NDC clip rect
+                {"TEXCOORD", 3, DXGI_FORMAT_R32_UINT, 0, 52,
+                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // effect id (P7)
             };
             D3D12_GRAPHICS_PIPELINE_STATE_DESC ui = pso; // inherit, then adjust
             ui.pRootSignature = meshRootSig_.Get();

@@ -642,10 +642,16 @@ struct UIVertex {
     u32 texIndex = 0;          // bindless texture (0 = white)
     f32 clipX0 = -2.0f, clipY0 = -2.0f; // NDC clip rect min (sentinel = open)
     f32 clipX1 = 2.0f, clipY1 = 2.0f;   // NDC clip rect max
+    // Per-element EFFECT id (P7 custom UI materials): 0 = normal (the shader is a plain
+    // color*tex passthrough, so default-init vertices are pixel-identical to before);
+    // 1 = grayscale/desaturate. The whole design stays a single bindless draw - the
+    // effect is a shader branch, not a blend-state or pipeline change. Extensible.
+    u32 fx = 0;
 };
-static_assert(sizeof(UIVertex) == 52,
-              "UIVertex layout is mirrored in both backends' input layouts "
-              "(D3D12 uiLayout / Vulkan uiAttrs) and UI.hlsl - keep in sync");
+static_assert(sizeof(UIVertex) == 56,
+              "UIVertex layout is mirrored in the DX12/Vulkan input layouts "
+              "(D3D12 uiLayout / Vulkan uiAttrs) and UI.hlsl - keep in sync. (The GL "
+              "backend binds a subset and auto-tracks the stride; fx there = 0.)");
 
 // One camera-facing particle billboard vertex, in WORLD space (the VS transforms
 // by the frame's viewProj). texIndex 0 = a procedural soft round dot.

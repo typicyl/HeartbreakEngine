@@ -18,6 +18,7 @@ struct UserSettings {
     f32 masterVolume = 1.0f;      // [0,1] -> AudioSystem Master bus
     int graphicsPreset = 1;       // 0 High (as authored), 1 Medium (default; lean shipped stack), 2 Low
     f32 brightness = 0.5f;        // [0,1] -> +/-1-stop VIEW exposure multiplier (0.5 = neutral)
+    f32 uiScale = 1.0f;           // [0.25,4] -> ui::SetUIScale (accessibility / display density)
     // Two INDEPENDENT accessibility toggles, following the usual convention:
     //   subtitles = spoken dialogue only        (on by default - story legibility)
     //   captions  = non-speech sounds too       (off by default - opt-in verbosity)

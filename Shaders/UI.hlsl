@@ -18,6 +18,7 @@ struct VSInput
     // NDC clip rect (xy = min, zw = max). The CPU emits the open sentinel
     // (-2..2) for unclipped content; ScrollViews emit their view rect.
     float4 clipRect    : TEXCOORD2;
+    uint   fx          : TEXCOORD3; // per-element effect id (0 = normal)
 };
 
 struct VSOutput
@@ -28,6 +29,7 @@ struct VSOutput
     nointerpolation uint   texIndex : TEXCOORD1;
     nointerpolation float4 clipRect : TEXCOORD2;
     float2 ndcPos     : TEXCOORD3; // interpolated NDC position for the clip test
+    nointerpolation uint   fx       : TEXCOORD4;
 };
 
 VSOutput VSMain(VSInput input)
@@ -39,6 +41,7 @@ VSOutput VSMain(VSInput input)
     o.texIndex = input.texIndex;
     o.clipRect = input.clipRect;
     o.ndcPos = input.positionNDC;
+    o.fx = input.fx;
     return o;
 }
 
@@ -50,5 +53,11 @@ float4 PSMain(VSOutput input) : SV_Target
         discard;
     float4 tex = gUITextures[NonUniformResourceIndex(input.texIndex)]
                      .Sample(gUISampler, input.uv);
-    return input.color * tex;
+    float4 result = input.color * tex; // fx 0 (default) = plain passthrough
+    if (input.fx == 1u) // grayscale / desaturate (custom UI material)
+    {
+        float l = dot(result.rgb, float3(0.299f, 0.587f, 0.114f));
+        result.rgb = float3(l, l, l);
+    }
+    return result;
 }

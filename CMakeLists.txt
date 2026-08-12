@@ -61,6 +61,7 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/BodyShape.cpp"
     "Source/Assets/MeshDerive.cpp"
     "Source/Assets/MeshSimplify.cpp"
+    "Source/Assets/MeshOptimize.cpp"
     "Source/Assets/MeshFaceSelect.cpp"
     "Source/Scene/CameraRig.cpp"
     "Source/Scene/CameraSystem.cpp"
@@ -150,7 +151,11 @@ set(HBE_UI_SOURCES
     "Source/UI/UIManager.cpp"
     "Source/UI/UIWorld.cpp"
     "Source/UI/UIFocus.cpp"
-    "Source/UI/FontAtlas.cpp")
+    "Source/UI/FontAtlas.cpp"
+    "Source/UI/Text/GlyphAtlas.cpp"
+    "Source/UI/Text/TextShaper.cpp"
+    "Source/UI/Svg/SvgCache.cpp"
+    "Source/UI/Style/Theme.cpp")
 
 set(HBE_RHI_SOURCES
     "Source/RHI/RHIFactory.cpp")
@@ -338,6 +343,14 @@ function(hbe_configure_engine_lib tgt is_editor)
     # stb single-header utilities: stb_easy_font for the in-game UI (runtime
     # too); the editor additionally uses stb_image for texture import.
     target_link_libraries(${tgt} PRIVATE stb)
+    # UI text stack (runtime): FreeType rasterization + HarfBuzz shaping + SheenBidi
+    # bidi. PRIVATE - no FreeType/HarfBuzz/SheenBidi type crosses into an engine header
+    # (Source/UI/FontAtlas.h stays clean; only Source/UI/Text/*.cpp include them). See
+    # cmake/Dependencies.cmake for why HarfBuzz is built without FreeType integration.
+    target_link_libraries(${tgt} PRIVATE freetype harfbuzz sheenbidi)
+    # UI vector graphics (runtime): LunaSVG rasterizes .svg assets on demand. PRIVATE -
+    # no lunasvg type crosses into an engine header (only Source/UI/Svg/*.cpp include it).
+    target_link_libraries(${tgt} PRIVATE lunasvg)
     # Jolt rigid-body physics (Source/Physics wraps it; no Jolt in headers).
     target_link_libraries(${tgt} PRIVATE Jolt)
     # Navigation RUNTIME: Detour (tiled navmesh query) + DetourTileCache (dynamic
@@ -349,6 +362,11 @@ function(hbe_configure_engine_lib tgt is_editor)
     target_link_libraries(${tgt} PRIVATE Detour DetourTileCache)
     # miniaudio playback (Source/Audio wraps it; header-only).
     target_link_libraries(${tgt} PRIVATE miniaudio_header)
+    # meshoptimizer: import-time geometry optimization (Source/Assets/MeshOptimize wraps it;
+    # no meshopt type crosses into an engine header). Linked into BOTH libraries: the editor
+    # runs the optimize passes at import, and the runtime keeps the decoders for a future
+    # compressed-.uaf path. Tiny, zero-dep static lib.
+    target_link_libraries(${tgt} PRIVATE meshoptimizer)
     # NanoVDB - header-only sparse-volume representation + PNanoVDB GPU reader. The
     # volumetric foundation (Source/Volume wraps it; no NanoVDB types cross into the RHI).
     # Zero external deps here; OpenVDB stays an optional editor-only add-on (vcpkg) later.

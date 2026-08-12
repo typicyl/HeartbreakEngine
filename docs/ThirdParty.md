@@ -11,7 +11,11 @@ attribution summary.
 | Assimp | 5.4.3 | BSD-3-Clause | model import (editor) |
 | EnTT | 3.13.2 | MIT | entity-component system |
 | nlohmann/json | 3.11.3 | MIT | project/asset JSON |
-| stb | master | MIT / public domain | image load, easy font |
+| stb | master | MIT / public domain | image load, easy font, glyph atlas packing |
+| FreeType | 2.13.3 | FTL / BSD-3-Clause | UI text: TTF/OTF glyph rasterization |
+| HarfBuzz | 10.1.0 | MIT (Old) | UI text: Unicode shaping (kerning/ligatures/complex scripts) |
+| SheenBidi | 2.6 | Apache-2.0 | UI text: Unicode Bidirectional Algorithm (RTL) |
+| LunaSVG (+plutovg) | 2.4.1 | MIT | UI vector graphics: on-demand SVG rasterization |
 | miniaudio | 0.11.21 | MIT / public domain | audio playback |
 | Jolt Physics | 5.2.0 | MIT | rigid-body + soft-body physics |
 | Mbed TLS | 3.6.7 | Apache-2.0 | collaboration transport security |

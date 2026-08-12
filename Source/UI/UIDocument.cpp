@@ -117,7 +117,20 @@ json WriteElement(const UIElement& e) {
                 {"disabledTexture", el->disabledTexture},
                 {"cellTexture", el->cellTexture},
                 {"slice", ToJson(el->slice)},
-                {"wrap", el->wrap}};
+                {"wrap", el->wrap},
+                {"focusedColor", ToJson(el->focusedColor)},
+                {"selectedColor", ToJson(el->selectedColor)},
+                {"styleTheme", el->styleTheme},
+                {"styleName", el->styleName},
+                {"id", el->id},
+                {"minSize", json::array({el->minSize.x, el->minSize.y})},
+                {"maxSize", json::array({el->maxSize.x, el->maxSize.y})},
+                {"aspectRatio", el->aspectRatio},
+                {"effect", el->effect},
+                {"navUp", el->navUp},
+                {"navDown", el->navDown},
+                {"navLeft", el->navLeft},
+                {"navRight", el->navRight}};
 }
 
 json WriteCanvas(const UICanvas& c) {
@@ -143,7 +156,10 @@ json WriteAnimator(const UIAnimator& a) {
 
 json WritePanel(const UIPanel& panel) {
     const UIPanel* p = &panel;
-    return json{{"name", p->name}, {"startVisible", p->startVisible}};
+    return json{{"name", p->name},
+                {"startVisible", p->startVisible},
+                {"firstFocus", p->firstFocus},
+                {"modal", p->modal}};
 }
 
 json WriteLayout(const UILayoutGroup& l) {
@@ -243,6 +259,19 @@ void ReadElement(const json& j, UIElement& out) {
     out.cellTexture = it->value("cellTexture", "");
     out.slice = glm::max(Vec4(it->value("slice", json()), glm::vec4(0.0f)), glm::vec4(0.0f));
     out.wrap = it->value("wrap", false);
+    out.focusedColor = Vec4(it->value("focusedColor", json()), glm::vec4(0.0f));
+    out.selectedColor = Vec4(it->value("selectedColor", json()), glm::vec4(0.0f));
+    out.styleTheme = it->value("styleTheme", "");
+    out.styleName = it->value("styleName", "");
+    out.id = it->value("id", "");
+    out.minSize = glm::max(vec2Of("minSize", {0.0f, 0.0f}), glm::vec2(0.0f));
+    out.maxSize = glm::max(vec2Of("maxSize", {0.0f, 0.0f}), glm::vec2(0.0f));
+    out.aspectRatio = glm::max(it->value("aspectRatio", 0.0f), 0.0f);
+    out.effect = it->value("effect", 0u);
+    out.navUp = it->value("navUp", "");
+    out.navDown = it->value("navDown", "");
+    out.navLeft = it->value("navLeft", "");
+    out.navRight = it->value("navRight", "");
 }
 
 void ReadCanvas(const json& j, UICanvas& out) {
@@ -273,6 +302,8 @@ void ReadAnimator(const json& j, UIAnimator& out) {
 void ReadPanel(const json& j, UIPanel& out) {
     out.name = j.value("name", "");
     out.startVisible = j.value("startVisible", false);
+    out.firstFocus = j.value("firstFocus", "");
+    out.modal = j.value("modal", false);
 }
 
 void ReadLayout(const json& j, UILayoutGroup& out) {
@@ -412,6 +443,17 @@ json DocToJson(const DocData& doc) {
 
 // Shared by LoadDocument (VFS bytes) and LoadDocumentFromString (undo snapshots).
 // `label` only names the source in diagnostics.
+// Upgrades a parsed document from an older on-disk `version` to the current in-memory
+// shape (D8/P5). A no-op today - v1 is the only version - but this is the dispatch
+// point every future breaking kDocVersion bump appends a step to. FIELD-level
+// back-compat (the old `anchor`/`textScale` keys) is handled in ReadElement
+// regardless of version; this hook is for DOCUMENT-shape changes the field readers
+// cannot express (a renamed/relocated block, a split component, ...).
+void MigrateDocument(DocData& /*doc*/, int fromVersion) {
+    if (fromVersion >= kDocVersion) return;
+    // (future) if (fromVersion < 2) UpgradeV1toV2(doc);
+}
+
 bool ParseDocRoot(const json& root, DocData& out, const std::string& label) {
     if (!root.is_object()) {
         HBE_ERROR("UI: '{}' is not a UI document (root is not an object).", label);
@@ -421,6 +463,16 @@ bool ParseDocRoot(const json& root, DocData& out, const std::string& label) {
     // routed us here, and refusing would turn a typo into "the game has no menu".
     if (const std::string kind = root.value("kind", std::string(kDocKind)); kind != kDocKind)
         HBE_WARN("UI: '{}' has kind '{}', expected '{}'.", label, kind, kDocKind);
+
+    // Version dispatch (D8/P5). `version` was WRITTEN from the start but never read;
+    // reading it gives a future breaking kDocVersion bump a real migration hook. A
+    // file NEWER than this engine loads best-effort (a warning, not a refusal - unknown
+    // forward keys are ignored by the .value() defaults everywhere below).
+    const int fileVersion = root.value("version", kDocVersion);
+    if (fileVersion > kDocVersion)
+        HBE_WARN("UI: '{}' is version {}, newer than this engine's {}; loading "
+                 "best-effort.",
+                 label, fileVersion, kDocVersion);
 
     out = DocData{};
     ReadDocHeader(root, out);
@@ -444,6 +496,7 @@ bool ParseDocRoot(const json& root, DocData& out, const std::string& label) {
             d.parent = -1;
         }
     }
+    MigrateDocument(out, fileVersion); // no-op at v1; the hook for future bumps
     return true;
 }
 
@@ -1475,7 +1528,20 @@ json FrozenElement(const UIElement* el) {
                 {"disabledTexture", el->disabledTexture},
                 {"cellTexture", el->cellTexture},
                 {"slice", ToJson(el->slice)},
-                {"wrap", el->wrap}};
+                {"wrap", el->wrap},
+                {"focusedColor", ToJson(el->focusedColor)},
+                {"selectedColor", ToJson(el->selectedColor)},
+                {"styleTheme", el->styleTheme},
+                {"styleName", el->styleName},
+                {"id", el->id},
+                {"minSize", json::array({el->minSize.x, el->minSize.y})},
+                {"maxSize", json::array({el->maxSize.x, el->maxSize.y})},
+                {"aspectRatio", el->aspectRatio},
+                {"effect", el->effect},
+                {"navUp", el->navUp},
+                {"navDown", el->navDown},
+                {"navLeft", el->navLeft},
+                {"navRight", el->navRight}};
     return je["ui"];
 }
 json FrozenCanvas(const UICanvas* canvas) {
@@ -1501,7 +1567,10 @@ json FrozenAnimator(const UIAnimator* an) {
 }
 json FrozenPanel(const UIPanel* p) {
     json je;
-    je["uiPanel"] = {{"name", p->name}, {"startVisible", p->startVisible}};
+    je["uiPanel"] = {{"name", p->name},
+                     {"startVisible", p->startVisible},
+                     {"firstFocus", p->firstFocus},
+                     {"modal", p->modal}};
     return je["uiPanel"];
 }
 json FrozenLayout(const UILayoutGroup* lg) {
@@ -1604,6 +1673,19 @@ void FuzzElement(Rng& r, UIElement& e) {
     e.cellTexture = r.S();
     e.slice = {r.F(0, 64), r.F(0, 64), r.F(0, 64), r.F(0, 64)};
     e.wrap = r.B();
+    e.focusedColor = {r.F(0, 1), r.F(0, 1), r.F(0, 1), r.F(0, 1)};
+    e.selectedColor = {r.F(0, 1), r.F(0, 1), r.F(0, 1), r.F(0, 1)};
+    e.styleTheme = r.S();
+    e.styleName = r.S();
+    e.id = r.S();
+    e.minSize = {r.F(0, 500), r.F(0, 500)};
+    e.maxSize = {r.F(0, 4000), r.F(0, 4000)};
+    e.aspectRatio = r.F(0, 4);
+    e.effect = static_cast<u32>(r.I(0, 3));
+    e.navUp = r.S();
+    e.navDown = r.S();
+    e.navLeft = r.S();
+    e.navRight = r.S();
 }
 
 // Field-by-field equality. Deliberately NOT memcmp: UIElement carries runtime
@@ -1644,16 +1726,18 @@ bool DocumentSelfTest(const std::vector<fs::path>& scenes) {
         expect(WriteWorldText(dw).dump() == FrozenWorldText(&dw).dump(),
                "worldText: defaults differ");
         // The key count is part of the contract: an added-but-unread key is a
-        // silent format fork. 53 for UIElement, counted from the block itself.
-        expect(WriteElement(de).size() == 53,
-               "ui block must emit exactly 53 keys, got " +
+        // silent format fork. 66 for UIElement (53 + P4's 4 + P5's id + P6's
+        // minSize/maxSize/aspectRatio + P7's effect + P8's navUp/Down/Left/Right),
+        // counted from the block itself.
+        expect(WriteElement(de).size() == 66,
+               "ui block must emit exactly 66 keys, got " +
                    std::to_string(WriteElement(de).size()));
         // 12 since the pick pass: `occlude` + `interactRange` (world-canvas
         // interaction, Interaction/Pick.cpp). Both defaults are duplicated in
         // Components.h and in ReadCanvas's .value() fallbacks - keep them equal.
         expect(WriteCanvas(dc).size() == 12, "uiCanvas block must emit 12 keys");
         expect(WriteAnimator(da).size() == 2, "uiAnimator block must emit 2 keys");
-        expect(WritePanel(dp).size() == 2, "uiPanel block must emit 2 keys");
+        expect(WritePanel(dp).size() == 4, "uiPanel block must emit 4 keys");
         expect(WriteLayout(dl).size() == 6, "uiLayoutGroup block must emit 6 keys");
         expect(WriteGroup(dg).size() == 2, "uiCanvasGroup block must emit 2 keys");
         expect(WriteWorldText(dw).size() == 5, "worldText block must emit 5 keys");
@@ -1685,6 +1769,8 @@ bool DocumentSelfTest(const std::vector<fs::path>& scenes) {
             UIPanel p;
             p.name = r.S();
             p.startVisible = r.B();
+            p.firstFocus = r.S();
+            p.modal = r.B();
             UILayoutGroup lg;
             lg.kind = static_cast<UILayoutGroup::Kind>(r.I(0, 2));
             lg.spacing = r.F(-50, 200);

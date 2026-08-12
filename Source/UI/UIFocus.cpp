@@ -32,9 +32,12 @@ const LayoutItem* FindItem(const std::vector<LayoutItem>& layout, entt::entity e
     return nullptr;
 }
 
-// True when the item is a live focus candidate this frame.
-bool Focusable(entt::registry& reg, const LayoutItem& item) {
+// True when the item is a live focus candidate this frame. `modal` (P8) traps focus
+// to a modal panel's subtree; entt::null = no modal = everything eligible.
+bool Focusable(entt::registry& reg, const LayoutItem& item,
+               entt::entity modal = entt::null) {
     if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) return false;
+    if (!IsDescendantOf(reg, item.entity, modal)) return false; // modal focus trap
     const UIElement& el = reg.get<UIElement>(item.entity);
     if (!el.visible || !el.enabled || !IsFocusable(el.type)) return false;
     // A non-interactive UICanvasGroup subtree can't take keyboard/gamepad focus.
@@ -55,12 +58,27 @@ bool Focusable(entt::registry& reg, const LayoutItem& item) {
 // 3=right) with a lateral penalty; same-canvas candidates win over
 // cross-canvas jumps (different canvases have unrelated pixel spaces).
 entt::entity PickInDirection(entt::registry& reg, const std::vector<LayoutItem>& layout,
-                             const LayoutItem& from, int dir) {
+                             const LayoutItem& from, int dir,
+                             entt::entity modal = entt::null) {
+    // Authored focus graph (P8): the `from` element may name a target element `id` for
+    // this direction. An override that resolves to a focusable, in-layout element wins;
+    // an empty or unresolvable one falls through to the geometric pick below.
+    if (const UIElement* fe = reg.try_get<UIElement>(from.entity)) {
+        const std::string& ov = dir == 0   ? fe->navUp
+                                : dir == 1 ? fe->navDown
+                                : dir == 2 ? fe->navLeft
+                                           : fe->navRight;
+        if (!ov.empty())
+            for (const LayoutItem& item : layout)
+                if (item.entity != from.entity && Focusable(reg, item, modal) &&
+                    reg.get<UIElement>(item.entity).id == ov)
+                    return item.entity;
+    }
     const glm::vec2 fc = Center(from.rect);
     entt::entity best = entt::null;
     f32 bestScore = 1e30f;
     for (const LayoutItem& item : layout) {
-        if (item.entity == from.entity || !Focusable(reg, item)) continue;
+        if (item.entity == from.entity || !Focusable(reg, item, modal)) continue;
         const glm::vec2 c = Center(item.rect);
         f32 axial, lateral;
         switch (dir) {
@@ -80,12 +98,13 @@ entt::entity PickInDirection(entt::registry& reg, const std::vector<LayoutItem>&
     return best;
 }
 
-// First candidate in reading order (top-left) - initial focus.
-entt::entity PickFirst(entt::registry& reg, const std::vector<LayoutItem>& layout) {
+// First candidate in reading order (top-left) - the geometric initial focus.
+entt::entity PickFirst(entt::registry& reg, const std::vector<LayoutItem>& layout,
+                       entt::entity modal = entt::null) {
     entt::entity best = entt::null;
     f32 bestScore = 1e30f;
     for (const LayoutItem& item : layout) {
-        if (!Focusable(reg, item)) continue;
+        if (!Focusable(reg, item, modal)) continue;
         const glm::vec2 c = Center(item.rect);
         const f32 score = c.y * 4.0f + c.x; // rows dominate
         if (score < bestScore) {
@@ -94,6 +113,53 @@ entt::entity PickFirst(entt::registry& reg, const std::vector<LayoutItem>& layou
         }
     }
     return best;
+}
+
+// Initial focus (P8): the authored firstFocus of the active modal panel, else of any
+// active panel, else geometric reading-order. Only focusable + in-layout ids count.
+entt::entity PickInitial(Scene& scene, const std::vector<LayoutItem>& layout,
+                         entt::entity modal) {
+    auto& reg = scene.Registry();
+    // Resolve `id` to a focusable, in-layout element that is ALSO a descendant of
+    // `panel` - so a panel's firstFocus can only land inside its OWN subtree (a
+    // background HUD's firstFocus can't point at, or be confused with, another screen).
+    const auto resolveIn = [&](entt::entity panel, const std::string& id) -> entt::entity {
+        if (id.empty()) return entt::null;
+        for (const LayoutItem& item : layout)
+            if (Focusable(reg, item, modal) && IsDescendantOf(reg, item.entity, panel) &&
+                reg.get<UIElement>(item.entity).id == id)
+                return item.entity;
+        return entt::null;
+    };
+    if (modal != entt::null && reg.all_of<UIPanel>(modal)) {
+        if (const entt::entity e = resolveIn(modal, reg.get<UIPanel>(modal).firstFocus);
+            e != entt::null)
+            return e;
+    } else {
+        // The TOPMOST active panel (its firstFocus target latest in the draw-ordered
+        // layout) that authored a resolvable firstFocus - so a persistent background
+        // HUD's firstFocus can't steal the first focus from the front screen.
+        entt::entity best = entt::null;
+        usize bestPos = 0;
+        for (const entt::entity p : reg.view<UIPanel>()) {
+            const UIPanel& panel = reg.get<UIPanel>(p);
+            if (!panel.active || panel.firstFocus.empty()) continue;
+            const entt::entity e = resolveIn(p, panel.firstFocus);
+            if (e == entt::null) continue;
+            usize pos = 0;
+            for (usize i = 0; i < layout.size(); ++i)
+                if (layout[i].entity == e) {
+                    pos = i;
+                    break;
+                }
+            if (best == entt::null || pos >= bestPos) {
+                best = e;
+                bestPos = pos;
+            }
+        }
+        if (best != entt::null) return best;
+    }
+    return PickFirst(reg, layout, modal);
 }
 
 // UTF-8 length in CHARACTERS (caret positions count characters, not bytes).
@@ -138,14 +204,18 @@ bool WantsTextInput(const UIContext& ctx) {
 
 void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) {
     auto& reg = scene.Registry();
+    // P8 modal scope: focus is trapped to the topmost SHOWN modal panel's subtree.
+    const entt::entity modal = ActiveModalPanel(scene, ctx.layout);
 
     // Validate carried-over focus: clear it if the entity died, left the layout
-    // (panel switch, scene swap), or is no longer focusable (its type changed) -
-    // so a stale focus ring never lingers on a non-interactive element.
+    // (panel switch, scene swap), is no longer focusable (its type changed), or now
+    // sits OUTSIDE an active modal (a dialog just opened over it) - so a stale focus
+    // ring never lingers on a non-interactive or now-blocked element.
     if (ctx.focused != entt::null) {
         const LayoutItem* fi = FindItem(ctx.layout, ctx.focused);
         if (!reg.valid(ctx.focused) || !reg.all_of<UIElement>(ctx.focused) || !fi ||
-            !IsFocusable(reg.get<UIElement>(ctx.focused).type)) {
+            !IsFocusable(reg.get<UIElement>(ctx.focused).type) ||
+            !IsDescendantOf(reg, ctx.focused, modal)) {
             ctx.focused = entt::null;
         }
     }
@@ -251,7 +321,7 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
             // A click that landed on ANOTHER TextInput commits this session and
             // immediately starts editing that one (no dead click).
             for (const LayoutItem& item : ctx.layout) {
-                if (item.entity == ctx.focused || !Focusable(reg, item)) continue;
+                if (item.entity == ctx.focused || !Focusable(reg, item, modal)) continue;
                 UIElement& other = reg.get<UIElement>(item.entity);
                 if (other.clicked && other.type == UIElement::Type::TextInput) {
                     beginEdit(item.entity);
@@ -272,7 +342,7 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
     const bool mouseMoved =
         input.MouseDeltaX() != 0.0f || input.MouseDeltaY() != 0.0f;
     for (const LayoutItem& item : ctx.layout) {
-        if (!Focusable(reg, item)) continue;
+        if (!Focusable(reg, item, modal)) continue;
         UIElement& el = reg.get<UIElement>(item.entity);
         if (el.hovered && mouseMoved) {
             ctx.focused = item.entity;
@@ -322,7 +392,7 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
     if (navFire) {
         ctx.focusVisible = true;
         if (ctx.focused == entt::null) {
-            ctx.focused = PickFirst(reg, ctx.layout); // first press just lands
+            ctx.focused = PickInitial(scene, ctx.layout, modal); // authored first-focus, else geometric
         } else if (const LayoutItem* from = FindItem(ctx.layout, ctx.focused)) {
             UIElement& el = reg.get<UIElement>(ctx.focused);
             // Value widgets consume left/right to adjust; up/down always
@@ -351,7 +421,7 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
                 }
             }
             if (!consumed) {
-                const entt::entity next = PickInDirection(reg, ctx.layout, *from, dir);
+                const entt::entity next = PickInDirection(reg, ctx.layout, *from, dir, modal);
                 if (next != entt::null) ctx.focused = next;
             }
         }

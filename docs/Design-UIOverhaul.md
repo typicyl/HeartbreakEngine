@@ -324,25 +324,127 @@ flags, and the event layer that make its seams clean. Each phase is independentl
 test‑gated.
 
 - **P1 — Audit** ✅ (this document).
-- **P2 — Real text stack.** FreeType + HarfBuzz + SheenBidi; dynamic paged glyph atlas;
-  widen `GlyphQuad` (glyph id + cluster + per‑glyph color); font fallback chain; rich‑text
-  span parser; ellipsis/truncation + max‑lines. *Highest leverage, unblocks localization,
-  no format break.* New self‑test `--test-uitext` (shaping/bidi/measure/wrap/ellipsis).
-- **P3 — SVG.** LunaSVG; `.svg` asset + cached rasterization keyed by path+target size →
-  bindless; `UIElement` image source accepts SVG; editor preview. `--test-uisvg`.
-- **P4 — Theme/Style asset.** `.hbtheme` + `UIStyleRef` + full state set (add focused/selected);
-  AssetFormats registration; shared serializer discipline; optional extract‑migrator. `--test-uistyle`.
-- **P5 — Core representation.** D1 runtime/authored split (`UIWidgetState`) · D2 optional stable
-  id · D4 per‑element dirty flags · D8 version‑dispatched reader. *The safe half of "core
-  refactor"; leaves the widget enum intact.*
-- **P6 — Layout richness.** min/max/preferred, margins, flex grow/shrink, aspect fitter,
-  content‑sized leaves, richer grid, DPI/UI‑scale factor, responsive breakpoints — all on the
-  kept `ComputeElementRect`.
-- **P7 — Rendering.** per‑element material/blend slot on `UIVertex`, dynamic atlas packer,
-  stencil/shape mask, indexed geometry, **GL clip + world‑UI parity**, profiling scopes,
-  isolate the UI GPU timer, raise/soft‑warn the vertex budget.
-- **P8 — Events + focus graph.** dispatch (capture/target/bubble, focus/blur/enter/leave),
-  modal scope, authored + auto focus graph — wrapping `ApplyPointerPass`.
+- **P2 — Real text stack.** ✅ **DONE (2026‑08‑11).** FreeType 2.13.3 + HarfBuzz 10.1.0 +
+  SheenBidi 2.6 wired (all permissive, static, runtime; HarfBuzz built w/o FT integration to
+  avoid the CMake cycle; SheenBidi amalgamation gated on `SB_CONFIG_UNITY` + `extern "C"`).
+  New `UI/Text/` module: `GlyphAtlas` (shared, paged, dynamically grown, white‑RGB+coverage‑α
+  pages so the one `color*tex` shader is preserved; `UpdateTexture` patches, never freed) +
+  `TextShaper` (UTF‑8 → SheenBidi bidi → per‑glyph font‑fallback itemization → HarfBuzz shape
+  → FreeType raster → positioned `GlyphQuad`s). `FontAtlas` rewritten as a FreeType‑free
+  facade; `GlyphQuad` widened (per‑glyph atlas index + source cluster + per‑glyph colour);
+  3 emit sites updated (screen/world/dev‑menu). `--test-uitext` PASSES (ASCII, accented
+  Latin‑1, Cyrillic, deterministic shaping, word‑wrap, `\n`, **RTL bidi visual reordering**).
+  Regressions green: `--test-uisolve`/`--test-uidoc`/`--test-uiseparation` PASS; 3× clean
+  `--uiworldtest` GPU runs (world‑UI target created, new font path, zero D3D12 errors);
+  editor + **shipping runtime** both build & link. *Still deferred to later P2 sub‑work:*
+  rich‑text span PARSER (the per‑glyph colour plumbing exists, the markup parser does not),
+  ellipsis/`max‑lines` truncation, MSDF for crisp large text. *Not verifiable headless:*
+  pixel‑perfect look + `--test-uicanvas` (needs a UI project, absent on this machine).
+- **P3 — SVG.** ✅ **DONE (2026‑08‑11).** LunaSVG 2.4.1 (+bundled plutovg, MIT) wired
+  (INTERFACE `LUNASVG_BUILD_STATIC` so consumers don't hit the dllimport trap). New
+  `UI/Svg/SvgCache`: VFS/pack‑aware load → parse once → **rasterize on demand at the
+  element's draw size** (supersampled, clamped) → cached bindless texture keyed by
+  (path,w,h); never import‑baked. `.svg` routed through `ResolveTexture`/`LoadUITexture`
+  (zero call‑site churn) + warmed by `PreloadUIAssets`; registered in `AssetFormats` as a
+  runtime‑loaded Leaf (ships in packs, `--test-assetformats` PASS). `--test-uisvg` PASS
+  (parse, multi‑res raster, RGBA byte order, malformed‑reject); regressions green; editor +
+  **shipping runtime** build & link. *Deferred:* true draw‑rect (device‑pixel) rasterization,
+  editor drag‑drop/thumbnail of `.svg` onto the canvas (folded into the P10 editor phase),
+  SVG fill‑override/mask. Basic multiplicative tint already works via `el.color`.
+- **P4 — Theme/Style asset.** ✅ **DONE (2026‑08‑11).** `.hbtheme` = named reusable styles;
+  a `UIElement` references one via `styleTheme`+`styleName` (kept as element FIELDS, not a new
+  component, to confine the change to the ONE shared `WriteElement`/`ReadElement`+frozen‑twin
+  lockstep — safest first serialization‑touching phase). New `UI/Style/Theme` (parse/cache/
+  resolve/overlay): at emit the style fills the element's UNSET skin fields (element‑set wins),
+  applied to a local copy so the authored component is untouched. Added the two missing visual
+  states **focused/selected** (`focusedColor`/`selectedColor`, wired into `stateFill`). `.hbtheme`
+  registered (`JsonScan`, ships themed fonts/textures). **Adversarially reviewed (3‑lens
+  workflow) → 6 findings, all fixed:** the frozen key‑count guard (53→57), themed sounds not
+  playing (wired into `PlayUISounds`), a `ParseTheme` type_error crash on wrong‑typed JSON
+  (hardened + full try/catch), a `selectedColor`/Toggle doc mismatch, and a per‑element alloc
+  nit (`std::optional`). `--test-uitheme` + frozen **`--test-uidoc`** + all regressions PASS;
+  editor + shipping runtime build & link. *Deferred to P10:* a dedicated Theme editor panel +
+  inspector `styleTheme`/`styleName` fields (today a `.hbtheme` is hand‑authored / set in the
+  `.hbui`). *Follow‑up:* broaden focused/selected theming beyond the Button state‑fill path.
+
+  `.hbtheme` shape:
+  ```json
+  { "version": 1, "kind": "hbtheme",
+    "styles": {
+      "PrimaryButton": {
+        "hoverColor": [0.9,0.3,0.35,1], "pressedColor": [0.7,0.2,0.25,1],
+        "focusedColor": [0.4,0.6,1,1], "font": "Fonts/Inter.uaf",
+        "hoverTexture": "UI/btn_hover.png", "slice": [12,12,12,12]
+      }
+    } }
+  ```
+- **P5 — Core representation (SAFE SUBSET).** ✅ **DONE (2026‑08‑11).** SCOPE DECISION (user‑
+  approved): after reading the interaction core, the D1 runtime/authored field‑split proved
+  pervasive (value/toggled/selected/scrollPos/text read across interaction/focus/animation/emit/
+  schematic/settings/editor) AND its hazard is already mitigated (documents excluded from scene
+  snapshots; the editor Play/Interact preview snapshots+restores those fields; the shipped runtime
+  never saves documents). So **D1 is bundled into P9's decomposition** (where those access sites get
+  restructured anyway), and P5 delivered the safe, additive pieces:
+  • **D8 — version‑dispatched `.hbui` reader**: `version` was written but never read (a latent trap);
+  now read, a newer‑than‑engine file warns + loads best‑effort, and `MigrateDocument(doc, fromVersion)`
+  is the dispatch hook every future breaking `kDocVersion` bump appends to.
+  • **D2 — stable opt‑in element `id`**: an additive `UIElement.id` (serialized through the same
+  Write/Read/Frozen/Fuzz lockstep + count guard 57→58) + `ui::FindElementById`. A stable handle for
+  future binding/localization/animation‑targeting/a11y (the `.hbui` entity still carries no guid).
+  • **Dirty‑flag foundation**: runtime `layoutDirty`/`styleDirty` on `UIElement` + `ui::MarkElementDirty`/
+  `MarkAllDirty` (wired into project‑switch) — advisory today; **P11's incremental layout is the consumer**.
+  Frozen **`--test-uidoc`** (58 keys) + all regressions PASS; editor + shipping runtime build & link.
+- **P6 — Layout richness (FOCUSED SUBSET).** ✅ **DONE (2026‑08‑11).** Delivered the two highest‑
+  value, most‑bounded items well, as default‑no‑op additive steps so `ComputeElementRect` stays
+  verbatim (`--test-uisolve`) and existing content is byte‑identical (`--test-uicanvas`):
+  • **DPI / UI‑scale factor** — a global `ui::SetUIScale`/`GetUIScale` (clamp [0.25,4]) applied in
+  `EffectiveCanvas` (the choke for every canvas path); persisted in `UserSettings.uiScale` (clamped
+  on load), applied at boot (runtime‑only so the editor/tests stay at 1.0), and a `setting:uiscale`
+  slider bound over the FULL [0.25,4] range (seed/apply exact inverses). The key responsive/accessibility
+  win (Steam Deck / density).
+  • **min/max/aspect constraints** — additive `UIElement.minSize/maxSize/aspectRatio` (serialized
+  through the shared lockstep, count 58→61) clamped by a new `ApplyLayoutConstraints` post‑step:
+  resized about the pivot for free elements, **pinned to the slot top‑left for layout‑group children**,
+  and re‑applied after a `fitContent` grow so they compose. **Adversarially reviewed (3‑lens workflow)
+  → 4 findings, all fixed:** the group‑child pivot bug (found by 2 agents), `fitContent`+maxSize compose,
+  and the uiScale slider‑range/load‑clamp inconsistency. `--test-uisolve` (constraints + top‑left pinning)
+  + `--test-uidoc` (61) + all regressions PASS; editor + shipping runtime build & link.
+  *Deferred* (each needs monolithic‑walk surgery best paired with P9's layout modularization): flex
+  grow/shrink, named margins, content‑size‑to‑TEXT for leaves (touches the layout↔text boundary),
+  richer grid (auto‑flow/spanning/track‑sizing), responsive breakpoints.
+- **P7 — Rendering (FOCUSED SUBSET; GL out of scope per user).** ✅ **DONE (2026‑08‑12).**
+  • **CPU profiling scopes** — `UIFrameStats` gained `layoutUs`/`emitUs`/`shapeUs` (chrono‑timed in
+  the cached `BuildVertices` + `Emitter::Text`), logged in the perf line. Addresses the audit's
+  "no CPU profiling scopes" finding; the observability P11 needs.
+  • **Per‑element material/effect slot** (the flagship "custom UI materials") — `UIVertex` gained a
+  `u32 fx` (52→56 B), mirrored in the DX12 input layout, Vulkan attrs, and `UI.hlsl` (a shader
+  BRANCH, so it's still ONE bindless draw — no blend‑state/pipeline change). Authored `UIElement.effect`
+  (serialized, count 61→62); effect 1 = grayscale/desaturate; 0 = pixel‑identical. **Adversarially
+  reviewed (3‑lens) → 1 nit** (a stale vertex‑budget comment; the cap correctly derives from
+  `sizeof(UIVertex)`) — clean serialization/emitter/profiling. Verified: `--test-uidoc` (62) + all
+  regressions PASS; **both backends smoke‑clean** (`--uiworldtest --d3d12`/`--vulkan`: device init,
+  world‑UI page + text through the new 56‑B format, zero validation/device‑removed). Editor + runtime
+  build & link. *Visual look of the grayscale effect is unverified headless — your eye.*
+  *Deferred* (render‑blind RHI/both‑backend work, best paired with a visual pass / P11 perf): dynamic
+  atlas packer, stencil/shape masking beyond the axis‑aligned clip, indexed geometry, UI‑GPU‑timer split.
+- **P8 — Focus graph + modal scope (FOCUSED SUBSET).** ✅ **DONE (2026‑08‑12).** Delivered the
+  bounded, additive (no‑op by default) half of "events + focus graph":
+  • **Authored focus graph** — `UIElement.navUp/navDown/navLeft/navRight` (target element `id`,
+  using P5's stable ids; serialized, count 62→66) override the geometric directional pick in
+  `PickInDirection`; unresolvable → geometric fallback. `UIPanel.firstFocus` (+ new `PickInitial`)
+  sets the initial focus target, **scoped to its own panel's subtree** and chosen from the topmost
+  active panel (so a background HUD can't steal it).
+  • **Modal scope** — `UIPanel.modal`; `ui::ActiveModalPanel(scene, layout)` picks the topmost
+  **shown** modal (requires a laid‑out descendant, so an active‑but‑unshown modal never locks the
+  UI) and `ui::IsDescendantOf` traps both pointer hit‑testing (`ApplyPointerPass`) and focus
+  (`Focusable`/`UpdateNavigation`, which also drops focus a newly‑opened modal now blocks) to its
+  subtree. `UIPanel` serialized fields (count 2→4).
+  **Adversarially reviewed (3‑lens) → 6 findings, all fixed:** a **major modal lockout** (trapping to
+  an unshown modal — fixed by the layout‑aware `ActiveModalPanel`), stacked‑modal + first‑focus
+  pool‑order/scoping bugs, a doc gap, and panel‑fuzz coverage. `--test-uidoc` (66/panel‑4) +
+  **`--test-uipick`** (interaction no‑regression) + all regressions PASS; editor + runtime build & link.
+  *Deferred to P9's decomposition:* the full capture/target/bubble event‑dispatch graph +
+  focus/blur/enter/leave listener events + eager focus‑on‑Show (needs UIManager↔UIContext wiring).
 - **P9 — Widget registry + advanced widgets.** D3 vtable; then Tab/Modal/Tooltip/ContextMenu/
   List/Tree/Reorderable/**Virtualized list**/Viewport/RenderTexture widget. *Riskiest core change;
   done after P5/P8 clean the seams.*

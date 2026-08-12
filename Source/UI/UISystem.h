@@ -50,6 +50,13 @@ struct CanvasConfig {
 // Effective canvas size for a target under `config`.
 glm::vec2 EffectiveCanvas(const CanvasConfig& config, glm::vec2 targetSize);
 
+// Global UI scale (P6): >1 enlarges the whole UI uniformly (accessibility / display
+// density / Steam Deck), clamped to [0.25, 4]. Applied inside EffectiveCanvas, so it
+// affects every canvas + layout path. The engine drives it from UserSettings; the
+// editor authoring canvas and headless tests leave it at 1.0.
+void SetUIScale(f32 scale);
+f32 GetUIScale();
+
 // An axis-aligned rectangle in canvas units (y-down, origin top-left).
 struct Rect {
     f32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -136,6 +143,12 @@ struct UIFrameStats {
     u32 verts = 0;       // overlay vertices built this frame
     u32 textLayouts = 0; // glyph re-layouts (cache misses) this frame
     u32 mapRebuilds = 0; // children-map rebuilds (structure changed)
+    // CPU profiling scopes (P7). microseconds, this frame. shapeUs is a SUBSET of
+    // emitUs (text shaping happens inside the emit walk); layoutUs + emitUs is the
+    // whole CPU UI-build cost (interaction/animation are timed at the engine level).
+    f32 layoutUs = 0.0f; // the layout walk (LayoutUI)
+    f32 emitUs = 0.0f;   // vertex emission (BuildVerticesImpl), includes shapeUs
+    f32 shapeUs = 0.0f;  // text shaping on cache misses
 };
 
 // Persistent UI processing context (one per scene lifetime, owned by the
@@ -337,6 +350,31 @@ void ClearTextureCache(Scene* scene);
 // hitch inside the frame loop.
 void PreloadUIAssets(Scene& scene, Renderer& renderer,
                      const std::filesystem::path& assetsDir);
+
+// P5 (D2): find the first UIElement carrying the authored `id` (empty id never
+// matches). Ids are unique within a document by convention; this returns the first
+// match in entity-pool order across the whole scene, entt::null if none. The stable
+// handle future data-binding / localization / animation-targeting reference elements
+// by, instead of the non-unique name/action.
+entt::entity FindElementById(Scene& scene, const std::string& id);
+
+// P8 modal scope: the topmost SHOWN modal UIPanel (entt::null = none). Only a modal
+// with a laid-out descendant in `layout` qualifies (so an active-but-unshown modal
+// never locks the UI); among several, the topmost in draw order wins. While one is
+// active, pointer hit-testing AND focus navigation are trapped to its subtree.
+entt::entity ActiveModalPanel(Scene& scene, const std::vector<LayoutItem>& layout);
+// True if `e` IS `ancestor` or a descendant (Parent-chain walk, depth-capped). An
+// entt::null `ancestor` returns true (no modal = everything eligible).
+bool IsDescendantOf(const entt::registry& reg, entt::entity e, entt::entity ancestor);
+
+// P5 dirty-flag FOUNDATION. MarkElementDirty flags an element's layout/style dirty
+// (call after mutating its geometry or style); MarkAllDirty flags every UI element.
+// Today the full layout/emit walk still runs and these are advisory - P11's
+// incremental layout is the CONSUMER that will skip clean elements. Kept as a small,
+// stable API now so producers can start marking correctly ahead of that.
+void MarkElementDirty(Scene& scene, entt::entity e, bool layout = true,
+                      bool style = false);
+void MarkAllDirty(Scene& scene);
 
 } // namespace ui
 } // namespace hbe

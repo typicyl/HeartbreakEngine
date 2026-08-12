@@ -433,7 +433,7 @@ private:
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
     VkPipeline uiPipeline_ = VK_NULL_HANDLE; // uses pipelineLayout_ (bindless set 1)
-    static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~40k verts @ 52 B)
+    static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~37449 verts @ 56 B)
     VkBuffer       uiVertexBuffers_[kMaxFramesInFlight]{};
     VkDeviceMemory uiVertexMemory_[kMaxFramesInFlight]{};
     u8*            uiVertexCpu_[kMaxFramesInFlight] = {};
@@ -2487,19 +2487,20 @@ bool VulkanDevice::CreateMeshPipeline() {
 
             VkVertexInputBindingDescription uiBinding{0, sizeof(UIVertex),
                                                       VK_VERTEX_INPUT_RATE_VERTEX};
-            VkVertexInputAttributeDescription uiAttrs[5] = {
+            VkVertexInputAttributeDescription uiAttrs[6] = {
                 {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, x)},
                 {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, u)},
                 {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(UIVertex, r)},
                 {3, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, texIndex)},
                 {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
-                 offsetof(UIVertex, clipX0)}, // NDC clip rect
+                 offsetof(UIVertex, clipX0)},                     // NDC clip rect
+                {5, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, fx)}, // effect id (P7)
             };
             VkPipelineVertexInputStateCreateInfo uiVi{
                 VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
             uiVi.vertexBindingDescriptionCount = 1;
             uiVi.pVertexBindingDescriptions = &uiBinding;
-            uiVi.vertexAttributeDescriptionCount = 5;
+            uiVi.vertexAttributeDescriptionCount = 6;
             uiVi.pVertexAttributeDescriptions = uiAttrs;
 
             VkPipelineDepthStencilStateCreateInfo uiDs{

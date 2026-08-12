@@ -14,6 +14,7 @@
 #include "Assets/MeshDerive.h"
 #include "Assets/MeshGenerator.h" // --skin-preview (headless skin sphere render)
 #include "Assets/MeshSimplify.h"
+#include "Assets/MeshOptimize.h" // --test-meshopt (import-time GPU geometry optimize)
 #include "Assets/MeshFaceSelect.h"
 #include "Core/Platform.h"
 #include "Assets/SlotIds.h"      // --test-slotids / --migrate-slots (pack slot identity)
@@ -66,6 +67,9 @@
 #include "UI/UIDocument.h"
 #include "UI/UIManager.h" // --test-uiscreens (panel lookup across the screen set)
 #include "UI/UISystem.h"  // --test-uisolve (direct-manipulation math gate)
+#include "UI/FontAtlas.h" // --test-uitext (text::TextSelfTest; FreeType-free header)
+#include "UI/Svg/SvgCache.h" // --test-uisvg (svg::SvgSelfTest; LunaSVG-free header)
+#include "UI/Style/Theme.h" // --test-uitheme (style::ThemeSelfTest)
 #include "Vfx/VfxStack.h"
 
 #include <glm/gtc/packing.hpp> // unpackHalf2x16 (GPU record colour)
@@ -347,6 +351,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-simplify") == 0) {
             const bool ok = hbe::mesh::SimplifySelfTest();
             std::printf("simplify %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-meshopt: import-time GPU geometry optimize (meshoptimizer). Proves the
+        // surface is preserved, morph deltas stay glued to their vertices through the
+        // reorder, the cache order improves, the weld collapses duplicates, and it is
+        // deterministic. Headless, no GPU/window/project.
+        if (std::strcmp(argv[i], "--test-meshopt") == 0) {
+            const bool ok = hbe::mesh::OptimizeSelfTest();
+            std::printf("meshopt %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         if (std::strcmp(argv[i], "--test-meshderive") == 0) {
@@ -952,6 +965,31 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-uisolve") == 0) {
             const bool ok = hbe::ui::ManipulationSelfTest();
             std::printf("uisolve %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-uitext: the TEXT STACK gate (P2 of docs/Design-UIOverhaul.md).
+        // Proves FreeType + HarfBuzz + SheenBidi render ASCII AND non-ASCII (the old
+        // stb_truetype atlas dropped every byte >= 0x80), shape deterministically,
+        // word-wrap, break on '\n', and visually reorder RTL text. Headless, no GPU.
+        if (std::strcmp(argv[i], "--test-uitext") == 0) {
+            const bool ok = hbe::ui::text::TextSelfTest();
+            std::printf("uitext %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-uisvg: the SVG rasterization gate (P3 of docs/Design-UIOverhaul.md).
+        // Proves LunaSVG parses + rasterizes to correct-size straight-alpha RGBA at
+        // multiple resolutions and rejects malformed input. Headless, no GPU.
+        if (std::strcmp(argv[i], "--test-uisvg") == 0) {
+            const bool ok = hbe::ui::svg::SvgSelfTest();
+            std::printf("uisvg %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-uitheme: the STYLE/THEME gate (P4 of docs/Design-UIOverhaul.md).
+        // Proves .hbtheme parses, ApplyStyle fills UNSET fields while element-set
+        // fields win, and malformed themes are rejected. Headless, no GPU.
+        if (std::strcmp(argv[i], "--test-uitheme") == 0) {
+            const bool ok = hbe::ui::style::ThemeSelfTest();
+            std::printf("uitheme %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-uieditor: the AUTHORING contract of that same panel's palette,

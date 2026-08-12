@@ -3,6 +3,7 @@
 
 #include "Assets/AssetFormats.h" // the single source of truth for source formats
 #include "Assets/MaterialAsset.h"
+#include "Assets/MeshOptimize.h" // import-time GPU geometry optimization (meshoptimizer)
 #include "Assets/ModelLoader.h"
 #include "Assets/SlotIds.h" // the pack slot is assigned HERE, at import
 #include "Assets/UAF.h"
@@ -422,6 +423,12 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
                      matDone.size(), matDir.string());
         }
     }
+
+    // Reorder each submesh's geometry for the GPU (vertex cache / overdraw / fetch) before
+    // it is written. Deterministic; morph-target deltas ride along through the same remap.
+    // Materials above only touch refs, never geometry, so this is safe to run last.
+    for (MeshData& md : *model)
+        mesh::OptimizeForGpu(md);
 
     return uaf::WriteMesh(out, *model, GenGuid(), rig.Valid() ? &rig : nullptr);
 }

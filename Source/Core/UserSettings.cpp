@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <fstream>
 
 #if defined(_WIN32)
@@ -40,6 +41,7 @@ bool UserSettings::Save(const std::filesystem::path& dir) const {
     j["masterVolume"] = masterVolume;
     j["graphicsPreset"] = graphicsPreset;
     j["brightness"] = brightness;
+    j["uiScale"] = uiScale;
     j["subtitlesEnabled"] = subtitlesEnabled;
     j["captionsEnabled"] = captionsEnabled;
     j["speakerNames"] = speakerNames;
@@ -70,6 +72,9 @@ bool UserSettings::Load(const std::filesystem::path& dir) {
     masterVolume = j.value("masterVolume", 1.0f);
     graphicsPreset = j.value("graphicsPreset", 1); // fresh install defaults to Medium (perf)
     brightness = j.value("brightness", 0.5f);
+    // Clamp to the SetUIScale domain so a hand-edited out-of-range value is sanitized
+    // to what the engine will actually apply + what the settings slider can express.
+    uiScale = std::clamp(j.value("uiScale", 1.0f), 0.25f, 4.0f);
     captionsEnabled = j.value("captionsEnabled", false);
     // Pre-split settings files only had "captionsEnabled", which gated dialogue
     // too. Inherit it as the subtitle default so an existing player who turned

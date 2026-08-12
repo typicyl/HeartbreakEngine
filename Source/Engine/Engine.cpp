@@ -39,6 +39,7 @@
 #include "Scene/WorldState.h" // per-area revisit state (capture on exit, replay on entry)
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
+#include "UI/Style/Theme.h" // themed UI sounds (PlayUISounds)
 #include "UI/UIFocus.h"
 #include "UI/UISystem.h"
 #include "UI/UIAnimation.h"
@@ -1365,6 +1366,9 @@ int Engine::Run(const EngineConfig& configIn) {
         HBE_INFO("User settings loaded: graphics preset {} ({}){}", gp, kPresetNames[gp],
                  onInit_ ? " - editor shows the authored look regardless" : "");
         audio.SetBusVolume("Master", userSettings_.masterVolume);
+        // Runtime only: the editor authoring canvas + --test-uicanvas stay at scale
+        // 1.0 (author at the reference); the shipped game applies the player's scale.
+        if (!onInit_) ui::SetUIScale(userSettings_.uiScale);
         // Enqueue captions when EITHER category is on; subtitle::Stack does the
         // real per-kind gating (a Voiceline .uaf is speech, so it must reach the
         // stack when only Subtitles is enabled).
@@ -1692,12 +1696,14 @@ int Engine::Run(const EngineConfig& configIn) {
                 const ui::UIFrameStats& us = uiCtx_.stats;
                 HBE_INFO("Perf: {:.1f} FPS avg ({:.2f} ms) | worst {:.1f} ms | {} jank "
                          "frame(s) <45 FPS | draws {}/{} ({} culled, {} runs x{} inst) | "
-                         "shadow {} drawn/{} culled | UI {} el {} verts {} txt {} maps",
+                         "shadow {} drawn/{} culled | UI {} el {} verts {} txt {} maps "
+                         "| ui-cpu lay {:.0f} emit {:.0f} shape {:.0f} us",
                          fpsFrames / elapsed, 1000.0f * elapsed / fpsFrames,
                          1000.0f * winMaxDt, winJank, rs.drawn, rs.total, rs.culled,
                          rs.instancedDraws, rs.totalInstances, rs.shadowDraws,
                          rs.shadowCulled, us.elements, us.verts,
-                         us.textLayouts, us.mapRebuilds);
+                         us.textLayouts, us.mapRebuilds, us.layoutUs, us.emitUs,
+                         us.shapeUs);
                 HBE_INFO("  CPU phases (avg/frame): gameplay {:.2f} ms | facial {:.2f} ms | "
                          "vfx-sim {:.3f} ms | vfx-expand {:.3f} ms | stream {:.3f} ms | "
                          "nav {:.3f} ms | pick {:.4f} ms ({:.2f} "
@@ -3969,7 +3975,6 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
         out.push_back(a00); out.push_back(a10); out.push_back(a11);
         out.push_back(a00); out.push_back(a11); out.push_back(a01);
     };
-    const u32 ft = font.TextureIndex();
     const f32 textPx = 17.0f, padX = 12.0f, padY = 10.0f, ox = 16.0f, oy = 16.0f;
     const auto measure = [&](const std::string& s) {
         std::vector<ui::GlyphQuad> q;
@@ -3982,8 +3987,8 @@ void Engine::BuildDevOverlay(std::vector<rhi::UIVertex>& out) {
         f32 w = 0.0f, h = 0.0f;
         font.Layout(s, textPx, q, w, h);
         for (const ui::GlyphQuad& gq : q)
-            addRect(x + gq.x0, y + gq.y0, x + gq.x1, y + gq.y1, r, g, b, 1.0f, ft, gq.u0, gq.v0,
-                    gq.u1, gq.v1);
+            addRect(x + gq.x0, y + gq.y0, x + gq.x1, y + gq.y1, r, g, b, 1.0f, gq.atlas, gq.u0,
+                    gq.v0, gq.u1, gq.v1);
     };
 
     // One display string per menu row.
@@ -4041,6 +4046,10 @@ void Engine::SeedSettingsWidgets() {
     scene_->Registry().view<UIElement>().each([&](UIElement& el) {
         if (el.action == "setting:volume") el.value = userSettings_.masterVolume;
         else if (el.action == "setting:brightness") el.value = userSettings_.brightness;
+        // UI scale slider spans the FULL SetUIScale domain [0.25, 4.0], so the seed
+        // and apply mappings are exact inverses and no applyable scale is unrepresentable.
+        else if (el.action == "setting:uiscale")
+            el.value = glm::clamp((userSettings_.uiScale - 0.25f) / 3.75f, 0.0f, 1.0f);
         else if (el.action == "setting:graphics") el.selected = userSettings_.graphicsPreset;
         else if (el.action == "setting:captions") el.toggled = userSettings_.captionsEnabled;
         else if (el.action == "setting:subtitles") el.toggled = userSettings_.subtitlesEnabled;
@@ -4057,6 +4066,9 @@ void Engine::ApplyChangedSettings() {
             if (audio_) audio_->SetBusVolume("Master", el.value);
         } else if (el.action == "setting:brightness") {
             userSettings_.brightness = el.value; // applied to exposure each frame
+        } else if (el.action == "setting:uiscale") {
+            userSettings_.uiScale = glm::mix(0.25f, 4.0f, glm::clamp(el.value, 0.0f, 1.0f));
+            ui::SetUIScale(userSettings_.uiScale); // relayouts at the new scale
         } else if (el.action == "setting:graphics") {
             userSettings_.graphicsPreset = el.selected; // applied to post each frame
         } else if (el.action == "setting:captions") {
@@ -4215,9 +4227,23 @@ void Engine::PlayUISounds() {
     // One cheap per-frame scan; maintains the hover edge for every widget so a
     // hover-out resets it.
     scene_->Registry().view<UIElement>().each([&](UIElement& el) {
-        if (el.clicked && !el.clickSound.empty()) audio_->PlayUAF(assets / el.clickSound);
-        if (moved && el.hovered && !el.prevHovered && !el.hoverSound.empty())
-            audio_->PlayUAF(assets / el.hoverSound);
+        const bool clickEvent = el.clicked;
+        const bool hoverEvent = moved && el.hovered && !el.prevHovered;
+        if (clickEvent || hoverEvent) {
+            // A themed widget with no own sound inherits the style's. Resolved only on
+            // an actual event (cheap: ResolveStyle is a cached lookup once warm), so
+            // idle styled widgets add no per-frame cost.
+            std::string clickSnd = el.clickSound, hoverSnd = el.hoverSound;
+            if ((clickSnd.empty() || hoverSnd.empty()) && !el.styleTheme.empty()) {
+                if (const ui::style::Style* s =
+                        ui::style::ResolveStyle(assets, el.styleTheme, el.styleName)) {
+                    if (clickSnd.empty()) clickSnd = s->clickSound;
+                    if (hoverSnd.empty()) hoverSnd = s->hoverSound;
+                }
+            }
+            if (clickEvent && !clickSnd.empty()) audio_->PlayUAF(assets / clickSnd);
+            if (hoverEvent && !hoverSnd.empty()) audio_->PlayUAF(assets / hoverSnd);
+        }
         el.prevHovered = el.hovered;
     });
 }

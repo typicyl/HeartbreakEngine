@@ -386,19 +386,19 @@ void AppendWorldText(Scene& scene, Renderer& renderer,
             if (wt.billboard) return origin + camRight * lx + camUp * ly;
             return glm::vec3(M * glm::vec4(lx, ly, 0.0f, 1.0f));
         };
-        const auto push = [&](glm::vec3 p, f32 u, f32 v) {
+        const auto push = [&](glm::vec3 p, f32 u, f32 v, u32 tex) {
             rhi::ParticleVertex pv;
             pv.x = p.x; pv.y = p.y; pv.z = p.z;
             pv.u = u; pv.v = v;
             pv.r = wt.color.r; pv.g = wt.color.g; pv.b = wt.color.b; pv.a = wt.color.a;
-            pv.texIndex = font.TextureIndex();
+            pv.texIndex = tex; // per-glyph atlas page (paged/fallback glyph atlas)
             outAlpha.push_back(pv);
         };
         for (const GlyphQuad& q : quads) {
             const glm::vec3 tl = place(q.x0, q.y0), tr = place(q.x1, q.y0);
             const glm::vec3 bl = place(q.x0, q.y1), br = place(q.x1, q.y1);
-            push(tl, q.u0, q.v0); push(tr, q.u1, q.v0); push(br, q.u1, q.v1);
-            push(tl, q.u0, q.v0); push(br, q.u1, q.v1); push(bl, q.u0, q.v1);
+            push(tl, q.u0, q.v0, q.atlas); push(tr, q.u1, q.v0, q.atlas); push(br, q.u1, q.v1, q.atlas);
+            push(tl, q.u0, q.v0, q.atlas); push(br, q.u1, q.v1, q.atlas); push(bl, q.u0, q.v1, q.atlas);
         }
     }
 }

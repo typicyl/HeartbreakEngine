@@ -8,6 +8,8 @@
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 #include "UI/FontAtlas.h"
+#include "UI/Style/Theme.h"
+#include "UI/Svg/SvgCache.h"
 
 #include <glm/gtc/constants.hpp>
 
@@ -15,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <optional>
 #include <unordered_map>
 
 namespace hbe::ui {
@@ -48,6 +51,9 @@ struct Emitter {
     glm::vec4 tint{1.0f};
     // Word-wrap captions to the rect's inner width (Text()).
     bool wrapText = false;
+    // Per-element effect id stamped into every emitted vertex (P7 custom UI materials).
+    // 0 = normal. Default keeps output pixel-identical.
+    u32 fx = 0;
 
     rhi::UIVertex Vertex(f32 x, f32 y, f32 u, f32 v, const glm::vec4& c, u32 tex) const {
         if (xfOn) {
@@ -66,6 +72,7 @@ struct Emitter {
         vert.texIndex = tex;
         vert.clipX0 = clipMin.x; vert.clipY0 = clipMin.y;
         vert.clipX1 = clipMax.x; vert.clipY1 = clipMax.y;
+        vert.fx = fx;
         return vert;
     }
 
@@ -148,7 +155,11 @@ struct Emitter {
             UIContext::TextCacheEntry& entry = cache->textCache[slotKey];
             if (entry.hash != hash) {
                 entry.hash = hash;
+                const auto s0 = std::chrono::steady_clock::now();
                 font.LayoutWrapped(text, sizePx, wrapW, entry.quads, entry.w, entry.h);
+                cache->stats.shapeUs += std::chrono::duration<f32, std::micro>(
+                                            std::chrono::steady_clock::now() - s0)
+                                            .count();
                 ++cache->stats.textLayouts;
             }
             quadsPtr = &entry.quads;
@@ -177,14 +188,17 @@ struct Emitter {
         }
         const glm::vec2 origin(ox, oy);
         for (const GlyphQuad& g : quads) {
+            // Per-glyph atlas page (a paged/fallback atlas spans several textures)
+            // and per-glyph colour (rich-text spans; a<=0 = inherit the run colour).
+            const glm::vec4 gc = g.color.a > 0.0f ? g.color : color;
             const rhi::UIVertex a = Vertex(origin.x + g.x0, origin.y + g.y0, g.u0, g.v0,
-                                           color, font.TextureIndex());
+                                           gc, g.atlas);
             const rhi::UIVertex b = Vertex(origin.x + g.x1, origin.y + g.y0, g.u1, g.v0,
-                                           color, font.TextureIndex());
+                                           gc, g.atlas);
             const rhi::UIVertex c = Vertex(origin.x + g.x1, origin.y + g.y1, g.u1, g.v1,
-                                           color, font.TextureIndex());
+                                           gc, g.atlas);
             const rhi::UIVertex d = Vertex(origin.x + g.x0, origin.y + g.y1, g.u0, g.v1,
-                                           color, font.TextureIndex());
+                                           gc, g.atlas);
             out->push_back(a); out->push_back(b); out->push_back(c);
             out->push_back(a); out->push_back(c); out->push_back(d);
         }
@@ -239,6 +253,10 @@ std::unordered_map<std::string, UITex>& UITexCache() {
 u32 LoadUITexture(Renderer& renderer, const std::filesystem::path& assetsDir,
                   const std::string& rel) {
     if (rel.empty() || assetsDir.empty()) return 0;
+    // A `.svg` is a vector asset: rasterize on demand (its own cache). Secondary uses
+    // (widget-part skins, sprite frames) get a fixed 256px box; the primary image is
+    // sized to the element in ResolveTexture.
+    if (svg::IsSvgPath(rel)) return svg::ResolveSvg(renderer, assetsDir, rel, 256, 256);
     auto& cache = UITexCache();
     if (auto it = cache.find(rel); it != cache.end()) return it->second.index;
     const rhi::TextureHandle handle = assets::LoadTexture(renderer, assetsDir / rel);
@@ -266,10 +284,28 @@ UITex UITexInfo(Renderer& renderer, const std::filesystem::path& assetsDir,
     return e;
 }
 
+// Pixel size to rasterize an SVG element at: the authored size x2 (supersampled so
+// it stays crisp on higher-DPI/4K targets), clamped; a fullscreen/degenerate size
+// falls back to a 512 box. TRUE draw-rect rasterization (device pixels of the
+// laid-out rect) is a later refinement - the rect is not available at this seam.
+void SvgRasterSize(const UIElement& el, u32& w, u32& h) {
+    const f32 sw = el.fullscreen ? 512.0f : el.size.x;
+    const f32 sh = el.fullscreen ? 512.0f : el.size.y;
+    w = static_cast<u32>(std::clamp<long>(std::lround(sw * 2.0f), 16L, 4096L));
+    h = static_cast<u32>(std::clamp<long>(std::lround(sh * 2.0f), 16L, 4096L));
+}
+
 // Resolves an element's texture ref to a bindless index (cached per element;
 // reset textureResolved to re-resolve after edits).
 u32 ResolveTexture(UIElement& el, Renderer& renderer,
                    const std::filesystem::path& assetsDir) {
+    // Vector image: rasterize to the element's size (the svg cache keys on path+size,
+    // so this is a hash lookup once warm - no per-element cache needed).
+    if (svg::IsSvgPath(el.texture)) {
+        u32 w = 0, h = 0;
+        SvgRasterSize(el, w, h);
+        return svg::ResolveSvg(renderer, assetsDir, el.texture, w, h);
+    }
     if (el.textureResolved) return el.textureIndexCache;
     el.textureResolved = true;
     el.textureIndexCache = LoadUITexture(renderer, assetsDir, el.texture);
@@ -278,17 +314,36 @@ u32 ResolveTexture(UIElement& el, Renderer& renderer,
 
 } // namespace
 
+namespace {
+// Global UI scale factor (P6). Runtime/accessibility setting, NOT authored per canvas,
+// so it lives here rather than in CanvasConfig/UICanvas (no serialization change). The
+// editor authoring canvas and the headless --test-uicanvas never touch it, so it stays
+// 1.0 there and byte-identity holds.
+f32 g_uiScale = 1.0f;
+} // namespace
+
+void SetUIScale(f32 scale) { g_uiScale = glm::clamp(scale, 0.25f, 4.0f); }
+f32 GetUIScale() { return g_uiScale; }
+
 glm::vec2 EffectiveCanvas(const CanvasConfig& config, glm::vec2 target) {
     target = glm::max(target, glm::vec2(1.0f));
+    glm::vec2 canvas;
     switch (config.mode) {
         case ScaleMode::PixelPerfect:
-            return target;
+            canvas = target;
+            break;
         case ScaleMode::MatchHeight:
-            return {config.refHeight * (target.x / target.y), config.refHeight};
+            canvas = {config.refHeight * (target.x / target.y), config.refHeight};
+            break;
         case ScaleMode::Stretch:
         default:
-            return {config.refWidth, config.refHeight};
+            canvas = {config.refWidth, config.refHeight};
+            break;
     }
+    // >1 enlarges the whole UI: a smaller effective canvas makes a fixed-px element
+    // cover a larger fraction of the target (renders bigger). 1.0 = byte-identical.
+    if (g_uiScale > 0.0f && g_uiScale != 1.0f) canvas /= g_uiScale;
+    return canvas;
 }
 
 Rect ComputeElementRect(const UIElement& el, const Rect& parent) {
@@ -306,6 +361,38 @@ Rect ComputeElementRect(const UIElement& el, const Rect& parent) {
     const glm::vec2 pivotPoint = regionMin + regionSize * el.pivot + el.offset;
     const glm::vec2 mn = pivotPoint - el.pivot * size;
     return {mn.x, mn.y, mn.x + size.x, mn.y + size.y};
+}
+
+// Clamps a laid-out rect's SIZE to the element's min/max (+ aspect), resized about the
+// pivot so it grows/shrinks in place. Default (all-zero fields) is a no-op FAST PATH -
+// existing content stays byte-identical, so ComputeElementRect above remains the
+// property-tested core and only this additive step carries the P6 constraints.
+static void ApplyLayoutConstraints(Rect& r, const UIElement& el,
+                                   bool anchorTopLeft = false) {
+    if (el.fullscreen) return; // "fill parent" - ignore size constraints
+    const glm::vec2 size = r.Size();
+    glm::vec2 c = size;
+    if (el.minSize.x > 0.0f) c.x = glm::max(c.x, el.minSize.x);
+    if (el.minSize.y > 0.0f) c.y = glm::max(c.y, el.minSize.y);
+    if (el.maxSize.x > 0.0f) c.x = glm::min(c.x, el.maxSize.x);
+    if (el.maxSize.y > 0.0f) c.y = glm::min(c.y, el.maxSize.y);
+    if (el.aspectRatio > 0.0f) { // width-driven aspect fit, then re-clamp the height
+        c.y = c.x / el.aspectRatio;
+        if (el.minSize.y > 0.0f) c.y = glm::max(c.y, el.minSize.y);
+        if (el.maxSize.y > 0.0f) c.y = glm::min(c.y, el.maxSize.y);
+    }
+    if (c == size) return; // no-op: default, or already within bounds
+    // Free/anchored elements resize about their own pivot (in place). A layout-group-
+    // PLACED child's slot, though, is pinned at its TOP-LEFT by the group's flow cursor,
+    // and its pivot is unused authoring data - so pivot-centering a constrained group
+    // child would shove it off the cursor (overlap the previous sibling, gap the next)
+    // and overflow a Grid cell about its centre. Pin to the origin for those.
+    const glm::vec2 pivot = anchorTopLeft ? glm::vec2(0.0f) : el.pivot;
+    const glm::vec2 pv{r.x0 + size.x * pivot.x, r.y0 + size.y * pivot.y};
+    r.x0 = pv.x - c.x * pivot.x;
+    r.y0 = pv.y - c.y * pivot.y;
+    r.x1 = r.x0 + c.x;
+    r.y1 = r.y0 + c.y;
 }
 
 void SolveElementFromRect(UIElement& el, const Rect& parent, const Rect& desired) {
@@ -495,6 +582,9 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
             if (const Parent* p = reg.try_get<Parent>(e); p && reg.valid(p->entity))
                 item.parentEntity = p->entity;
             item.rect = forced ? *forced : ComputeElementRect(*el, parentRect);
+            // Group-placed (forced) children pin at the slot's top-left; free elements
+            // resize about their own pivot. No-op by default (min/max/aspect all 0).
+            ApplyLayoutConstraints(item.rect, *el, forced != nullptr);
             item.canvas = canvas;
             item.canvasEntity = canvasEntity;
             item.clip = clip;
@@ -601,6 +691,11 @@ static void LayoutUIImpl(Scene& scene, glm::vec2 targetSize,
             }
             out[selfIdx].rect.x1 = far.x + lg->padding.z;
             out[selfIdx].rect.y1 = far.y + lg->padding.w;
+            // fitContent overwrote the far edges, so re-enforce this group's own
+            // min/max/aspect on the wrapped size, pinned at the (fixed) top-left -
+            // else fitContent silently wins over a maxSize cap.
+            if (const UIElement* gel = reg.try_get<UIElement>(e))
+                ApplyLayoutConstraints(out[selfIdx].rect, *gel, /*anchorTopLeft=*/true);
         }
 
         if (scroll) {
@@ -848,6 +943,9 @@ static void ApplyPointerPass(Scene& scene, const std::vector<LayoutItem>& layout
     auto& reg = scene.Registry();
     const bool hasPointer = pointerNorm.x >= 0.0f && pointerNorm.y >= 0.0f;
     const bool editorView = scene.EditorView();
+    // P8 modal scope: while a modal panel is active AND shown, only its subtree is
+    // hittable (a dialog blocks the widgets behind it). null = no modal = no filtering.
+    const entt::entity modalPanel = ActiveModalPanel(scene, layout);
     // Reticle mode: world pages are pressed with the Interact action, not LMB.
     const bool worldOverride = pointers && pointers->worldButtonOverride;
     const bool worldPressed = worldOverride ? pointers->worldPressed : pressed;
@@ -861,6 +959,7 @@ static void ApplyPointerPass(Scene& scene, const std::vector<LayoutItem>& layout
         if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) return false;
         const UIElement& el = reg.get<UIElement>(item.entity);
         if (!el.visible || !IsInteractive(el.type)) return false;
+        if (!IsDescendantOf(reg, item.entity, modalPanel)) return false; // modal traps hits
         if (editorView && scene.IsEditorHidden(item.entity)) return false;
         world = item.canvasEntity != entt::null && reg.valid(item.canvasEntity) &&
                 reg.all_of<UICanvas>(item.canvasEntity) &&
@@ -1054,8 +1153,8 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
 
     const bool editorView = scene.EditorView();
     for (const LayoutItem& item : layout) {
-        UIElement& el = reg.get<UIElement>(item.entity);
-        if (!el.visible) continue;
+        UIElement& elReal = reg.get<UIElement>(item.entity);
+        if (!elReal.visible) continue;
         if (editorView && scene.IsEditorHidden(item.entity)) continue; // editor-hidden
         // Route: world-canvas items -> that canvas's texture batch; no worldOut
         // (boot splash) or no RT yet -> skip them (never the screen overlay).
@@ -1072,6 +1171,18 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
                 dest = &(*worldOut)[bit->second].verts;
             }
         }
+        // Style overlay (P4): a themed element emits through a LOCAL COPY so the whole
+        // block below reads themed values transparently; the authored component is
+        // never mutated and interaction (which reads it) is unaffected. Bound via a
+        // pointer because a reference cannot be re-seated. Unstyled = no copy.
+        std::optional<UIElement> styledStorage; // constructed only for themed elements
+        UIElement* elp = &elReal;
+        if (!elReal.styleTheme.empty()) {
+            styledStorage = elReal;
+            style::ApplyStyle(*styledStorage, assetsDir, elReal.styleTheme, elReal.styleName);
+            elp = &*styledStorage;
+        }
+        UIElement& el = *elp;
         const Rect& rect = item.rect;
         // Per-element 2D transform (scale + rotation about the pivot). Skipped entirely
         // at identity so untransformed elements emit exactly as before.
@@ -1108,7 +1219,7 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
         const Emitter emit{dest,   item.canvas, xfPivot, xfScale,
                            xfCos,  xfSin,       hasXf,   ctx,
                            static_cast<u64>(static_cast<u32>(item.entity)), 0,
-                           clipMinN, clipMaxN, groupTint, el.wrap};
+                           clipMinN, clipMaxN, groupTint, el.wrap, el.effect};
         const glm::vec2 center = (rect.Min() + glm::vec2(rect.x1, rect.y1)) * 0.5f;
         FontAtlas& font = ResolveFont(renderer, assetsDir, el.font);
         // Runtime-resolved caption (token substitution) wins over the template.
@@ -1126,6 +1237,13 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
         // pressed skin visible for exactly one frame, which reads as a flicker on a
         // screen button and as nothing at all on a 3D button the player is holding.
         const bool pressedState = el.clicked || el.held;
+        // Focus/selected visual states (P4). Focus = the keyboard/gamepad-focused
+        // widget (mouse hover is handled separately above); selected = an "on" widget
+        // (a toggled Toggle, or an app-driven selection). Both only recolour when a
+        // focusedColor/selectedColor is actually set - no legacy auto-multiply - so
+        // pre-P4 widgets are unaffected.
+        const bool focusedState = ctx && ctx->focused == item.entity && ctx->focusVisible;
+        const bool selectedState = el.toggled;
         const auto stateFill = [&](const glm::vec4& base) -> glm::vec4 {
             glm::vec4 f = base;
             if (disabled)
@@ -1136,6 +1254,10 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
             else if (el.hovered)
                 f = el.hoverColor.a > 0.0f ? el.hoverColor
                                            : base * glm::vec4(1.22f, 1.22f, 1.22f, 1.0f);
+            else if (focusedState && el.focusedColor.a > 0.0f)
+                f = el.focusedColor;
+            else if (selectedState && el.selectedColor.a > 0.0f)
+                f = el.selectedColor;
             return glm::clamp(f, glm::vec4(0.0f), glm::vec4(1.0f));
         };
         // Draws a background quad, or a 9-slice when `slice` is set and `rel`
@@ -1419,10 +1541,19 @@ void BuildVertices(Scene& scene, Renderer& renderer,
                    const std::filesystem::path& assetsDir, glm::vec2 targetSize,
                    const CanvasConfig& config, std::vector<rhi::UIVertex>& out,
                    std::vector<WorldUIBatch>* worldOut, UIContext& ctx) {
+    using Clock = std::chrono::steady_clock;
+    const auto us = [](Clock::time_point a, Clock::time_point b) {
+        return std::chrono::duration<f32, std::micro>(b - a).count();
+    };
     ctx.stats = {}; // fresh per-frame counters (LayoutUI + the emit fill them)
+    const auto t0 = Clock::now();
     LayoutUI(scene, targetSize, config, ctx); // cached children map
+    const auto t1 = Clock::now();
     BuildVerticesImpl(scene, renderer, assetsDir, targetSize, config, out, worldOut,
-                      ctx.layout, &ctx);
+                      ctx.layout, &ctx); // accumulates ctx.stats.shapeUs on cache misses
+    const auto t2 = Clock::now();
+    ctx.stats.layoutUs = us(t0, t1);
+    ctx.stats.emitUs = us(t1, t2); // includes shapeUs (shaping runs inside the emit)
     ctx.stats.elements = static_cast<u32>(ctx.layout.size());
     ctx.stats.verts = static_cast<u32>(out.size());
 }
@@ -1474,8 +1605,73 @@ void BuildDocumentVertices(Scene& scene, Renderer& renderer,
     }
 }
 
+entt::entity FindElementById(Scene& scene, const std::string& id) {
+    if (id.empty()) return entt::null;
+    auto& reg = scene.Registry();
+    for (const entt::entity e : reg.view<UIElement>())
+        if (reg.get<UIElement>(e).id == id) return e;
+    return entt::null;
+}
+
+entt::entity ActiveModalPanel(Scene& scene, const std::vector<LayoutItem>& layout) {
+    auto& reg = scene.Registry();
+    entt::entity best = entt::null;
+    usize bestLast = 0;
+    for (const entt::entity panel : reg.view<UIPanel>()) {
+        const UIPanel& p = reg.get<UIPanel>(panel);
+        if (!p.active || !p.modal) continue;
+        // Only a modal that is actually SHOWN (has a laid-out descendant) may trap
+        // input. Otherwise an active-but-unshown modal (nested under an inactive root,
+        // its own root hidden, or faded to ~0 opacity) would reject EVERY laid-out item
+        // and lock the whole UI with no visible dialog. Among shown modals, the one
+        // whose last descendant is latest in the draw-ordered layout is topmost, so
+        // stacked modals trap to the front one (not an arbitrary entt pool order).
+        bool shown = false;
+        usize last = 0;
+        for (usize i = 0; i < layout.size(); ++i)
+            if (IsDescendantOf(reg, layout[i].entity, panel)) {
+                shown = true;
+                last = i;
+            }
+        if (shown && (best == entt::null || last >= bestLast)) {
+            best = panel;
+            bestLast = last;
+        }
+    }
+    return best;
+}
+
+bool IsDescendantOf(const entt::registry& reg, entt::entity e, entt::entity ancestor) {
+    if (ancestor == entt::null) return true; // no modal active -> everything eligible
+    for (int depth = 0; e != entt::null && depth < 64; ++depth) {
+        if (e == ancestor) return true;
+        const Parent* p = reg.try_get<Parent>(e);
+        e = (p && reg.valid(p->entity)) ? p->entity : entt::null;
+    }
+    return false;
+}
+
+void MarkElementDirty(Scene& scene, entt::entity e, bool layout, bool style) {
+    if (auto* el = scene.Registry().try_get<UIElement>(e)) {
+        if (layout) el->layoutDirty = true;
+        if (style) el->styleDirty = true;
+    }
+}
+
+void MarkAllDirty(Scene& scene) {
+    auto& reg = scene.Registry();
+    for (const entt::entity e : reg.view<UIElement>()) {
+        UIElement& el = reg.get<UIElement>(e);
+        el.layoutDirty = true;
+        el.styleDirty = true;
+    }
+}
+
 void ClearTextureCache(Scene* scene) {
     UITexCache().clear(); // path->index cache (project switch / re-import)
+    svg::ClearSvgCache(); // rasterized SVG + parsed-doc cache
+    style::ClearThemeCache(); // parsed .hbtheme cache
+    if (scene) MarkAllDirty(*scene); // re-resolve styles + re-layout after a swap
     if (!scene) return;
     for (const entt::entity e : scene->Registry().view<UIElement>()) {
         UIElement& el = scene->Registry().get<UIElement>(e);
@@ -1503,8 +1699,16 @@ void PreloadUIAssets(Scene& scene, Renderer& renderer,
             ++fonts;
         }
         if (!el.texture.empty()) {
-            el.textureIndexCache = LoadUITexture(renderer, assetsDir, el.texture);
-            el.textureResolved = true;
+            if (svg::IsSvgPath(el.texture)) {
+                // Warm the SVG raster at the SAME size emission uses (no first-frame
+                // re-raster), rather than LoadUITexture's default 256 box.
+                u32 sw = 0, sh = 0;
+                SvgRasterSize(el, sw, sh);
+                svg::ResolveSvg(renderer, assetsDir, el.texture, sw, sh);
+            } else {
+                el.textureIndexCache = LoadUITexture(renderer, assetsDir, el.texture);
+                el.textureResolved = true;
+            }
             ++textures;
         }
         for (const std::string& f : el.frames) { // sprite-animation frames
@@ -1561,6 +1765,52 @@ bool ManipulationSelfTest() {
     const auto nearRect = [&](const Rect& a, const Rect& b, f32 eps = 0.002f) {
         return near2({a.x0, a.y0}, {b.x0, b.y0}, eps) && near2({a.x1, a.y1}, {b.x1, b.y1}, eps);
     };
+
+    // --- 0) ApplyLayoutConstraints: min/max/aspect clamp about the pivot (P6) --
+    {
+        const Rect base{100.0f, 100.0f, 300.0f, 200.0f}; // 200x100 at (100,100), centre (200,150)
+        UIElement el;                                    // default: all constraints 0
+        Rect r = base;
+        ApplyLayoutConstraints(r, el);
+        expect(nearRect(r, base), "constraints: default is a no-op (byte-identity)");
+
+        el = UIElement{};
+        el.minSize = {250.0f, 0.0f};
+        r = base;
+        ApplyLayoutConstraints(r, el);
+        expect(near2(r.Size(), {250.0f, 100.0f}), "constraints: minSize widens");
+        expect(near2({(r.x0 + r.x1) * 0.5f, (r.y0 + r.y1) * 0.5f}, {200.0f, 150.0f}),
+               "constraints: resize keeps the pivot (centre) fixed");
+
+        el = UIElement{};
+        el.maxSize = {120.0f, 0.0f};
+        r = base;
+        ApplyLayoutConstraints(r, el);
+        expect(near2(r.Size(), {120.0f, 100.0f}), "constraints: maxSize shrinks");
+
+        el = UIElement{};
+        el.aspectRatio = 1.0f; // square: height fits to width (200)
+        r = base;
+        ApplyLayoutConstraints(r, el);
+        expect(near2(r.Size(), {200.0f, 200.0f}), "constraints: aspectRatio fits height to width");
+
+        el = UIElement{};
+        el.fullscreen = true;
+        el.minSize = {10.0f, 10.0f};
+        r = base;
+        ApplyLayoutConstraints(r, el);
+        expect(nearRect(r, base), "constraints: fullscreen ignores size constraints");
+
+        // anchorTopLeft (a layout-group slot): the resize keeps the ORIGIN fixed, not
+        // the pivot - else a constrained flow child shoves off the cursor.
+        el = UIElement{};
+        el.minSize = {250.0f, 0.0f};
+        r = base;
+        ApplyLayoutConstraints(r, el, /*anchorTopLeft=*/true);
+        expect(near2({r.x0, r.y0}, {100.0f, 100.0f}),
+               "constraints: group child keeps its top-left (slot origin) fixed");
+        expect(near2(r.Size(), {250.0f, 100.0f}), "constraints: group child still resizes");
+    }
 
     // --- 1) SolveElementFromRect is the inverse of ComputeElementRect ---------
     // Deterministic LCG fuzz: anchors (including inverted and degenerate ones),
