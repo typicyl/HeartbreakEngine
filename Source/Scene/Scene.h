@@ -95,6 +95,10 @@ struct SceneEnvironment {
     glm::vec3  giSpacing{1.0f};
     glm::ivec3 giDims{0};
     std::string giSource;       // cached .hbgi (rel to Assets; "" = no baked volume)
+    // Baked navigation mesh (.hbnav, rel to Assets; "" = none). Like giSource this is
+    // per-scene identity that survives file -> live scene -> save; the Engine's NavWorld
+    // streams tiles from it independently of the level's own geometry streaming.
+    std::string navSource;
     // The scene FILE's permanent pack slot, carried through load so a live save can
     // re-emit it (0xFFFFFFFF = none; slot 0 is valid). Packaging identity, not
     // rendering state - it rides here because the environment is the one thing that

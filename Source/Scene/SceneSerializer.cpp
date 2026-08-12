@@ -408,6 +408,7 @@ SceneData HeaderOf(const SceneEnvironment& env) {
     h.exposure = env.exposure;
     h.shadowDistance = env.shadowDistance;
     h.giSource = env.giSource;
+    h.navSource = env.navSource;
     // Slot identity survives file -> live scene -> save. Without this hop a save to
     // a NEW path (Save As, a migration, a headless tool) silently strips the asset's
     // permanent pack slot, renumbering it at the next cook. SaveScene also carries
@@ -549,6 +550,7 @@ json BuildSceneJson(const Scene& scene,
     root["shadowDistance"] = hdr.shadowDistance;
     root["post"] = PostToJson(hdr.post);
     if (!hdr.giSource.empty()) root["giSource"] = hdr.giSource;
+    if (!hdr.navSource.empty()) root["navSource"] = hdr.navSource;
     // Slot identity survives the round trip (see SceneData::packSlot). Written only
     // when the source carried one, so a never-stamped scene stays byte-identical.
     if (hdr.packSlot != SceneData::kNoPackSlot) root["packSlot"] = hdr.packSlot;
@@ -1227,7 +1229,7 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         }
         // Per-object Static/Dynamic layer, authored INTO the one scene file. A
         // level is ONE .hbscene, so this tag is the ONLY carrier of the layer -
-        // the navmesh filter (GridNav) and MaterialFlag_PainterlyExempt read it.
+        // the navmesh baker and MaterialFlag_PainterlyExempt read it.
         // Always written on disk, not just in snapshots.
         if (const SceneLayer* sl = reg.try_get<SceneLayer>(e))
             je["sceneLayer"] = ToString(sl->kind);
@@ -1402,6 +1404,7 @@ void ParseSceneJson(const json& root, SceneData& out) {
     out.kind = SceneKindFromString(root.value("kind", std::string("full")));
     out.ambientIntensity = root.value("ambientIntensity", 1.0f);
     out.giSource = root.value("giSource", std::string());
+    out.navSource = root.value("navSource", std::string());
     if (const auto ps = root.find("packSlot"); ps != root.end() && ps->is_number_unsigned())
         out.packSlot = ps->get<u32>();
     // Absent = a file written before these existed; 0 means "unidentified", which the
@@ -2767,6 +2770,10 @@ void ApplyEnvironment(Scene& scene, Renderer& renderer, const SceneData& data) {
         env.dayLengthSeconds = data.dayLengthSeconds;
         env.dynamicSky = data.dynamicSky;
     }
+    // Navigation asset for this scene. The Engine's NavWorld watches env.navSource and
+    // (re)loads the .hbnav when it changes; set it here (before the GI early-return
+    // below) so it is always applied on load.
+    env.navSource = data.navSource;
     // Load the cached GI volume (.hbgi) so baked GI lights the scene without a
     // re-bake.
     //
@@ -2893,7 +2900,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         // NOTE: the file's header `kind` does NOT stamp a layer on its entities any
         // more. A level is ONE scene file, so a file is not a layer of anything -
         // the Static/Dynamic tag is per ENTITY (read below from `sceneLayerKind`).
-        // Consumers treat an untagged entity as Static (see GridNav::Rebuild).
+        // Consumers treat an untagged entity as Static (see the navmesh baker's filter).
         // Per-entity runtime tags from an in-memory snapshot put every entity back
         // in its own scene file instead of collapsing the grouping.
         if (d.hasSceneSourceTag) reg.emplace_or_replace<SceneSource>(e, SceneSource{d.sceneSourceTag});

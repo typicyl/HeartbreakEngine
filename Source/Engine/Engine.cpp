@@ -19,7 +19,8 @@
 #include "Physics/PhysicsWorld.h"
 #include "Assets/MusicGraph.h"
 #include "Project/Project.h"
-#include "Navigation/GridNav.h"
+#include "Navigation/NavAgents.h"
+#include "Navigation/NavWorld.h"
 #include "Scene/AnimationSystem.h"
 #include "Scene/CameraSystem.h"
 #include "Scene/CharacterController.h"
@@ -1053,708 +1054,6 @@ int Engine::Run(const EngineConfig& configIn) {
         return code;
     }
 
-    // Navigation smoke test: a headless (no window/GPU) check of the real-time
-    // grid A* pathfinder routing around static + dynamic obstacles.
-    if (config.navTest) {
-        int code = 0;
-
-        // --- Grid A* (real-time, dynamic obstacles, no bake) -------------------
-        {
-            Scene gscene;
-            entt::registry& gr = gscene.Registry();
-            const entt::entity floor = gscene.CreateEntity("Floor");
-            Transform ft;
-            ft.scale = glm::vec3(40.0f, 1.0f, 40.0f);
-            gr.emplace<Transform>(floor, ft);
-            gr.emplace<MeshInstance>(floor, MeshInstance{});
-            gr.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
-
-            nav::GridNav gn;
-            gn.EnsureBuilt(gscene, {});
-            const glm::vec3 A(-18, 0, -18), B(18, 0, 18);
-            const auto reaches = [&](const std::vector<glm::vec3>& p) {
-                return !p.empty() &&
-                       glm::distance(glm::vec2(p.back().x, p.back().z), glm::vec2(B.x, B.z)) < 2.0f;
-            };
-            const std::vector<nav::GridObstacle> obs = {{glm::vec3(0, 0, 0), 5.0f}};
-            const auto clear = gn.FindPath(A, B, {});
-            const auto around = gn.FindPath(A, B, obs);
-            f32 minD = 1e9f;
-            for (const glm::vec3& p : around)
-                minD = std::min(minD, glm::distance(glm::vec2(p.x, p.z), glm::vec2(0.0f)));
-            if (gn.Ready() && reaches(clear) && reaches(around) && minD > 4.0f) {
-                HBE_INFO("GridNavTest PASS: A* reaches goal, and reroutes around a r=5 obstacle "
-                         "(closest corner {:.1f}m, {} corners) - no bake.",
-                         minD, static_cast<u32>(around.size()));
-            } else {
-                HBE_ERROR("GridNavTest FAIL: ready={} clear={} around={} minD={:.1f}.", gn.Ready(),
-                          reaches(clear), reaches(around), minD);
-                code = 1;
-            }
-
-            // Agent walks A->B with the obstacle present (re-plan + steering).
-            const entt::entity ag = gscene.CreateEntity("Agent");
-            Transform at;
-            at.position = A;
-            gr.emplace<Transform>(ag, at);
-            NavigationAgent na;
-            na.target = B;
-            na.hasTarget = true;
-            na.speed = 5.0f;
-            gr.emplace<NavigationAgent>(ag, na);
-            const entt::entity obE = gscene.CreateEntity("Obstacle");
-            gr.emplace<Transform>(obE, Transform{});
-            NavigationObstacle no;
-            no.radius = 5.0f;
-            gr.emplace<NavigationObstacle>(obE, no);
-            f32 reachedAt = -1.0f, minClr = 1e9f;
-            for (int i = 0; i < 2400; ++i) {
-                nav::UpdateAgents(gscene, gn, 1.0f / 60.0f);
-                const glm::vec3 p = gr.get<Transform>(ag).position;
-                minClr = std::min(minClr, glm::distance(glm::vec2(p.x, p.z), glm::vec2(0.0f)));
-                if (glm::distance(glm::vec2(p.x, p.z), glm::vec2(B.x, B.z)) < 1.0f) {
-                    reachedAt = static_cast<f32>(i) / 60.0f;
-                    break;
-                }
-            }
-            if (reachedAt >= 0.0f && minClr > 3.5f) {
-                HBE_INFO("GridAgentTest PASS: agent walked A->B around the obstacle in {:.1f}s "
-                         "(closest approach {:.1f}m).",
-                         reachedAt, minClr);
-            } else {
-                HBE_ERROR("GridAgentTest FAIL: reachedAt={:.1f} minClr={:.1f}.", reachedAt, minClr);
-                code = 1;
-            }
-        }
-
-        // --- TERRAIN as a nav surface, and a SCULPT that costs no rebuild ---------
-        // A terrain-ONLY world is a valid world (there is no static mesh here at all),
-        // which is exactly what the "AI has no walkable surface" report was about.
-        {
-            Scene ts;
-            entt::registry& tr = ts.Registry();
-            const entt::entity te = ts.CreateEntity("Terrain");
-            tr.emplace<Transform>(te, Transform{});
-            TerrainComponent tc;
-            tc.chunks = 8;
-            tc.resolution = 8;   // GridN = 65, 64 m across
-            tc.chunkSize = 8.0f;
-            tc.height = 0.0f;    // flat, then sculpted below
-            tr.emplace<TerrainComponent>(te, tc);
-            terrain::EnsureHeights(tr.get<TerrainComponent>(te));
-
-            nav::GridNav gn;
-            const bool ready = gn.EnsureBuilt(ts, {});
-            const glm::vec3 A(-26, 0, -26), B(26, 0, 26);
-            const auto crosses = [&](const std::vector<glm::vec3>& p) {
-                return !p.empty() && glm::distance(glm::vec2(p.back().x, p.back().z),
-                                                   glm::vec2(B.x, B.z)) < 2.0f;
-            };
-            const auto path = gn.FindPath(A, B, {});
-            if (ready && gn.TerrainCount() == 1 && gn.TriangleCount() == 0 && crosses(path)) {
-                HBE_INFO("NavTerrainTest PASS: terrain-only world is walkable - A* crossed 64 m "
-                         "of heightfield in {} corners with ZERO triangles stored (analytic).",
-                         static_cast<u32>(path.size()));
-            } else {
-                HBE_ERROR("NavTerrainTest FAIL: ready={} terrains={} tris={} crossed={}.", ready,
-                          gn.TerrainCount(), gn.TriangleCount(), crosses(path));
-                code = 1;
-            }
-
-            // Off the terrain there must be NO ground: an edge-clamped heightmap sampled
-            // past its border would invent an infinite skirt of walkable floor.
-            if (gn.GroundAt(500.0f, 500.0f, 0.0f).has_value()) {
-                HBE_ERROR("NavTerrainTest FAIL: found walkable ground 500 m outside the terrain.");
-                code = 1;
-            }
-
-            // SCULPT MID-PATH: nav borrows `heights`, so a stroke must be visible
-            // immediately and must NOT trigger a full rebuild.
-            const u32 rebuildsBefore = gn.RebuildCount();
-            const f32 flatY = gn.GroundAt(0.0f, 0.0f, 0.0f).value_or(-999.0f);
-            terrain::SculptHeights(tr.get<TerrainComponent>(te), 0.0f, 0.0f, 6.0f, 4.0f,
-                                   terrain::Brush::Raise, 0.0f);
-            gn.EnsureBuilt(ts, {});
-            const f32 raisedY = gn.GroundAt(0.0f, 0.0f, 4.0f).value_or(-999.0f);
-            if (gn.RebuildCount() != rebuildsBefore) {
-                HBE_ERROR("NavSculptTest FAIL: a sculpt stroke triggered {} full rebuild(s).",
-                          gn.RebuildCount() - rebuildsBefore);
-                code = 1;
-            } else if (raisedY - flatY < 3.0f) {
-                HBE_ERROR("NavSculptTest FAIL: sculpt did not reach navigation ({:.2f} -> {:.2f}).",
-                          flatY, raisedY);
-                code = 1;
-            } else {
-                HBE_INFO("NavSculptTest PASS: +4 m sculpt visible to nav same call ({:.2f} -> "
-                         "{:.2f} m) with 0 rebuilds - the borrow works.",
-                         flatY, raisedY);
-            }
-
-            // A painted HOLE is not walkable ground, for AI as it is for the player.
-            terrain::PaintHole(tr.get<TerrainComponent>(te), -16.0f, -16.0f, 3.0f, /*erase=*/false);
-            gn.EnsureBuilt(ts, {});
-            if (gn.GroundAt(-16.0f, -16.0f, 0.0f).has_value()) {
-                HBE_ERROR("NavHoleTest FAIL: a painted hole is still walkable ground for AI.");
-                code = 1;
-            } else if (!gn.GroundAt(-16.0f + 8.0f, -16.0f, 0.0f).has_value()) {
-                HBE_ERROR("NavHoleTest FAIL: a hole removed walkable ground 8 m away.");
-                code = 1;
-            } else {
-                HBE_INFO("NavHoleTest PASS: painted hole is a hole for AI too; ground 8 m away "
-                         "still walkable.");
-            }
-        }
-
-        // --- SLOPE LIMIT: a cliff is a wall, a gentle ramp is a road ---------------
-        // maxSlopeDeg is the terrain half of "AI must not climb what a human could not".
-        // NOTE ON PARAMS: at the DEFAULTS the STEP rule is stricter than the slope rule
-        // and would mask it completely - maxStep 0.5 m over a cellSize 0.5 m cell is a
-        // 45 deg ceiling, below maxSlopeDeg's 50 deg, so every slope this test could
-        // reject would already have been rejected as a step. maxStep is raised to 2 m
-        // here so the ONLY thing that can refuse the steep ramp is the slope test.
-        {
-            Scene ps;
-            entt::registry& pr = ps.Registry();
-            const entt::entity te = ps.CreateEntity("Ramp");
-            pr.emplace<Transform>(te, Transform{});
-            TerrainComponent tc;
-            tc.chunks = 8;
-            tc.resolution = 8; // GridN = 65, 64 m across, 1 m sample step
-            tc.chunkSize = 8.0f;
-            tc.height = 0.0f;
-            pr.emplace<TerrainComponent>(te, tc);
-            TerrainComponent& t = pr.get<TerrainComponent>(te);
-            terrain::EnsureHeights(t);
-
-            // Ground at y=0 for x<=0, then a ramp of the given gradient up to an 8 m
-            // plateau. Authored directly (not sculpted) so the gradient under test is
-            // exact rather than whatever a brush falloff happens to produce.
-            const auto ramp = [&](f32 tanTheta) {
-                const i32 n = static_cast<i32>(t.GridN());
-                const f32 step = terrain::SampleStep(t);
-                const f32 half = terrain::ExtentXZ(t) * 0.5f;
-                for (i32 gz = 0; gz < n; ++gz)
-                    for (i32 gx = 0; gx < n; ++gx) {
-                        const f32 lx = -half + static_cast<f32>(gx) * step;
-                        t.heights[static_cast<usize>(gz) * n + gx] =
-                            lx <= 0.0f ? 0.0f : std::min(8.0f, lx * tanTheta);
-                    }
-            };
-
-            nav::GridNav gn;
-            nav::GridNavParams sp;   // cellSize 0.5, maxSlopeDeg 50
-            sp.maxStep = 2.0f;       // see the note above
-            gn.SetParams(sp);
-
-            const glm::vec3 A(-20, 0, 0), B(28, 8, 0);
-            const auto reaches = [&](const std::vector<glm::vec3>& p) {
-                return !p.empty() && glm::distance(glm::vec2(p.back().x, p.back().z),
-                                                   glm::vec2(B.x, B.z)) < 2.0f;
-            };
-            const auto maxCornerX = [](const std::vector<glm::vec3>& p) {
-                f32 m = -1e9f;
-                for (const glm::vec3& q : p) m = std::max(m, q.x);
-                return m;
-            };
-
-            ramp(0.4663f); // 25 deg - inside maxSlopeDeg
-            gn.EnsureBuilt(ps, {});
-            const bool gentleGround = gn.GroundAt(8.0f, 0.0f, 3.7f).has_value();
-            const bool climbed = reaches(gn.FindPath(A, B, {}));
-
-            ramp(2.1445f); // 65 deg - a cliff
-            gn.EnsureBuilt(ps, {});
-            const bool steepGround = gn.GroundAt(2.0f, 0.0f, 4.0f).has_value();
-            const std::vector<glm::vec3> refused = gn.FindPath(A, B, {});
-            const f32 stoppedAt = maxCornerX(refused);
-
-            if (gentleGround && climbed && !steepGround && !reaches(refused) && stoppedAt < 1.5f) {
-                HBE_INFO("NavSlopeTest PASS: a 25 deg ramp is walkable ground and A* climbed it "
-                         "to the plateau; the same ramp at 65 deg is not ground at all and the "
-                         "path stopped at the foot of it (x={:.1f}).",
-                         stoppedAt);
-            } else {
-                HBE_ERROR("NavSlopeTest FAIL: gentleGround={} climbed={} steepGround={} "
-                          "steepReached={} stoppedAt={:.1f}.",
-                          gentleGround, climbed, steepGround, reaches(refused), stoppedAt);
-                code = 1;
-            }
-        }
-
-        // --- A HOLE is routed AROUND, not just "no ground under one sample" -------
-        // NavHoleTest proves GroundAt refuses a hole; this proves the PLANNER does the
-        // useful thing with that - an agent crossing a corridor with a hole in it walks
-        // around the hole instead of into it.
-        {
-            Scene hs;
-            entt::registry& hr = hs.Registry();
-            const entt::entity te = hs.CreateEntity("Terrain");
-            hr.emplace<Transform>(te, Transform{});
-            TerrainComponent tc;
-            tc.chunks = 8;
-            tc.resolution = 8;
-            tc.chunkSize = 8.0f;
-            tc.height = 0.0f; // flat, so the ONLY thing in the way is the hole
-            hr.emplace<TerrainComponent>(te, tc);
-            TerrainComponent& t = hr.get<TerrainComponent>(te);
-            terrain::EnsureHeights(t);
-
-            nav::GridNav gn;
-            gn.EnsureBuilt(hs, {});
-            const glm::vec3 A(-20, 0, 0), B(20, 0, 0); // straight line through the origin
-            const auto offAxis = [](const std::vector<glm::vec3>& p) {
-                f32 m = 0.0f;
-                for (const glm::vec3& q : p) m = std::max(m, std::fabs(q.z));
-                return m;
-            };
-            const auto nearestToHole = [](const std::vector<glm::vec3>& p) {
-                f32 m = 1e9f;
-                for (const glm::vec3& q : p)
-                    m = std::min(m, glm::distance(glm::vec2(q.x, q.z), glm::vec2(0.0f)));
-                return m;
-            };
-            const f32 offFlat = offAxis(gn.FindPath(A, B, {}));
-
-            terrain::PaintHole(t, 0.0f, 0.0f, 4.0f, /*erase=*/false);
-            gn.EnsureBuilt(hs, {});
-            const std::vector<glm::vec3> around = gn.FindPath(A, B, {});
-            const bool arrives = !around.empty() &&
-                                 glm::distance(glm::vec2(around.back().x, around.back().z),
-                                               glm::vec2(B.x, B.z)) < 2.0f;
-            const f32 clearance = nearestToHole(around);
-            if (offFlat < 2.0f && arrives && clearance > 3.0f) {
-                HBE_INFO("NavHolePathTest PASS: flat terrain paths straight ({:.1f} m off axis); "
-                         "an r=4 painted hole diverted the path {:.1f} m off axis and no corner "
-                         "came closer than {:.1f} m to the hole.",
-                         offFlat, offAxis(around), clearance);
-            } else {
-                HBE_ERROR("NavHolePathTest FAIL: offFlat={:.1f} arrives={} clearance={:.1f}.",
-                          offFlat, arrives, clearance);
-                code = 1;
-            }
-        }
-
-        // --- AN AGENT ACTUALLY WALKS SCULPTED TERRAIN ------------------------------
-        // Everything above queries the planner. This drives the real per-frame path -
-        // nav::UpdateAgents - across ground that exists only because a BRUSH put it
-        // there, and checks the agent rode the sculpted surface the whole way rather
-        // than gliding at its old height.
-        {
-            Scene ws;
-            entt::registry& wr = ws.Registry();
-            const entt::entity te = ws.CreateEntity("Terrain");
-            wr.emplace<Transform>(te, Transform{});
-            TerrainComponent tc;
-            tc.chunks = 8;
-            tc.resolution = 8;
-            tc.chunkSize = 8.0f;
-            tc.height = 0.0f;
-            wr.emplace<TerrainComponent>(te, tc);
-            TerrainComponent& t = wr.get<TerrainComponent>(te);
-            terrain::EnsureHeights(t);
-            // One broad SCULPT stroke: a 4 m mound spanning almost the whole terrain, so
-            // walking around it costs far more than walking over it (83 m of detour
-            // against 58 m plus an 8 m climb penalty) and the agent has to climb. The
-            // smoothstep falloff peaks at 1.5*amount/radius = 0.21 -> ~12 deg, well
-            // inside both maxSlopeDeg and the step rule at the DEFAULT params.
-            terrain::SculptHeights(t, 0.0f, 0.0f, 28.0f, 4.0f, terrain::Brush::Raise, 0.0f);
-
-            nav::GridNav gn;
-            gn.EnsureBuilt(ws, {});
-            const glm::vec3 A(-29, 0, 0), B(29, 0, 0);
-            const entt::entity ag = ws.CreateEntity("Walker");
-            Transform at;
-            at.position = glm::vec3(A.x, terrain::SampleHeight(t, A.x, A.z), A.z);
-            wr.emplace<Transform>(ag, at);
-            NavigationAgent na;
-            na.target = B;
-            na.hasTarget = true;
-            na.speed = 5.0f;
-            wr.emplace<NavigationAgent>(ag, na);
-
-            f32 reachedAt = -1.0f, peakY = -1e9f, worstDrift = 0.0f;
-            for (int i = 0; i < 2400; ++i) {
-                nav::UpdateAgents(ws, gn, 1.0f / 60.0f);
-                const glm::vec3 p = wr.get<Transform>(ag).position;
-                peakY = std::max(peakY, p.y);
-                // The sculpted surface under the agent's own feet, from the heightmap the
-                // brush wrote - so this is "did it ride the ground the artist made", not
-                // "did nav agree with itself".
-                worstDrift = std::max(worstDrift,
-                                      std::fabs(p.y - terrain::SampleHeight(t, p.x, p.z)));
-                if (glm::distance(glm::vec2(p.x, p.z), glm::vec2(B.x, B.z)) < 1.0f) {
-                    reachedAt = static_cast<f32>(i) / 60.0f;
-                    break;
-                }
-            }
-            if (reachedAt >= 0.0f && peakY > 2.0f && worstDrift < 0.1f) {
-                HBE_INFO("NavAgentTerrainTest PASS: agent walked 58 m of SCULPTED terrain in "
-                         "{:.1f}s, climbed to {:.2f} m over the mound, and stayed within {:.3f} m "
-                         "of the brushed surface the whole way.",
-                         reachedAt, peakY, worstDrift);
-            } else {
-                HBE_ERROR("NavAgentTerrainTest FAIL: reachedAt={:.1f} peakY={:.2f} drift={:.3f}.",
-                          reachedAt, peakY, worstDrift);
-                code = 1;
-            }
-        }
-
-        // --- STREAMED shard geometry: enters and leaves the index, no rebuild ------
-        // The reported gap: a streamed prop was invisible to AI, so agents walked
-        // through spawned geometry. Also covers the CLEARANCE rule - a prop TALLER than
-        // `climb` used to be ignored entirely (walls not walkable so skipped, roof out
-        // of climb range), which left the headline bug only half fixed.
-        {
-            Scene ss;
-            entt::registry& sr = ss.Registry();
-            const entt::entity floor = ss.CreateEntity("Floor");
-            Transform ft;
-            ft.scale = glm::vec3(40.0f, 1.0f, 40.0f);
-            sr.emplace<Transform>(floor, ft);
-            sr.emplace<MeshInstance>(floor, MeshInstance{});
-            sr.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
-
-            nav::GridNav gn;
-            gn.EnsureBuilt(ss, {});
-            const u32 baseRebuilds = gn.RebuildCount();
-            const int baseTris = gn.TriangleCount();
-            const glm::vec3 A(-14, 0, 0), B(14, 0, 0);
-            // Straight line A->B passes through the origin; a wall there must divert it.
-            const auto straightish = [&](const std::vector<glm::vec3>& p) {
-                f32 maxOff = 0.0f;
-                for (const glm::vec3& q : p) maxOff = std::max(maxOff, std::abs(q.z));
-                return maxOff;
-            };
-            const f32 offClear = straightish(gn.FindPath(A, B, {}));
-
-            // Spawn a shard holding a 3 m tall, 1 m thin wall across the path. 3 m is
-            // deliberately taller than GridNavParams::climb (2 m).
-            const entt::entity shard = ss.CreateEntity("StreamedWall");
-            Transform wt;
-            wt.position = glm::vec3(0.0f, 1.5f, 0.0f);
-            wt.scale = glm::vec3(1.0f, 3.0f, 24.0f);
-            sr.emplace<Transform>(shard, wt);
-            sr.emplace<MeshInstance>(shard, MeshInstance{});
-            sr.emplace<MeshRef>(shard, MeshRef{"prim:cube"});
-            sr.emplace<StreamShard>(shard, StreamShard{7});
-            gn.EnsureBuilt(ss, {});
-
-            const bool indexed = gn.HasStreamedShard(7) && gn.StreamedBlockCount() == 1 &&
-                                 gn.TriangleCount() > baseTris;
-            const bool noRebuild = gn.RebuildCount() == baseRebuilds;
-            const f32 offWall = straightish(gn.FindPath(A, B, {}));
-            if (indexed && noRebuild && offWall > 6.0f && offClear < 2.0f) {
-                HBE_INFO("NavShardTest PASS: streamed shard indexed incrementally ({} -> {} tris, "
-                         "0 rebuilds); a 3 m wall (taller than climb) diverted the path {:.1f} m "
-                         "off the straight line (was {:.1f} m).",
-                         baseTris, gn.TriangleCount(), offWall, offClear);
-            } else {
-                HBE_ERROR("NavShardTest FAIL: indexed={} noRebuild={} offWall={:.1f} "
-                          "offClear={:.1f} blocks={}.",
-                          indexed, noRebuild, offWall, offClear, gn.StreamedBlockCount());
-                code = 1;
-            }
-
-            // Despawn: the triangles must LEAVE the index, still with no full rebuild.
-            sr.destroy(shard);
-            gn.EnsureBuilt(ss, {});
-            const f32 offGone = straightish(gn.FindPath(A, B, {}));
-            if (!gn.HasStreamedShard(7) && gn.StreamedBlockCount() == 0 &&
-                gn.TriangleCount() == baseTris && gn.RebuildCount() == baseRebuilds &&
-                offGone < 2.0f) {
-                HBE_INFO("NavShardTest PASS: despawn removed the block ({} tris again, 0 "
-                         "rebuilds) and the path went straight through ({:.1f} m off).",
-                         gn.TriangleCount(), offGone);
-            } else {
-                HBE_ERROR("NavShardTest FAIL (despawn): blocks={} tris={} rebuilds={} "
-                          "offGone={:.1f}.",
-                          gn.StreamedBlockCount(), gn.TriangleCount(),
-                          gn.RebuildCount() - baseRebuilds, offGone);
-                code = 1;
-            }
-        }
-
-        // --- A MOVED static mesh must invalidate the index -------------------------
-        // With only entity ids in the fingerprint, dragging a wall with the gizmo left
-        // nav holding its OLD triangles forever.
-        {
-            Scene ms;
-            entt::registry& mr = ms.Registry();
-            const entt::entity floor = ms.CreateEntity("Floor");
-            Transform ft;
-            ft.scale = glm::vec3(40.0f, 1.0f, 40.0f);
-            mr.emplace<Transform>(floor, ft);
-            mr.emplace<MeshInstance>(floor, MeshInstance{});
-            mr.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
-            const entt::entity wall = ms.CreateEntity("Wall");
-            Transform wt;
-            wt.position = glm::vec3(0.0f, 1.5f, 0.0f);
-            wt.scale = glm::vec3(1.0f, 3.0f, 24.0f);
-            mr.emplace<Transform>(wall, wt);
-            mr.emplace<MeshInstance>(wall, MeshInstance{});
-            mr.emplace<MeshRef>(wall, MeshRef{"prim:cube"});
-
-            nav::GridNav gn;
-            gn.EnsureBuilt(ms, {});
-            const auto offOf = [&](const std::vector<glm::vec3>& p) {
-                f32 m = 0.0f;
-                for (const glm::vec3& q : p) m = std::max(m, std::abs(q.z));
-                return m;
-            };
-            const f32 blocked = offOf(gn.FindPath({-14, 0, 0}, {14, 0, 0}, {}));
-            const u32 before = gn.RebuildCount();
-            mr.get<Transform>(wall).position = glm::vec3(0.0f, 1.5f, 200.0f); // gizmo drag
-            // A PLACEMENT change is caught by the amortized heavy fingerprint tier, so the
-            // contract is "within kHeavyFingerprintPeriod frames", not "next frame" - the
-            // per-frame cost of checking every static mesh's world matrix was 0.216 ms,
-            // more than half the frame's whole CPU headroom. Assert the real window: it
-            // must happen, and it must happen inside that many EnsureBuilt calls.
-            int framesToNotice = -1;
-            for (int i = 1; i <= 16; ++i) {
-                gn.EnsureBuilt(ms, {});
-                if (gn.RebuildCount() > before) { framesToNotice = i; break; }
-            }
-            const f32 moved = offOf(gn.FindPath({-14, 0, 0}, {14, 0, 0}, {}));
-            if (blocked > 6.0f && moved < 2.0f && framesToNotice > 0 && framesToNotice <= 8) {
-                HBE_INFO("NavStaleTest PASS: moving a static wall rebuilt the index after {} "
-                         "frame(s) (path went {:.1f} m off -> {:.1f} m off).",
-                         framesToNotice, blocked, moved);
-            } else {
-                HBE_ERROR("NavStaleTest FAIL: blocked={:.1f} moved={:.1f} framesToNotice={}.",
-                          blocked, moved, framesToNotice);
-                code = 1;
-            }
-        }
-
-        // --- An UNREACHABLE target must not cost a query every frame ---------------
-        // The pathology: `ag.path.empty()` was tested first and unconditionally, so an
-        // agent whose goal is walled off re-ran a full maxExpand query at frame rate
-        // (~4.7 ms/frame, against ~0.4 ms of headroom) forever.
-        {
-            Scene us;
-            entt::registry& ur = us.Registry();
-            const entt::entity floor = us.CreateEntity("Floor");
-            Transform ft;
-            ft.scale = glm::vec3(20.0f, 1.0f, 20.0f);
-            ur.emplace<Transform>(floor, ft);
-            ur.emplace<MeshInstance>(floor, MeshInstance{});
-            ur.emplace<MeshRef>(floor, MeshRef{"prim:plane"});
-            nav::GridNav gn;
-            gn.EnsureBuilt(us, {});
-            const entt::entity ag = us.CreateEntity("StuckAgent");
-            Transform at;
-            at.position = glm::vec3(0.0f, 0.0f, 0.0f);
-            ur.emplace<Transform>(ag, at);
-            NavigationAgent na;
-            na.target = glm::vec3(4000.0f, 0.0f, 4000.0f); // far off the mesh: unreachable
-            na.hasTarget = true;
-            ur.emplace<NavigationAgent>(ag, na);
-
-            u32 queries = 0;
-            constexpr int kFrames = 240; // 4 s at 60 Hz
-            for (int i = 0; i < kFrames; ++i) {
-                nav::UpdateAgents(us, gn, 1.0f / 60.0f);
-                queries += gn.LastQueryCount();
-            }
-            // At ~3 Hz the honest ceiling over 4 s is ~13; anything near kFrames means
-            // the empty-path branch is still bypassing the cooldown.
-            if (queries <= 20) {
-                HBE_INFO("NavBudgetTest PASS: an agent with an unreachable target issued {} A* "
-                         "queries in {} frames (~{:.1f} Hz), not one per frame.",
-                         queries, kFrames, queries * 60.0f / kFrames);
-            } else {
-                HBE_ERROR("NavBudgetTest FAIL: {} queries in {} frames - the re-plan cooldown is "
-                          "being bypassed.",
-                          queries, kFrames);
-                code = 1;
-            }
-        }
-
-        jobs::Shutdown();
-        return code;
-    }
-
-    // Navigation COST harness. Reports the per-frame nav band and the per-query cost, and
-    // where two implementations of one hot path both still exist in this binary it times
-    // BOTH - so the before/after is a measurement in one process rather than a claim
-    // about a build that is no longer here.
-    if (config.navBench) {
-        using bclock = std::chrono::high_resolution_clock;
-        const auto msOf = [](bclock::duration d) {
-            return std::chrono::duration<f64, std::milli>(d).count();
-        };
-
-        // A world shaped like the reference project's problem case: a big terrain (the
-        // walkable floor), a few thousand static meshes, and a couple of thousand
-        // entities owned by stream shards.
-        Scene bs;
-        entt::registry& br = bs.Registry();
-        const entt::entity te = bs.CreateEntity("Terrain");
-        br.emplace<Transform>(te, Transform{});
-        TerrainComponent btc;
-        btc.chunks = 16;
-        btc.resolution = 40; // GridN = 641, matching the reference project
-        btc.chunkSize = 32.0f;
-        btc.height = 6.0f;
-        br.emplace<TerrainComponent>(te, btc);
-        terrain::EnsureHeights(br.get<TerrainComponent>(te));
-
-        constexpr int kStatic = 2000, kStreamed = 2000, kShards = 40;
-        for (int i = 0; i < kStatic; ++i) {
-            const entt::entity e = bs.CreateEntity("S" + std::to_string(i));
-            Transform t;
-            t.position = glm::vec3(static_cast<f32>((i % 50) * 8 - 200), 0.5f,
-                                   static_cast<f32>((i / 50) * 8 - 160));
-            br.emplace<Transform>(e, t);
-            br.emplace<MeshInstance>(e, MeshInstance{});
-            br.emplace<MeshRef>(e, MeshRef{"prim:cube"});
-        }
-        for (int i = 0; i < kStreamed; ++i) {
-            const entt::entity e = bs.CreateEntity("D" + std::to_string(i));
-            Transform t;
-            t.position = glm::vec3(static_cast<f32>((i % 50) * 8 - 196), 0.5f,
-                                   static_cast<f32>((i / 50) * 8 - 156));
-            br.emplace<Transform>(e, t);
-            br.emplace<MeshInstance>(e, MeshInstance{});
-            br.emplace<MeshRef>(e, MeshRef{"prim:cube"});
-            br.emplace<StreamShard>(e, StreamShard{static_cast<u32>(i % kShards)});
-        }
-
-        nav::GridNav gn;
-        const auto tBuild = bclock::now();
-        gn.EnsureBuilt(bs, {});
-        const f64 firstBuildMs = msOf(bclock::now() - tBuild);
-        HBE_INFO("NavBench: world = 641^2 terrain (512 m) + {} static + {} streamed meshes in {} "
-                 "shards -> {} tris, {} terrain surface(s), {} block(s). First build {:.2f} ms.",
-                 kStatic, kStreamed, kShards, gn.TriangleCount(), gn.TerrainCount(),
-                 gn.StreamedBlockCount(), firstBuildMs);
-
-        // 1. Steady-state per-frame cost: EnsureBuilt with nothing changed. Split into the
-        //    cheap streamed gate (what runs now) and the full per-shard content
-        //    fingerprint (what ran every frame before).
-        constexpr int kFrames = 400;
-        auto t0 = bclock::now();
-        for (int i = 0; i < kFrames; ++i) gn.EnsureBuilt(bs, {});
-        const f64 steadyMs = msOf(bclock::now() - t0) / kFrames;
-
-        t0 = bclock::now();
-        for (int i = 0; i < kFrames; ++i) gn.BenchStreamPoll(bs, {}, /*forceFull=*/true);
-        const f64 fullPollMs = msOf(bclock::now() - t0) / kFrames;
-        t0 = bclock::now();
-        for (int i = 0; i < kFrames; ++i) gn.BenchStreamPoll(bs, {}, /*forceFull=*/false);
-        const f64 gatePollMs = msOf(bclock::now() - t0) / kFrames;
-
-        // 2. A terrain SCULPT must not cost a rebuild.
-        const u32 rb0 = gn.RebuildCount();
-        t0 = bclock::now();
-        for (int i = 0; i < 100; ++i) {
-            terrain::SculptHeights(br.get<TerrainComponent>(te), static_cast<f32>(i % 40) - 20.0f,
-                                   0.0f, 4.0f, 0.05f, terrain::Brush::Raise, 0.0f);
-            gn.EnsureBuilt(bs, {});
-        }
-        const f64 sculptFrameMs = msOf(bclock::now() - t0) / 100.0;
-        const u32 sculptRebuilds = gn.RebuildCount() - rb0;
-
-        // 3. Query cost, and the obstacle-index win. 50 obstacles, like the budget note.
-        std::vector<nav::GridObstacle> obs;
-        for (int i = 0; i < 50; ++i)
-            obs.push_back({glm::vec3(static_cast<f32>(i % 10) * 6.0f - 30.0f, 0.0f,
-                                     static_cast<f32>(i / 10) * 6.0f - 15.0f),
-                           2.0f});
-        // Start and goal must sit ON the ground: this terrain undulates +/-6 m, and a
-        // start point 4 m above the surface is farther than `climb` from every walkable
-        // cell, so the query would (correctly) find nothing and time nothing.
-        // ...and they must be in the OPEN: the prop grid is on 8 m centres, so a point
-        // that lands on one puts the agent inside a cube, where the clearance test
-        // legitimately rejects its whole neighbourhood. +4 m sits mid-gap.
-        const TerrainComponent& btr = br.get<TerrainComponent>(te);
-        const glm::vec3 QA(-124.0f, terrain::SampleHeight(btr, -124.0f, -124.0f), -124.0f);
-        const glm::vec3 QB(108.0f, terrain::SampleHeight(btr, 108.0f, 100.0f), 100.0f);
-        t0 = bclock::now();
-        int corners = 0;
-        constexpr int kQueries = 20;
-        for (int i = 0; i < kQueries; ++i) corners = static_cast<int>(gn.FindPath(QA, QB, obs).size());
-        const f64 queryMs = msOf(bclock::now() - t0) / kQueries;
-
-        // Ground sample with and without the clearance test, so the cost of making
-        // non-walkable geometry block (the tall-prop fix) is a number and not a guess.
-        {
-            constexpr int kG = 200000;
-            volatile f32 acc = 0.0f;
-            auto tg = bclock::now();
-            for (int i = 0; i < kG; ++i) {
-                const f32 x = static_cast<f32>(i % 600) * 0.5f - 150.0f;
-                const f32 z = static_cast<f32>((i / 600) % 600) * 0.5f - 150.0f;
-                acc += gn.BenchGround(x, z, 0.0f, false).value_or(0.0f);
-            }
-            const f64 plainNs = msOf(bclock::now() - tg) * 1e6 / kG;
-            tg = bclock::now();
-            for (int i = 0; i < kG; ++i) {
-                const f32 x = static_cast<f32>(i % 600) * 0.5f - 150.0f;
-                const f32 z = static_cast<f32>((i / 600) % 600) * 0.5f - 150.0f;
-                acc += gn.BenchGround(x, z, 0.0f, true).value_or(0.0f);
-            }
-            const f64 clearNs = msOf(bclock::now() - tg) * 1e6 / kG;
-            HBE_INFO("NavBench: ground sample {:.1f} ns (no clearance) vs {:.1f} ns (with "
-                     "clearance - the tall-prop blocker test).",
-                     plainNs, clearNs);
-        }
-
-        // Obstacle test in isolation: the grid vs the linear scan it replaced.
-        constexpr int kSamples = 200000;
-        volatile int sink = 0;
-        t0 = bclock::now();
-        for (int i = 0; i < kSamples; ++i) {
-            const f32 x = static_cast<f32>(i % 400) * 0.5f - 100.0f;
-            const f32 z = static_cast<f32>((i / 400) % 400) * 0.5f - 100.0f;
-            if (nav::GridNav::BenchLinearBlocked(obs, 0.4f, x, z)) ++sink;
-        }
-        const f64 linearNs = msOf(bclock::now() - t0) * 1e6 / kSamples;
-        nav::GridNav::ObstacleGrid probe;
-        probe.Build(obs, 0.4f);
-        t0 = bclock::now();
-        for (int i = 0; i < kSamples; ++i) {
-            const f32 x = static_cast<f32>(i % 400) * 0.5f - 100.0f;
-            const f32 z = static_cast<f32>((i / 400) % 400) * 0.5f - 100.0f;
-            if (probe.Blocked(x, z)) ++sink;
-        }
-        const f64 gridNs = msOf(bclock::now() - t0) * 1e6 / kSamples;
-
-        // 4. A stuck agent: the pathology was one full query PER FRAME, forever.
-        const entt::entity ag = bs.CreateEntity("Stuck");
-        Transform at;
-        at.position = glm::vec3(0.0f, terrain::SampleHeight(btr, 0.0f, 0.0f), 0.0f);
-        br.emplace<Transform>(ag, at);
-        NavigationAgent na;
-        na.target = glm::vec3(9000.0f, 0.0f, 9000.0f); // unreachable
-        na.hasTarget = true;
-        br.emplace<NavigationAgent>(ag, na);
-        u32 stuckQueries = 0;
-        t0 = bclock::now();
-        for (int i = 0; i < 300; ++i) {
-            gn.EnsureBuilt(bs, {});
-            nav::UpdateAgents(bs, gn, 1.0f / 60.0f);
-            stuckQueries += gn.LastQueryCount();
-        }
-        const f64 stuckFrameMs = msOf(bclock::now() - t0) / 300.0;
-
-        HBE_INFO("NavBench RESULTS (Release, {} static tris, {} streamed entities, 50 obstacles):",
-                 gn.TriangleCount(), kStreamed);
-        HBE_INFO("  steady-state EnsureBuilt (nothing changed) : {:.4f} ms/frame", steadyMs);
-        HBE_INFO("  streamed poll, FULL fingerprint (was)      : {:.4f} ms/frame", fullPollMs);
-        HBE_INFO("  streamed poll, cheap gate (is)             : {:.4f} ms/frame", gatePollMs);
-        HBE_INFO("  terrain sculpt + EnsureBuilt               : {:.4f} ms/frame, {} rebuild(s)",
-                 sculptFrameMs, sculptRebuilds);
-        HBE_INFO("  one ~330 m A* query ({} corners)            : {:.3f} ms", corners, queryMs);
-        HBE_INFO("  obstacle test, linear scan (was)           : {:.2f} ns/sample", linearNs);
-        HBE_INFO("  obstacle test, XZ grid (is)                : {:.2f} ns/sample", gridNs);
-        HBE_INFO("  stuck agent, whole nav band                : {:.4f} ms/frame ({} queries in "
-                 "300 frames)",
-                 stuckFrameMs, stuckQueries);
-        jobs::Shutdown();
-        return 0;
-    }
-
     // Resolve the boot backend order: an explicit --d3d12/--vulkan/--opengl pins a
     // single backend; otherwise the active project's build profile (or the
     // primary-plus-fallback default) drives a try-each-in-turn chain so a machine
@@ -1851,10 +1150,6 @@ int Engine::Run(const EngineConfig& configIn) {
     input_ = &input;
     physics_ = &physics;
     audio_ = &audio;
-
-    // The pathfinder lives for the whole run; the pointer lets the editor inspect it.
-    nav::GridNav gridNav;
-    gridNav_ = &gridNav; // real-time A* the agents path on (auto-builds, no bake)
 
     bool sceneBuilt = false;
 
@@ -2145,8 +1440,8 @@ int Engine::Run(const EngineConfig& configIn) {
                  p.painterlyStrokes ? "on" : "off");
     }
 
-    // NavigationAgents path on GridNav (the real-time A*), which auto-builds from
-    // static geometry each frame (see the agent update below) - no startup bake.
+    // NavigationAgents path on the scene's baked navmesh (.hbnav), which NavWorld loads
+    // and streams around the player (see the nav band in the sim update) - no runtime bake.
 
     // World-space UI smoke test (--uiworldtest): a lit page floating in the scene
     // with a label + slider, exercising canvas->texture->quad on both backends.
@@ -2297,7 +1592,6 @@ int Engine::Run(const EngineConfig& configIn) {
     // other bucket. `accNavQueries` is reported alongside so a suspicious millisecond
     // count can be attributed to query volume rather than guessed at.
     f64 accNavMs = 0.0;
-    u64 accNavQueries = 0;
     std::vector<rhi::UIVertex> uiVertices; // reused each frame
     std::vector<ui::WorldUIBatch> worldUIBatches;      // world-canvas triangles (reused)
     std::vector<Renderer::WorldUIDraw> worldUIDraws;   // -> renderer, one frame each
@@ -2406,20 +1700,17 @@ int Engine::Run(const EngineConfig& configIn) {
                          us.textLayouts, us.mapRebuilds);
                 HBE_INFO("  CPU phases (avg/frame): gameplay {:.2f} ms | facial {:.2f} ms | "
                          "vfx-sim {:.3f} ms | vfx-expand {:.3f} ms | stream {:.3f} ms | "
-                         "nav {:.3f} ms ({:.2f} A*/frame) | pick {:.4f} ms ({:.2f} "
+                         "nav {:.3f} ms | pick {:.4f} ms ({:.2f} "
                          "cast/frame) | renderScene-submit {:.2f} ms | cpu-particles {}",
                          accGpMs / fpsFrames, accFacialMs / fpsFrames,
                          accVfxSimMs / fpsFrames, accVfxBuildMs / fpsFrames,
                          accStreamMs / fpsFrames, accNavMs / fpsFrames,
-                         static_cast<f64>(accNavQueries) / fpsFrames,
                          accPickMs / fpsFrames,
                          static_cast<f64>(accPickCasts) / fpsFrames, accRenderMs / fpsFrames,
                          particle::LiveCount(scene));
-                if (gridNav.Ready()) {
-                    HBE_INFO("  Navigation: {} static tri(s) | {} terrain surface(s) | "
-                             "{} streamed block(s) | {} full rebuild(s) since boot",
-                             gridNav.StaticTriangleCount(), gridNav.TerrainCount(),
-                             gridNav.StreamedBlockCount(), gridNav.RebuildCount());
+                if (navWorld_.Loaded()) {
+                    HBE_INFO("  Navigation: {}/{} tile column(s) resident (streamed)",
+                             navWorld_.ResidentTileColumns(), navWorld_.TotalTileColumns());
                 }
                 // Streaming, when a level is actually bound. `resident/total` is the
                 // whole point of the feature in one number; the maxima are the WINDOW's
@@ -2455,7 +1746,6 @@ int Engine::Run(const EngineConfig& configIn) {
                 accPickMs = 0.0;
                 accPickCasts = 0;
                 accNavMs = 0.0;
-                accNavQueries = 0;
                 winMaxDt = 0.0f;
                 winJank = 0;
                 fpsFrames = 0;
@@ -2777,22 +2067,24 @@ int Engine::Run(const EngineConfig& configIn) {
                                  ui::PointerOverInteractive(scene, uiCtx_));
             accGpMs += std::chrono::duration<f64, std::milli>(clock::now() - _pt).count();
         }
-        // NavigationAgents steer along real-time grid A* paths while the
-        // simulation runs (play mode in the editor; always in the runtime). The
-        // grid auto-rebuilds from static geometry (no bake) and re-plans around
-        // moving NavigationObstacles.
-        if (physics.IsRunning()) {
+        // NAVIGATION. The scene's baked navmesh (.hbnav) is streamed by NavWorld on its
+        // own radius, INDEPENDENT of the level's geometry streaming - so AI can path
+        // through regions whose visuals are not loaded. The load-sync + tile streaming
+        // run every frame (edit + play) so the editor overlay works while authoring;
+        // obstacle sync + agent steering run only while the simulation is playing.
+        {
             const auto _nt = clock::now();
             const std::filesystem::path navAssets =
                 Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
-            gridNav.EnsureBuilt(scene, navAssets);
-            nav::UpdateAgents(scene, gridNav, dt);
-            // The nav band has its own accumulator because it is the one band whose cost
-            // is driven by AGENT COUNT and by whether targets are reachable, not by scene
-            // size - and because the acceptance criterion for this system is stated as a
-            // per-frame millisecond budget. Without a number here it cannot be checked.
+            const std::string& navSrc = scene.Environment().navSource;
+            if (navSrc != navWorld_.SourcePath()) navWorld_.Load(navAssets, navSrc);
+            if (physics.IsRunning()) nav::SyncObstacles(scene, navWorld_);
+            navWorld_.Update(StreamFoci(scene, renderer), dt);
+            if (physics.IsRunning()) nav::UpdateAgents(scene, navWorld_, dt);
+            // The nav band has its own accumulator: its cost is driven by agent count and
+            // by tile streaming, not by scene size, and the acceptance criterion is a
+            // per-frame millisecond budget - so it needs a number here to be checkable.
             accNavMs += std::chrono::duration<f64, std::milli>(clock::now() - _nt).count();
-            accNavQueries += gridNav.LastQueryCount();
         }
         // Control rebinding (from a "rebind:<action>" UI button): capture the next
         // key/button and persist. Runs regardless of physics so it works in menus.
@@ -3316,7 +2608,9 @@ int Engine::Run(const EngineConfig& configIn) {
     // staging job first, so no worker is left writing into freed shards while the job
     // system is being shut down.
     tagStream_.Reset();
-    gridNav_ = nullptr;
+    // Unload the navmesh before the job system shuts down: Unload drains any in-flight
+    // tile-read job so no worker is left writing into freed nav memory.
+    navWorld_.Unload();
     renderer.Shutdown();
     jobs::Shutdown();
     window_ = nullptr;
@@ -3832,7 +3126,8 @@ void Engine::LoadGameplayScene(const std::filesystem::path& scenePath) {
         return;
     }
     currentScenePath_ = scenePath;
-    // No nav step: GridNav auto-rebuilds from the new static geometry each frame.
+    // No nav step here: NavWorld (re)loads the scene's navSource and streams tiles in the
+    // sim band once the new environment is applied.
 }
 
 // --- Checkpoint save/load ----------------------------------------------------
@@ -4328,7 +3623,7 @@ void Engine::LoadGameplayWorld() {
     bool loaded = false;
     if (!s.startupScene.empty()) {
         const std::filesystem::path gp = assets / s.startupScene;
-        // A level is ONE .hbscene; GridNav picks up its static geometry next frame.
+        // A level is ONE .hbscene; NavWorld loads its baked navSource in the sim band.
         if (vfs::Exists(gp) && tagStream_.BindLevel(*scene_, *renderer_, gp, assets, s.tags)) {
             loaded = true;
             currentScenePath_ = gp;
@@ -4346,7 +3641,7 @@ void Engine::LoadGameplayWorld() {
 
     // The HUD is a resident UIPanel in the persistent UI scene (shown on reveal in
     // EnterPlaying) - no per-scene HUD load.
-    // No nav step: GridNav rebuilds from the loaded gameplay geometry each frame.
+    // No nav step: NavWorld loads the scene's navSource and streams tiles in the sim band.
 }
 
 void Engine::EnterPlaying() {
@@ -5753,10 +5048,6 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             // Optional numeric argument: --painterly 7
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 config.forcePainterlyRadius = std::stof(argv[++i]);
-        } else if (arg == "--navtest") {
-            config.navTest = true;
-        } else if (arg == "--navbench") {
-            config.navBench = true;
         } else if (arg == "--fracturetest") {
             config.fractureTest = true;
         } else if (arg == "--destructiontest") {

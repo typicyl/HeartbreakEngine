@@ -92,6 +92,9 @@ const std::vector<EngineAsset> kEngineAssets = {
      "screen/world UI tree; ui::LoadDocument reads it via the VFS"},
     {".hbgi",       "GI Volume",        true,  RefScan::Leaf,     nullptr,
      "baked irradiance cache (SceneEnvironment::giSource); binary SH atlas, no paths"},
+    {".hbnav",      "Navigation",       true,  RefScan::Leaf,     nullptr,
+     "baked tiled navmesh (SceneEnvironment::navSource); NavWorld streams Detour tiles "
+     "from it. Binary header + compressed tile blobs, names no other asset"},
     {".hbprobe",    "Probe Cache",      true,  RefScan::Leaf,     nullptr,
      "baked local env maps (ReflectionProbe::source); binary pixels, no paths. Was "
      "absent from this table entirely, so IsPackable said false and every probe "

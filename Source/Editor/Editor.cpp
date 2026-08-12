@@ -5733,9 +5733,8 @@ void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path
     PushUndo(engine.GetScene()); // Ctrl+Z returns to the previous world
     selected_ = entt::null;
     engine.GetPhysics().SetEditedEntity(entt::null);
-    // Drop the pathfinding debug overlay; GridNav rebuilds from the new scene.
-    navBuilt_ = false;
-    navCells_.clear();
+    // Drop the navmesh debug overlay; the new scene's navSource loads on the next frame.
+    navTris_.clear();
     navPath_.clear();
     if (scene::LoadScene(engine.GetScene(), engine.GetRenderer(), path)) {
         currentScenePath_ = path;
@@ -19916,119 +19915,121 @@ void Editor::DrawNavigation(Engine& engine) {
     if (!panelOpen_[Panel_Navigation]) return;
     ImGui::Begin("Navigation", &panelOpen_[Panel_Navigation]);
 
-    // --- Real-time A* (the live pathfinder agents use; no bake) ----------------
-    ImGui::SeparatorText("Pathfinding (real-time A*)");
-    ImGui::TextWrapped("Agents path on a grid A* built live from static geometry - no bake. "
-                       "It reroutes around moving Navigation Obstacles each ~0.3s.");
-    ImGui::SliderFloat("Cell size##grid", &gridParams_.cellSize, 0.25f, 2.0f, "%.2f m");
-    ImGui::SliderFloat("Agent radius##grid", &gridParams_.agentRadius, 0.1f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Max step##grid", &gridParams_.maxStep, 0.1f, 2.0f, "%.2f");
-    ImGui::SliderFloat("Max slope##grid", &gridParams_.maxSlopeDeg, 10.0f, 70.0f, "%.0f deg");
+    Scene& scene = engine.GetScene();
+    nav::NavWorld& world = engine.GetNavWorld();
     const std::filesystem::path navAssets =
         Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
-    const auto gatherObstacles = [&]() {
-        std::vector<nav::GridObstacle> obs;
-        entt::registry& r = engine.GetScene().Registry();
-        for (const entt::entity e : r.view<Transform, NavigationObstacle>()) {
-            const NavigationObstacle& o = r.get<NavigationObstacle>(e);
-            if (o.enabled) obs.push_back({glm::vec3(engine.GetScene().WorldMatrix(e)[3]), o.radius});
+
+    // --- Bake (Recast -> .hbnav) -----------------------------------------------
+    ImGui::SeparatorText("Bake (Recast -> .hbnav)");
+    ImGui::TextWrapped("Voxelises the scene's navigation geometry into a tiled navmesh the "
+                       "runtime streams with Detour. Meshes bake by default; a mesh opts OUT "
+                       "with a disabled Navmesh Input. Dynamic movers use Navigation Obstacle "
+                       "instead of baking.");
+    ImGui::SliderFloat("Cell size##nav", &navBake_.cellSize, 0.1f, 1.0f, "%.2f m");
+    ImGui::SliderFloat("Cell height##nav", &navBake_.cellHeight, 0.1f, 1.0f, "%.2f m");
+    ImGui::SliderInt("Tile voxels##nav", &navBake_.tileVoxels, 16, 128);
+    ImGui::SliderFloat("Agent radius##nav", &navBake_.agentRadius, 0.1f, 2.0f, "%.2f m");
+    ImGui::SliderFloat("Agent height##nav", &navBake_.agentHeight, 0.5f, 4.0f, "%.2f m");
+    ImGui::SliderFloat("Max climb##nav", &navBake_.agentMaxClimb, 0.1f, 2.0f, "%.2f m");
+    ImGui::SliderFloat("Max slope##nav", &navBake_.agentMaxSlopeDeg, 10.0f, 70.0f, "%.0f deg");
+    ImGui::TextDisabled("Tile size: %.1f m (%d cells x %.2f m)",
+                        navBake_.tileVoxels * navBake_.cellSize, navBake_.tileVoxels,
+                        navBake_.cellSize);
+
+    if (ImGui::Button("Bake Navmesh") && Project::HasActive()) {
+        SceneEnvironment& env = scene.Environment();
+        const std::string rel = env.navSource.empty() ? "Nav/navmesh.hbnav" : env.navSource;
+        const nav::NavBakeResult r = nav::BakeNavMesh(scene, navAssets, navBake_);
+        if (r.ok) {
+            const std::filesystem::path outAbs = navAssets / rel;
+            std::error_code ec;
+            std::filesystem::create_directories(outAbs.parent_path(), ec);
+            std::ofstream f(outAbs, std::ios::binary | std::ios::trunc);
+            if (f) {
+                f.write(reinterpret_cast<const char*>(r.bytes.data()),
+                        static_cast<std::streamsize>(r.bytes.size()));
+                f.close();
+                StampNewAsset(outAbs);
+                PushUndo(scene); // assigning navSource is a scene edit
+                env.navSource = rel;
+                // Drop the loaded navmesh so the per-frame sync reloads the fresh bake.
+                world.Unload();
+                navStatus_ = "Baked " + std::to_string(r.tileColumns) + " tile column(s) from " +
+                             std::to_string(r.totalTris) + " tris -> " + rel +
+                             ". SAVE THE SCENE (Ctrl+S) or the reference is lost.";
+            } else {
+                navStatus_ = "Bake OK but could not write " + outAbs.string();
+            }
+        } else {
+            navStatus_ = "Bake produced nothing: " + r.message;
         }
-        return obs;
-    };
-    if (ImGui::Button("Rebuild Grid")) {
-        nav::GridNav& g = engine.GetGridNav();
-        g.SetParams(gridParams_);
-        g.Rebuild(engine.GetScene(), navAssets);
-        g.DebugCells(navStart_, 60.0f, navCells_);
-        navBuilt_ = g.Ready();
-        navStatus_ = g.Ready() ? ("Grid: " + std::to_string(g.TriangleCount()) + " tris, " +
-                                  std::to_string(g.TerrainCount()) + " terrain surface(s), " +
-                                  std::to_string(navCells_.size()) +
-                                  " walkable cells near start.")
-                               : "Grid: no static geometry and no terrain found.";
     }
-    ImGui::SameLine();
-    ImGui::Checkbox("Show##grid", &navShow_);
-    ImGui::DragFloat3("Start##grid", &navStart_.x, 0.1f);
-    ImGui::DragFloat3("End##grid", &navEnd_.x, 0.1f);
-    if (selected_ != entt::null && engine.GetScene().Registry().valid(selected_)) {
-        if (ImGui::SmallButton("Start = selection##g"))
-            navStart_ = glm::vec3(engine.GetScene().WorldMatrix(selected_)[3]);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("End = selection##g"))
-            navEnd_ = glm::vec3(engine.GetScene().WorldMatrix(selected_)[3]);
-    }
-    if (ImGui::Button("Find Path (A*)")) {
-        nav::GridNav& g = engine.GetGridNav();
-        g.SetParams(gridParams_);
-        g.EnsureBuilt(engine.GetScene(), navAssets);
-        navPath_ = g.FindPath(navStart_, navEnd_, gatherObstacles());
-        g.DebugCells(navStart_, 60.0f, navCells_);
-        navBuilt_ = g.Ready();
-        navStatus_ = navPath_.empty()
-                         ? "A*: no path (check there is static ground + a reachable goal)."
-                         : ("A*: " + std::to_string(navPath_.size()) + " corners.");
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear")) {
-        navBuilt_ = false;
-        navPath_.clear();
-        navCells_.clear();
-        navStatus_.clear();
-    }
-    if (navBuilt_ && !navPath_.empty()) {
-        f32 len = 0.0f;
-        for (usize i = 1; i < navPath_.size(); ++i)
-            len += glm::distance(navPath_[i - 1], navPath_[i]);
-        ImGui::Text("Path: %d corners, length %.1f", static_cast<int>(navPath_.size()), len);
-    }
+    if (!Project::HasActive()) ImGui::TextDisabled("(open a project to bake)");
     if (!navStatus_.empty()) ImGui::TextWrapped("%s", navStatus_.c_str());
 
-    // Input geometry. REPORTED BY GridNav, not re-derived here: this used to count every
-    // NavmeshInput entity (including streamed ones, which deliberately do not get a vote
-    // in the predicate) and to say "baking", of which there is none - GridNav samples on
-    // demand. It also never mentioned terrain, which is a nav surface now.
-    {
-        entt::registry& reg = engine.GetScene().Registry();
-        const nav::GridNav& g = engine.GetGridNav();
-        ImGui::SeparatorText("Input geometry");
-        switch (g.ActiveSource()) {
-            case nav::NavSource::StaticLayer:
-                ImGui::TextWrapped("Static layer: %d mesh(es) sampled (untagged counts as "
-                                   "Static). Navmesh Input can only opt a static mesh OUT.",
-                                   g.AcceptedMeshCount());
-                break;
-            case nav::NavSource::NavmeshInputTag:
-                ImGui::TextWrapped("Navmesh Input tags: %d mesh(es) sampled. Untagged meshes "
-                                   "are ignored.",
-                                   g.AcceptedMeshCount());
-                break;
-            case nav::NavSource::AllMeshes:
-                ImGui::TextWrapped("No Static layer and no tags - ALL %d mesh(es) sampled. Add "
-                                   "a Navmesh Input component to narrow it.",
-                                   g.AcceptedMeshCount());
-                break;
-        }
-        ImGui::TextWrapped("+ %d terrain surface(s) (sampled analytically - a sculpt needs no "
-                           "rebuild) and %d streamed shard block(s). %u full rebuild(s) so far.",
-                           g.TerrainCount(), g.StreamedBlockCount(), g.RebuildCount());
-        const bool hasSel = selected_ != entt::null && reg.valid(selected_);
-        ImGui::BeginDisabled(!hasSel);
-        if (ImGui::Button("Tag Selected")) {
-            if (hasSel && !reg.all_of<NavmeshInput>(selected_)) {
-                PushUndo(engine.GetScene());
-                reg.emplace<NavmeshInput>(selected_);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Untag Selected")) {
-            if (hasSel && reg.all_of<NavmeshInput>(selected_)) {
-                PushUndo(engine.GetScene());
-                reg.remove<NavmeshInput>(selected_);
-            }
-        }
-        ImGui::EndDisabled();
+    // --- Streamed navmesh state + test path ------------------------------------
+    ImGui::SeparatorText("Streamed navmesh (Detour)");
+    if (world.Loaded()) {
+        ImGui::Text("Loaded '%s': %d/%d tile column(s) resident.", world.SourcePath().c_str(),
+                    world.ResidentTileColumns(), world.TotalTileColumns());
+    } else if (!scene.Environment().navSource.empty()) {
+        ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "navSource set but not loaded (status %u).",
+                           static_cast<u32>(world.Status()));
+    } else {
+        ImGui::TextDisabled("No navmesh (bake one, then Save the scene).");
     }
+    ImGui::Checkbox("Show navmesh", &navShow_);
+    ImGui::DragFloat3("Start##nav", &navStart_.x, 0.1f);
+    ImGui::DragFloat3("End##nav", &navEnd_.x, 0.1f);
+    if (selected_ != entt::null && scene.Registry().valid(selected_)) {
+        if (ImGui::SmallButton("Start = selection##nav"))
+            navStart_ = glm::vec3(scene.WorldMatrix(selected_)[3]);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("End = selection##nav"))
+            navEnd_ = glm::vec3(scene.WorldMatrix(selected_)[3]);
+    }
+    if (ImGui::Button("Test Path")) {
+        bool missing = false;
+        if (world.FindPath(navStart_, navEnd_, navPath_, &missing)) {
+            f32 len = 0.0f;
+            for (usize i = 1; i < navPath_.size(); ++i) len += glm::distance(navPath_[i - 1], navPath_[i]);
+            navStatus_ = "Path: " + std::to_string(navPath_.size()) + " corners, " +
+                         std::to_string(static_cast<int>(len)) + " m.";
+        } else {
+            navPath_.clear();
+            navStatus_ = missing ? "Path: required tiles not resident yet (streaming - move the "
+                                   "camera near start/end, or retry)."
+                                 : "Path: unreachable on the resident navmesh.";
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##nav")) {
+        navPath_.clear();
+        navStatus_.clear();
+    }
+
+    // Navmesh Input opt-out helpers for the selected mesh.
+    entt::registry& reg = scene.Registry();
+    const bool hasSel = selected_ != entt::null && reg.valid(selected_);
+    ImGui::BeginDisabled(!hasSel);
+    if (ImGui::Button("Exclude Selected (add disabled Navmesh Input)")) {
+        if (hasSel) {
+            PushUndo(scene);
+            reg.emplace_or_replace<NavmeshInput>(selected_, NavmeshInput{false});
+        }
+    }
+    if (ImGui::Button("Re-include Selected (remove Navmesh Input)")) {
+        if (hasSel && reg.all_of<NavmeshInput>(selected_)) {
+            PushUndo(scene);
+            reg.remove<NavmeshInput>(selected_);
+        }
+    }
+    ImGui::EndDisabled();
+
+    // Keep the overlay triangles fresh from the resident navmesh (cheap - windowed set).
+    navTris_.clear();
+    if (navShow_ && world.Loaded()) world.DebugTriangles(navTris_);
 
     ImGui::End();
 }
@@ -20036,7 +20037,7 @@ void Editor::DrawNavigation(Engine& engine) {
 
 void Editor::DrawNavOverlay(Scene& scene, Renderer& renderer) {
     (void)scene;
-    if (!vpVisible_ || !navBuilt_ || !navShow_) return;
+    if (!vpVisible_ || !navShow_) return;
     const glm::mat4 vp = renderer.GetCamera().ViewProjection();
     ImDrawList* draw = ImGui::GetForegroundDrawList();
     draw->PushClipRect(ImVec2(vpX_, vpY_), ImVec2(vpX_ + vpW_, vpY_ + vpH_), true);
@@ -20049,12 +20050,15 @@ void Editor::DrawNavOverlay(Scene& scene, Renderer& renderer) {
         return true;
     };
 
-    // Real-time A* walkable cells (small dots).
-    const ImU32 cellCol = IM_COL32(80, 200, 120, 120);
-    for (const glm::vec3& p : navCells_) {
-        ImVec2 s;
-        if (project(p, s)) draw->AddRectFilled(ImVec2(s.x - 1.5f, s.y - 1.5f),
-                                               ImVec2(s.x + 1.5f, s.y + 1.5f), cellCol);
+    // Resident navmesh triangles (translucent green fill + edges).
+    const ImU32 fillCol = IM_COL32(60, 190, 110, 60);
+    const ImU32 edgeCol = IM_COL32(90, 220, 140, 130);
+    for (usize i = 0; i + 2 < navTris_.size(); i += 3) {
+        ImVec2 a, b, c;
+        if (project(navTris_[i], a) && project(navTris_[i + 1], b) && project(navTris_[i + 2], c)) {
+            draw->AddTriangleFilled(a, b, c, fillCol);
+            draw->AddTriangle(a, b, c, edgeCol, 1.0f);
+        }
     }
 
     if (navPath_.size() >= 2) {

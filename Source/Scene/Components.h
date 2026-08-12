@@ -1488,10 +1488,12 @@ struct RectLightComponent {
     bool twoSided = false;
 };
 
-// Moves the entity toward `target`: nav::UpdateAgents finds a grid A* path
-// (nav::GridNav), steers the Transform along it (seek + arrival), snaps the
-// agent to the ground, faces movement, and softly avoids NavigationObstacles and
-// other agents. Runs while the simulation is playing (like physics/scripts).
+// Moves the entity toward `target`: nav::UpdateAgents finds a Detour path on the
+// scene's baked navmesh (streamed by nav::NavWorld), steers the Transform along it
+// (seek + arrival), snaps the agent onto the navmesh, faces movement, and softly avoids
+// NavigationObstacles and other agents. Runs while the simulation is playing (like
+// physics/scripts). If required navmesh tiles are still streaming it keeps the current
+// path and retries - it never blocks.
 struct NavigationAgent {
     glm::vec3 target{0.0f}; // desired destination (world space)
     bool hasTarget = false; // set true to start moving (gameplay or inspector)
@@ -1512,9 +1514,10 @@ struct NavigationAgent {
     f32 repathCooldown = 0.0f;   // re-plans periodically so it reroutes around movers
 };
 
-// A dynamic obstacle that NavigationAgents route + steer around. nav::GridNav
-// blocks the grid cells it covers each query, so agents re-plan around it in real
-// time, plus a soft local-avoidance push between re-plans.
+// A dynamic obstacle that NavigationAgents route + steer around. It is fed to the
+// navmesh as a DetourTileCache obstacle, which rebuilds the affected navmesh tiles so
+// agents re-plan around it in real time (no re-bake), plus a soft local-avoidance push
+// between re-plans. Move it freely - crates, vehicles, barricades, doors.
 struct NavigationObstacle {
     f32 radius = 1.0f;
     f32 height = 2.0f; // reserved (vertical extent)
@@ -1622,13 +1625,11 @@ struct WaterComponent {
     bool dirty = true; // rebuild/UpdateMesh the grid on the next water::Update
 };
 
-// Opts an entity's mesh INTO the pathfinding geometry. When any entity in the
-// scene carries this, nav::GridNav samples only the tagged meshes (the walkable
-// floors plus the walls/props that should block) instead of every mesh - so
-// decorative geometry, the player, etc. stay out of pathfinding. With no
-// NavmeshInput anywhere it falls back to using every mesh, so existing scenes
-// keep working. GridNav decides walkable vs. blocking from slope, so tag both
-// the ground and the obstacles you want considered.
+// Opts an entity's mesh OUT of the baked navmesh when `enabled` is false. All meshes
+// bake into the navmesh by default (except paint strokes, explicit NavigationObstacles,
+// and Dynamic-layer movers), and the baker decides walkable vs. blocking from slope - so
+// this is only needed to EXCLUDE a mesh the baker would otherwise treat as walkable
+// floor or blocking geometry. An enabled NavmeshInput is a no-op (the mesh already bakes).
 struct NavmeshInput {
     bool enabled = true;
 };

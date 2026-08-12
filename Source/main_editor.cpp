@@ -9,6 +9,7 @@
 #include "Assets/AssetFormats.h" // --test-assetformats (the registry's own invariants)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
 #include "Assets/SeamWeld.h"
+#include "Navigation/NavBaker.h" // --test-nav (Recast bake -> Detour stream/query/obstacles)
 #include "Scene/BodyShape.h"
 #include "Assets/MeshDerive.h"
 #include "Assets/MeshGenerator.h" // --skin-preview (headless skin sphere render)
@@ -134,6 +135,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-seamweld") == 0) {
             const bool ok = hbe::weld::SelfTest();
             std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-nav (alias --navtest): headless navigation end-to-end. Recast-bakes
+        // synthetic geometry into a .hbnav, streams the tiles through Detour, paths
+        // around a baked wall, then adds/removes a dtTileCache obstacle and confirms the
+        // path reroutes and recovers. Pure CPU: no GPU, no window.
+        if (std::strcmp(argv[i], "--test-nav") == 0 || std::strcmp(argv[i], "--navtest") == 0) {
+            const bool ok = hbe::nav::SelfTest();
+            std::printf("nav %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-nanovdb: prove the header-only NanoVDB build (grid builder + createNanoGrid +

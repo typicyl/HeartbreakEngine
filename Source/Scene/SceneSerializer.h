@@ -248,6 +248,7 @@ struct SceneData {
     f32 exposure = 1.0f;
     f32 shadowDistance = 150.0f;
     std::string giSource; // cached .hbgi GI volume (rel to Assets)
+    std::string navSource; // cached .hbnav navmesh (rel to Assets)
     // The scene's PERMANENT pack slot (top-level "packSlot"; see Assets/SlotIds.h).
     // kNoPackSlot = the file carries none (slot 0 is a VALID slot - Tree=0 in the
     // owner-spec test - so absence needs a sentinel, not zero). Parsed and re-emitted

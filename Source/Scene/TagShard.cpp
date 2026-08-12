@@ -542,42 +542,14 @@ BakeReport Bake(std::vector<BakeRow>& rows, const std::vector<TagDef>& defs) {
                                "together; merging them (a larger shard cell) is cheaper.");
             }
         }
-        // --- Validator: navmesh input inside a streamed tag ---
-        // GridNav rebuilds from the live Static+mesh set, re-reading every `.uaf`
-        // from disk. Streaming such a mesh makes every shard transition a navmesh
-        // rebuild - and the ground the AI walks on comes and goes.
-        if (!def.alwaysLoaded) {
-            usize navCount = 0;
-            std::string firstName;
-            for (usize s = firstShard; s < rep.members.size(); ++s) {
-                for (const u32 m : rep.members[s]) {
-                    if (!rows[m].navInput) continue;
-                    if (navCount++ == 0) firstName = rows[m].name;
-                }
-            }
-            if (navCount > 0) {
-                // Streamed geometry IS nav geometry again. GridNav::SyncStreamedGeometry
-                // indexes each resident shard's triangles INCREMENTALLY and removes them
-                // with the shard, so there is no full rebuild on a spawn and no
-                // fall-through while the shard is loaded. The remaining authoring hazard
-                // is the one streaming always had: while the shard is OUT, that ground
-                // does not exist for AI either.
-                //
-                // The old text told authors to "clear Navmesh Input on those meshes" as a
-                // remedy, which caused the exact fall-through it warned about - clearing
-                // the flag is what removes a streamed mesh from the navmesh now.
-                report.Add(Severity::Warning, tagName,
-                           std::to_string(navCount) + " navmesh-input mesh(es) (e.g. '" +
-                               firstName + "') are in the streamed tag '" + tagName +
-                               "'. These ARE navigation geometry: their triangles are "
-                               "indexed when the shard becomes resident and removed when it "
-                               "despawns, with no navmesh rebuild either way. Note only that "
-                               "agents have no ground here while the shard is unloaded - if "
-                               "AI must path across it at all times, mark the tag "
-                               "alwaysLoaded. (A streamed prop that MOVES should carry a "
-                               "NavigationObstacle; moving geometry is not re-indexed.)");
-            }
-        }
+        // NOTE: the former "navmesh input inside a streamed tag" warning is GONE.
+        // Navigation is now BAKED into a persistent .hbnav (Recast) and streamed
+        // INDEPENDENTLY of the tags, so nav geometry inside a streamed tag is captured at
+        // bake time and AI keeps its ground even while the visual shard is unloaded - the
+        // exact hazard that warning described no longer exists. (A streamed prop that
+        // MOVES at runtime is not re-baked and should carry a NavigationObstacle instead;
+        // that is a per-object authoring note, not a per-tag bake error. `rows[].navInput`
+        // is kept for that future per-object check.)
         // --- Validator: chunked terrain inside a streamed tag ---
         // The one place a respawn cycle GROWS VRAM. Paint canvases and world-UI render
         // targets are cached across respawns precisely because the RHI has no texture or

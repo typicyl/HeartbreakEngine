@@ -93,8 +93,20 @@ set(HBE_SCENE_SOURCES
 set(HBE_PHYSICS_SOURCES
     "Source/Physics/PhysicsWorld.cpp")
 
+# Navigation RUNTIME: Detour-backed tiled navmesh + DetourTileCache dynamic obstacles,
+# consumed from baked `.hbnav` tiles. Compiled into BOTH engine libraries; links Detour
+# + DetourTileCache (never Recast - see the bake sources below).
 set(HBE_NAV_SOURCES
-    "Source/Navigation/GridNav.cpp")
+    "Source/Navigation/NavTileCodec.cpp"
+    "Source/Navigation/NavFormat.cpp"
+    "Source/Navigation/NavMesh.cpp"
+    "Source/Navigation/NavWorld.cpp"
+    "Source/Navigation/NavAgents.cpp")
+
+# Navigation BAKING (Recast): editor-only, added ONLY to hbe_editor so the shipped
+# runtime never links Recast. See HBE_EDITOR_SOURCES.
+set(HBE_NAV_BAKE_SOURCES
+    "Source/Navigation/NavBaker.cpp")
 
 # The unified pick pass (world-UI pages + 3D interactables, one ray, one winner).
 set(HBE_INTERACT_SOURCES
@@ -242,7 +254,9 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/MovieRender.cpp"
     "Source/Editor/MovieEncoder.cpp"
     "Source/Editor/stb_image_impl.cpp"
-    "Source/Editor/stb_image_write_impl.cpp")
+    "Source/Editor/stb_image_write_impl.cpp"
+    # Navigation baking (Recast) - editor only; the shipped runtime has no Recast.
+    ${HBE_NAV_BAKE_SOURCES})
 
 # NanoVDB volumetric foundation (baker / asset / cache / runtime). Header-only NanoVDB,
 # zero external runtime deps. OpenVDB (editor-only, vcpkg) is a later optional addition.
@@ -326,8 +340,13 @@ function(hbe_configure_engine_lib tgt is_editor)
     target_link_libraries(${tgt} PRIVATE stb)
     # Jolt rigid-body physics (Source/Physics wraps it; no Jolt in headers).
     target_link_libraries(${tgt} PRIVATE Jolt)
-    # Navigation is a custom grid A* pathfinder (Source/Navigation/GridNav) - no
-    # external nav dependency.
+    # Navigation RUNTIME: Detour (tiled navmesh query) + DetourTileCache (dynamic
+    # obstacles / per-tile rebuild). Both engine libraries link these; the runtime
+    # consumes pre-baked `.hbnav` tiles and never touches Recast. DetourTileCache
+    # depends only on Detour (verified against v1.6.0), so no Recast is pulled in here.
+    # No Detour type crosses into engine headers (Source/Navigation/NavWorld.h is
+    # Detour-free via pimpl). See cmake/Dependencies.cmake for the runtime/editor split.
+    target_link_libraries(${tgt} PRIVATE Detour DetourTileCache)
     # miniaudio playback (Source/Audio wraps it; header-only).
     target_link_libraries(${tgt} PRIVATE miniaudio_header)
     # NanoVDB - header-only sparse-volume representation + PNanoVDB GPU reader. The
@@ -382,6 +401,11 @@ function(hbe_configure_engine_lib tgt is_editor)
         # game that will never open a collaboration session.
         target_sources(${tgt} PRIVATE ${HBE_COLLAB_P2P_SOURCES})
         target_link_libraries(${tgt} PRIVATE LibDataChannel::LibDataChannelStatic)
+        # Recast (navmesh GENERATION) is an authoring/bake dependency. Linked ONLY into
+        # hbe_editor so the shipped runtime carries no navmesh generator - it consumes
+        # the baked `.hbnav` through Detour/DetourTileCache alone. NavBaker.cpp is the
+        # only TU that includes Recast.h (added via HBE_NAV_BAKE_SOURCES above).
+        target_link_libraries(${tgt} PRIVATE Recast)
         # comdlg32 = file dialogs, ole32 = IFileDialog folder picker (COM).
         # mf* = Media Foundation H.264 .mp4 encode/decode (offline movie render).
         target_link_libraries(${tgt} PRIVATE comdlg32 ole32 mfplat mfreadwrite mfuuid mf)

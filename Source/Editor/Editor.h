@@ -15,7 +15,7 @@
 #include "Editor/SaveDispatch.h" // Ctrl+S: which focused surface owns the chord
 #include "Editor/TimelineSnap.h" // the shared per-frame grid for every timeline
 #include "Core/Types.h"
-#include "Navigation/GridNav.h"
+#include "Navigation/NavBaker.h" // nav::NavBuildSettings for the bake panel
 #include "Renderer/CameraController.h"
 #include "RHI/RHI.h"
 #include "Assets/MusicGraph.h"
@@ -1815,18 +1815,17 @@ private:
     bool showBuildSettings_ = false;
     std::string buildResult_; // last build status line (shown in Stats)
 
-    // -- Navigation (real-time grid A*: params, rebuild, visualise, test paths) ---
+    // -- Navigation (Recast bake -> .hbnav; Detour streaming/query/visualise) ---
     void DrawNavigation(Engine& engine);
-    // Projects the A* walkable cells + test path into the viewport (debug overlay).
+    // Projects the resident navmesh triangles + test path into the viewport overlay.
     void DrawNavOverlay(Scene& scene, Renderer& renderer);
-    bool navBuilt_ = false;
-    bool navShow_ = true;            // overlay the pathfinding debug in the viewport
+    bool navShow_ = true;            // overlay the navmesh + test path in the viewport
     glm::vec3 navStart_{-8.0f, 0.0f, -8.0f};
     glm::vec3 navEnd_{8.0f, 0.0f, 8.0f};
     std::vector<glm::vec3> navPath_; // last queried path corners (world space)
     std::string navStatus_;
-    nav::GridNavParams gridParams_;  // real-time A* pathfinder params (the live system)
-    std::vector<glm::vec3> navCells_; // walkable grid cell centers (debug overlay)
+    nav::NavBuildSettings navBake_;  // Recast bake settings for the .hbnav
+    std::vector<glm::vec3> navTris_; // resident navmesh triangles (debug overlay, 3/vert)
 
     // -- Objectives browser (searchable index of task goals in the loaded scene) ---
     // Objectives ("task goals") are runtime strings (id + HUD text) that emerge from

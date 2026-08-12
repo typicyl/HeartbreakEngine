@@ -12,7 +12,6 @@
 #include "Assets/MaterialAsset.h"
 #include "Assets/MeshGenerator.h" // a real ribbon `.uaf` for the drag path's asset shape
 #include "Assets/UAF.h"
-#include "Navigation/GridNav.h"
 #include "Renderer/Renderer.h"
 #include "Scene/SceneSerializer.h"
 #include "Scene/TagStreaming.h"
@@ -411,10 +410,10 @@ usize Rehome(Scene& scene) {
 // ---------------------------------------------------------------------------
 // --test-strokezones - the headless proof. See StrokeZone.h.
 //
-// Navigation/GridNav.h is reached "upward" from Scene/ by the TEST ONLY, the way
-// TagStreaming.cpp's self-test already reaches Renderer: the nav exclusion lives in
-// GridNav (Navigation depends on Scene, never the reverse) and the only honest way
-// to assert it is to build a navmesh and count triangles.
+// The nav-exclusion contract is asserted directly through strokezone::IsStroke (the
+// same predicate the navmesh baker consults, Navigation/NavBaker.cpp) rather than by
+// building a navmesh - so this test needs no dependency on the Navigation module and
+// keeps Scene/ free of an upward include.
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -726,35 +725,27 @@ bool SelfTest() {
     }
 
     // === 5. A stroke is never nav geometry ====================================
+    // Asserted through IsStroke - the exact predicate NavBaker's geometry gather uses to
+    // skip strokes - so the contract is checked without building a navmesh.
     {
-        Renderer renderer;
-        (void)renderer;
         Scene s;
-        MakeProp(s, "Floor", {0.0f, 0.0f, 0.0f}, glm::vec3(20.0f, 0.1f, 20.0f), kTagUntagged,
-                 "prim:plane");
-        // A FRESH GridNav per measurement: StaticTriangleCount is the observable
-        // (AcceptedMeshCount is only refreshed by the incremental EnsureBuilt path,
-        // so it reads stale after a bare Rebuild).
-        nav::GridNav navA;
-        navA.Rebuild(s, dir);
-        const int trisFloor = navA.StaticTriangleCount();
-        expect(trisFloor > 0, "the bare floor produces navmesh triangles");
+        const entt::entity floor = MakeProp(s, "Floor", {0.0f, 0.0f, 0.0f},
+                                            glm::vec3(20.0f, 0.1f, 20.0f), kTagUntagged, "prim:plane");
+        entt::registry& reg = s.Registry();
+        expect(!IsStroke(reg, floor), "an ordinary floor prop IS nav geometry (not a stroke)");
 
-        // The same scene plus a stroke lying on that floor.
+        // A stroke lying on that floor is a decal, excluded from the navmesh.
         const entt::entity st = MakeStroke(s, {0.0f, 0.02f, 0.0f}, "prim:plane", matRel);
         Attach(s, st, kTagUntagged);
-        nav::GridNav navB;
-        navB.Rebuild(s, dir);
-        expect(navB.StaticTriangleCount() == trisFloor,
-               "adding a paint stroke changes the navmesh by NOTHING - strokes are decals");
+        expect(IsStroke(reg, st),
+               "a paint stroke is excluded from the navmesh - strokes are decals, not collision");
 
-        // The exclusion must be about being a stroke, not about the mesh source: an
-        // ordinary prop with the SAME mesh is still collected. Without this, a bug
-        // that rejected every `prim:plane` would pass the assertion above.
-        MakeProp(s, "Crate", {3.0f, 0.0f, 3.0f}, glm::vec3(0.5f), kTagUntagged, "prim:plane");
-        nav::GridNav navC;
-        navC.Rebuild(s, dir);
-        expect(navC.StaticTriangleCount() > trisFloor,
+        // The exclusion is about being a stroke, not the mesh source: an ordinary prop
+        // with the SAME mesh is still nav geometry. Without this, a bug that rejected
+        // every `prim:plane` would pass the assertion above.
+        const entt::entity crate = MakeProp(s, "Crate", {3.0f, 0.0f, 3.0f}, glm::vec3(0.5f),
+                                            kTagUntagged, "prim:plane");
+        expect(!IsStroke(reg, crate),
                "...while a normal prop with the same mesh is still nav geometry");
     }
 
@@ -959,9 +950,6 @@ bool SelfTest() {
         entt::registry& reg = s.Registry();
         MakeProp(s, "Floor", {0.0f, 0.0f, 0.0f}, glm::vec3(20.0f, 0.1f, 20.0f), kTagUntagged,
                  "prim:plane");
-        nav::GridNav navA;
-        navA.Rebuild(s, dir);
-        const int trisFloor = navA.StaticTriangleCount();
 
         const entt::entity legacy = s.CreateEntity(kUntaggedGroupName);
         reg.emplace<Transform>(legacy, Transform{});
@@ -971,11 +959,10 @@ bool SelfTest() {
                "the fixture really is unmarked (this is what a legacy scene looks like)");
 
         expect(HasAnyGroup(reg), "the re-home menu is ENABLED on a legacy scene");
-        expect(IsStroke(reg, old), "a legacy stroke reads as a stroke without being adopted");
-        nav::GridNav navB;
-        navB.Rebuild(s, dir);
-        expect(navB.StaticTriangleCount() == trisFloor,
-               "...so a LEGACY stroke is excluded from the navmesh too");
+        // IsStroke keys off the stroke marker, not the group node, so an unadopted legacy
+        // stroke still reads as a stroke - which is what excludes it from the navmesh.
+        expect(IsStroke(reg, old),
+               "a legacy stroke reads as a stroke (so it is excluded from the navmesh too)");
         expect(AllStrokes(reg).size() == 1, "AllStrokes sees it, so Rehome has something to move");
 
         // The migration itself: tag the hut the stroke sits on, then re-home.

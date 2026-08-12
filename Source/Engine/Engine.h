@@ -8,7 +8,7 @@
 #include "Core/Types.h"
 #include "Assets/CutsceneAsset.h" // active cutscene the player evaluates
 #include "Dialogue/DialogueGraph.h" // active dialogue graph the conversation player walks
-#include "Navigation/GridNav.h" // real-time A* pathfinder (agents path on this)
+#include "Navigation/NavWorld.h" // persistent streamed Detour navmesh (agents path on this)
 #include "Scene/ParticleGpuSim.h" // GPU particle simulation context (compute-driven)
 #include "Scene/PrecipSystem.h"   // precip::PrecipField (camera-following rain/snow)
 #include "Scene/OceanFFT.h"       // ocean::GpuOcean (GPU FFT ocean, compute-driven)
@@ -139,13 +139,6 @@ struct EngineConfig {
     // Optional CSV of per-frame times written at exit (for graphing / regression).
     std::string benchmarkCsv;
 
-    // Navigation smoke test: route the grid A* pathfinder around a static + a
-    // dynamic obstacle and walk an agent to the goal, then exit.
-    bool navTest = false;
-    // Navigation cost harness (--navbench): reports the per-frame nav band, the per-query
-    // cost, and both sides of the hot paths that still have two implementations.
-    bool navBench = false;
-
     // Fracture smoke test: headless Voronoi-fracture correctness check
     // (volume conservation, adjacency symmetry, determinism, .hbfrac round-trip).
     bool fractureTest = false;
@@ -219,9 +212,10 @@ public:
     Input&        GetInput()    { return *input_; }
     PhysicsWorld& GetPhysics()  { return *physics_; }
     AudioSystem&  GetAudio()    { return *audio_; }
-    // Real-time A* pathfinder NavigationAgents path on (no bake; reroutes around
-    // moving NavigationObstacles). Auto-rebuilds from static geometry each frame.
-    nav::GridNav& GetGridNav() { return *gridNav_; }
+    // Persistent, independently-streamed Detour navmesh NavigationAgents path on.
+    // Loaded from the scene's baked .hbnav (SceneEnvironment::navSource); streams tiles
+    // around the player on its own radius, decoupled from geometry streaming.
+    nav::NavWorld& GetNavWorld() { return navWorld_; }
 
     // Mouse-look cursor lock (hide + recenter). Driven by the game flow (locked
     // while Playing) and callable directly.
@@ -522,7 +516,9 @@ public:
 private:
     void UpdateCutscene(f32 dt); // evaluate the active .hbcutscene camera/anim/dialogue tracks
     void PlayUISounds();         // play UIElement hover/click sounds (edge-detected)
-    nav::GridNav* gridNav_ = nullptr;
+    // Owned by value: the navmesh manager for the current level. Loads/streams the
+    // scene's .hbnav (SceneEnvironment::navSource); see Engine::Run's sim band.
+    nav::NavWorld navWorld_;
     f32       dt_ = 0.0f;
 
     // Game flow runtime state (only active when the project sets a main-menu
