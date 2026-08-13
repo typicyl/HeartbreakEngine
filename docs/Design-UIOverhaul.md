@@ -447,7 +447,76 @@ test‑gated.
   focus/blur/enter/leave listener events + eager focus‑on‑Show (needs UIManager↔UIContext wiring).
 - **P9 — Widget registry + advanced widgets.** D3 vtable; then Tab/Modal/Tooltip/ContextMenu/
   List/Tree/Reorderable/**Virtualized list**/Viewport/RenderTexture widget. *Riskiest core change;
-  done after P5/P8 clean the seams.*
+  done after P5/P8 clean the seams.* **Being delivered in risk-ordered SUB-SLICES** (the phase is
+  ~3-4 phases of work; each slice builds + is adversarially reviewed on its own):
+  - **P9.1 — Tooltip.** ✅ **DONE (2026-08-12).** A hover tooltip delivered as a composable
+    ATTRIBUTE (`UIElement.tooltip` + `tooltipDelay`) that works on ANY element — deliberately NOT a
+    new `Type` enum value, so it grows no emit-switch arm (composition over monolithic widget types,
+    the overhaul's stated aim). Pipeline: the pointer pass (`ApplyPointerPass`) records the topmost
+    tooltip-bearing element under the cursor into `UIContext.tooltipCandidate` (independent of the
+    interaction gate, so a *disabled* control can still explain itself); `ui::UpdateTooltipTimer`
+    advances a dwell timer on the **presentation clock** and unconditionally (see review below);
+    `BuildVerticesImpl` emits a wrapped, screen-clipped popup below the element once the delay passes.
+    Serialized (element key count 66→68, both writers + fuzz + guard), authored via a Tooltip field
+    in the editor inspector. **Adversarially reviewed (3 lenses: timer-lifecycle / emit-positioning /
+    serialization-lockstep) → 1 major + 1 minor + nits, all fixed:** the **major** — the dwell timer
+    ran on the pause-scaled simulation `dt`, so tooltips never appeared on the *paused* pause/settings
+    menu (a primary surface); fixed by moving it to a dedicated `UpdateTooltipTimer` on the unscaled
+    presentation clock, called every frame (also fixes the minor: a popup freezing while the dev menu
+    owns input). Emit + serialization lenses came back clean (wrap-consistency invariant, byte-identity,
+    coordinate space, clamp all verified). `--test-uidoc` (68) + `--test-uipick` + full battery PASS;
+    editor + runtime build & link both clean; D3D12 GPU smoke clean.
+  - **P9.2 — WidgetVTable decomposition (D3).** ✅ **DONE (2026-08-12)** — spec at
+    [Design-UIWidgetRegistry.md](Design-UIWidgetRegistry.md). The god-struct's per-type `switch`es (emit,
+    pointer, nav, activate) are all a `WidgetVTable` indexed by the unchanged `Type` enum; `IsInteractive`/
+    `IsFocusable` collapsed to its flags. Proven byte/flag-identical by `--test-uivtable` (emit 1752 verts +
+    pointer 40 + nav/activate 21 probes) and **the default is flipped — the vtable is the shipped path**
+    (battery + both-backend link + D3D12 live-UI smoke green). *Detail log:* **Foundation LANDED + PROVEN
+    (2026-08-12):** the `WidgetVTable`/`WidgetEmitCtx` registry (UISystem.cpp, internal — welded to the
+    `Emitter`), the additive dual-path emit dispatch (`g_uiUseVTable`, **defaults FALSE** so the shipped
+    runtime is byte-for-byte the legacy switch), and the **`--test-uivtable` frozen-vertex gate** — which
+    boots a real GPU session with its OWN corpus (no project needed, so it runs on this machine), emits
+    legacy vs vtable, and `memcmp`s the streams. **ALL 10 emit widgets now extracted (Label, Image,
+    Panel, Button, ProgressBar, Slider, Toggle, Selector, ScrollView, TextInput) → gate PASS, 1752 verts
+    byte-identical** over a state cross-product corpus (selector options, radial bar, toggle on/off,
+    slider value, hovered button, textinput text+placeholder, overflowing scrollview). The whole ~230-line
+    emit switch is decomposed. (Gate note: the corpus loops legacy builds to a fixed point first — the
+    ScrollView's auto-measured `contentExtent` settles over several builds, so a naive capture would drift.)
+    Full regression battery + runtime link green (legacy default untouched). **Interact `onPointer` also
+    DONE + PROVEN (2026-08-12):** all 6 interactive types' pointer arms extracted into `onPointer` slots
+    (ApplyPointerToElement's preamble stays; its switch is the gated fallback), verified by a new
+    `WidgetPointerParitySelfTest` (drives every interactive widget both ways, asserts identical flag
+    mutations — 40 probes) folded into `--test-uivtable`. *Remaining:* onNav/onActivate (UIFocus keyboard
+    switches, entangled with UpdateNavigation), the IsInteractive/IsFocusable→flag collapse, then flipping
+    the default to vtable.
+  - **P9.3 — advanced widgets (composable-first).** 🔨 IN PROGRESS.
+    - **Tabs** ✅ **DONE (2026-08-12).** Composable ATTRIBUTES (`UIElement.tabGroup` + `tabTarget`,
+      using P5 ids) — NOT a new type/component. `ui::ProcessTabs` (per-frame, after interaction) shows the
+      clicked tab's target, hides the other targets in its group, and sets `toggled` on the active tab (so
+      a P4 selectedColor highlights it). Serialized (key count 68→70), authored via inspector fields, works
+      in the editor Interact preview. **Adversarially reviewed → 3 fixes:** doc-scoped the group/id lookup
+      (cross-screen safety — two resident screens can reuse a `tabGroup` name), ran ProcessTabs in the
+      preview, and added `visible` to the preview snapshot (corruption guard). Play-mode pollution already
+      safe (CaptureSnapshot/RestoreSnapshot covers it). Battery + both-backend link green.
+    - **Foldout / collapsible** ✅ **DONE (2026-08-12).** `UIElement.collapseTarget` (a P5 id) — clicking
+      toggles that element's visibility (accordion sections, tree nodes) and sets `toggled` to the expanded
+      state. Handled in the same `ui::ProcessTabs` (doc-scoped, preview-safe — inherits the tab review
+      fixes). Serialized (key count 70→71) + inspector field. Independent of tabs (tab SETS, foldout TOGGLES).
+    - *Remaining:* List (≈ ScrollView+VerticalLayoutGroup already, may need only a convenience), Tree
+      (≈ nested foldouts now), Viewport/RenderTexture. **Virtualized list** is the real perf gap but is
+      coupled to **data-binding** (nothing to virtualize without a data source) — treat as a joint effort.
+  - **P9.4 — data-binding + virtualized list.** 🔨 IN PROGRESS — spec at
+    [Design-UIDataBinding.md](Design-UIDataBinding.md) (scoped by the `ui-databind-scope` workflow).
+    - **B2 data-binding model** ✅ **DONE (2026-08-12).** `ui::UIDataModel` (keyed store + revisions +
+      providers) + `UIElement.bind{Text,Value,Visible,Texture}` (serialized, key count 71→75) →
+      `ui::ResolveBindings` (rev fast-skip + value-compare guard) wired into the Engine frame order;
+      inert until used (**zero behavior change**); headless `--test-uibind` PASS. Unifies the ad-hoc
+      dynamic-content paths behind one channel.
+    - *Remaining:* B1 (id-index O(1) `FindElementById`, perf), B3 (migrate token/interact/caption/
+      settings onto the model), B4 (non-virtualized bound list = `UIList` + `InstantiateSubtree`), B5
+      (virtualization). B4/B5 are the audit's perf gap; each phase is independently shippable + testable.
+  - **P9.5+ (remaining):** full event-dispatch graph (capture/target/bubble + listeners). (D1
+    runtime/authored split is lower-value — serialization already excludes runtime fields.)
 - **P10 — Editor.** multi‑select + align/distribute, rotate/scale gizmos, responsive/DPI/
   controller preview matrix, per‑state authoring, content‑browser drag‑drop, **animation timeline panel**.
 - **P11 — Animation.** timeline model (bezier/pingpong/speed/events), generalized targets,

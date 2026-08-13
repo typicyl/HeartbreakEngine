@@ -1982,8 +1982,16 @@ int Engine::Run(const EngineConfig& configIn) {
             // mouse sets, edits text buffers. Suspended while the editor owns
             // the keyboard (ImGui feeds SetUIKeyboardCaptured).
             const bool wasEditing = ui::WantsTextInput(uiCtx_);
-            if (!uiKeyboardExternal_ && !devMenuOpen_) // dev menu owns nav while open
+            const bool uiOwnsInput = !uiKeyboardExternal_ && !devMenuOpen_;
+            if (uiOwnsInput) // dev menu owns nav while open
                 ui::UpdateNavigation(scene, input, uiCtx_, dt);
+            // P9: the tooltip dwell is a PRESENTATION timer (dt_, so it ticks on the
+            // paused menu) and runs UNCONDITIONALLY (so a shown popup can't freeze while
+            // the dev menu owns nav); uiOwnsInput=false drops any shown tooltip.
+            ui::UpdateTooltipTimer(scene, uiCtx_, dt_, uiOwnsInput);
+            // P9: apply any tab clicks this frame (a tabTarget element shows its content
+            // and hides the other targets in its tabGroup). Reads `clicked` set just above.
+            ui::ProcessTabs(scene);
             // While a text field is being edited, mute the normal keyboard
             // queries so gameplay / dev-menu / schematic key reads stay quiet
             // (the editing code uses the raw variants). Latch capture through
@@ -2009,6 +2017,12 @@ int Engine::Run(const EngineConfig& configIn) {
         if (!onInit_) {             // runtime only (not the editor preview)
             ApplyChangedSettings(); // live-apply any Settings widget the user just changed
         }
+        // P9.4 data-binding: pull providers, then push bound model values into element
+        // runtime fields (runtimeText/value/visible/texture) BEFORE BuildVertices reads
+        // them. A no-op when nothing is registered/bound (globalRev fast-skip), so it is
+        // inert until a project uses it.
+        uiDataModel_.RefreshProviders();
+        ui::ResolveBindings(scene, uiDataModel_, uiCtx_);
         // Captions run in the RUNTIME always, and in the editor while PLAYING.
         //
         // They used to share the `!onInit_` gate above, which meant they never ran in

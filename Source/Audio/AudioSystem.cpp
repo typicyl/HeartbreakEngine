@@ -1,5 +1,6 @@
 // Audio/AudioSystem.cpp - miniaudio-backed implementation.
 #include "Audio/AudioSystem.h"
+#include "Audio/SpatializerResonance.h" // optional binaural backend (HDS Resonance fork)
 
 #include "Assets/AudioEvent.h"
 #include "Assets/MusicGraph.h"
@@ -14,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib> // std::getenv (HBE_RESONANCE gate)
 #include <deque>
 #include <functional>
 #include <list>
@@ -109,6 +111,7 @@ struct AudioSystem::Impl {
         f32 minDist = 1.0f, maxDist = 30.0f;
         f32 occ = 0.0f;                // smoothed occlusion 0..1 (0 = clear)
         f32 curCutoff = 20000.0f;      // current LPF cutoff (Hz), to skip no-op reinits
+        int resSlot = -1;              // Resonance source slot (>=0 = routed binaurally)
     };
     std::list<Voice> voices;
     u32 nextVoiceId = 1;
@@ -116,6 +119,15 @@ struct AudioSystem::Impl {
     // Spatial occlusion config (set by the engine from project settings).
     OcclusionConfig occlusion;
     static constexpr f32 kOpenCutoff = 20000.0f; // "transparent" LPF (no muffle)
+
+    // Optional binaural spatial backend (HDS Resonance fork). OFF unless HBE_RESONANCE=1 in
+    // the environment. When on, a spatial voice claims a source slot and routes
+    // sound -> lpf -> this node -> Master for HRTF rendering instead of miniaudio's amplitude
+    // panning; when off, everything below behaves exactly as before (resSlot stays -1). Gated
+    // so it cannot change shipping behaviour until enabled + playtested. See
+    // Audio/SpatializerResonance.h.
+    ResonanceSpatializer resonance;
+    bool useResonance = false;
 
     // Insert a per-voice low-pass node between a positional sound and its bus so
     // occlusion can darken the tone. No-op (leaves hasLpf=false) if unavailable;
@@ -127,15 +139,30 @@ struct AudioSystem::Impl {
         const ma_uint32 sr = ma_engine_get_sample_rate(&engine);
         ma_lpf_node_config cfg = ma_lpf_node_config_init(ch, sr, kOpenCutoff, 2);
         if (ma_lpf_node_init(ng, &cfg, nullptr, &v.lpf) != MA_SUCCESS) return;
-        ma_node* dst = GroupOf(bus) ? reinterpret_cast<ma_node*>(GroupOf(bus))
-                                    : ma_node_graph_get_endpoint(ng);
-        // sound -> lpf -> bus (attach the destination first, then reroute the sound).
-        ma_node_attach_output_bus(&v.lpf, 0, dst, 0);
+        // When this voice claimed a Resonance slot, its LPF feeds the binaural node's INPUT
+        // bus (== the slot index); Resonance mixes it into Master. Otherwise the normal
+        // sound -> lpf -> bus routing. The LPF stays in front either way so the bespoke
+        // occlusion muffle still applies before the signal reaches Resonance.
+        ma_node* dst;
+        ma_uint32 dstBus = 0;
+        if (v.resSlot >= 0 && resonance.IsReady() && resonance.InputNode() != nullptr) {
+            dst = static_cast<ma_node*>(resonance.InputNode());
+            dstBus = static_cast<ma_uint32>(v.resSlot);
+        } else {
+            dst = GroupOf(bus) ? reinterpret_cast<ma_node*>(GroupOf(bus))
+                               : ma_node_graph_get_endpoint(ng);
+        }
+        // sound -> lpf -> dst (attach the destination first, then reroute the sound).
+        ma_node_attach_output_bus(&v.lpf, 0, dst, dstBus);
         ma_node_attach_output_bus(&v.sound, 0, &v.lpf, 0);
         v.hasLpf = true;
         v.curCutoff = kOpenCutoff;
     }
     void DestroyLpf(Voice& v) {
+        if (v.resSlot >= 0) {
+            resonance.ReleaseSource(v.resSlot);
+            v.resSlot = -1;
+        }
         if (v.hasLpf) {
             ma_lpf_node_uninit(&v.lpf, nullptr);
             v.hasLpf = false;
@@ -389,9 +416,14 @@ struct AudioSystem::Impl {
             voices.pop_back();
             return nullptr;
         }
-        const ma_uint32 flags = position ? 0 : MA_SOUND_FLAG_NO_SPATIALIZATION;
+        // Positional voices claim a Resonance slot up front when the binaural backend is on;
+        // that decides the sound flags (Resonance spatializes, so miniaudio must not pan).
+        if (position && useResonance && resonance.IsReady()) v.resSlot = resonance.AcquireSource();
+        const ma_uint32 flags =
+            (position && v.resSlot < 0) ? 0 : MA_SOUND_FLAG_NO_SPATIALIZATION;
         if (ma_sound_init_from_data_source(&engine, &v.buffer, flags, GroupOf(bus),
                                            &v.sound) != MA_SUCCESS) {
+            if (v.resSlot >= 0) resonance.ReleaseSource(v.resSlot);
             ma_audio_buffer_uninit(&v.buffer);
             voices.pop_back();
             return nullptr;
@@ -400,18 +432,22 @@ struct AudioSystem::Impl {
         ma_sound_set_pitch(&v.sound, glm::max(pitch, 0.05f));
         ma_sound_set_looping(&v.sound, loop ? MA_TRUE : MA_FALSE);
         if (position) {
-            ma_sound_set_position(&v.sound, position->x, position->y, position->z);
-            ma_sound_set_attenuation_model(&v.sound, ma_attenuation_model_inverse);
-            ma_sound_set_min_distance(&v.sound, glm::max(minDist, 0.01f));
-            ma_sound_set_max_distance(&v.sound, glm::max(maxDist, minDist + 0.01f));
-            // Positional -> occlusion-capable: route through a per-voice LPF and
-            // remember its world position so the occlusion pass can process it.
+            // Positional -> occlusion-capable: route through a per-voice LPF and remember its
+            // world position so the occlusion pass can process it.
             v.spatial = true;
             v.worldPos = *position;
             v.baseVolume = volume;
             v.minDist = minDist;
             v.maxDist = maxDist;
-            AttachOcclusionLpf(v, bus);
+            if (v.resSlot < 0) {
+                // miniaudio panning path (Resonance owns distance/position when slotted).
+                ma_sound_set_position(&v.sound, position->x, position->y, position->z);
+                ma_sound_set_attenuation_model(&v.sound, ma_attenuation_model_inverse);
+                ma_sound_set_min_distance(&v.sound, glm::max(minDist, 0.01f));
+                ma_sound_set_max_distance(&v.sound, glm::max(maxDist, minDist + 0.01f));
+            }
+            AttachOcclusionLpf(v, bus); // -> Resonance node when v.resSlot >= 0, else -> bus
+            if (v.resSlot >= 0) resonance.SetSource(v.resSlot, *position, volume, 0.0f);
         }
         ma_sound_start(&v.sound);
         return &v;
@@ -422,6 +458,7 @@ struct AudioSystem::Impl {
         DestroyMusic();
         for (auto& [id, sv] : spatial) DestroySpatial(sv);
         spatial.clear();
+        resonance.Shutdown(); // uninit the node while the engine + Master are still alive
         DestroyBuses();
         if (ready) ma_engine_uninit(&engine);
     }
@@ -435,6 +472,24 @@ AudioSystem::AudioSystem() : impl_(std::make_unique<Impl>()) {
     } else {
         HBE_WARN("Audio: no playback device available; audio disabled.");
     }
+    // Opt-in binaural spatial backend (HDS Resonance fork). Off unless HBE_RESONANCE=1, so
+    // existing builds behave identically until it is explicitly enabled and playtested. The
+    // node itself is created in ConfigureBuses, once the Master bus exists.
+#if HBE_HAVE_RESONANCE
+    // std::getenv trips MSVC's C4996 "unsafe" deprecation; it is fine for a read-only lookup.
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+    const char* resEnv = std::getenv("HBE_RESONANCE");
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (resEnv != nullptr && resEnv[0] == '1') {
+        impl_->useResonance = true;
+        HBE_INFO("Audio: HDS Resonance binaural spatializer requested (HBE_RESONANCE=1).");
+    }
+#endif
 }
 
 AudioSystem::~AudioSystem() = default;
@@ -450,6 +505,7 @@ void AudioSystem::ConfigureBuses(const std::vector<AudioBusDesc>& buses) {
     impl_->DestroyMusic();
     for (auto& [id, sv] : impl_->spatial) impl_->DestroySpatial(sv);
     impl_->spatial.clear();
+    impl_->resonance.Shutdown(); // node feeds Master; tear it down before the buses go
     impl_->DestroyBuses();
 
     // Master always exists, attached to the engine endpoint.
@@ -461,6 +517,13 @@ void AudioSystem::ConfigureBuses(const std::vector<AudioBusDesc>& buses) {
             return;
         }
         impl_->busOrder.push_back("Master");
+    }
+
+    // Bring up the optional binaural backend now that Master exists (its stereo output feeds
+    // the Master group, so master volume still applies). No-op unless HBE_RESONANCE=1.
+    if (impl_->useResonance) {
+        impl_->resonance.Init(&impl_->engine, &impl_->buses["Master"].group,
+                              ma_engine_get_sample_rate(&impl_->engine));
     }
 
     // Children attach to their parent; unknown parents fall back to Master.
@@ -936,6 +999,8 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
     ma_engine_listener_set_direction(&impl_->engine, 0, listenerForward.x,
                                      listenerForward.y, listenerForward.z);
     ma_engine_listener_set_world_up(&impl_->engine, 0, 0.0f, 1.0f, 0.0f);
+    if (impl_->useResonance && impl_->resonance.IsReady())
+        impl_->resonance.SetListener(listenerPos, listenerForward, glm::vec3(0.0f, 1.0f, 0.0f));
 
     // Drive every AudioSource entity.
     for (const entt::entity e : reg.view<AudioSource>()) {
@@ -989,17 +1054,25 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
                 impl_->spatial.erase(id);
                 continue;
             }
-            if (ma_sound_init_from_data_source(&impl_->engine, &sv.voice.buffer, 0,
+            // Claim a Resonance slot up front (it decides the sound flags), else miniaudio.
+            if (impl_->useResonance && impl_->resonance.IsReady())
+                sv.voice.resSlot = impl_->resonance.AcquireSource();
+            const ma_uint32 sflags =
+                sv.voice.resSlot >= 0 ? MA_SOUND_FLAG_NO_SPATIALIZATION : 0u;
+            if (ma_sound_init_from_data_source(&impl_->engine, &sv.voice.buffer, sflags,
                                                impl_->GroupOf(src.bus),
                                                &sv.voice.sound) != MA_SUCCESS) {
+                if (sv.voice.resSlot >= 0) impl_->resonance.ReleaseSource(sv.voice.resSlot);
                 ma_audio_buffer_uninit(&sv.voice.buffer); // don't leak the buffer
                 impl_->spatial.erase(id);
                 continue;
             }
-            ma_sound_set_attenuation_model(&sv.voice.sound, ma_attenuation_model_inverse);
-            ma_sound_set_spatialization_enabled(&sv.voice.sound, MA_TRUE);
+            if (sv.voice.resSlot < 0) {
+                ma_sound_set_attenuation_model(&sv.voice.sound, ma_attenuation_model_inverse);
+                ma_sound_set_spatialization_enabled(&sv.voice.sound, MA_TRUE);
+            }
             sv.voice.spatial = true;
-            impl_->AttachOcclusionLpf(sv.voice, src.bus); // route through the occlusion LPF
+            impl_->AttachOcclusionLpf(sv.voice, src.bus); // -> Resonance node when slotted
             src.voiceId = id;
             HBE_INFO("Audio: spatial voice for '{}' ready.", src.asset);
             it = impl_->spatial.find(id);
@@ -1011,19 +1084,27 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
 
         // Follow the entity, apply component settings.
         const glm::vec3 pos = glm::vec3(scene.WorldMatrix(e)[3]);
-        ma_sound_set_position(snd, pos.x, pos.y, pos.z);
         ma_sound_set_looping(snd, src.loop ? MA_TRUE : MA_FALSE);
-        ma_sound_set_min_distance(snd, glm::max(src.minDistance, 0.01f));
-        ma_sound_set_max_distance(snd, glm::max(src.maxDistance, src.minDistance + 0.01f));
-        // Volume: occlusion attenuates + muffles when geometry blocks the path;
-        // otherwise the base component volume (and the LPF stays transparent).
         sv.voice.baseVolume = src.volume;
         sv.voice.worldPos = pos;
-        if (occlude)
-            impl_->ApplyOcclusion(sv.voice, impl_->ComputeOcclusion(pos, listenerPos, segmentBlocked),
-                                  dt);
-        else
-            impl_->ClearOcclusion(sv.voice); // occlusion off -> base volume + open LPF
+        if (sv.voice.resSlot >= 0) {
+            // Resonance owns spatialization: feed position + volume + our multi-ray occlusion
+            // scalar (the bespoke geometry probe is kept), no miniaudio panning/attenuation.
+            const f32 occ =
+                occlude ? impl_->ComputeOcclusion(pos, listenerPos, segmentBlocked) : 0.0f;
+            impl_->resonance.SetSource(sv.voice.resSlot, pos, src.volume, occ);
+        } else {
+            // miniaudio panning: position + distance; occlusion attenuates + muffles when
+            // geometry blocks the path, else base volume with the LPF transparent.
+            ma_sound_set_position(snd, pos.x, pos.y, pos.z);
+            ma_sound_set_min_distance(snd, glm::max(src.minDistance, 0.01f));
+            ma_sound_set_max_distance(snd, glm::max(src.maxDistance, src.minDistance + 0.01f));
+            if (occlude)
+                impl_->ApplyOcclusion(
+                    sv.voice, impl_->ComputeOcclusion(pos, listenerPos, segmentBlocked), dt);
+            else
+                impl_->ClearOcclusion(sv.voice); // occlusion off -> base volume + open LPF
+        }
 
         const bool isPlaying = ma_sound_is_playing(snd) != MA_FALSE;
         if (src.playing && !isPlaying) {
@@ -1055,6 +1136,12 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
     // event would otherwise stay muffled/quiet forever).
     for (Impl::Voice& v : impl_->voices) {
         if (!v.spatial) continue;
+        if (v.resSlot >= 0) {
+            const f32 occ =
+                occlude ? impl_->ComputeOcclusion(v.worldPos, listenerPos, segmentBlocked) : 0.0f;
+            impl_->resonance.SetSource(v.resSlot, v.worldPos, v.baseVolume, occ);
+            continue;
+        }
         if (occlude)
             impl_->ApplyOcclusion(v, impl_->ComputeOcclusion(v.worldPos, listenerPos, segmentBlocked),
                                   dt);

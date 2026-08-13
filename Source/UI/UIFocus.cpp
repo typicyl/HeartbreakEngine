@@ -13,12 +13,9 @@ namespace hbe::ui {
 namespace {
 
 // Widgets the focus ring can land on. ScrollViews are wheel/auto-scroll only
-// (focusing one would trap directional navigation inside it).
-bool IsFocusable(UIElement::Type t) {
-    return t == UIElement::Type::Button || t == UIElement::Type::Slider ||
-           t == UIElement::Type::Toggle || t == UIElement::Type::Selector ||
-           t == UIElement::Type::TextInput;
-}
+// (focusing one would trap directional navigation inside it). P9.2: delegates to the
+// WidgetVTable flag so the focusable set has ONE definition (in UISystem.cpp).
+bool IsFocusable(const UIElement& el) { return WidgetIsFocusable(el); }
 
 glm::vec2 Center(const Rect& r) {
     return {(r.x0 + r.x1) * 0.5f, (r.y0 + r.y1) * 0.5f};
@@ -39,7 +36,7 @@ bool Focusable(entt::registry& reg, const LayoutItem& item,
     if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) return false;
     if (!IsDescendantOf(reg, item.entity, modal)) return false; // modal focus trap
     const UIElement& el = reg.get<UIElement>(item.entity);
-    if (!el.visible || !el.enabled || !IsFocusable(el.type)) return false;
+    if (!el.visible || !el.enabled || !IsFocusable(el)) return false;
     // A non-interactive UICanvasGroup subtree can't take keyboard/gamepad focus.
     if (!item.groupInteractive) return false;
     // Clipped fully out of an ancestor ScrollView = not reachable.
@@ -202,6 +199,37 @@ bool WantsTextInput(const UIContext& ctx) {
     return ctx.editing != entt::null;
 }
 
+void UpdateTooltipTimer(Scene& scene, UIContext& ctx, f32 dt, bool uiActive) {
+    auto& reg = scene.Registry();
+    // P9 tooltip dwell timer. The pointer pass (UpdateInteraction) put the topmost
+    // tooltip-bearing element under the cursor into ctx.tooltipCandidate; advance the
+    // dwell while it holds steady, reset when it moves on. BuildVertices shows the
+    // popup once tooltipTime passes the element's tooltipDelay.
+    //
+    // Called UNCONDITIONALLY each frame (unlike UpdateNavigation, which the dev menu /
+    // external ImGui keyboard owner suspends) so a shown tooltip can never freeze on
+    // screen: when the game UI is not the active owner, drop it. And it takes the
+    // PRESENTATION clock (dt_), not the pause-scaled simulation delta, so tooltips work
+    // on the pause / settings menu - a primary tooltip surface - which is exactly where
+    // the simulation clock is frozen to zero.
+    if (!uiActive) {
+        ctx.tooltipHover = entt::null;
+        ctx.tooltipTime = 0.0f;
+        return;
+    }
+    if (ctx.tooltipCandidate != ctx.tooltipHover) {
+        ctx.tooltipHover = ctx.tooltipCandidate;
+        ctx.tooltipTime = 0.0f;
+    } else if (ctx.tooltipHover != entt::null) {
+        ctx.tooltipTime += dt;
+    }
+    if (ctx.tooltipHover != entt::null &&
+        (!reg.valid(ctx.tooltipHover) || !reg.all_of<UIElement>(ctx.tooltipHover))) {
+        ctx.tooltipHover = entt::null;
+        ctx.tooltipTime = 0.0f;
+    }
+}
+
 void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) {
     auto& reg = scene.Registry();
     // P8 modal scope: focus is trapped to the topmost SHOWN modal panel's subtree.
@@ -214,7 +242,7 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
     if (ctx.focused != entt::null) {
         const LayoutItem* fi = FindItem(ctx.layout, ctx.focused);
         if (!reg.valid(ctx.focused) || !reg.all_of<UIElement>(ctx.focused) || !fi ||
-            !IsFocusable(reg.get<UIElement>(ctx.focused).type) ||
+            !IsFocusable(reg.get<UIElement>(ctx.focused)) ||
             !IsDescendantOf(reg, ctx.focused, modal)) {
             ctx.focused = entt::null;
         }
@@ -395,31 +423,12 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
             ctx.focused = PickInitial(scene, ctx.layout, modal); // authored first-focus, else geometric
         } else if (const LayoutItem* from = FindItem(ctx.layout, ctx.focused)) {
             UIElement& el = reg.get<UIElement>(ctx.focused);
-            // Value widgets consume left/right to adjust; up/down always
-            // navigates. But at the value's END (slider clamp, selector edge)
-            // the direction is NOT consumed - it falls through to navigation so
-            // focus can escape a widget in a single-row layout (no soft-lock).
-            bool consumed = false;
-            if (el.type == UIElement::Type::Slider && (dir == 2 || dir == 3)) {
-                const f32 nv =
-                    glm::clamp(el.value + (dir == 3 ? 0.05f : -0.05f), 0.0f, 1.0f);
-                if (nv != el.value) {
-                    el.value = nv;
-                    el.changed = true;
-                    ctx.interactives.push_back(ctx.focused);
-                    consumed = true; // still room to move; keep focus here
-                }
-            } else if (el.type == UIElement::Type::Selector && !el.options.empty() &&
-                       (dir == 2 || dir == 3)) {
-                const int n = static_cast<int>(el.options.size());
-                const int next = el.selected + (dir == 3 ? 1 : -1);
-                if (next >= 0 && next < n) { // non-wrapping: escape at the ends
-                    el.selected = next;
-                    el.changed = true;
-                    ctx.interactives.push_back(ctx.focused);
-                    consumed = true;
-                }
-            }
+            // Value widgets consume left/right to adjust; up/down always navigates. At the
+            // value's END (slider clamp, selector edge) the direction is NOT consumed - it
+            // falls through to navigation so focus can escape in a single-row layout (no
+            // soft-lock). P9.2: the per-type value change is the WidgetVTable's onNav.
+            const bool consumed = WidgetNav(el, dir);
+            if (consumed) ctx.interactives.push_back(ctx.focused);
             if (!consumed) {
                 const entt::entity next = PickInDirection(reg, ctx.layout, *from, dir, modal);
                 if (next != entt::null) ctx.focused = next;
@@ -434,29 +443,10 @@ void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt) 
         reg.all_of<UIElement>(ctx.focused)) {
         UIElement& el = reg.get<UIElement>(ctx.focused);
         ctx.focusVisible = true;
-        switch (el.type) {
-            case UIElement::Type::Button:
-                el.clicked = true; // PollClickedAction / schematics / game flow
-                break;
-            case UIElement::Type::Toggle:
-                el.toggled = !el.toggled;
-                el.clicked = true;
-                el.changed = true;
-                break;
-            case UIElement::Type::Selector:
-                if (!el.options.empty()) {
-                    el.selected =
-                        (el.selected + 1) % static_cast<int>(el.options.size());
-                    el.clicked = true;
-                    el.changed = true;
-                }
-                break;
-            case UIElement::Type::TextInput:
-                beginEdit(ctx.focused);
-                break;
-            default:
-                break;
-        }
+        // P9.2: per-type activation (click / toggle / advance) lives in the WidgetVTable;
+        // a TextInput asks for an edit session, and beginEdit stays here since it owns the
+        // UIContext edit state (editing/caret/preEditText).
+        if (WidgetActivate(el)) beginEdit(ctx.focused);
         ctx.interactives.push_back(ctx.focused);
     }
 }

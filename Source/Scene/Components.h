@@ -1104,6 +1104,44 @@ struct UIElement {
     // of trusting geometry, and an unresolvable id also falls back to geometric.
     std::string navUp, navDown, navLeft, navRight;
 
+    // --- Tooltip (P9): a composable ATTRIBUTE, not a new widget type ----------
+    // Hover this element for `tooltipDelay` seconds and a small popup shows `tooltip`
+    // (wrapped, clamped on-screen, drawn on top) just below/above the element. Empty =
+    // none. Works on ANY element - it is an attribute, so it needs no new Type enum
+    // value or emit-switch arm (the composition the overhaul favours over monolithic
+    // widget classes).
+    std::string tooltip;
+    f32 tooltipDelay = 0.6f;
+
+    // --- Tab switching (P9): composable ATTRIBUTES, not a new widget type ----------
+    // A "tab" is any clickable element (usually a Button) that carries a `tabTarget`
+    // (the P5 `id` of the content element to SHOW when it is clicked) and a `tabGroup`
+    // (a name shared by the sibling tabs). Clicking one shows its target, hides every
+    // other target in the same group, and sets `toggled` on the active tab (clearing the
+    // others) so a selectedColor highlights it. Empty tabTarget = not a tab. No new Type,
+    // no new component - tabs compose from existing elements + ids (see ui::ProcessTabs).
+    std::string tabGroup;
+    std::string tabTarget;
+
+    // --- Collapsible / foldout (P9): another composable attribute ------------------
+    // A clickable element with `collapseTarget` (a P5 `id`) TOGGLES that element's
+    // visibility when clicked (accordion sections, foldable panels, tree nodes), and
+    // sets its own `toggled` to the new expanded state so a caret / selectedColor can
+    // reflect open vs closed. Empty = not a foldout. Independent of tabs (a tab SETS
+    // visibility exclusively; a foldout TOGGLES its own). Handled by ui::ProcessTabs.
+    std::string collapseTarget;
+
+    // --- Data-binding (P9.4): model keys -> runtime fields --------------------------
+    // Each names a ui::UIDataModel key whose value is pushed into the matching RUNTIME
+    // field every frame by ui::ResolveBindings (never the serialized authored field, the
+    // same contract as runtimeText). Empty = not bound. bindText->runtimeText (numbers
+    // format), bindValue->value+fill, bindVisible->visible, bindTexture->texture. This
+    // unifies the ad-hoc dynamic-content paths (tokens, settings, interact/caption pushes).
+    std::string bindText;
+    std::string bindValue;
+    std::string bindVisible;
+    std::string bindTexture;
+
     bool hovered = false;            // runtime state (UISystem)
     bool clicked = false;            // pressed this frame (runtime state)
     // HELD for as long as the pointer's button is DOWN over this element - the

@@ -156,7 +156,9 @@ set(HBE_UI_SOURCES
     "Source/UI/Text/GlyphAtlas.cpp"
     "Source/UI/Text/TextShaper.cpp"
     "Source/UI/Svg/SvgCache.cpp"
-    "Source/UI/Style/Theme.cpp")
+    "Source/UI/Style/Theme.cpp"
+    "Source/UI/WidgetVTableTest.cpp"
+    "Source/UI/UIData.cpp")
 
 set(HBE_RHI_SOURCES
     "Source/RHI/RHIFactory.cpp")

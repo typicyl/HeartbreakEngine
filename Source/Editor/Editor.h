@@ -972,6 +972,7 @@ private:
         bool toggled = false;
         int selected = 0;
         glm::vec2 scrollPos{0.0f};
+        bool visible = true; // P9: ProcessTabs (run in the preview) writes visible
     };
     std::vector<UIPreviewState> uiEdPreview_;
     // A tab X was clicked on a document with unsaved work: the close waits for the

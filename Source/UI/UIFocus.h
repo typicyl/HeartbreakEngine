@@ -25,6 +25,13 @@ struct UIContext;
 // rects, same as interaction). `dt` drives caret blink and stick auto-repeat.
 void UpdateNavigation(Scene& scene, const Input& input, UIContext& ctx, f32 dt);
 
+// P9 tooltip dwell timer. MUST be called every frame with the PRESENTATION clock
+// (dt_, not the pause-scaled simulation delta) so tooltips work on the paused
+// pause/settings menu, and UNCONDITIONALLY (not suspended with UpdateNavigation) so a
+// shown popup can't freeze when the dev menu / external ImGui owns the keyboard.
+// `uiActive` = the game UI owns input this frame; false drops any shown tooltip.
+void UpdateTooltipTimer(Scene& scene, UIContext& ctx, f32 dt, bool uiActive);
+
 // True while a TextInput edit session is active. The engine feeds this into
 // Input::SetTextCapture so gameplay/dev-menu keyboard reads go quiet while the
 // user types.

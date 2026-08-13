@@ -21,6 +21,7 @@
 #include "UI/UIDocument.h" // ui::DocumentSet (the resident `.hbui` UI layer)
 #include "UI/UIManager.h" // persistent-UI-document panel manager (game flow drives it)
 #include "UI/UISystem.h"  // ui::UIContext (cached layout/interaction state)
+#include "UI/UIData.h"    // ui::UIDataModel (P9.4 data-binding)
 
 #include <entt/entt.hpp> // entt::entity (loading-overlay entity tracking)
 
@@ -415,6 +416,7 @@ private:
     void BindMenuWorld();
     void ApplyMenuPost(); // env.post <- uiScenePost_ (no-op when not captured)
     ui::UIContext uiCtx_;           // cached UI layout/interaction/text state
+    ui::UIDataModel uiDataModel_;   // P9.4 data-binding: keyed store the UI reads each frame
     // GPU VERTEX EXPANSION (ParticleEmitter::gpuExpand). One per-frame-in-flight
     // ring of 64-byte records: [emitter record][its particles] per batch. Created
     // lazily on the first frame an opted-in emitter exists, so projects that never

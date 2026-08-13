@@ -320,10 +320,21 @@ namespace {
 // editor authoring canvas and the headless --test-uicanvas never touch it, so it stays
 // 1.0 there and byte-identity holds.
 f32 g_uiScale = 1.0f;
+
+// P9.2: route UI emit + interaction (pointer/nav/activate) through the WidgetVTable
+// instead of the legacy switches. Now defaults TRUE: --test-uivtable proves the vtable
+// path byte-for-byte identical to the legacy switches (emit vertices + interaction
+// flags), so the vtable is the shipped path. The legacy switches are kept as the gate's
+// comparison baseline (the test flips this to false to compare); a later cleanup can
+// retire them behind a checked-in golden.
+bool g_uiUseVTable = true;
 } // namespace
 
 void SetUIScale(f32 scale) { g_uiScale = glm::clamp(scale, 0.25f, 4.0f); }
 f32 GetUIScale() { return g_uiScale; }
+
+void SetUIUseVTable(bool on) { g_uiUseVTable = on; }
+bool GetUIUseVTable() { return g_uiUseVTable; }
 
 glm::vec2 EffectiveCanvas(const CanvasConfig& config, glm::vec2 target) {
     target = glm::max(target, glm::vec2(1.0f));
@@ -815,12 +826,42 @@ void LayoutUI(Scene& scene, glm::vec2 targetSize, const CanvasConfig& legacyConf
     LayoutUIImpl(scene, targetSize, legacyConfig, ctx.children, ctx.layout);
 }
 
-// Widget types that respond to the pointer (hover/click/drag/wheel).
-static bool IsInteractive(UIElement::Type t) {
-    return t == UIElement::Type::Button || t == UIElement::Type::Slider ||
-           t == UIElement::Type::Toggle || t == UIElement::Type::Selector ||
-           t == UIElement::Type::ScrollView || t == UIElement::Type::TextInput;
-}
+// P9.2 WidgetVTable forward pieces: the pointer path (ApplyPointerToElement, just below)
+// needs WidgetPointerCtx + WidgetVTable + Widget() declared before it. The emit-side
+// WidgetEmitCtx, all handler bodies, the table, and Widget()'s definition live together
+// further down (welded to the Emitter). See docs/Design-UIWidgetRegistry.md.
+struct WidgetEmitCtx; // full definition near the emit path
+struct WidgetPointerCtx {
+    glm::vec2 pointer;
+    bool pressed; // click edge this frame
+    bool down;    // button held
+    f32 wheel;
+    bool over;    // pointer inside the rect (preamble already applied clip/group/enabled)
+    const LayoutItem& item; // rect for Selector cell / Slider value math
+};
+struct WidgetVTable {
+    bool isInteractive = false;
+    bool isFocusable = false;
+    bool wheelTarget = false;
+    // `el` is non-const: emit may resolve+cache the element's texture (ResolveTexture),
+    // exactly as the legacy loop does - it is the SAME el, so the cache is shared.
+    void (*emit)(UIElement& el, const WidgetEmitCtx& c, const Emitter& e) = nullptr;
+    // Per-type pointer handling (interactive types only). Returns `touched` (starts at
+    // in.over). Moved verbatim from the ApplyPointerToElement switch.
+    bool (*onPointer)(UIElement& el, const WidgetPointerCtx& in) = nullptr;
+    // Keyboard/gamepad value-nav: dir 2=left 3=right. Returns true if CONSUMED (the
+    // value changed) - the caller then keeps focus; false lets focus move on. Slider /
+    // Selector only. Moved from UIFocus::UpdateNavigation.
+    bool (*onNav)(UIElement& el, int dir) = nullptr;
+    // Enter/gamepad-A activation. Mutates el (click/toggle/advance) and returns true
+    // when the widget wants a text-edit SESSION (TextInput) - the caller runs beginEdit.
+    bool (*onActivate)(UIElement& el) = nullptr;
+};
+static const WidgetVTable& Widget(UIElement::Type t);
+
+// Widget types that respond to the pointer (hover/click/drag/wheel). P9.2: this is now
+// the single source of truth via the WidgetVTable flag (declared above; defined below).
+static bool IsInteractive(UIElement::Type t) { return Widget(t).isInteractive; }
 
 // One laid-out interactive element vs the resolved pointer (shared by the
 // legacy and cached interaction paths). Returns true when any flag was touched.
@@ -848,6 +889,17 @@ static bool ApplyPointerToElement(UIElement& el, const LayoutItem& item,
     // element. RELEASE needs no flag - it is this going false.
     if (setHover) el.held = over && down;
     bool touched = over;
+    // P9.2: interactive types route through the WidgetVTable's onPointer; the legacy
+    // switch below stays byte-for-byte as the fallback (and the default path while
+    // g_uiUseVTable is off). The preamble above (enabled/clip/hover/held) is container
+    // policy and stays here either way.
+    if (g_uiUseVTable) {
+        const WidgetVTable& vt = Widget(el.type);
+        if (vt.onPointer)
+            return vt.onPointer(el, WidgetPointerCtx{pointer, pressed, down, wheel, over,
+                                                     item});
+        return touched;
+    }
     switch (el.type) {
         case UIElement::Type::Button:
             el.clicked = over && pressed;
@@ -939,7 +991,8 @@ static bool ApplyPointerToElement(UIElement& el, const LayoutItem& item,
 static void ApplyPointerPass(Scene& scene, const std::vector<LayoutItem>& layout,
                              glm::vec2 pointerNorm, const PointerState* pointers,
                              bool pressed, bool down, f32 wheel,
-                             std::vector<entt::entity>* touched) {
+                             std::vector<entt::entity>* touched,
+                             entt::entity* tooltipOut = nullptr) {
     auto& reg = scene.Registry();
     const bool hasPointer = pointerNorm.x >= 0.0f && pointerNorm.y >= 0.0f;
     const bool editorView = scene.EditorView();
@@ -1048,6 +1101,33 @@ static void ApplyPointerPass(Scene& scene, const std::vector<LayoutItem>& layout
     } else if (wheelItem) {
         apply(*wheelItem, wheelPointer, wheelWorld, false, false, wheel, true);
     }
+
+    // Tooltip target (P9): the topmost SCREEN element under the pointer with a
+    // non-empty tooltip, respecting visibility, clip and modal scope. Deliberately
+    // NOT gated on `enabled`/interactivity - a disabled control explaining itself is
+    // the classic tooltip. World-canvas tooltips are a follow-up (skipped here).
+    if (tooltipOut) {
+        *tooltipOut = entt::null;
+        if (hasPointer)
+            for (usize i = n; i-- > 0;) {
+                const LayoutItem& item = layout[i];
+                if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) continue;
+                const UIElement& el = reg.get<UIElement>(item.entity);
+                if (!el.visible || el.tooltip.empty()) continue;
+                if (!IsDescendantOf(reg, item.entity, modalPanel)) continue;
+                if (editorView && scene.IsEditorHidden(item.entity)) continue;
+                const bool world = item.canvasEntity != entt::null &&
+                                   reg.valid(item.canvasEntity) &&
+                                   reg.all_of<UICanvas>(item.canvasEntity) &&
+                                   reg.get<UICanvas>(item.canvasEntity).worldSpace;
+                if (world) continue;
+                const glm::vec2 p = pointerNorm * item.canvas;
+                if (item.hasClip && !item.clip.Contains(p)) continue;
+                if (!item.rect.Contains(p)) continue;
+                *tooltipOut = item.entity;
+                break;
+            }
+    }
 }
 
 void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
@@ -1102,13 +1182,14 @@ void UpdateInteraction(Scene& scene, const Input& input, glm::vec2 pointerNorm,
         if (!anyDown) el.dragging = false;
     }
     ctx.interactives.clear();
+    ctx.tooltipCandidate = entt::null; // cleared here so a no-pointer frame drops it
     if (!hasPointer && !hasWorldPointer) return;
 
     // Hit-test against LAST frame's layout (ctx.layout, filled by BuildVertices)
     // - the effective behavior of the old two-walk code, since animations run
     // after interaction. Empty on the very first frame (nothing to hit).
     ApplyPointerPass(scene, ctx.layout, pointerNorm, pointers, pressed, down, wheel,
-                     &ctx.interactives);
+                     &ctx.interactives, &ctx.tooltipCandidate);
 }
 
 bool PointerOverInteractive(Scene& scene, const UIContext& ctx) {
@@ -1121,6 +1202,690 @@ bool PointerOverInteractive(Scene& scene, const UIContext& ctx) {
         if (el.hovered || el.held || el.dragging) return true;
     }
     return false;
+}
+
+// ============================================================================
+// P9.2 - WidgetVTable (D3 decomposition, emit path). A runtime dispatch table
+// indexed by UIElement::Type; each entry's emit() is the per-widget slice of the
+// BuildVerticesImpl switch, MOVED VERBATIM with identical inputs, so its output is
+// byte-identical to the legacy arm (proven by --test-uivtable). The on-disk enum
+// and serialization are untouched - pure runtime dispatch. Kept in THIS TU because
+// it is welded to the internal Emitter + texture helpers; only the flag + self-test
+// cross the header. See docs/Design-UIWidgetRegistry.md.
+// ============================================================================
+
+// Everything the emit arms read besides `el` and the `Emitter` - filled from the
+// per-element preamble so an extracted arm body moves verbatim (it aliases these
+// back to their old local names at the top). The three helper methods are the loop's
+// partTex / stateFill / quadOrSlice lambdas, promoted.
+struct WidgetEmitCtx {
+    Renderer& renderer;
+    const std::filesystem::path& assetsDir;
+    const LayoutItem& item;
+    Rect rect;
+    glm::vec2 center;
+    FontAtlas& font;
+    const std::string& disp;
+    UIContext* ctx;
+    bool disabled, pressedState, focusedState, selectedState, sliced;
+
+    u32 PartTex(const std::string& rel) const {
+        return rel.empty() ? 0u : LoadUITexture(renderer, assetsDir, rel);
+    }
+    glm::vec4 StateFill(const UIElement& el, const glm::vec4& base) const {
+        glm::vec4 f = base;
+        if (disabled)
+            f = el.disabledColor.a > 0.0f ? el.disabledColor : base;
+        else if (pressedState)
+            f = el.pressedColor.a > 0.0f ? el.pressedColor
+                                         : base * glm::vec4(0.72f, 0.72f, 0.72f, 1.0f);
+        else if (el.hovered)
+            f = el.hoverColor.a > 0.0f ? el.hoverColor
+                                       : base * glm::vec4(1.22f, 1.22f, 1.22f, 1.0f);
+        else if (focusedState && el.focusedColor.a > 0.0f)
+            f = el.focusedColor;
+        else if (selectedState && el.selectedColor.a > 0.0f)
+            f = el.selectedColor;
+        return glm::clamp(f, glm::vec4(0.0f), glm::vec4(1.0f));
+    }
+    void QuadOrSlice(const UIElement& el, const Emitter& emit, const Rect& r,
+                     const glm::vec4& col, u32 tex, const std::string& rel) const {
+        if (sliced && tex != 0 && !rel.empty()) {
+            const UITex info = UITexInfo(renderer, assetsDir, rel);
+            emit.NineSlice(r, col, tex, static_cast<f32>(info.w),
+                           static_cast<f32>(info.h), el.slice);
+        } else {
+            emit.Quad(r, col, tex);
+        }
+    }
+};
+
+// (WidgetPointerCtx + WidgetVTable + Widget() are declared above ApplyPointerToElement;
+// their definitions/table follow here alongside WidgetEmitCtx and the handler bodies.)
+
+// --- Extracted emit arms (bodies verbatim; the aliases restore the old locals) ---
+static void EmitLabel(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    const std::string& disp = c.disp;
+    emit.Text(disp, rect, el.hAlign, el.vAlign, el.textSize, el.color, font);
+}
+static void EmitPanel(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    const std::string& disp = c.disp;
+    Renderer& renderer = c.renderer;
+    const std::filesystem::path& assetsDir = c.assetsDir;
+    const auto quadOrSlice = [&](const Rect& r, const glm::vec4& col, u32 tex,
+                                 const std::string& rel) {
+        c.QuadOrSlice(el, emit, r, col, tex, rel);
+    };
+    quadOrSlice(rect, el.color, ResolveTexture(el, renderer, assetsDir), el.texture);
+    if (!disp.empty()) {
+        emit.Text(disp, rect, el.hAlign, el.vAlign, el.textSize,
+                  {1.0f, 1.0f, 1.0f, el.color.a}, font);
+    }
+}
+static void EmitImage(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    Renderer& renderer = c.renderer;
+    const std::filesystem::path& assetsDir = c.assetsDir;
+    const auto quadOrSlice = [&](const Rect& r, const glm::vec4& col, u32 tex,
+                                 const std::string& rel) {
+        c.QuadOrSlice(el, emit, r, col, tex, rel);
+    };
+    const u32 tex = ResolveTexture(el, renderer, assetsDir);
+    if (el.texture.empty() || tex != 0) quadOrSlice(rect, el.color, tex, el.texture);
+}
+static void EmitButton(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    const std::string& disp = c.disp;
+    Renderer& renderer = c.renderer;
+    const std::filesystem::path& assetsDir = c.assetsDir;
+    const bool disabled = c.disabled;
+    const bool pressedState = c.pressedState;
+    const auto stateFill = [&](const glm::vec4& base) { return c.StateFill(el, base); };
+    const auto partTex = [&](const std::string& rel) { return c.PartTex(rel); };
+    const auto quadOrSlice = [&](const Rect& r, const glm::vec4& col, u32 tex,
+                                 const std::string& rel) {
+        c.QuadOrSlice(el, emit, r, col, tex, rel);
+    };
+    const glm::vec4 fill = stateFill(el.color);
+    u32 tex = ResolveTexture(el, renderer, assetsDir);
+    std::string activeRel = el.texture;
+    const std::string* stateRel = nullptr;
+    if (disabled && !el.disabledTexture.empty()) stateRel = &el.disabledTexture;
+    else if (pressedState && !el.pressedTexture.empty()) stateRel = &el.pressedTexture;
+    else if (el.hovered && !el.hoverTexture.empty()) stateRel = &el.hoverTexture;
+    if (stateRel) {
+        const u32 t = partTex(*stateRel);
+        if (t) { tex = t; activeRel = *stateRel; }
+    }
+    quadOrSlice(rect, fill, tex, activeRel);
+    const f32 luma = 0.299f * fill.r + 0.587f * fill.g + 0.114f * fill.b;
+    const glm::vec4 textColor =
+        luma > 0.55f ? glm::vec4(0.05f, 0.05f, 0.06f, 1.0f)
+                     : glm::vec4(0.96f, 0.96f, 0.98f, 1.0f);
+    emit.Text(disp, rect, el.hAlign, el.vAlign, el.textSize, textColor, font);
+}
+static void EmitProgressBar(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    const std::string& disp = c.disp;
+    const glm::vec2& center = c.center;
+    Renderer& renderer = c.renderer;
+    const std::filesystem::path& assetsDir = c.assetsDir;
+    const auto partTex = [&](const std::string& rel) { return c.PartTex(rel); };
+    const f32 fraction = glm::clamp(el.fill, 0.0f, 1.0f);
+    if (el.radial) {
+        const glm::vec2 size = rect.Size();
+        const f32 outerR = glm::min(size.x, size.y) * 0.5f;
+        const f32 innerR = outerR * 0.62f;
+        emit.Wheel(center, outerR, innerR, 1.0f, el.color);
+        emit.Wheel(center, outerR, innerR, fraction, el.fillColor);
+    } else {
+        const u32 baseTex = ResolveTexture(el, renderer, assetsDir);
+        const u32 fillTex = partTex(el.fillTexture);
+        emit.Quad(rect, baseTex ? glm::vec4(1.0f) : el.color, baseTex);
+        Rect fillRect = rect;
+        fillRect.x1 = rect.x0 + (rect.x1 - rect.x0) * fraction;
+        emit.Quad(fillRect, fillTex ? glm::vec4(1.0f) : el.fillColor, fillTex);
+    }
+    if (!disp.empty()) {
+        emit.Text(disp, rect, el.hAlign, el.vAlign, el.textSize,
+                  {1.0f, 1.0f, 1.0f, 1.0f}, font);
+    }
+}
+static void EmitSlider(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    const auto partTex = [&](const std::string& rel) { return c.PartTex(rel); };
+    const f32 v = glm::clamp(el.value, 0.0f, 1.0f);
+    const glm::vec2 sz = rect.Size();
+    const f32 cy = (rect.y0 + rect.y1) * 0.5f;
+    const u32 trackTex = partTex(el.trackTexture);
+    const u32 fillTex = partTex(el.fillTexture);
+    const u32 handleTex = partTex(el.handleTexture);
+    Rect track;
+    if (trackTex) {
+        track = rect;
+    } else {
+        const f32 trackH = glm::min(sz.y * 0.35f, 12.0f);
+        track = {rect.x0, cy - trackH * 0.5f, rect.x1, cy + trackH * 0.5f};
+    }
+    emit.Quad(track, trackTex ? glm::vec4(1.0f) : el.color, trackTex);
+    Rect fillR = track;
+    fillR.x1 = track.x0 + (track.x1 - track.x0) * v;
+    emit.Quad(fillR, fillTex ? glm::vec4(1.0f) : el.fillColor, fillTex);
+    const f32 hx = rect.x0 + (rect.x1 - rect.x0) * v;
+    const f32 hr = el.handleSize > 0.0f ? el.handleSize * 0.5f
+                                        : glm::max(sz.y * 0.5f, 8.0f);
+    emit.Quad({hx - hr, cy - hr, hx + hr, cy + hr},
+              handleTex ? glm::vec4(1.0f) : el.fillColor, handleTex);
+}
+static void EmitToggle(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    const auto partTex = [&](const std::string& rel) { return c.PartTex(rel); };
+    const std::string& skin = el.toggled ? el.onTexture : el.offTexture;
+    const u32 tex = partTex(skin);
+    const glm::vec4 bg = tex ? glm::vec4(1.0f) : (el.toggled ? el.fillColor : el.color);
+    emit.Quad(rect, bg, tex);
+    if (!tex) {
+        emit.Text(el.toggled ? "On" : "Off", rect, el.hAlign, el.vAlign, el.textSize,
+                  {1.0f, 1.0f, 1.0f, 1.0f}, font);
+    }
+}
+static void EmitSelector(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    const auto partTex = [&](const std::string& rel) { return c.PartTex(rel); };
+    emit.Quad(rect, el.color);
+    const int n = static_cast<int>(el.options.size());
+    if (n > 0) {
+        const f32 w = (rect.x1 - rect.x0) / static_cast<f32>(n);
+        const int sel = glm::clamp(el.selected, 0, n - 1);
+        const u32 cellTex = partTex(el.cellTexture);
+        for (int i = 0; i < n; ++i) {
+            const Rect opt{rect.x0 + w * i, rect.y0, rect.x0 + w * (i + 1), rect.y1};
+            if (i == sel)
+                emit.Quad(opt, cellTex ? glm::vec4(1.0f) : el.fillColor, cellTex);
+            emit.Text(el.options[i], opt, UIElement::HAlign::Center,
+                      UIElement::VAlign::Center, el.textSize, {1.0f, 1.0f, 1.0f, 1.0f},
+                      font);
+        }
+    }
+}
+static void EmitTextInput(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    FontAtlas& font = c.font;
+    Renderer& renderer = c.renderer;
+    const std::filesystem::path& assetsDir = c.assetsDir;
+    const bool disabled = c.disabled;
+    UIContext* ctx = c.ctx;
+    const LayoutItem& item = c.item;
+    const auto partTex = [&](const std::string& rel) { return c.PartTex(rel); };
+    const auto quadOrSlice = [&](const Rect& r, const glm::vec4& col, u32 tex,
+                                 const std::string& rel) {
+        c.QuadOrSlice(el, emit, r, col, tex, rel);
+    };
+    const bool editing = ctx && ctx->editing == item.entity;
+    glm::vec4 bg = el.color;
+    u32 bgTex = ResolveTexture(el, renderer, assetsDir);
+    if (disabled) {
+        if (el.disabledColor.a > 0.0f) bg = el.disabledColor;
+        if (!el.disabledTexture.empty()) bgTex = partTex(el.disabledTexture);
+    } else if (editing || el.hovered) {
+        bg = glm::clamp(bg * glm::vec4(1.22f, 1.22f, 1.22f, 1.0f), glm::vec4(0.0f),
+                        glm::vec4(1.0f));
+    }
+    const std::string& bgRel =
+        (disabled && !el.disabledTexture.empty()) ? el.disabledTexture : el.texture;
+    quadOrSlice(rect, bg, bgTex, bgRel);
+    Emitter clipped = emit;
+    clipped.wrapText = false;
+    {
+        const glm::vec2 mn(rect.x0 / item.canvas.x * 2.0f - 1.0f,
+                           1.0f - rect.y1 / item.canvas.y * 2.0f);
+        const glm::vec2 mx(rect.x1 / item.canvas.x * 2.0f - 1.0f,
+                           1.0f - rect.y0 / item.canvas.y * 2.0f);
+        clipped.clipMin = glm::max(emit.clipMin, mn);
+        clipped.clipMax = glm::min(emit.clipMax, mx);
+    }
+    const f32 luma = 0.299f * bg.r + 0.587f * bg.g + 0.114f * bg.b;
+    glm::vec4 textColor = luma > 0.55f ? glm::vec4(0.05f, 0.05f, 0.06f, 1.0f)
+                                       : glm::vec4(0.96f, 0.96f, 0.98f, 1.0f);
+    if (el.text.empty() && !editing) {
+        if (!el.placeholder.empty()) {
+            textColor.a = 0.45f;
+            clipped.Text(el.placeholder, rect, UIElement::HAlign::Left,
+                         UIElement::VAlign::Center, el.textSize, textColor, font);
+        }
+        return;
+    }
+    f32 caretW = 0.0f;
+    if (editing) {
+        int n = 0;
+        usize caretByte = el.text.size();
+        for (usize i = 0; i < el.text.size(); ++i) {
+            if ((static_cast<u8>(el.text[i]) & 0xC0) != 0x80) {
+                if (n == ctx->caretPos) { caretByte = i; break; }
+                ++n;
+            }
+        }
+        static thread_local std::vector<GlyphQuad> measure;
+        f32 mh = 0.0f;
+        font.Layout(el.text.substr(0, caretByte), el.textSize, measure, caretW, mh);
+    }
+    const f32 inset = 4.0f;
+    const f32 avail = glm::max((rect.x1 - rect.x0) - inset * 2.0f, 8.0f);
+    const f32 shift = (editing && caretW > avail) ? avail - caretW : 0.0f;
+    Rect textRect = rect;
+    textRect.x0 += shift;
+    clipped.Text(el.text, textRect, UIElement::HAlign::Left, UIElement::VAlign::Center,
+                 el.textSize, textColor, font);
+    if (editing && glm::fract(ctx->caretBlink * 1.6f) < 0.65f) {
+        const f32 cx = textRect.x0 + inset + caretW;
+        const f32 cy = (rect.y0 + rect.y1) * 0.5f;
+        const f32 half = el.textSize * 0.55f;
+        clipped.Quad({cx, cy - half, cx + 2.0f, cy + half}, textColor);
+    }
+}
+static void EmitScrollView(UIElement& el, const WidgetEmitCtx& c, const Emitter& emit) {
+    const Rect& rect = c.rect;
+    Renderer& renderer = c.renderer;
+    const std::filesystem::path& assetsDir = c.assetsDir;
+    if (el.color.a > 0.0f)
+        emit.Quad(rect, el.color, ResolveTexture(el, renderer, assetsDir));
+    if (el.autoScroll == 0.0f) {
+        const glm::vec2 view = rect.Size();
+        if (el.scrollVertical && el.contentExtent.y > view.y + 0.5f) {
+            const f32 thumbH = glm::max(view.y * view.y / el.contentExtent.y, 24.0f);
+            const f32 maxScroll = el.contentExtent.y - view.y;
+            const f32 t = glm::clamp(el.scrollPos.y / maxScroll, 0.0f, 1.0f);
+            const f32 ty = rect.y0 + (view.y - thumbH) * t;
+            emit.Quad({rect.x1 - 6.0f, rect.y0, rect.x1 - 2.0f, rect.y1},
+                      {0.0f, 0.0f, 0.0f, 0.25f});
+            emit.Quad({rect.x1 - 6.0f, ty, rect.x1 - 2.0f, ty + thumbH}, el.fillColor);
+        } else if (el.scrollHorizontal && el.contentExtent.x > view.x + 0.5f) {
+            const f32 thumbW = glm::max(view.x * view.x / el.contentExtent.x, 24.0f);
+            const f32 maxScroll = el.contentExtent.x - view.x;
+            const f32 t = glm::clamp(el.scrollPos.x / maxScroll, 0.0f, 1.0f);
+            const f32 tx = rect.x0 + (view.x - thumbW) * t;
+            emit.Quad({rect.x0, rect.y1 - 6.0f, rect.x1, rect.y1 - 2.0f},
+                      {0.0f, 0.0f, 0.0f, 0.25f});
+            emit.Quad({tx, rect.y1 - 6.0f, tx + thumbW, rect.y1 - 2.0f}, el.fillColor);
+        }
+    }
+}
+
+// --- Per-type pointer handlers (bodies verbatim from ApplyPointerToElement's switch;
+//     `touched` starts at in.over and is returned) ---
+static bool OnPointerButton(UIElement& el, const WidgetPointerCtx& in) {
+    const bool over = in.over, pressed = in.pressed;
+    bool touched = over;
+    el.clicked = over && pressed;
+    touched |= el.clicked;
+    return touched;
+}
+static bool OnPointerToggle(UIElement& el, const WidgetPointerCtx& in) {
+    const bool over = in.over, pressed = in.pressed;
+    bool touched = over;
+    if (over && pressed) {
+        el.toggled = !el.toggled;
+        el.clicked = true;
+        el.changed = true;
+        touched = true;
+    }
+    return touched;
+}
+static bool OnPointerSelector(UIElement& el, const WidgetPointerCtx& in) {
+    const bool over = in.over, pressed = in.pressed;
+    const glm::vec2 pointer = in.pointer;
+    const LayoutItem& item = in.item;
+    bool touched = over;
+    if (over && pressed && !el.options.empty()) {
+        const int n = static_cast<int>(el.options.size());
+        const f32 w = (item.rect.x1 - item.rect.x0) / static_cast<f32>(n);
+        int cell = w > 0.0f ? static_cast<int>((pointer.x - item.rect.x0) / w) : 0;
+        cell = glm::clamp(cell, 0, n - 1);
+        el.selected = cell;
+        el.clicked = true;
+        el.changed = true;
+        touched = true;
+    }
+    return touched;
+}
+static bool OnPointerSlider(UIElement& el, const WidgetPointerCtx& in) {
+    const bool over = in.over, pressed = in.pressed, down = in.down;
+    const glm::vec2 pointer = in.pointer;
+    const LayoutItem& item = in.item;
+    bool touched = over;
+    if (over && pressed) el.dragging = true;
+    if (el.dragging && down) {
+        const f32 span = glm::max(item.rect.x1 - item.rect.x0, 1e-3f);
+        const f32 nv = glm::clamp((pointer.x - item.rect.x0) / span, 0.0f, 1.0f);
+        if (nv != el.value) el.changed = true;
+        el.value = nv;
+        touched = true;
+    }
+    return touched;
+}
+static bool OnPointerTextInput(UIElement& el, const WidgetPointerCtx& in) {
+    const bool over = in.over, pressed = in.pressed;
+    bool touched = over;
+    el.clicked = over && pressed;
+    touched |= el.clicked;
+    return touched;
+}
+static bool OnPointerScrollView(UIElement& el, const WidgetPointerCtx& in) {
+    const bool over = in.over;
+    const f32 wheel = in.wheel;
+    bool touched = over;
+    if (over && wheel != 0.0f && el.autoScroll == 0.0f) {
+        const glm::vec2 maxScroll =
+            glm::max(el.contentExtent - el.viewExtent, glm::vec2(0.0f));
+        glm::vec2 next = el.scrollPos;
+        if (el.scrollVertical) next.y -= wheel * el.scrollSpeed;
+        else if (el.scrollHorizontal) next.x -= wheel * el.scrollSpeed;
+        next = glm::clamp(next, glm::vec2(0.0f), maxScroll);
+        if (next != el.scrollPos) {
+            el.scrollPos = next;
+            el.changed = true;
+        }
+        touched = true;
+    }
+    return touched;
+}
+// --- Per-type keyboard/gamepad nav + activation (bodies verbatim from UIFocus) ---
+static bool OnNavSlider(UIElement& el, int dir) {
+    if (dir == 2 || dir == 3) {
+        const f32 nv = glm::clamp(el.value + (dir == 3 ? 0.05f : -0.05f), 0.0f, 1.0f);
+        if (nv != el.value) {
+            el.value = nv;
+            el.changed = true;
+            return true;
+        }
+    }
+    return false;
+}
+static bool OnNavSelector(UIElement& el, int dir) {
+    if (!el.options.empty() && (dir == 2 || dir == 3)) {
+        const int n = static_cast<int>(el.options.size());
+        const int next = el.selected + (dir == 3 ? 1 : -1);
+        if (next >= 0 && next < n) {
+            el.selected = next;
+            el.changed = true;
+            return true;
+        }
+    }
+    return false;
+}
+static bool OnActivateButton(UIElement& el) {
+    el.clicked = true;
+    return false;
+}
+static bool OnActivateToggle(UIElement& el) {
+    el.toggled = !el.toggled;
+    el.clicked = true;
+    el.changed = true;
+    return false;
+}
+static bool OnActivateSelector(UIElement& el) {
+    if (!el.options.empty()) {
+        el.selected = (el.selected + 1) % static_cast<int>(el.options.size());
+        el.clicked = true;
+        el.changed = true;
+    }
+    return false;
+}
+static bool OnActivateTextInput(UIElement& /*el*/) {
+    return true; // caller begins the edit session
+}
+
+// Indexed by UIElement::Type (Panel=0 .. TextInput=9). Flags mirror IsInteractive /
+// IsFocusable (populated now; the predicate collapse to these is a follow-up step).
+static const WidgetVTable kWidgets[] = {
+    // {interactive, focusable, wheel, emit, onPointer, onNav, onActivate}
+    /* Panel       */ {false, false, false, &EmitPanel, nullptr, nullptr, nullptr},
+    /* Label       */ {false, false, false, &EmitLabel, nullptr, nullptr, nullptr},
+    /* Button      */ {true, true, false, &EmitButton, &OnPointerButton, nullptr, &OnActivateButton},
+    /* Image       */ {false, false, false, &EmitImage, nullptr, nullptr, nullptr},
+    /* ProgressBar */ {false, false, false, &EmitProgressBar, nullptr, nullptr, nullptr},
+    /* Slider      */ {true, true, false, &EmitSlider, &OnPointerSlider, &OnNavSlider, nullptr},
+    /* Toggle      */ {true, true, false, &EmitToggle, &OnPointerToggle, nullptr, &OnActivateToggle},
+    /* Selector    */ {true, true, false, &EmitSelector, &OnPointerSelector, &OnNavSelector, &OnActivateSelector},
+    /* ScrollView  */ {true, false, true, &EmitScrollView, &OnPointerScrollView, nullptr, nullptr},
+    /* TextInput   */ {true, true, false, &EmitTextInput, &OnPointerTextInput, nullptr, &OnActivateTextInput},
+};
+static_assert(sizeof(kWidgets) / sizeof(kWidgets[0]) == 10,
+              "kWidgets must have one entry per UIElement::Type");
+static const WidgetVTable& Widget(UIElement::Type t) {
+    const int i = static_cast<int>(t);
+    return (i >= 0 && i < 10) ? kWidgets[i] : kWidgets[0];
+}
+
+// P9.2 focusable flag - single source of truth for UIFocus (a different TU), replacing
+// its hand-written IsFocusable list. Takes the element (the header can't name the nested
+// UIElement::Type).
+bool WidgetIsFocusable(const UIElement& el) { return Widget(el.type).isFocusable; }
+
+// P9.2 keyboard/gamepad value-nav dispatch (called by UIFocus). dir 2=left 3=right;
+// returns true if the value changed (consumed). vtable when enabled, else the legacy
+// switch moved here from UpdateNavigation.
+bool WidgetNav(UIElement& el, int dir) {
+    if (g_uiUseVTable) {
+        const WidgetVTable& vt = Widget(el.type);
+        return vt.onNav ? vt.onNav(el, dir) : false;
+    }
+    if (el.type == UIElement::Type::Slider && (dir == 2 || dir == 3)) {
+        const f32 nv = glm::clamp(el.value + (dir == 3 ? 0.05f : -0.05f), 0.0f, 1.0f);
+        if (nv != el.value) {
+            el.value = nv;
+            el.changed = true;
+            return true;
+        }
+    } else if (el.type == UIElement::Type::Selector && !el.options.empty() &&
+               (dir == 2 || dir == 3)) {
+        const int n = static_cast<int>(el.options.size());
+        const int next = el.selected + (dir == 3 ? 1 : -1);
+        if (next >= 0 && next < n) {
+            el.selected = next;
+            el.changed = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+// P9.2 Enter/gamepad-A activation dispatch (called by UIFocus). Mutates el; returns true
+// when the widget wants a text-edit session (TextInput) so the caller runs beginEdit.
+bool WidgetActivate(UIElement& el) {
+    if (g_uiUseVTable) {
+        const WidgetVTable& vt = Widget(el.type);
+        return vt.onActivate ? vt.onActivate(el) : false;
+    }
+    switch (el.type) {
+        case UIElement::Type::Button:
+            el.clicked = true;
+            break;
+        case UIElement::Type::Toggle:
+            el.toggled = !el.toggled;
+            el.clicked = true;
+            el.changed = true;
+            break;
+        case UIElement::Type::Selector:
+            if (!el.options.empty()) {
+                el.selected = (el.selected + 1) % static_cast<int>(el.options.size());
+                el.clicked = true;
+                el.changed = true;
+            }
+            break;
+        case UIElement::Type::TextInput:
+            return true;
+        default:
+            break;
+    }
+    return false;
+}
+
+// P9 Tab switching + foldouts. For every element clicked THIS frame: a `tabTarget` shows
+// that content and hides the OTHER tabs' targets in the same `tabGroup` (exclusive select);
+// a `collapseTarget` TOGGLES its own target open/closed (accordion). Both are scoped to the
+// clicked element's document and reflect state via `toggled`. Composable: ordinary clickable
+// elements + P5 ids, no new type/component. Call once per frame AFTER interaction/navigation.
+void ProcessTabs(Scene& scene) {
+    auto& reg = scene.Registry();
+    // The scene holds EVERY resident UI screen at once, so tab matching must be scoped to
+    // the clicked tab's own document (UIDocMember::doc; 0 = legacy/no document) - otherwise
+    // two screens that reuse a generic tabGroup ("tabs") would blank each other's panels.
+    const auto docOf = [&](entt::entity e) -> u32 {
+        const UIDocMember* m = reg.try_get<UIDocMember>(e);
+        return m ? m->doc : 0u;
+    };
+    const auto findInDoc = [&](const std::string& id, u32 doc) -> entt::entity {
+        if (id.empty()) return entt::null;
+        for (const entt::entity e : reg.view<UIElement>())
+            if (reg.get<UIElement>(e).id == id && docOf(e) == doc) return e;
+        return entt::null;
+    };
+    static thread_local std::vector<entt::entity> clicked;
+    clicked.clear();
+    for (const entt::entity e : reg.view<UIElement>()) {
+        const UIElement& el = reg.get<UIElement>(e);
+        if (el.clicked && (!el.tabTarget.empty() || !el.collapseTarget.empty()))
+            clicked.push_back(e);
+    }
+    for (const entt::entity e : clicked) {
+        if (!reg.valid(e) || !reg.all_of<UIElement>(e)) continue;
+        const u32 doc = docOf(e);
+        const std::string group = reg.get<UIElement>(e).tabGroup;
+        const std::string target = reg.get<UIElement>(e).tabTarget;
+        const std::string collapse = reg.get<UIElement>(e).collapseTarget;
+        // Tab: exclusively show this target, hide + deselect the group's other targets.
+        if (!target.empty()) {
+            if (!group.empty()) {
+                for (const entt::entity b : reg.view<UIElement>()) {
+                    UIElement& other = reg.get<UIElement>(b);
+                    if (other.tabTarget.empty() || other.tabGroup != group) continue;
+                    if (docOf(b) != doc) continue; // same document only (cross-screen safe)
+                    if (const entt::entity panel = findInDoc(other.tabTarget, doc);
+                        panel != entt::null)
+                        reg.get<UIElement>(panel).visible = false;
+                    other.toggled = false; // deselect (selectedColor highlights active)
+                }
+            }
+            if (const entt::entity panel = findInDoc(target, doc); panel != entt::null)
+                reg.get<UIElement>(panel).visible = true;
+            reg.get<UIElement>(e).toggled = true; // select the clicked tab
+        }
+        // Foldout: toggle this element's own target open/closed.
+        if (!collapse.empty()) {
+            if (const entt::entity panel = findInDoc(collapse, doc); panel != entt::null) {
+                UIElement& p = reg.get<UIElement>(panel);
+                p.visible = !p.visible;
+                reg.get<UIElement>(e).toggled = p.visible; // reflect expanded state
+            }
+        }
+    }
+}
+
+// Interact parity gate (P9.2): the vertex gate can't see input handling, so this runs
+// ApplyPointerToElement over every interactive laid-out element BOTH ways (legacy switch
+// vs vtable onPointer) on fresh copies and asserts identical flag mutations + return.
+// Same TU as the static ApplyPointerToElement, so it can call it directly.
+bool WidgetPointerParitySelfTest(Scene& scene, glm::vec2 target, const CanvasConfig& cfg) {
+    std::vector<LayoutItem> layout;
+    LayoutUI(scene, target, cfg, layout);
+    auto& reg = scene.Registry();
+    const bool prev = GetUIUseVTable();
+    bool ok = true;
+    int tested = 0;
+    struct Probe {
+        bool center;
+        bool pressed;
+        bool down;
+        f32 wheel;
+        bool drag;
+    };
+    const Probe probes[] = {
+        {true, true, true, 0.0f, false},    // press / click
+        {true, false, true, 0.0f, true},    // held drag (Slider)
+        {true, false, false, 1.0f, false},  // wheel up (ScrollView)
+        {true, false, false, -1.0f, false}, // wheel down
+        {false, true, false, 0.0f, false},  // pointer outside the rect
+    };
+    for (const LayoutItem& item : layout) {
+        if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) continue;
+        const UIElement& src = reg.get<UIElement>(item.entity);
+        if (!Widget(src.type).isInteractive) continue;
+        const glm::vec2 c =
+            (item.rect.Min() + glm::vec2(item.rect.x1, item.rect.y1)) * 0.5f;
+        const glm::vec2 outside(item.rect.x0 - 100.0f, item.rect.y0 - 100.0f);
+        for (const Probe& p : probes) {
+            const glm::vec2 ptr = p.center ? c : outside;
+            UIElement a = src, b = src;
+            a.dragging = b.dragging = p.drag;
+            SetUIUseVTable(false);
+            const bool ta = ApplyPointerToElement(a, item, ptr, p.pressed, p.down, p.wheel);
+            SetUIUseVTable(true);
+            const bool tb = ApplyPointerToElement(b, item, ptr, p.pressed, p.down, p.wheel);
+            const bool same =
+                ta == tb && a.hovered == b.hovered && a.held == b.held &&
+                a.clicked == b.clicked && a.changed == b.changed &&
+                a.toggled == b.toggled && a.selected == b.selected &&
+                a.dragging == b.dragging && a.value == b.value &&
+                a.scrollPos == b.scrollPos;
+            if (!same) {
+                ok = false;
+                HBE_ERROR("uivtable: pointer parity FAIL type {} (pressed={} down={} "
+                          "wheel={})",
+                          static_cast<int>(src.type), p.pressed, p.down, p.wheel);
+            }
+            ++tested;
+        }
+    }
+
+    // Keyboard/gamepad nav + activate parity (WidgetNav / WidgetActivate dual-path).
+    int navTested = 0;
+    for (const LayoutItem& item : layout) {
+        if (!reg.valid(item.entity) || !reg.all_of<UIElement>(item.entity)) continue;
+        const UIElement& src = reg.get<UIElement>(item.entity);
+        if (!Widget(src.type).isFocusable) continue;
+        for (int dir : {2, 3}) {
+            UIElement a = src, b = src;
+            SetUIUseVTable(false);
+            const bool ca = WidgetNav(a, dir);
+            SetUIUseVTable(true);
+            const bool cb = WidgetNav(b, dir);
+            if (ca != cb || a.value != b.value || a.selected != b.selected ||
+                a.changed != b.changed) {
+                ok = false;
+                HBE_ERROR("uivtable: nav parity FAIL type {} dir {}",
+                          static_cast<int>(src.type), dir);
+            }
+            ++navTested;
+        }
+        {
+            UIElement a = src, b = src;
+            SetUIUseVTable(false);
+            const bool wa = WidgetActivate(a);
+            SetUIUseVTable(true);
+            const bool wb = WidgetActivate(b);
+            if (wa != wb || a.clicked != b.clicked || a.toggled != b.toggled ||
+                a.selected != b.selected || a.changed != b.changed) {
+                ok = false;
+                HBE_ERROR("uivtable: activate parity FAIL type {}",
+                          static_cast<int>(src.type));
+            }
+            ++navTested;
+        }
+    }
+
+    SetUIUseVTable(prev);
+    HBE_INFO("uivtable: pointer parity over {} probes; nav/activate over {}", tested,
+             navTested);
+    return ok;
 }
 
 static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
@@ -1275,6 +2040,24 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
             }
         };
 
+        // P9.2 WidgetVTable dispatch: an extracted widget emits through the registry;
+        // every other type falls through to the (byte-for-byte unchanged) legacy switch
+        // below. Off by default (g_uiUseVTable); flipped only by --test-uivtable /
+        // --uivtable. The focus ring after the switch runs either way.
+        bool emittedByVTable = false;
+        if (g_uiUseVTable) {
+            const WidgetVTable& vt = Widget(el.type);
+            if (vt.emit) {
+                const WidgetEmitCtx ectx{renderer,     assetsDir,    item,
+                                         rect,          center,       font,
+                                         disp,          ctx,          disabled,
+                                         pressedState,  focusedState, selectedState,
+                                         sliced};
+                vt.emit(el, ectx, emit);
+                emittedByVTable = true;
+            }
+        }
+        if (!emittedByVTable)
         switch (el.type) {
             case UIElement::Type::Panel: {
                 quadOrSlice(rect, el.color, ResolveTexture(el, renderer, assetsDir),
@@ -1522,6 +2305,64 @@ static void BuildVerticesImpl(Scene& scene, Renderer& renderer,
             emit.Quad({rect.x0 - t, rect.y1, rect.x1 + t, rect.y1 + t}, ring);
             emit.Quad({rect.x0 - t, rect.y0, rect.x0, rect.y1}, ring);
             emit.Quad({rect.x1, rect.y0, rect.x1 + t, rect.y1}, ring);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Tooltip popup (P9). Drawn LAST, so it sits on top of the whole UI, once the
+    // pointer has dwelt on a tooltip-bearing element past its delay (the timer runs
+    // in UpdateNavigation). Screen overlay only - a world-canvas host's rect is in
+    // texture pixels, not the overlay's space, so it is skipped (a follow-up). The
+    // `ctx` guard also keeps the authoring/boot builds (ctx == nullptr) untouched, so
+    // the editor==runtime byte-identity contract is unaffected.
+    // -------------------------------------------------------------------------
+    if (ctx && ctx->tooltipHover != entt::null && reg.valid(ctx->tooltipHover) &&
+        reg.all_of<UIElement>(ctx->tooltipHover)) {
+        const UIElement& te = reg.get<UIElement>(ctx->tooltipHover);
+        const LayoutItem* ti = nullptr;
+        for (const LayoutItem& it : layout)
+            if (it.entity == ctx->tooltipHover) {
+                ti = &it;
+                break;
+            }
+        const bool worldHost =
+            ti && ti->canvasEntity != entt::null && reg.valid(ti->canvasEntity) &&
+            reg.all_of<UICanvas>(ti->canvasEntity) &&
+            reg.get<UICanvas>(ti->canvasEntity).worldSpace;
+        if (ti && !te.tooltip.empty() && !worldHost && ctx->tooltipTime >= te.tooltipDelay) {
+            FontAtlas& font = ResolveFont(renderer, assetsDir, te.font);
+            if (font.Ready()) {
+                const glm::vec2 canvas = ti->canvas;
+                // padX MUST stay >= Emitter::Text's internal pad (4px): the box is sized
+                // from a measure at `maxW`, and Text() re-wraps at the box inner width
+                // (boxW - 2*pad). padX >= pad keeps that width >= the measured max line
+                // width, so the re-wrap reproduces the same breaks and never overflows.
+                const f32 sizePx = 16.0f, padX = 8.0f, padY = 5.0f, gap = 6.0f;
+                const f32 maxW = glm::max(canvas.x * 0.4f, 80.0f); // wrap very long tips
+                static thread_local std::vector<GlyphQuad> tq;
+                f32 tw = 0.0f, th = 0.0f;
+                font.LayoutWrapped(te.tooltip, sizePx, maxW, tq, tw, th);
+                const f32 boxW = tw + padX * 2.0f;
+                const f32 boxH = th + padY * 2.0f;
+                // Prefer below the element; flip above when it would clip the bottom;
+                // then clamp fully inside the canvas.
+                f32 x0 = ti->rect.x0;
+                f32 y0 = ti->rect.y1 + gap;
+                if (y0 + boxH > canvas.y) y0 = ti->rect.y0 - gap - boxH;
+                x0 = glm::clamp(x0, 2.0f, glm::max(canvas.x - boxW - 2.0f, 2.0f));
+                y0 = glm::clamp(y0, 2.0f, glm::max(canvas.y - boxH - 2.0f, 2.0f));
+                const Rect box{x0, y0, x0 + boxW, y0 + boxH};
+                Emitter tip{&out, canvas};
+                tip.wrapText = true; // match the measured wrap when Text() re-lays it out
+                tip.clipMin = {-1.0f, -1.0f}; // clip to the screen so a tooltip larger
+                tip.clipMax = {1.0f, 1.0f};   // than the canvas can't spill off-viewport
+                tip.Quad({box.x0 - 1.0f, box.y0 - 1.0f, box.x1 + 1.0f, box.y1 + 1.0f},
+                         glm::vec4(0.0f, 0.0f, 0.0f, 0.85f)); // 1px border / drop shadow
+                tip.Quad(box, glm::vec4(0.12f, 0.12f, 0.14f, 0.96f)); // panel
+                tip.Text(te.tooltip, box, UIElement::HAlign::Center,
+                         UIElement::VAlign::Center, sizePx,
+                         glm::vec4(0.94f, 0.94f, 0.96f, 1.0f), font);
+            }
         }
     }
 }

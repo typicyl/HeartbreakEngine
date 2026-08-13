@@ -782,10 +782,10 @@ void Editor::UIReorder(Engine& engine, entt::entity e, int dir, bool run) {
 // --- Interact preview -------------------------------------------------------
 
 void Editor::UIEditorBeginInteract(Engine& engine) {
-    // Snapshot the four fields interaction WRITES IN PLACE. They are authored
-    // initial state (a slider's starting value, which selector cell is chosen),
-    // and the runtime overwrites them - so a preview that left them changed would
-    // silently re-author the document just because somebody tested a click.
+    // Snapshot the fields interaction WRITES IN PLACE. They are authored initial state
+    // (a slider's starting value, which selector cell is chosen, and P9: which tab panel
+    // is visible), and the runtime overwrites them - so a preview that left them changed
+    // would silently re-author the document just because somebody tested a click.
     uiEdPreview_.clear();
     if (activeDoc_ == 0) return;
     const auto& reg = engine.GetScene().Registry();
@@ -793,7 +793,8 @@ void Editor::UIEditorBeginInteract(Engine& engine) {
         const UIDocMember* m = reg.try_get<UIDocMember>(e);
         if (!m || m->doc != activeDoc_) continue;
         const UIElement& el = reg.get<UIElement>(e);
-        uiEdPreview_.push_back({e, el.value, el.toggled, el.selected, el.scrollPos});
+        uiEdPreview_.push_back(
+            {e, el.value, el.toggled, el.selected, el.scrollPos, el.visible});
     }
     uiEdInteractCtx_.layout.clear();
     uiEdInteractCtx_.interactives.clear();
@@ -809,6 +810,7 @@ void Editor::UIEditorEndInteract(Engine& engine) {
         el->toggled = s.toggled;
         el->selected = s.selected;
         el->scrollPos = s.scrollPos;
+        el->visible = s.visible; // P9: undo any tab switch tested in the preview
         el->hovered = false;
         el->clicked = false;
         el->changed = false;
@@ -1561,6 +1563,10 @@ void Editor::DrawUIEditorPanel(Engine& engine) {
         }
         ui::UpdateInteraction(scene, engine.GetInput(), ptr, /*pointers*/ nullptr,
                               uiEdInteractCtx_);
+        // P9: run tab switching so testing a tab click in the preview actually swaps the
+        // content (the same code the game runs). The `visible` change it makes is snapshot
+        // + restored by UIEditorBeginInteract/EndInteract, so it never re-authors the doc.
+        ui::ProcessTabs(scene);
     }
 
     // Input is hit-tested against LAST frame's layout (see the header note). It is

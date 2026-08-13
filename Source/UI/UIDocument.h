@@ -204,6 +204,19 @@ std::vector<entt::entity> InstantiateDocument(Scene& scene, Renderer* renderer,
                                               const DocData& doc, DocHandle handle,
                                               bool screenOwned, bool preload = true);
 
+// Clone ONE subtree of an already-loaded document - the template rooted at `rootIndex`
+// plus its transitive children - into the live registry under `parent` (the subtree root
+// re-parents to it). This is InstantiateDocument's structural half for a single subtree:
+// no renderer / no preload, so it stays headless. Returns the cloned root (entt::null on
+// a bad index). Used by the bound list (P9.4 B4) to spawn one row per data item from the
+// in-memory template subtree. Bumps the UI structure version once.
+entt::entity InstantiateSubtree(Scene& scene, const DocData& doc, int rootIndex,
+                                entt::entity parent, DocHandle handle, bool screenOwned);
+
+// Headless self-test (--test-uisubtree): clones a subtree from an in-code DocData and
+// asserts entity count, hierarchy re-parenting, and component-field preservation.
+bool SubtreeInstantiateSelfTest();
+
 // Rebuilds a DocData from the LIVE entities carrying UIDocMember{doc}. Parent
 // links are remapped to document indices; a parent outside the document becomes
 // a root. This is how the editor saves: entities created/deleted/reparented

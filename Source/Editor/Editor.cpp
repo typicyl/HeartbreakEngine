@@ -10384,6 +10384,81 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                                       "e.g. setting:volume, setting:graphics, setting:captions.");
             }
 
+            // Tooltip (P9): a composable hover popup that works on ANY element type
+            // (an attribute, not a new widget type). Empty = none.
+            {
+                char tbuf[256];
+                std::snprintf(tbuf, sizeof(tbuf), "%s", el->tooltip.c_str());
+                if (ImGui::InputText("Tooltip", tbuf, sizeof(tbuf))) {
+                    PushUndo(scene);
+                    el->tooltip = tbuf;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Hover text shown as a small popup after a short "
+                                      "delay. Works on any element. Empty = no tooltip.");
+                if (!el->tooltip.empty()) {
+                    f32 d = el->tooltipDelay;
+                    if (ImGui::DragFloat("Tooltip delay", &d, 0.05f, 0.0f, 5.0f, "%.2fs")) {
+                        PushUndo(scene);
+                        el->tooltipDelay = glm::max(d, 0.0f);
+                    }
+                }
+            }
+
+            // Tabs (P9): composable tab switching via ids - no new widget type. A tab is
+            // any clickable element that names a `tabTarget` (the id to show) + `tabGroup`.
+            {
+                char gbuf[64];
+                std::snprintf(gbuf, sizeof(gbuf), "%s", el->tabGroup.c_str());
+                if (ImGui::InputText("Tab group", gbuf, sizeof(gbuf))) {
+                    PushUndo(scene);
+                    el->tabGroup = gbuf;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Tabs sharing a group switch as one set (clicking one "
+                                      "hides the others' targets). Empty = not a tab.");
+                char ttbuf[64];
+                std::snprintf(ttbuf, sizeof(ttbuf), "%s", el->tabTarget.c_str());
+                if (ImGui::InputText("Tab target (id)", ttbuf, sizeof(ttbuf))) {
+                    PushUndo(scene);
+                    el->tabTarget = ttbuf;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Element id (see the Id field) shown when this tab is "
+                                      "clicked; the group's other targets hide.");
+                char ctbuf[64];
+                std::snprintf(ctbuf, sizeof(ctbuf), "%s", el->collapseTarget.c_str());
+                if (ImGui::InputText("Collapse target (id)", ctbuf, sizeof(ctbuf))) {
+                    PushUndo(scene);
+                    el->collapseTarget = ctbuf;
+                }
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Foldout: clicking this element toggles that id's "
+                                      "visibility (accordion / tree node).");
+            }
+
+            // Data-binding (P9.4): each names a UIDataModel key whose value is pushed into
+            // a runtime field every frame (game/schematic code Sets the key). Empty = none.
+            {
+                const auto bindField = [&](const char* label, std::string& field,
+                                           const char* tip) {
+                    char b[64];
+                    std::snprintf(b, sizeof(b), "%s", field.c_str());
+                    if (ImGui::InputText(label, b, sizeof(b))) {
+                        PushUndo(scene);
+                        field = b;
+                    }
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+                };
+                bindField("Bind text", el->bindText,
+                          "Model key -> this element's text (numbers are formatted).");
+                bindField("Bind value", el->bindValue,
+                          "Model key -> value + fill (slider / progress bar).");
+                bindField("Bind visible", el->bindVisible,
+                          "Model key -> visible (bool / number!=0 / non-empty text).");
+                bindField("Bind texture", el->bindTexture, "Model key -> texture path.");
+            }
+
             bool visible = el->visible;
             if (ImGui::Checkbox("Visible", &visible)) {
                 PushUndo(scene);

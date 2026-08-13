@@ -130,7 +130,16 @@ json WriteElement(const UIElement& e) {
                 {"navUp", el->navUp},
                 {"navDown", el->navDown},
                 {"navLeft", el->navLeft},
-                {"navRight", el->navRight}};
+                {"navRight", el->navRight},
+                {"tooltip", el->tooltip},
+                {"tooltipDelay", el->tooltipDelay},
+                {"tabGroup", el->tabGroup},
+                {"tabTarget", el->tabTarget},
+                {"collapseTarget", el->collapseTarget},
+                {"bindText", el->bindText},
+                {"bindValue", el->bindValue},
+                {"bindVisible", el->bindVisible},
+                {"bindTexture", el->bindTexture}};
 }
 
 json WriteCanvas(const UICanvas& c) {
@@ -272,6 +281,15 @@ void ReadElement(const json& j, UIElement& out) {
     out.navDown = it->value("navDown", "");
     out.navLeft = it->value("navLeft", "");
     out.navRight = it->value("navRight", "");
+    out.tooltip = it->value("tooltip", "");
+    out.tooltipDelay = glm::max(it->value("tooltipDelay", 0.6f), 0.0f);
+    out.tabGroup = it->value("tabGroup", "");
+    out.tabTarget = it->value("tabTarget", "");
+    out.collapseTarget = it->value("collapseTarget", "");
+    out.bindText = it->value("bindText", "");
+    out.bindValue = it->value("bindValue", "");
+    out.bindVisible = it->value("bindVisible", "");
+    out.bindTexture = it->value("bindTexture", "");
 }
 
 void ReadCanvas(const json& j, UICanvas& out) {
@@ -610,6 +628,166 @@ std::vector<entt::entity> InstantiateDocument(Scene& scene, Renderer* renderer,
         if (anyElement) PreloadUIAssets(scene, *renderer, Project::Active().AssetsDir());
     }
     return created;
+}
+
+entt::entity InstantiateSubtree(Scene& scene, const DocData& doc, int rootIndex,
+                                entt::entity parent, DocHandle handle, bool screenOwned) {
+    auto& reg = scene.Registry();
+    const int n = static_cast<int>(doc.entities.size());
+    if (rootIndex < 0 || rootIndex >= n) return entt::null;
+
+    // Collect the subtree: the root, then transitively every entity whose parent is
+    // already in the set. Parent links are index-based and NOT ordered (a child may sit
+    // before its parent), so grow to a fixpoint rather than assume topological order.
+    std::vector<bool> inSet(static_cast<usize>(n), false);
+    std::vector<int> order; // doc indices in the order created (root first)
+    inSet[static_cast<usize>(rootIndex)] = true;
+    order.push_back(rootIndex);
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (int i = 0; i < n; ++i) {
+            if (inSet[static_cast<usize>(i)]) continue;
+            const int p = doc.entities[static_cast<usize>(i)].parent;
+            if (p >= 0 && p < n && inSet[static_cast<usize>(p)]) {
+                inSet[static_cast<usize>(i)] = true;
+                order.push_back(i);
+                grew = true;
+            }
+        }
+    }
+
+    // PASS 1 - create the subtree's entities + components (mirrors InstantiateDocument,
+    // structural half only; no renderer/preload).
+    std::vector<int> docToLocal(static_cast<usize>(n), -1);
+    std::vector<entt::entity> created;
+    created.reserve(order.size());
+    for (const int idx : order) {
+        const DocEntity& d = doc.entities[static_cast<usize>(idx)];
+        const entt::entity e = scene.CreateEntity(d.name);
+        docToLocal[static_cast<usize>(idx)] = static_cast<int>(created.size());
+        created.push_back(e);
+        reg.emplace<UIDocMember>(e, UIDocMember{handle, screenOwned});
+        if (d.hasTransform) reg.emplace<Transform>(e, d.transform);
+        if (d.hasElement) {
+            UIElement el = d.element;
+            el.hovered = false;
+            el.clicked = false;
+            reg.emplace<UIElement>(e, el);
+        }
+        if (d.hasCanvas) reg.emplace<UICanvas>(e, d.canvas);
+        if (d.hasAnimator) reg.emplace<UIAnimator>(e, d.animator);
+        if (d.hasPanel) reg.emplace<UIPanel>(e, d.panel);
+        if (d.hasLayout) reg.emplace<UILayoutGroup>(e, d.layout);
+        if (d.hasGroup) reg.emplace<UICanvasGroup>(e, d.group);
+    }
+
+    // PASS 2 - parent links. The subtree root re-parents to the caller's `parent`;
+    // every other node to its mapped in-subtree parent.
+    for (usize k = 0; k < order.size(); ++k) {
+        const int idx = order[k];
+        if (idx == rootIndex) {
+            if (parent != entt::null) reg.emplace<Parent>(created[k], Parent{parent});
+            continue;
+        }
+        const int p = doc.entities[static_cast<usize>(idx)].parent;
+        if (p >= 0 && p < n && docToLocal[static_cast<usize>(p)] >= 0)
+            reg.emplace<Parent>(created[k],
+                                Parent{created[static_cast<usize>(docToLocal[static_cast<usize>(p)])]});
+    }
+
+    scene.BumpUIVersion();
+    return created.empty() ? entt::null : created[0]; // created[0] == rootIndex
+}
+
+bool SubtreeInstantiateSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool c, const char* what) {
+        if (!c) {
+            ok = false;
+            HBE_ERROR("uisubtree: FAILED - {}", what);
+        }
+    };
+
+    // A doc with a sibling Panel (index 0, NOT part of the template) and a template
+    // subtree: [1] Tpl(id "tpl") -> [3] Label("row") -> [2] Icon. Index 2 (Icon) is
+    // listed BEFORE its parent index 3, deliberately, to exercise the fixpoint collection.
+    DocData doc;
+    {
+        DocEntity d;
+        d.name = "Panel";
+        d.parent = -1;
+        d.hasElement = true;
+        d.element.type = UIElement::Type::Panel;
+        doc.entities.push_back(d);
+    }
+    {
+        DocEntity d;
+        d.name = "Tpl";
+        d.parent = -1;
+        d.hasElement = true;
+        d.element.id = "tpl";
+        d.element.type = UIElement::Type::Panel;
+        doc.entities.push_back(d);
+    }
+    {
+        DocEntity d;
+        d.name = "Icon";
+        d.parent = 3; // child of Label (index 3), listed before it
+        d.hasElement = true;
+        d.element.type = UIElement::Type::Image;
+        doc.entities.push_back(d);
+    }
+    {
+        DocEntity d;
+        d.name = "Label";
+        d.parent = 1; // child of Tpl
+        d.hasElement = true;
+        d.element.type = UIElement::Type::Label;
+        d.element.text = "row";
+        doc.entities.push_back(d);
+    }
+
+    Scene scene;
+    auto& reg = scene.Registry();
+    const entt::entity host = scene.CreateEntity("host");
+
+    const entt::entity root =
+        InstantiateSubtree(scene, doc, /*rootIndex*/ 1, host, /*handle*/ 7,
+                           /*screenOwned*/ true);
+    expect(root != entt::null, "subtree root instantiated");
+
+    int members = 0;
+    for (const entt::entity e : reg.view<UIDocMember>()) {
+        (void)e;
+        ++members;
+    }
+    expect(members == 3, "exactly the 3-node subtree cloned (sibling Panel excluded)");
+
+    if (root != entt::null && reg.all_of<UIElement>(root)) {
+        expect(reg.get<UIElement>(root).id == "tpl", "root is the template (id preserved)");
+        const Parent* rp = reg.try_get<Parent>(root);
+        expect(rp && rp->entity == host, "root re-parented to the host");
+        const UIDocMember* m = reg.try_get<UIDocMember>(root);
+        expect(m && m->doc == 7, "UIDocMember handle stamped");
+    }
+
+    entt::entity label = entt::null, icon = entt::null;
+    for (const entt::entity e : reg.view<UIElement>()) {
+        const UIElement& el = reg.get<UIElement>(e);
+        if (el.text == "row") label = e;
+        if (el.type == UIElement::Type::Image) icon = e;
+    }
+    expect(label != entt::null && icon != entt::null, "label + icon cloned");
+    if (label != entt::null) {
+        const Parent* p = reg.try_get<Parent>(label);
+        expect(p && p->entity == root, "label parented to the cloned root");
+    }
+    if (icon != entt::null) {
+        const Parent* p = reg.try_get<Parent>(icon);
+        expect(p && p->entity == label, "icon parented to label (nesting preserved)");
+    }
+
+    return ok;
 }
 
 void CaptureDocument(const Scene& scene, DocHandle doc, const DocData& header,
@@ -1541,7 +1719,16 @@ json FrozenElement(const UIElement* el) {
                 {"navUp", el->navUp},
                 {"navDown", el->navDown},
                 {"navLeft", el->navLeft},
-                {"navRight", el->navRight}};
+                {"navRight", el->navRight},
+                {"tooltip", el->tooltip},
+                {"tooltipDelay", el->tooltipDelay},
+                {"tabGroup", el->tabGroup},
+                {"tabTarget", el->tabTarget},
+                {"collapseTarget", el->collapseTarget},
+                {"bindText", el->bindText},
+                {"bindValue", el->bindValue},
+                {"bindVisible", el->bindVisible},
+                {"bindTexture", el->bindTexture}};
     return je["ui"];
 }
 json FrozenCanvas(const UICanvas* canvas) {
@@ -1686,6 +1873,15 @@ void FuzzElement(Rng& r, UIElement& e) {
     e.navDown = r.S();
     e.navLeft = r.S();
     e.navRight = r.S();
+    e.tooltip = r.S();
+    e.tooltipDelay = r.F(0, 5);
+    e.tabGroup = r.S();
+    e.tabTarget = r.S();
+    e.collapseTarget = r.S();
+    e.bindText = r.S();
+    e.bindValue = r.S();
+    e.bindVisible = r.S();
+    e.bindTexture = r.S();
 }
 
 // Field-by-field equality. Deliberately NOT memcmp: UIElement carries runtime
@@ -1726,11 +1922,12 @@ bool DocumentSelfTest(const std::vector<fs::path>& scenes) {
         expect(WriteWorldText(dw).dump() == FrozenWorldText(&dw).dump(),
                "worldText: defaults differ");
         // The key count is part of the contract: an added-but-unread key is a
-        // silent format fork. 66 for UIElement (53 + P4's 4 + P5's id + P6's
-        // minSize/maxSize/aspectRatio + P7's effect + P8's navUp/Down/Left/Right),
-        // counted from the block itself.
-        expect(WriteElement(de).size() == 66,
-               "ui block must emit exactly 66 keys, got " +
+        // silent format fork. 70 for UIElement (53 + P4's 4 + P5's id + P6's
+        // minSize/maxSize/aspectRatio + P7's effect + P8's navUp/Down/Left/Right +
+        // P9's tooltip/tooltipDelay + P9's tabGroup/tabTarget + P9's collapseTarget +
+        // P9.4's bindText/bindValue/bindVisible/bindTexture), counted from the block.
+        expect(WriteElement(de).size() == 75,
+               "ui block must emit exactly 75 keys, got " +
                    std::to_string(WriteElement(de).size()));
         // 12 since the pick pass: `occlude` + `interactRange` (world-canvas
         // interaction, Interaction/Pick.cpp). Both defaults are duplicated in

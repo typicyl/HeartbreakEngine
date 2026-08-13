@@ -67,6 +67,7 @@
 #include "UI/UIDocument.h"
 #include "UI/UIManager.h" // --test-uiscreens (panel lookup across the screen set)
 #include "UI/UISystem.h"  // --test-uisolve (direct-manipulation math gate)
+#include "UI/UIData.h"    // --test-uibind (data-binding gate)
 #include "UI/FontAtlas.h" // --test-uitext (text::TextSelfTest; FreeType-free header)
 #include "UI/Svg/SvgCache.h" // --test-uisvg (svg::SvgSelfTest; LunaSVG-free header)
 #include "UI/Style/Theme.h" // --test-uitheme (style::ThemeSelfTest)
@@ -965,6 +966,22 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-uisolve") == 0) {
             const bool ok = hbe::ui::ManipulationSelfTest();
             std::printf("uisolve %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-uibind: the P9.4 data-binding gate. Drives a ui::UIDataModel +
+        // ResolveBindings and asserts runtime fields + the rev/no-op write guard.
+        // Headless, no GPU/window/project. Same contract as --test-uisolve.
+        if (std::strcmp(argv[i], "--test-uibind") == 0) {
+            const bool ok = hbe::ui::DataBindSelfTest();
+            std::printf("uibind %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-uisubtree: the P9.4 B4 primitive gate. Clones a template subtree from an
+        // in-code DocData and asserts entity count + re-parenting + field preservation.
+        // Headless, no GPU/window/project. Same contract as --test-uibind.
+        if (std::strcmp(argv[i], "--test-uisubtree") == 0) {
+            const bool ok = hbe::ui::SubtreeInstantiateSelfTest();
+            std::printf("uisubtree %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-uitext: the TEXT STACK gate (P2 of docs/Design-UIOverhaul.md).
@@ -2770,6 +2787,36 @@ int main(int argc, char** argv) {
             canEngine.Run(config);
             std::printf("uicanvas %s\n", canOk ? "PASS" : "FAIL");
             return canOk ? 0 : 1;
+        }
+    }
+
+    // --test-uivtable: the P9.2 WidgetVTable byte-identity gate. Boots a real GPU
+    // session (so fonts bake and the emit path is the shipped one) but needs NO
+    // project - it builds its OWN widget corpus, emits it with the legacy switch and
+    // again through the WidgetVTable, and asserts the two rhi::UIVertex streams are
+    // byte-identical. This is what makes the D3 decomposition provable render-blind.
+    // See ui::WidgetVTableSelfTest / docs/Design-UIWidgetRegistry.md.
+    {
+        bool vtFlagSeen = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--test-uivtable") == 0) vtFlagSeen = true;
+        if (vtFlagSeen) {
+            static bool vtRan = false, vtOk = false;
+            hbe::Engine vtEngine;
+            vtEngine.SetOnInit([](hbe::Engine& e) {
+                e.GetPhysics().SetRunning(false);
+                e.SetGameCameraEnabled(false);
+                e.GetScene().SetEditorView(false); // the shipped runtime emit path
+            });
+            vtEngine.SetOnFrame([](hbe::Engine& e) {
+                if (vtRan) return;
+                vtRan = true;
+                vtOk = hbe::ui::WidgetVTableSelfTest(e.GetScene(), e.GetRenderer());
+                e.Quit();
+            });
+            vtEngine.Run(config);
+            std::printf("uivtable %s\n", vtOk ? "PASS" : "FAIL");
+            return vtOk ? 0 : 1;
         }
     }
 

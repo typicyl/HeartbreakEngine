@@ -35,6 +35,12 @@ struct ResonanceSpatializer::Impl {
         Impl* self;
     };
 
+    // miniaudio node process callback. A STATIC MEMBER (not a free function) so it can name
+    // the private nested Node, and so the vtable that points at it can be built inside a
+    // member function - keeping the private Impl out of namespace scope entirely.
+    static void OnProcess(ma_node* pNode, const float** ppFramesIn, ma_uint32* pFrameCountIn,
+                          float** ppFramesOut, ma_uint32* pFrameCountOut);
+
     ma_engine* engine = nullptr;
     vraudio::ResonanceAudioApi* api = nullptr;
     int sampleRate = 48000;
@@ -133,23 +139,12 @@ struct ResonanceSpatializer::Impl {
     }
 };
 
-namespace {
-
-void ResonanceOnProcess(ma_node* pNode, const float** ppFramesIn, ma_uint32* pFrameCountIn,
-                        float** ppFramesOut, ma_uint32* pFrameCountOut) {
-    auto* node = reinterpret_cast<ResonanceSpatializer::Impl::Node*>(pNode);
+void ResonanceSpatializer::Impl::OnProcess(ma_node* pNode, const float** ppFramesIn,
+                                           ma_uint32* pFrameCountIn, float** ppFramesOut,
+                                           ma_uint32* pFrameCountOut) {
+    auto* node = reinterpret_cast<Node*>(pNode);
     node->self->Process(ppFramesIn, pFrameCountIn, ppFramesOut, pFrameCountOut);
 }
-
-ma_node_vtable g_resonanceVtable = {
-    ResonanceOnProcess,
-    nullptr, // onGetRequiredInputFrameCount
-    static_cast<ma_uint8>(kMaxSources), // input bus count
-    1,                                  // output bus count
-    MA_NODE_FLAG_CONTINUOUS_PROCESSING | MA_NODE_FLAG_ALLOW_NULL_INPUT,
-};
-
-} // namespace
 
 ResonanceSpatializer::ResonanceSpatializer() : impl_(std::make_unique<Impl>()) {}
 ResonanceSpatializer::~ResonanceSpatializer() { Shutdown(); }
@@ -182,8 +177,19 @@ bool ResonanceSpatializer::Init(void* maEngine, void* destNode, u32 sampleRate) 
     for (int s = 0; s < kMaxSources; ++s) inChannels[s] = 1;
     ma_uint32 outChannels[1] = {2};
 
+    // Static storage duration (the node keeps a pointer to this vtable for its lifetime).
+    // Built here, inside a member function, so &Impl::OnProcess and the private Impl stay
+    // accessible without naming Impl at namespace scope.
+    static ma_node_vtable vtable = {
+        &Impl::OnProcess,
+        nullptr, // onGetRequiredInputFrameCount
+        static_cast<ma_uint8>(kMaxSources), // input bus count
+        1,                                  // output bus count
+        MA_NODE_FLAG_CONTINUOUS_PROCESSING | MA_NODE_FLAG_ALLOW_NULL_INPUT,
+    };
+
     ma_node_config cfg = ma_node_config_init();
-    cfg.vtable = &g_resonanceVtable;
+    cfg.vtable = &vtable;
     cfg.pInputChannels = inChannels;
     cfg.pOutputChannels = outChannels;
 

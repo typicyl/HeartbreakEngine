@@ -57,6 +57,40 @@ glm::vec2 EffectiveCanvas(const CanvasConfig& config, glm::vec2 targetSize);
 void SetUIScale(f32 scale);
 f32 GetUIScale();
 
+// P9.2 WidgetVTable (D3): route UI emit through the per-type registry instead of the
+// legacy switch. OFF by default (the shipped runtime keeps the legacy path until the
+// byte-identity gate signs off); --test-uivtable and --uivtable flip it. See
+// docs/Design-UIWidgetRegistry.md.
+void SetUIUseVTable(bool on);
+bool GetUIUseVTable();
+
+// P9.2 WidgetVTable dispatch shared with UIFocus (keyboard/gamepad). `WidgetIsFocusable`
+// is the single source of truth for which types take focus; `WidgetNav` adjusts a value
+// widget on left/right (dir 2/3) and returns true if it consumed the direction;
+// `WidgetActivate` runs Enter/A activation and returns true when the widget wants a
+// text-edit session (TextInput). Each honours GetUIUseVTable(). (Element-typed, not
+// Type-typed: this header only forward-declares UIElement, not its nested enum.)
+bool WidgetIsFocusable(const UIElement& el);
+bool WidgetNav(UIElement& el, int dir);
+bool WidgetActivate(UIElement& el);
+
+// P9 Tab switching: apply any tab clicks THIS frame (an element with a `tabTarget` shows
+// that content and hides the other targets in its `tabGroup`). Call once per frame after
+// interaction/navigation. Composable - no new widget type. See UIElement::tabGroup.
+void ProcessTabs(Scene& scene);
+
+// The frozen-vertex parity gate: builds an in-code corpus of every widget type + a
+// state cross-product, emits it with the legacy switch and again with the vtable, and
+// asserts the two rhi::UIVertex streams are byte-identical (plus a self-consistency
+// re-run). Runs in a real GPU session but needs NO project (own corpus). Returns true
+// on PASS. Defined in WidgetVTableTest.cpp.
+bool WidgetVTableSelfTest(Scene& scene, Renderer& renderer);
+
+// P9.2 interact parity: runs ApplyPointerToElement over every interactive element in
+// `scene` both ways (legacy switch vs vtable onPointer) and asserts identical flag
+// mutations. Headless (no emit); called by WidgetVTableSelfTest. Defined in UISystem.cpp.
+bool WidgetPointerParitySelfTest(Scene& scene, glm::vec2 target, const CanvasConfig& cfg);
+
 // An axis-aligned rectangle in canvas units (y-down, origin top-left).
 struct Rect {
     f32 x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -199,6 +233,20 @@ struct UIContext {
     f32 caretBlink = 0.0f;             // seconds since edit start (blink phase)
     f32 navRepeat = 0.0f;              // held-direction auto-repeat countdown
     int navHeldDir = -1;               // 0=up 1=down 2=left 3=right (-1 = none)
+
+    // Tooltip (P9): the pointer pass records the topmost element under the cursor that
+    // carries a non-empty `tooltip` into `tooltipCandidate` (independent of the
+    // interaction gate, so a DISABLED widget can still explain itself). UpdateNavigation
+    // (which has dt) advances `tooltipTime` while the candidate holds steady and resets
+    // it when the candidate changes; once it passes the element's `tooltipDelay`,
+    // BuildVertices emits the popup below `tooltipHover`.
+    entt::entity tooltipCandidate = entt::null; // under the cursor THIS frame
+    entt::entity tooltipHover = entt::null;      // what the timer is counting on
+    f32 tooltipTime = 0.0f;
+
+    // P9.4 data-binding: the model globalRev applied by the last ui::ResolveBindings, so an
+    // unchanged model fast-skips the per-element bind walk.
+    u64 lastBindGlobalRev = 0;
 
     UIFrameStats stats;
 };
