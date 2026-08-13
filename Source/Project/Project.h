@@ -167,6 +167,10 @@ struct AudioOcclusionSettings {
 struct SpatialAudioSettings {
     bool binaural = true;         // HRTF spatialization for 3D sources (vs. amplitude panning)
     bool speakerMode = false;     // true = loudspeakers (panning), false = headphones (HRTF)
+    // Multi-environment reverb: each acoustic room (AcousticSpace) contributes its own reverb tail,
+    // coupled to the listener through portals - so a sound in the next room rings in THAT room's
+    // reverb, heard through the doorway. Opt-in (extra CPU + tuning). Needs binaural + rooms.
+    bool environmentReverb = false;
 };
 
 // One device's button/key icon set: id -> texture `.uaf` path (relative to Assets).

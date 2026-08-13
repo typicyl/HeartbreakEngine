@@ -78,6 +78,18 @@ public:
     // SetSourceRoomEffectsGain + SetSoundObjectSpread.
     void SetSourceParams(int slot, f32 reverbSend, f32 spreadDeg);
 
+    // -- Multi-environment reverb (HDS-Resonance EnvironmentReverb) --------------------------------
+    // The environment-aware reverb: several active rooms each contribute their own reverb tail,
+    // mixed by coupling to the listener (the library mixes ALL active environments up to capacity,
+    // not just the loudest). It runs inside this node (the node already receives every spatial
+    // voice's audio), so no extra routing is needed; its tails are summed into the binaural output.
+    // Driven by AcousticWorld: `SetEnvironments` declares the active environments this frame
+    // (copied); `SetSourceEnvironment` routes a spatial source slot into the room it occupies.
+    // No-op when the backend/reverb is unavailable or disabled.
+    void SetEnvironmentReverbEnabled(bool enabled);
+    void SetEnvironments(const AcousticEnvironment* envs, int count);
+    void SetSourceEnvironment(int slot, int environmentId);
+
     // Max number of simultaneous spatial voices the pool supports.
     static int Capacity();
 

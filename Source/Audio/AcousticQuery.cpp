@@ -7,7 +7,8 @@
 #include "Scene/Scene.h"
 
 #if HBE_HAVE_RESONANCE
-#include "hdsr/acoustics.h" // the HDS-Resonance acoustics library (materials/rooms/propagation)
+#include "hdsr/acoustics.h"          // materials / rooms / propagation
+#include "hdsr/environment_reverb.h" // multi-environment reverb
 #endif
 
 #include <glm/geometric.hpp>
@@ -136,7 +137,7 @@ bool AcousticSelfTest() {
 
 bool HdsrLibrarySelfTest() {
 #if HBE_HAVE_RESONANCE
-    return hdsr::SelfTest();
+    return hdsr::SelfTest() && hdsr::EnvironmentReverb::SelfTest();
 #else
     return true; // acoustics library not built in -> nothing to test
 #endif

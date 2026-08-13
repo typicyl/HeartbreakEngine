@@ -27,11 +27,16 @@ class PhysicsWorld;
 
 class AcousticWorld {
 public:
-    // Recomputes the listener's room from the highest-priority enabled AcousticSpace containing
-    // `listenerPos` and pushes it to `audio` (only when it changed, so a static room does not
-    // re-trigger the reverb network every frame). Outside all spaces -> room disabled (dry).
+    // Drives the listener's room (early reflections + reverb via the single-room path) AND, when
+    // `environmentReverbEnabled`, the MULTI-ENVIRONMENT reverb: every enabled AcousticSpace coupled
+    // to the listener (through portals/propagation, measured with `physics`) is declared as an
+    // active environment so the library mixes each room's own reverb tail by its coupling. The
+    // listener's room drives the single-room path (reflections; its late tail comes from the
+    // environment reverb when enabled). `physics` may be null when the game is not simulating
+    // (coupling then can't be measured, so only the listener's room contributes).
     void Update(Scene& scene, const glm::vec3& listenerPos,
-                const std::filesystem::path& assetsDir, AudioSystem& audio);
+                const std::filesystem::path& assetsDir, AudioSystem& audio,
+                const PhysicsWorld* physics, bool environmentReverbEnabled);
 
     // Fraction of sound energy transmitted from `a` to `b` through intervening geometry: the
     // product of each hit wall's material transmission, with any AcousticPortal opening overriding

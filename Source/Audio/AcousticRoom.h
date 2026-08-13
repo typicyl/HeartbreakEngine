@@ -25,4 +25,16 @@ struct AcousticRoom {
     f32 reverbGain = 0.045f;         // late-reverb tail level
 };
 
+// One active acoustic ENVIRONMENT for the multi-environment reverb (hdsr::EnvironmentReverb): a
+// room that contributes its own reverb tail to the listener, scaled by `coupling` (how much of it
+// reaches the listener through portals/propagation; 1 = the listener is inside it). `id` is a
+// stable identifier (e.g. an AcousticSpace entity). The library mixes ALL active environments up
+// to its capacity - this is not a "pick the loudest room" selection.
+struct AcousticEnvironment {
+    int id = -1;
+    f32 rt60[9] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    f32 coupling = 0.0f; // fraction of this environment's tail reaching the listener [0,1]
+    f32 gain = 1.0f;
+};
+
 } // namespace hbe

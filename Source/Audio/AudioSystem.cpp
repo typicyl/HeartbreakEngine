@@ -32,6 +32,30 @@ std::vector<AudioBusDesc> DefaultAudioBuses() {
             {"Ambience", "Master", 1.0f, false}};
 }
 
+namespace {
+// The id (entity, as an int) of the highest-priority enabled AcousticSpace whose box contains
+// `point`, or -1. Routes a spatial source into the room it occupies for the multi-environment
+// reverb. (A trivial point-in-box test - engine geometry glue, not the acoustic model.)
+int AcousticSpaceIdAt(Scene& scene, const glm::vec3& point) {
+    entt::registry& reg = scene.Registry();
+    entt::entity best = entt::null;
+    int bestPri = 0;
+    for (const entt::entity e : reg.view<AcousticSpace>()) {
+        const AcousticSpace& sp = reg.get<AcousticSpace>(e);
+        if (!sp.enabled || !reg.all_of<Transform>(e)) continue;
+        const glm::vec3 local =
+            glm::abs(glm::vec3(glm::inverse(scene.WorldMatrix(e)) * glm::vec4(point, 1.0f)));
+        if (local.x <= sp.halfExtents.x && local.y <= sp.halfExtents.y &&
+            local.z <= sp.halfExtents.z && (best == entt::null || sp.priority >= bestPri)) {
+            best = e;
+            bestPri = sp.priority;
+        }
+    }
+    // Non-negative + stable per valid entity; must match AcousticWorld's environment id exactly.
+    return best == entt::null ? -1 : static_cast<int>(entt::to_integral(best) & 0x7FFFFFFFu);
+}
+} // namespace
+
 struct AudioSystem::Impl {
     ma_engine engine{};
     bool ready = false;
@@ -924,6 +948,14 @@ void AudioSystem::SetRoom(const AcousticRoom& room, bool enabled) {
     if (impl_) impl_->resonance.SetRoom(room, enabled); // no-op when the backend is unavailable
 }
 
+void AudioSystem::SetEnvironmentReverbEnabled(bool enabled) {
+    if (impl_) impl_->resonance.SetEnvironmentReverbEnabled(enabled);
+}
+
+void AudioSystem::SetEnvironments(const AcousticEnvironment* envs, int count) {
+    if (impl_) impl_->resonance.SetEnvironments(envs, count);
+}
+
 void AudioSystem::SetMusicGraph(const MusicGraph& graph,
                                 const std::filesystem::path& assetsDir) {
     if (!impl_) return;
@@ -1278,6 +1310,7 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
             impl_->resonance.SetSource(sv.voice.resSlot, apparent,
                                        src.volume * impl_->SpatialBusGainToNode(sv.bus), occ,
                                        src.minDistance, src.maxDistance);
+            impl_->resonance.SetSourceEnvironment(sv.voice.resSlot, AcousticSpaceIdAt(scene, pos));
         } else {
             // miniaudio panning: position + distance; occlusion attenuates + muffles when
             // geometry blocks the path, else base volume with the LPF transparent.
@@ -1330,6 +1363,7 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
             impl_->resonance.SetSource(v.resSlot, apparent,
                                        v.baseVolume * impl_->SpatialBusGainToNode(v.bus), occ,
                                        v.minDist, v.maxDist);
+            impl_->resonance.SetSourceEnvironment(v.resSlot, AcousticSpaceIdAt(scene, v.worldPos));
             continue;
         }
         if (occlude)

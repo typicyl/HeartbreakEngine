@@ -135,6 +135,15 @@ public:
     // and when the Resonance backend is unavailable. See Audio/AcousticRoom.h.
     void SetRoom(const AcousticRoom& room, bool enabled);
 
+    // Multi-environment reverb (HDS-Resonance): several active acoustic environments each
+    // contribute their own reverb tail, mixed by coupling to the listener inside the library.
+    // `SetEnvironmentReverbEnabled` turns it on; `SetEnvironments` declares the active environments
+    // for this frame (copied). Driven by AcousticWorld from the room/portal topology; each spatial
+    // source is routed into the room it occupies internally. No-op on the panning path / when the
+    // backend is unavailable.
+    void SetEnvironmentReverbEnabled(bool enabled);
+    void SetEnvironments(const AcousticEnvironment* envs, int count);
+
     // -- Adaptive music director -------------------------------------------------
     // Interactive music: a graph of STATES (each a set of synced looping LAYERS)
     // that crossfade, with runtime PARAMETERS that fade layers in/out for a smooth,

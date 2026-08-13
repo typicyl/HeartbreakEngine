@@ -14808,6 +14808,11 @@ void Editor::DrawAudioMixer(Engine& engine) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("On for stereo speakers - HRTF is a headphone technique, so over\n"
                               "speakers Resonance switches to panning. Off for headphones.");
+        changed |= ImGui::Checkbox("Multi-environment reverb", &sa.environmentReverb);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Each acoustic room contributes its OWN reverb tail, coupled through\n"
+                              "portals - a sound in the next room rings in that room's reverb,\n"
+                              "heard through the doorway. Needs AcousticSpace rooms. Extra CPU.");
         ImGui::EndDisabled();
         if (changed) Project::Active().Save();
     }

@@ -14,6 +14,9 @@
 // The fork's public renderer API (vraudio). The include root is the fork's repo root, added
 // PRIVATE to this target in HeartbreakEngine/CMakeLists.txt.
 #include "resonance_audio/api/resonance_audio_api.h"
+// The HDS-Resonance multi-environment reverb (library component). Its tails are mixed into this
+// node's output; the node already receives every spatial voice's audio, so no extra routing.
+#include "hdsr/environment_reverb.h"
 
 #include <atomic>
 #include <cstring>
@@ -62,6 +65,21 @@ struct ResonanceSpatializer::Impl {
     // variable onProcess frame count.
     std::vector<float> ring;
     size_t ringCap = 0, ringHead = 0, ringCount = 0;
+
+    // --- Multi-environment reverb (hdsr::EnvironmentReverb) ---
+    // The active-environment table + per-slot environment assignment are written from the main
+    // thread and read in OnProcess (audio thread). Like the per-voice LPF, this is a benign,
+    // bounded race - a torn read of a POD table entry is a one-block transient, never a crash; the
+    // FDN state itself is only touched on the audio thread (in Process). Off by default: when
+    // disabled, Process is byte-identical to the pre-environment-reverb path.
+    static const int kMaxEnv = 16;
+    static const int kReverbEnvCapacity = 8; // environments mixed simultaneously (perf capacity)
+    hdsr::EnvironmentReverb envReverb;
+    bool envReverbEnabled = false;
+    AcousticEnvironment envTable[kMaxEnv];
+    int envCount = 0;
+    int slotEnvId[kMaxSources]; // environment id per source slot; -1 = unassigned
+    std::vector<float> envOut;  // one Process block of interleaved stereo reverb
 
     void RingPush(const float* stereo, size_t frames) {
         for (size_t i = 0; i < frames; ++i) {
@@ -134,6 +152,23 @@ struct ResonanceSpatializer::Impl {
         if (got < frames) {
             std::memset(dst + got * 2, 0, sizeof(float) * 2 * (frames - got));
         }
+
+        // 4) Multi-environment reverb: route each active source into the room it occupies and mix
+        //    EVERY active environment's tail (coupling-weighted, in the library) into the output,
+        //    alongside the vraudio binaural. Off by default -> this block is skipped entirely.
+        if (envReverbEnabled && envReverb.IsReady()) {
+            envReverb.BeginBlock();
+            for (int e = 0; e < envCount; ++e)
+                envReverb.SetEnvironment(envTable[e].id, envTable[e].rt60, envTable[e].coupling,
+                                         envTable[e].gain);
+            for (int s = 0; s < kMaxSources; ++s)
+                if (active[s].load(std::memory_order_relaxed) && in != nullptr &&
+                    in[s] != nullptr && slotEnvId[s] >= 0)
+                    envReverb.AddInput(slotEnvId[s], in[s], static_cast<int>(frames));
+            envReverb.Process(envOut.data(), static_cast<int>(frames));
+            for (ma_uint32 i = 0; i < frames * 2; ++i) dst[i] += envOut[i];
+        }
+
         *frameCountIn = frames;
         *frameCountOut = frames;
     }
@@ -172,6 +207,13 @@ bool ResonanceSpatializer::Init(void* maEngine, void* destNode, u32 sampleRate) 
     impl_->ringCap = kBlockSize * 8;
     impl_->ring.assign(impl_->ringCap * 2, 0.0f);
     impl_->ringHead = impl_->ringCount = impl_->accumFill = 0;
+
+    // Multi-environment reverb: an FDN bank per simultaneously-mixed environment (off until the
+    // integration enables it; when off, Process skips it entirely).
+    impl_->envReverb.Init(static_cast<int>(sampleRate), Impl::kReverbEnvCapacity);
+    impl_->envOut.assign(kMaxProcess * 2, 0.0f);
+    for (int s = 0; s < kMaxSources; ++s) impl_->slotEnvId[s] = -1;
+    impl_->envCount = 0;
 
     ma_uint32 inChannels[kMaxSources];
     for (int s = 0; s < kMaxSources; ++s) inChannels[s] = 1;
@@ -251,6 +293,7 @@ int ResonanceSpatializer::AcquireSource() {
 void ResonanceSpatializer::ReleaseSource(int slot) {
     if (!impl_ || slot < 0 || slot >= kMaxSources) return;
     if (impl_->api != nullptr) impl_->api->SetSourceVolume(impl_->sourceId[slot], 0.0f);
+    impl_->slotEnvId[slot] = -1;
     impl_->active[slot].store(false, std::memory_order_release);
 }
 
@@ -289,6 +332,25 @@ void ResonanceSpatializer::SetSourceParams(int slot, f32 reverbSend, f32 spreadD
     const auto id = impl_->sourceId[slot];
     impl_->api->SetSourceRoomEffectsGain(id, glm::max(reverbSend, 0.0f));
     impl_->api->SetSoundObjectSpread(id, glm::clamp(spreadDeg, 0.0f, 360.0f));
+}
+
+void ResonanceSpatializer::SetEnvironmentReverbEnabled(bool enabled) {
+    if (impl_) impl_->envReverbEnabled = enabled;
+}
+
+void ResonanceSpatializer::SetEnvironments(const AcousticEnvironment* envs, int count) {
+    if (!impl_) return;
+    if (envs == nullptr || count <= 0) {
+        impl_->envCount = 0;
+        return;
+    }
+    if (count > Impl::kMaxEnv) count = Impl::kMaxEnv;
+    for (int i = 0; i < count; ++i) impl_->envTable[i] = envs[i];
+    impl_->envCount = count;
+}
+
+void ResonanceSpatializer::SetSourceEnvironment(int slot, int environmentId) {
+    if (impl_ && slot >= 0 && slot < kMaxSources) impl_->slotEnvId[slot] = environmentId;
 }
 
 void ResonanceSpatializer::SetRoom(const AcousticRoom& room, bool enabled) {
@@ -344,6 +406,9 @@ void ResonanceSpatializer::SetSource(int, const glm::vec3&, f32, f32, f32, f32) 
 void ResonanceSpatializer::SetSpeakerMode(bool) {}
 void ResonanceSpatializer::SetRoom(const AcousticRoom&, bool) {}
 void ResonanceSpatializer::SetSourceParams(int, f32, f32) {}
+void ResonanceSpatializer::SetEnvironmentReverbEnabled(bool) {}
+void ResonanceSpatializer::SetEnvironments(const AcousticEnvironment*, int) {}
+void ResonanceSpatializer::SetSourceEnvironment(int, int) {}
 int ResonanceSpatializer::Capacity() { return 0; }
 
 } // namespace hbe

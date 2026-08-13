@@ -73,6 +73,23 @@ bool RoomsEqual(const AcousticRoom& a, const AcousticRoom& b) {
            NearlyEq(a.reflectionCutoffHz, b.reflectionCutoffHz);
 }
 
+// Compute an AcousticSpace's room acoustics from its world transform + wall/floor/ceiling materials.
+AcousticRoom RoomForSpace(const Scene& scene, entt::entity e, const AcousticSpace& sp) {
+    const glm::mat4 W = scene.WorldMatrix(e);
+    const glm::vec3 center = glm::vec3(W[3]);
+    const glm::vec3 cx(W[0]), cy(W[1]), cz(W[2]);
+    const glm::vec3 scale(glm::length(cx), glm::length(cy), glm::length(cz));
+    const glm::vec3 dims = 2.0f * sp.halfExtents * scale;
+    glm::mat3 rotM;
+    rotM[0] = scale.x > 1e-6f ? cx / scale.x : glm::vec3(1, 0, 0);
+    rotM[1] = scale.y > 1e-6f ? cy / scale.y : glm::vec3(0, 1, 0);
+    rotM[2] = scale.z > 1e-6f ? cz / scale.z : glm::vec3(0, 0, 1);
+    const glm::quat rot = glm::quat_cast(rotM);
+    return ComputeAcousticRoom(center, rot, dims, MaterialByName(sp.wallMaterial),
+                               MaterialByName(sp.floorMaterial), MaterialByName(sp.ceilingMaterial),
+                               sp.reflectionGain, sp.reverbGain, sp.reverbTime);
+}
+
 } // namespace
 
 AcousticRoom ComputeAcousticRoom(const glm::vec3& center, const glm::quat& rotation,
@@ -159,8 +176,8 @@ void AcousticWorld::ClearCaches() {
 }
 
 void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
-                           const std::filesystem::path& assetsDir, AudioSystem& audio) {
-    (void)assetsDir; // P2 rooms use preset materials (no disk); assetsDir is for P3 per-surface.
+                           const std::filesystem::path& assetsDir, AudioSystem& audio,
+                           const PhysicsWorld* physics, bool environmentReverbEnabled) {
     entt::registry& reg = scene.Registry();
 
     // Highest-priority enabled AcousticSpace whose OBB contains the listener (>= tie-break =
@@ -180,6 +197,38 @@ void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
         }
     }
 
+    // Multi-environment reverb topology: declare EVERY enabled space coupled to the listener - the
+    // listener's own room at coupling 1, and each other room by how much of its tail reaches the
+    // listener through portals/propagation (measured with the physics geometry). The library mixes
+    // all of them up to its capacity (not just the loudest). Runs even outdoors (best == null): a
+    // source in a nearby room still leaks its reverb out.
+    audio.SetEnvironmentReverbEnabled(environmentReverbEnabled);
+    if (environmentReverbEnabled) {
+        std::vector<AcousticEnvironment> envs;
+        for (const entt::entity e : reg.view<AcousticSpace>()) {
+            const AcousticSpace& sp = reg.get<AcousticSpace>(e);
+            if (!sp.enabled || !reg.all_of<Transform>(e)) continue;
+            f32 coupling = 1.0f;
+            if (e != best) {
+                if (physics == nullptr) continue; // coupling needs geometry queries
+                const glm::vec3 c = glm::vec3(scene.WorldMatrix(e)[3]);
+                coupling = SegmentTransmission(*physics, scene, c, listenerPos, assetsDir);
+                if (coupling < 0.03f) continue; // negligibly coupled -> skip
+            }
+            const AcousticRoom rm = RoomForSpace(scene, e, sp);
+            AcousticEnvironment env;
+            // Non-negative, stable per valid entity (masks the sign bit so a recycled entity's id
+            // is never negative). Must match AudioSystem's per-voice room id exactly.
+            env.id = static_cast<int>(entt::to_integral(e) & 0x7FFFFFFFu);
+            for (int b = 0; b < 9; ++b) env.rt60[b] = rm.rt60[b];
+            env.coupling = coupling;
+            env.gain = 1.0f;
+            envs.push_back(env);
+            if (envs.size() >= 16u) break;
+        }
+        audio.SetEnvironments(envs.empty() ? nullptr : envs.data(), static_cast<int>(envs.size()));
+    }
+
     if (best == entt::null) {
         // Outdoors / no room: disable room effects (push once on the transition out).
         if (!hasPushed_ || lastEnabled_) {
@@ -193,22 +242,10 @@ void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
 
     AcousticSpace& sp = reg.get<AcousticSpace>(best);
     sp.active = true;
-
-    const glm::mat4 W = scene.WorldMatrix(best);
-    const glm::vec3 center = glm::vec3(W[3]);
-    // World scale + rotation from the columns (rooms are box regions, usually near-orthonormal).
-    const glm::vec3 cx(W[0]), cy(W[1]), cz(W[2]);
-    const glm::vec3 scale(glm::length(cx), glm::length(cy), glm::length(cz));
-    const glm::vec3 dims = 2.0f * sp.halfExtents * scale;
-    glm::mat3 rotM;
-    rotM[0] = scale.x > 1e-6f ? cx / scale.x : glm::vec3(1, 0, 0);
-    rotM[1] = scale.y > 1e-6f ? cy / scale.y : glm::vec3(0, 1, 0);
-    rotM[2] = scale.z > 1e-6f ? cz / scale.z : glm::vec3(0, 0, 1);
-    const glm::quat rot = glm::quat_cast(rotM);
-
-    const AcousticRoom room = ComputeAcousticRoom(
-        center, rot, dims, MaterialByName(sp.wallMaterial), MaterialByName(sp.floorMaterial),
-        MaterialByName(sp.ceilingMaterial), sp.reflectionGain, sp.reverbGain, sp.reverbTime);
+    AcousticRoom room = RoomForSpace(scene, best, sp);
+    // With the environment reverb on, IT owns the late reverb tail (the listener's room is one
+    // environment at coupling 1); the single-room path then supplies only the early reflections.
+    if (environmentReverbEnabled) room.reverbGain = 0.0f;
 
     // Push only when the room actually changed (space switch, moved region, or live param edit) so
     // the reverb network is not reconfigured every frame while standing in a static room.
