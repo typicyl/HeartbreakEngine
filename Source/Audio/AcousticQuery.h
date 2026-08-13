@@ -59,4 +59,9 @@ bool AcousticRaycast(const PhysicsWorld& physics, const Scene& scene, const glm:
 // (save/load), and entity -> AcousticMaterial resolution + caching. Returns true on pass.
 bool AcousticSelfTest();
 
+// Runs the HDS-Resonance acoustics LIBRARY self-test (hdsr::SelfTest) when the backend is built in.
+// The gate + fork include live here (engine-lib side) so the exe can call it without the fork's
+// compile definitions. Returns true when the library is unavailable (nothing to test).
+bool HdsrLibrarySelfTest();
+
 } // namespace hbe

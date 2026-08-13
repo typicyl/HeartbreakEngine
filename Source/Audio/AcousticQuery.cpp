@@ -6,6 +6,10 @@
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 
+#if HBE_HAVE_RESONANCE
+#include "hdsr/acoustics.h" // the HDS-Resonance acoustics library (materials/rooms/propagation)
+#endif
+
 #include <glm/geometric.hpp>
 
 #include <cmath>
@@ -128,6 +132,14 @@ bool AcousticSelfTest() {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
     return ok;
+}
+
+bool HdsrLibrarySelfTest() {
+#if HBE_HAVE_RESONANCE
+    return hdsr::SelfTest();
+#else
+    return true; // acoustics library not built in -> nothing to test
+#endif
 }
 
 } // namespace hbe

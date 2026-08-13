@@ -380,10 +380,11 @@ int main(int argc, char** argv) {
         // entity -> AcousticMaterial resolution + caching (physically-informed audio P1).
         // Headless, no GPU/window/project.
         if (std::strcmp(argv[i], "--test-acoustics") == 0) {
+            const bool libOk = hbe::HdsrLibrarySelfTest(); // HDS-Resonance acoustics library
             const bool matOk = hbe::AcousticSelfTest();
             const bool roomOk = hbe::AcousticRoomSelfTest();
             const bool evOk = hbe::assets::AudioEventSelfTest();
-            const bool ok = matOk && roomOk && evOk;
+            const bool ok = libOk && matOk && roomOk && evOk;
             std::printf("acoustics %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
