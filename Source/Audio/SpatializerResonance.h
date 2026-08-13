@@ -19,6 +19,7 @@
 // (HBE_HAVE_RESONANCE=0) so the engine still builds and runs on plain miniaudio.
 #pragma once
 
+#include "Audio/AcousticRoom.h"
 #include "Core/Types.h"
 
 #include <glm/glm.hpp>
@@ -65,6 +66,17 @@ public:
     // switches to amplitude panning (which also avoids HRTF coloring and is cheaper). Maps
     // straight to vraudio SetStereoSpeakerMode.
     void SetSpeakerMode(bool speakers);
+
+    // Applies (or disables when `enabled` is false) shoebox room acoustics - early reflections +
+    // late reverb heard by all spatialized sources. `room` is engine POD; it is translated to the
+    // backend's ReflectionProperties/ReverbProperties internally (no vraudio type in this header).
+    void SetRoom(const AcousticRoom& room, bool enabled);
+
+    // Per-source static parameters, set once at voice creation: `reverbSend` scales how much this
+    // source feeds the room reverb (a distant tail is wetter than a close mechanical click);
+    // `spreadDeg` widens the source from a point (0) toward diffuse. Maps to vraudio
+    // SetSourceRoomEffectsGain + SetSoundObjectSpread.
+    void SetSourceParams(int slot, f32 reverbSend, f32 spreadDeg);
 
     // Max number of simultaneous spatial voices the pool supports.
     static int Capacity();

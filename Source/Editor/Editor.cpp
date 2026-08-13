@@ -50,6 +50,7 @@
 #include "UI/UIWorld.h"
 #include "Project/Project.h"
 #include "Renderer/Camera.h"
+#include "Audio/AcousticWorld.h" // acoustic bake: auto-place rooms (ClusterAcousticCells)
 #include "Renderer/IBL.h"
 #include "Renderer/Renderer.h"
 #include "RHI/RHI.h"
@@ -6920,6 +6921,20 @@ void Editor::DrawHierarchy(Engine& engine) {
             reg.emplace<MusicZone>(e);
             selected_ = e;
         }
+        if (ImGui::MenuItem("Acoustic Space")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Acoustic Space");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<AcousticSpace>(e);
+            selected_ = e;
+        }
+        if (ImGui::MenuItem("Acoustic Portal")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Acoustic Portal");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<AcousticPortal>(e);
+            selected_ = e;
+        }
         if (ImGui::MenuItem("Post Volume")) {
             PushUndo(scene);
             const entt::entity e = scene.CreateEntity("Post Volume");
@@ -7982,6 +7997,16 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             if (!reg.all_of<MusicZone>(sel) && ImGui::MenuItem("Music Zone")) {
                 PushUndo(scene);
                 reg.emplace<MusicZone>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<AcousticSpace>(sel) && ImGui::MenuItem("Acoustic Space")) {
+                PushUndo(scene);
+                reg.emplace<AcousticSpace>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<AcousticPortal>(sel) && ImGui::MenuItem("Acoustic Portal")) {
+                PushUndo(scene);
+                reg.emplace<AcousticPortal>(sel);
                 if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
             }
             ImGui::EndMenu();
@@ -9161,6 +9186,83 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<MusicZone>(sel);
+        }
+    }
+
+    // --- Acoustic Space (room reverb/reflections while the listener is inside) --
+    if (AcousticSpace* as = reg.try_get<AcousticSpace>(sel)) {
+        const SectionState s = ComponentSection("Acoustic Space");
+        if (s.open) {
+            ImGui::DragFloat3("Half Extents", glm::value_ptr(as->halfExtents), 0.1f, 0.05f, 1000.0f);
+            undoOnActivate();
+            const auto matCombo = [&](const char* label, std::string& ref) {
+                if (ImGui::BeginCombo(label, ref.c_str())) {
+                    for (const AcousticPreset& p : AcousticPresets())
+                        if (ImGui::Selectable(p.name, ref == p.name)) {
+                            PushUndo(scene);
+                            ref = p.name;
+                        }
+                    ImGui::EndCombo();
+                }
+            };
+            matCombo("Walls", as->wallMaterial);
+            matCombo("Floor", as->floorMaterial);
+            matCombo("Ceiling", as->ceilingMaterial);
+            ImGui::DragFloat("Reverb Gain", &as->reverbGain, 0.01f, 0.0f, 4.0f, "%.2f");
+            undoOnActivate();
+            ImGui::DragFloat("Reverb Time (xRT60)", &as->reverbTime, 0.01f, 0.0f, 4.0f, "%.2f");
+            undoOnActivate();
+            ImGui::DragFloat("Reflection Gain", &as->reflectionGain, 0.01f, 0.0f, 4.0f, "%.2f");
+            undoOnActivate();
+            ImGui::DragInt("Priority", &as->priority, 0.1f);
+            undoOnActivate();
+            bool en = as->enabled;
+            if (ImGui::Checkbox("Enabled", &en)) {
+                PushUndo(scene);
+                as->enabled = en;
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled(as->active ? "Status: ACTIVE (listener inside)"
+                                           : "Status: inactive");
+            ImGui::TextDisabled("Box uses this entity's Transform. Reverb + reflections come from\n"
+                                "the box size + wall/floor/ceiling materials (binaural audio).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<AcousticSpace>(sel);
+        }
+    }
+
+    // --- Acoustic Portal (doorway/window that lets sound through a wall) --------
+    if (AcousticPortal* ap = reg.try_get<AcousticPortal>(sel)) {
+        const SectionState s = ComponentSection("Acoustic Portal");
+        if (s.open) {
+            ImGui::DragFloat3("Half Extents", glm::value_ptr(ap->halfExtents), 0.05f, 0.02f, 100.0f);
+            undoOnActivate();
+            if (ImGui::BeginCombo("Closed material", ap->closedMaterial.c_str())) {
+                for (const AcousticPreset& p : AcousticPresets())
+                    if (ImGui::Selectable(p.name, ap->closedMaterial == p.name)) {
+                        PushUndo(scene);
+                        ap->closedMaterial = p.name;
+                    }
+                ImGui::EndCombo();
+            }
+            ImGui::SliderFloat("Openness", &ap->openness, 0.0f, 1.0f, "%.2f");
+            undoOnActivate();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("1 = fully open (sound passes freely), 0 = shut (uses the closed\n"
+                                  "material). Drive this from a door animation.");
+            bool en = ap->enabled;
+            if (ImGui::Checkbox("Enabled", &en)) {
+                PushUndo(scene);
+                ap->enabled = en;
+            }
+            ImGui::TextDisabled("Box uses this entity's Transform. Place it over a doorway/window in\n"
+                                "a wall (needs spatial occlusion enabled in the Audio Mixer).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<AcousticPortal>(sel);
         }
     }
 
@@ -14709,6 +14811,46 @@ void Editor::DrawAudioMixer(Engine& engine) {
         ImGui::EndDisabled();
         if (changed) Project::Active().Save();
     }
+
+    // Acoustic baking: auto-detect enclosed rooms (reusing the GI/IBL enclosure classifier) and
+    // place an AcousticSpace per room, so large levels don't need every room hand-authored.
+    ImGui::SeparatorText("Acoustic Baking");
+    ImGui::TextDisabled("Auto-detects enclosed rooms and places AcousticSpace regions.");
+    static f32 bakeSpacing = 3.0f;
+    ImGui::SetNextItemWidth(120.0f);
+    ImGui::DragFloat("Cell spacing (m)", &bakeSpacing, 0.1f, 1.0f, 20.0f, "%.1f");
+    if (ImGui::Button("Bake Acoustics (auto rooms)")) {
+        Scene& scene = engine.GetScene();
+        PushUndo(scene);
+        const std::vector<ProbePlacement> cells =
+            AutoPlaceProbes(scene, Project::Active().AssetsDir(), bakeSpacing);
+        std::vector<glm::vec3> pts;
+        pts.reserve(cells.size());
+        for (const ProbePlacement& p : cells) pts.push_back(p.position);
+        const std::vector<AcousticCellCluster> clusters = ClusterAcousticCells(pts, bakeSpacing);
+        entt::registry& reg = scene.Registry();
+        int made = 0;
+        for (const AcousticCellCluster& cl : clusters) {
+            if (cl.cellCount < 1) continue;
+            const glm::vec3 center = (cl.min + cl.max) * 0.5f;
+            const glm::vec3 half = glm::max((cl.max - cl.min) * 0.5f, glm::vec3(1.0f));
+            const entt::entity e = scene.CreateEntity("Baked Room");
+            Transform t;
+            t.position = center;
+            reg.emplace<Transform>(e, t);
+            AcousticSpace sp;
+            sp.halfExtents = half;
+            reg.emplace<AcousticSpace>(e, sp);
+            ++made;
+        }
+        SetSaveStatus("Baked " + std::to_string(made) + " acoustic room(s) from " +
+                          std::to_string(cells.size()) + " interior cells.",
+                      false);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Grids the level, finds enclosed interior cells (reusing the GI enclosure\n"
+                          "classifier), clusters them into rooms, and creates an AcousticSpace per\n"
+                          "room (default materials - tune per room). Existing components are kept.");
     ImGui::End();
 }
 
@@ -17708,6 +17850,47 @@ void Editor::DrawAssetViewer(Engine& engine) {
         texPicker("AO", editedMat_.aoTex);
         texPicker("Emissive Map", editedMat_.emissiveTex);
 
+        // Acoustics: how this surface interacts with sound (physically-informed audio). Pick a
+        // preset to seed absorption/scattering/transmission, then hand-tune - which flips the
+        // stored label to "Custom". Absorption is per octave band.
+        ImGui::SeparatorText("Acoustics");
+        {
+            const std::string curPreset =
+                editedMat_.acousticPreset.empty() ? std::string("Custom") : editedMat_.acousticPreset;
+            if (ImGui::BeginCombo("Acoustic preset", curPreset.c_str())) {
+                for (const AcousticPreset& p : AcousticPresets()) {
+                    if (ImGui::Selectable(p.name, curPreset == p.name)) {
+                        editedMat_.acoustic = p.material;
+                        editedMat_.acousticPreset = p.name;
+                        edited = true;
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            bool ac = false;
+            ac |= ImGui::SliderFloat("Transmission (through)", &editedMat_.acoustic.transmission,
+                                     0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How much sound passes THROUGH this surface.\n"
+                                  "0 = perfect blocker, 1 = acoustically open.");
+            ac |= ImGui::SliderFloat("Scattering", &editedMat_.acoustic.scattering, 0.0f, 1.0f,
+                                     "%.2f");
+            if (ImGui::TreeNode("Absorption (per octave band)")) {
+                static const char* kBandLabels[kAcousticBands] = {
+                    "31 Hz", "63 Hz", "125 Hz", "250 Hz", "500 Hz",
+                    "1 kHz", "2 kHz", "4 kHz", "8 kHz"};
+                for (int b = 0; b < kAcousticBands; ++b)
+                    ac |= ImGui::SliderFloat(kBandLabels[b],
+                                             &editedMat_.acoustic.absorption[static_cast<usize>(b)],
+                                             0.0f, 1.0f, "%.2f");
+                ImGui::TreePop();
+            }
+            if (ac) {
+                editedMat_.acousticPreset = "Custom"; // hand-tuned: no longer matches a preset
+                edited = true;
+            }
+        }
+
         if (edited) {
             editedMatDirty_ = true;
             matPreviewStale = true;
@@ -17813,6 +17996,104 @@ void Editor::DrawAssetViewer(Engine& engine) {
             edited |= ImGui::DragFloat("Max Distance", &editedEvent_.maxDistance, 0.1f,
                                        0.01f, 1000.0f);
         }
+
+        // Composite: each component is a separate 3D source (own offset/attenuation/bus/DSP). When
+        // any exist they REPLACE the flat pool above on post (e.g. Rifle.Fire = Muzzle Blast +
+        // Mechanical + Shell Casing + Near Reflection + Distant Tail).
+        ImGui::SeparatorText("Composite components");
+        ImGui::TextDisabled("Present components REPLACE the flat pool on post; each is its own 3D source.");
+        const std::vector<std::string> compBuses = audio.BusNames();
+        int removeComp = -1;
+        for (int ci = 0; ci < static_cast<int>(editedEvent_.components.size()); ++ci) {
+            AudioEventComponent& c = editedEvent_.components[static_cast<usize>(ci)];
+            ImGui::PushID(2000 + ci);
+            char hdr[128];
+            std::snprintf(hdr, sizeof(hdr), "%s###comp%d",
+                          c.name.empty() ? "Component" : c.name.c_str(), ci);
+            const bool open = ImGui::CollapsingHeader(hdr);
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 24.0f);
+            if (ImGui::SmallButton("X")) removeComp = ci;
+            if (open) {
+                char nb[64];
+                std::snprintf(nb, sizeof(nb), "%s", c.name.c_str());
+                if (ImGui::InputText("Name", nb, sizeof(nb))) {
+                    c.name = nb;
+                    edited = true;
+                }
+                int rmSnd = -1;
+                for (int si = 0; si < static_cast<int>(c.sounds.size()); ++si) {
+                    AudioEventSound& s = c.sounds[static_cast<usize>(si)];
+                    ImGui::PushID(si);
+                    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+                    const std::string cur = s.asset.empty() ? "(none)" : s.asset;
+                    if (ImGui::BeginCombo("##csnd", cur.c_str())) {
+                        for (const std::string& choice : audioChoices)
+                            if (ImGui::Selectable(choice.c_str(), choice == s.asset)) {
+                                s.asset = choice;
+                                edited = true;
+                            }
+                        ImGui::EndCombo();
+                    }
+                    AssetDropTarget(".uaf", uaf::AssetType::Audio,
+                                    [&](const std::filesystem::path& src) {
+                                        s.asset = Project::Active().RelativeAssetPath(src);
+                                        edited = true;
+                                    });
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(70.0f);
+                    edited |= ImGui::DragFloat("##cwt", &s.weight, 0.05f, 0.0f, 100.0f, "w %.2f");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("x")) rmSnd = si;
+                    ImGui::PopID();
+                }
+                if (rmSnd >= 0) {
+                    c.sounds.erase(c.sounds.begin() + rmSnd);
+                    edited = true;
+                }
+                if (ImGui::SmallButton("+ sound")) {
+                    c.sounds.push_back({});
+                    edited = true;
+                }
+                edited |= ImGui::DragFloat3("Offset", glm::value_ptr(c.offset), 0.05f);
+                edited |= ImGui::DragFloat("Delay (s)", &c.delaySeconds, 0.01f, 0.0f, 10.0f, "%.2f");
+                edited |= ImGui::SliderFloat("Volume##c", &c.volume, 0.0f, 2.0f);
+                edited |= ImGui::SliderFloat("Vol Var##c", &c.volumeVariance, 0.0f, 1.0f);
+                edited |= ImGui::SliderFloat("Pitch##c", &c.pitch, 0.25f, 4.0f);
+                edited |= ImGui::SliderFloat("Pitch Var##c", &c.pitchVariance, 0.0f, 1.0f);
+                if (ImGui::BeginCombo("Bus##c", c.bus.empty() ? "(event bus)" : c.bus.c_str())) {
+                    if (ImGui::Selectable("(event bus)", c.bus.empty())) {
+                        c.bus.clear();
+                        edited = true;
+                    }
+                    for (const std::string& b : compBuses)
+                        if (ImGui::Selectable(b.c_str(), b == c.bus)) {
+                            c.bus = b;
+                            edited = true;
+                        }
+                    ImGui::EndCombo();
+                }
+                edited |= ImGui::Checkbox("Spatial##c", &c.spatial);
+                if (c.spatial) {
+                    edited |= ImGui::DragFloat("Min Dist##c", &c.minDistance, 0.1f, 0.01f, 1000.0f);
+                    edited |= ImGui::DragFloat("Max Dist##c", &c.maxDistance, 0.1f, 0.01f, 1000.0f);
+                    edited |= ImGui::SliderFloat("Reverb Send##c", &c.reverbSend, 0.0f, 4.0f);
+                    edited |= ImGui::SliderFloat("Spread (deg)##c", &c.spread, 0.0f, 360.0f);
+                }
+                edited |= ImGui::Checkbox("Loop##c", &c.loop);
+                ImGui::SameLine();
+                edited |= ImGui::Checkbox("Enabled##c", &c.enabled);
+            }
+            ImGui::PopID();
+        }
+        if (removeComp >= 0) {
+            editedEvent_.components.erase(editedEvent_.components.begin() + removeComp);
+            edited = true;
+        }
+        if (ImGui::SmallButton("+ Add component")) {
+            editedEvent_.components.push_back({});
+            edited = true;
+        }
+
         if (edited) editedEventDirty_ = true;
 
         ImGui::Separator();
@@ -19667,6 +19948,18 @@ void Editor::DrawSelectionOutline(Scene& scene, Renderer& renderer) {
         const ImU32 col = mz->active ? IM_COL32(230, 90, 220, 235)
                                      : IM_COL32(170, 90, 220, 200);
         drawBox(m, -mz->halfExtents, mz->halfExtents, col, 1.5f);
+    }
+    // Acoustic space volume (orange = active/listener inside, amber = idle).
+    if (const AcousticSpace* as = reg.try_get<AcousticSpace>(selected_)) {
+        const ImU32 col = as->active ? IM_COL32(255, 170, 60, 235)
+                                     : IM_COL32(210, 150, 70, 200);
+        drawBox(m, -as->halfExtents, as->halfExtents, col, 1.5f);
+    }
+    // Acoustic portal (teal = open, amber = shut).
+    if (const AcousticPortal* ap = reg.try_get<AcousticPortal>(selected_)) {
+        const ImU32 col = ap->openness > 0.5f ? IM_COL32(70, 220, 180, 225)
+                                              : IM_COL32(200, 150, 70, 210);
+        drawBox(m, -ap->halfExtents, ap->halfExtents, col, 1.5f);
     }
     // Camera spline path (control points + connecting lines).
     if (const CameraSpline* sp = reg.try_get<CameraSpline>(selected_)) {

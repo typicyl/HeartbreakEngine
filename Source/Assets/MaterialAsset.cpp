@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <fstream>
 
 namespace hbe::assets {
@@ -34,7 +35,7 @@ glm::vec4 Vec4(const json& j, glm::vec4 def) {
 
 bool SaveMaterial(const fs::path& path, const MaterialAsset& mat) {
     json j;
-    j["version"] = 1;
+    j["version"] = 2; // 2 adds the "acoustic" block (P1 acoustic materials)
     j["name"] = mat.name;
     j["baseColor"] = ToJson(mat.baseColor);
     j["metallic"] = mat.metallic;
@@ -53,6 +54,15 @@ bool SaveMaterial(const fs::path& path, const MaterialAsset& mat) {
     if (!mat.aoTex.empty()) tex["ao"] = mat.aoTex;
     if (!mat.emissiveTex.empty()) tex["emissive"] = mat.emissiveTex;
     if (!mat.thicknessTex.empty()) tex["thickness"] = mat.thicknessTex;
+
+    {
+        json a;
+        a["preset"] = mat.acousticPreset;
+        a["absorption"] = mat.acoustic.absorption; // std::array<f32,9> -> JSON array
+        a["scattering"] = mat.acoustic.scattering;
+        a["transmission"] = mat.acoustic.transmission;
+        j["acoustic"] = std::move(a);
+    }
 
     std::error_code ec;
     fs::create_directories(path.parent_path(), ec);
@@ -95,6 +105,16 @@ std::optional<MaterialAsset> LoadMaterial(const fs::path& path) {
         m.aoTex = it->value("ao", "");
         m.emissiveTex = it->value("emissive", "");
         m.thicknessTex = it->value("thickness", "");
+    }
+    // Acoustic block (absent in v1 files -> keep the default AcousticMaterial + "Default").
+    if (const auto it = j.find("acoustic"); it != j.end() && it->is_object()) {
+        m.acousticPreset = it->value("preset", std::string("Default"));
+        if (const auto ab = it->find("absorption"); ab != it->end() && ab->is_array()) {
+            const int n = std::min<int>(kAcousticBands, static_cast<int>(ab->size()));
+            for (int i = 0; i < n; ++i) m.acoustic.absorption[static_cast<usize>(i)] = (*ab)[i].get<f32>();
+        }
+        m.acoustic.scattering = it->value("scattering", m.acoustic.scattering);
+        m.acoustic.transmission = it->value("transmission", m.acoustic.transmission);
     }
     return m;
 }

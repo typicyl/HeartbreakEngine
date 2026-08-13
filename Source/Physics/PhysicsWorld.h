@@ -13,6 +13,7 @@
 
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace hbe {
 
@@ -82,6 +83,19 @@ public:
         entt::entity entity = entt::null; // entt::null when the body has no entity
     };
     RayHit RaycastDetailed(const glm::vec3& origin, const glm::vec3& dir, f32 maxDist) const;
+
+    // ALL world hits along `origin + dir*maxDist`, nearest first. A single closest hit is enough
+    // for line-of-sight, but acoustics needs every wall between a source and the listener (each
+    // contributes transmission loss), so this collects them all. `dir` need not be unit; distances
+    // are true world distances; normals are not computed (cheaper). Main-thread only, like the
+    // other raycasts.
+    struct RayHitAll {
+        f32 distance = 0.0f;
+        glm::vec3 point{0.0f};
+        entt::entity entity = entt::null;
+    };
+    void RaycastAll(const glm::vec3& origin, const glm::vec3& dir, f32 maxDist,
+                    std::vector<RayHitAll>& out) const;
 
     // -- Contact events -------------------------------------------------------
     // A collision that exceeded `SetContactReportThreshold`. Destruction breaks on

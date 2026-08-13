@@ -461,6 +461,8 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const CameraComponent>()) add(e);
     for (const entt::entity e : reg.view<const CameraZone>()) add(e);
     for (const entt::entity e : reg.view<const MusicZone>()) add(e);
+    for (const entt::entity e : reg.view<const AcousticSpace>()) add(e);
+    for (const entt::entity e : reg.view<const AcousticPortal>()) add(e);
     for (const entt::entity e : reg.view<const CameraSpline>()) add(e);
     for (const entt::entity e : reg.view<const TerrainComponent>()) add(e);
     for (const entt::entity e : reg.view<const MotionMatching>()) add(e);
@@ -962,6 +964,23 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                {"fadeSeconds", mz->fadeSeconds},
                                {"priority", mz->priority},
                                {"enabled", mz->enabled}};
+        }
+        if (const AcousticSpace* as = reg.try_get<AcousticSpace>(e)) {
+            je["acousticSpace"] = {{"halfExtents", ToJson(as->halfExtents)},
+                                   {"wallMaterial", as->wallMaterial},
+                                   {"floorMaterial", as->floorMaterial},
+                                   {"ceilingMaterial", as->ceilingMaterial},
+                                   {"reverbGain", as->reverbGain},
+                                   {"reverbTime", as->reverbTime},
+                                   {"reflectionGain", as->reflectionGain},
+                                   {"priority", as->priority},
+                                   {"enabled", as->enabled}};
+        }
+        if (const AcousticPortal* ap = reg.try_get<AcousticPortal>(e)) {
+            je["acousticPortal"] = {{"halfExtents", ToJson(ap->halfExtents)},
+                                    {"closedMaterial", ap->closedMaterial},
+                                    {"openness", ap->openness},
+                                    {"enabled", ap->enabled}};
         }
         if (const CameraSpline* sp = reg.try_get<CameraSpline>(e)) {
             json pts = json::array();
@@ -1790,6 +1809,27 @@ void ParseSceneJson(const json& root, SceneData& out) {
             mz.fadeSeconds = it->value("fadeSeconds", -1.0f);
             mz.priority = it->value("priority", 0);
             mz.enabled = it->value("enabled", true);
+        }
+        if (auto it = je.find("acousticSpace"); it != je.end()) {
+            d.hasAcousticSpace = true;
+            AcousticSpace& as = d.acousticSpace;
+            as.halfExtents = Vec3(it->value("halfExtents", json()), as.halfExtents);
+            as.wallMaterial = it->value("wallMaterial", as.wallMaterial);
+            as.floorMaterial = it->value("floorMaterial", as.floorMaterial);
+            as.ceilingMaterial = it->value("ceilingMaterial", as.ceilingMaterial);
+            as.reverbGain = it->value("reverbGain", 1.0f);
+            as.reverbTime = it->value("reverbTime", 1.0f);
+            as.reflectionGain = it->value("reflectionGain", 1.0f);
+            as.priority = it->value("priority", 0);
+            as.enabled = it->value("enabled", true);
+        }
+        if (auto it = je.find("acousticPortal"); it != je.end()) {
+            d.hasAcousticPortal = true;
+            AcousticPortal& ap = d.acousticPortal;
+            ap.halfExtents = Vec3(it->value("halfExtents", json()), ap.halfExtents);
+            ap.closedMaterial = it->value("closedMaterial", ap.closedMaterial);
+            ap.openness = it->value("openness", 1.0f);
+            ap.enabled = it->value("enabled", true);
         }
         if (auto it = je.find("cameraSpline"); it != je.end()) {
             d.hasCameraSpline = true;
@@ -3112,6 +3152,8 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasCamera) reg.emplace<CameraComponent>(e, d.camera);
         if (d.hasCameraZone) reg.emplace<CameraZone>(e, d.cameraZone);
         if (d.hasMusicZone) reg.emplace<MusicZone>(e, d.musicZone);
+        if (d.hasAcousticSpace) reg.emplace<AcousticSpace>(e, d.acousticSpace);
+        if (d.hasAcousticPortal) reg.emplace<AcousticPortal>(e, d.acousticPortal);
         if (d.hasCameraSpline) reg.emplace<CameraSpline>(e, d.cameraSpline);
         if (d.hasPaint && !d.paintSource.empty()) {
             // A MISSING CANVAS MUST NOT DELETE THE PAINT COMPONENT. Same rule, same
@@ -4892,6 +4934,8 @@ HBE_PLAIN_DELTA(Cam, "camera", hasCamera, camera, CameraComponent)
 HBE_PLAIN_DELTA(CamZone, "cameraZone", hasCameraZone, cameraZone, CameraZone)
 HBE_PLAIN_DELTA(CamSpline, "cameraSpline", hasCameraSpline, cameraSpline, CameraSpline)
 HBE_PLAIN_DELTA(MusZone, "musicZone", hasMusicZone, musicZone, MusicZone)
+HBE_PLAIN_DELTA(AcSpace, "acousticSpace", hasAcousticSpace, acousticSpace, AcousticSpace)
+HBE_PLAIN_DELTA(AcPortal, "acousticPortal", hasAcousticPortal, acousticPortal, AcousticPortal)
 HBE_PLAIN_DELTA(PostVol, "postVolume", hasPostVolume, postVolume, PostVolume)
 HBE_PLAIN_DELTA(Interact, "interactable", hasInteractable, interactable, Interactable)
 HBE_PLAIN_DELTA(Trig, "trigger", hasTrigger, trigger, TriggerVolume)
@@ -4929,6 +4973,8 @@ const DeltaApplier kAppliers[] = {
     {"cameraZone", &CamZoneApply, &CamZoneRemove},
     {"cameraSpline", &CamSplineApply, &CamSplineRemove},
     {"musicZone", &MusZoneApply, &MusZoneRemove},
+    {"acousticSpace", &AcSpaceApply, &AcSpaceRemove},
+    {"acousticPortal", &AcPortalApply, &AcPortalRemove},
     {"postVolume", &PostVolApply, &PostVolRemove},
     {"interactable", &InteractApply, &InteractRemove},
     {"trigger", &TrigApply, &TrigRemove},

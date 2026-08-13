@@ -45,6 +45,7 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/UAP.cpp"
     "Source/Assets/VFS.cpp"
     "Source/Assets/MaterialAsset.cpp"
+    "Source/Assets/AcousticMaterial.cpp"
     "Source/Assets/CharacterAsset.cpp"
     "Source/Assets/SeamWeld.cpp"
     "Source/Assets/CharacterBuild.cpp"
@@ -131,7 +132,9 @@ set(HBE_VFX_SOURCES
 
 set(HBE_AUDIO_SOURCES
     "Source/Audio/AudioSystem.cpp"
-    "Source/Audio/SpatializerResonance.cpp")
+    "Source/Audio/SpatializerResonance.cpp"
+    "Source/Audio/AcousticQuery.cpp"
+    "Source/Audio/AcousticWorld.cpp")
 
 set(HBE_PROJECT_SOURCES
     "Source/Project/Project.cpp")

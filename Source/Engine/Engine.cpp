@@ -8,6 +8,7 @@
 #include "Assets/Fracture.h"      // --fracturetest smoke test
 #include "Assets/MeshGenerator.h" // GenerateCube for the fracture test
 #include "Assets/VFS.h"
+#include "Audio/AcousticWorld.h"
 #include "Audio/AudioSystem.h"
 #include "Core/Input.h"
 #include "Core/JobSystem.h"
@@ -1093,6 +1094,7 @@ int Engine::Run(const EngineConfig& configIn) {
     HBE_INFO("Boot: window created.");
 
     Renderer renderer;
+    AcousticWorld acoustics; // scene-driven room reverb/reflections (physically-informed audio)
     bool rendererReady = false;
     for (rhi::GraphicsAPI api : backendOrder) {
         if (!rhi::IsBackendCompiled(api)) {
@@ -2139,22 +2141,21 @@ int Engine::Run(const EngineConfig& configIn) {
             const SpatialAudioSettings& sa = psettings.spatialAudio;
             audio.SetSpatialMode(sa.binaural, sa.speakerMode);
         }
-        std::function<bool(const glm::vec3&, const glm::vec3&)> segBlocked;
+        const std::filesystem::path audioAssetsDir =
+            Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+        // Material-aware occlusion: fraction of sound energy reaching the listener through
+        // intervening geometry (each wall attenuates by its acoustic transmission; doorways pass).
+        std::function<f32(const glm::vec3&, const glm::vec3&)> segTransmit;
         if (physics.IsRunning()) {
-            segBlocked = [&physics](const glm::vec3& a, const glm::vec3& b) {
-                glm::vec3 d = b - a;
-                const f32 len = glm::length(d);
-                if (len < 1e-3f) return false;
-                return physics.Raycast(a, d / len, len) < len - 0.05f; // blocked before reaching b
+            segTransmit = [&physics, &scene, &acoustics, &audioAssetsDir](const glm::vec3& a,
+                                                                          const glm::vec3& b) {
+                return acoustics.SegmentTransmission(physics, scene, a, b, audioAssetsDir);
             };
         }
-        audio.UpdateScene(scene,
-                          Project::HasActive() ? Project::Active().AssetsDir()
-                                               : std::filesystem::path(),
-                          renderer.GetCamera().Position(),
+        audio.UpdateScene(scene, audioAssetsDir, renderer.GetCamera().Position(),
                           renderer.GetCamera().Forward(),
                           physics.IsRunning(), // autoplay only when the game runs
-                          segBlocked, dt);
+                          segTransmit, dt);
         audio.Update();
         // Adaptive music: install + start the project's graph on the edge into the
         // running game; crossfade out when it stops. Parameters/state are then driven
@@ -2354,6 +2355,10 @@ int Engine::Run(const EngineConfig& configIn) {
         // ran earlier with last frame's camera; this refreshes the binaural head + miniaudio
         // listener so 3D direction/distance track the camera without a frame of lag.
         audio.SetListenerPose(renderer.GetCamera().Position(), renderer.GetCamera().Forward());
+
+        // Room acoustics: drive the listener's reverb + early reflections from the AcousticSpace
+        // it occupies (uses this frame's post-camera listener). No-op without binaural audio.
+        acoustics.Update(scene, renderer.GetCamera().Position(), audioAssetsDir, audio);
 
         // Particles: simulate (spawn + integrate) and build this frame's billboards
         // against the camera basis. Emit even in the editor so emitters preview live.

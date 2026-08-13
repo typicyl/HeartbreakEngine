@@ -22,6 +22,7 @@
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/CollisionCollectorImpl.h> // AllHitCollisionCollector (RaycastAll)
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
@@ -560,6 +561,27 @@ PhysicsWorld::RayHit PhysicsWorld::RaycastDetailed(const glm::vec3& origin, cons
         out.normal = {n.GetX(), n.GetY(), n.GetZ()};
     }
     return out;
+}
+
+void PhysicsWorld::RaycastAll(const glm::vec3& origin, const glm::vec3& dir, f32 maxDist,
+                             std::vector<RayHitAll>& out) const {
+    out.clear();
+    if (!impl_ || maxDist <= 0.0f) return;
+    const glm::vec3 unit = glm::length(dir) > 1e-6f ? glm::normalize(dir) : glm::vec3(0, 0, -1);
+    const JPH::RRayCast ray{ToJph(origin), ToJph(unit) * maxDist};
+    JPH::RayCastSettings settings; // defaults: ignore back faces, treat convex as solid
+    JPH::AllHitCollisionCollector<JPH::CastRayCollector> collector;
+    impl_->system.GetNarrowPhaseQuery().CastRay(ray, settings, collector);
+    if (collector.mHits.empty()) return;
+    collector.Sort(); // nearest first
+    out.reserve(collector.mHits.size());
+    for (const JPH::RayCastResult& r : collector.mHits) {
+        RayHitAll h;
+        h.distance = r.mFraction * maxDist;
+        h.point = origin + unit * h.distance;
+        h.entity = impl_->EntityForBody(r.mBodyID.GetIndexAndSequenceNumber());
+        out.push_back(h);
+    }
 }
 
 void PhysicsWorld::SetContactReportThreshold(f32 impulse) {

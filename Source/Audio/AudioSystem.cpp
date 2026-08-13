@@ -206,8 +206,8 @@ struct AudioSystem::Impl {
     // direct ray plus a ring of offset rays around the source: if some offset ray
     // finds a clear path (a doorway/gap), occlusion drops and the sound leaks.
     f32 ComputeOcclusion(const glm::vec3& src, const glm::vec3& listener,
-                         const std::function<bool(const glm::vec3&, const glm::vec3&)>& blocked) const {
-        if (!blocked) return 0.0f;
+                         const std::function<f32(const glm::vec3&, const glm::vec3&)>& transmit) const {
+        if (!transmit) return 0.0f;
         glm::vec3 dir = listener - src;
         const f32 len = glm::length(dir);
         if (len < 1e-3f) return 0.0f;
@@ -219,14 +219,44 @@ struct AudioSystem::Impl {
         const glm::vec3 t1 = glm::normalize(glm::cross(dir, up));
         const glm::vec3 t2 = glm::cross(dir, t1);
         const int rays = glm::clamp(occlusion.rays, 1, 16);
-        int hit = 0;
-        if (blocked(o0, listener)) ++hit;
+        // Occlusion = 1 - average TRANSMISSION over the ray fan. The direct line plus a ring of
+        // offset rays: a ray through concrete transmits little (high occlusion), one through a
+        // doorway transmits fully (leaks through the gap), so material AND openings both shape it.
+        f32 sum = glm::clamp(transmit(o0, listener), 0.0f, 1.0f);
         for (int i = 1; i < rays; ++i) {
             const f32 a = 6.2831853f * static_cast<f32>(i) / static_cast<f32>(glm::max(rays - 1, 1));
             const glm::vec3 off = (t1 * std::cos(a) + t2 * std::sin(a)) * occlusion.spread;
-            if (blocked(o0 + off, listener)) ++hit;
+            sum += glm::clamp(transmit(o0 + off, listener), 0.0f, 1.0f);
         }
-        return static_cast<f32>(hit) / static_cast<f32>(rays);
+        return glm::clamp(1.0f - sum / static_cast<f32>(rays), 0.0f, 1.0f);
+    }
+
+    // Directional diffraction: when the DIRECT path to a source is heavily occluded but an open
+    // AcousticPortal offers a clearer path, the sound should appear to come from the DOORWAY, not
+    // through the wall. Returns an apparent emit position pulled toward the best open portal (the
+    // true position when the direct path is clear or no portal helps). Reuses the transmission
+    // callback + the scene's portals; position-only, so a wrong guess never silences a voice.
+    glm::vec3 DiffractedPosition(Scene& scene, const glm::vec3& src, const glm::vec3& listener,
+                                 const std::function<f32(const glm::vec3&, const glm::vec3&)>& transmit) {
+        if (!transmit) return src;
+        const f32 directT = glm::clamp(transmit(src, listener), 0.0f, 1.0f);
+        if (directT >= 0.5f) return src; // direct path mostly clear -> no diffraction
+        entt::registry& reg = scene.Registry();
+        f32 bestScore = directT + 0.15f; // require a meaningfully clearer portal path
+        glm::vec3 best(0.0f);
+        bool found = false;
+        for (const entt::entity e : reg.view<AcousticPortal>()) {
+            const AcousticPortal& p = reg.get<AcousticPortal>(e);
+            if (!p.enabled || p.openness < 0.4f || !reg.all_of<Transform>(e)) continue;
+            const glm::vec3 c = glm::vec3(scene.WorldMatrix(e)[3]);
+            const f32 t = glm::min(transmit(src, c), transmit(c, listener)) * p.openness;
+            if (t > bestScore) {
+                bestScore = t;
+                best = c;
+                found = true;
+            }
+        }
+        return found ? glm::mix(src, best, glm::clamp(1.0f - directT, 0.3f, 1.0f)) : src;
     }
 
     // Glide a voice's occlusion toward `target` and apply attenuation + LPF cutoff.
@@ -422,7 +452,7 @@ struct AudioSystem::Impl {
     Voice* StartVoice(const void* pcm, usize bytes, u32 channels, u32 sampleRate,
                       u32 bitsPerSample, const std::string& bus, f32 volume,
                       f32 pitch, bool loop, const glm::vec3* position,
-                      f32 minDist, f32 maxDist) {
+                      f32 minDist, f32 maxDist, f32 startDelaySec = 0.0f) {
         if (!ready || !pcm || bytes == 0 || channels == 0 || sampleRate == 0) {
             return nullptr;
         }
@@ -488,8 +518,74 @@ struct AudioSystem::Impl {
                 resonance.SetSource(v.resSlot, *position, volume * SpatialBusGainToNode(bus),
                                     0.0f, minDist, maxDist);
         }
+        // Scheduled start (composite-event component delays): miniaudio starts the voice at a
+        // future engine time, so the shell casing / distant tail lag the muzzle blast without a
+        // bespoke scheduler. The voice exists immediately (occlusion tracks it) but is silent until.
+        if (startDelaySec > 0.0f) {
+            const ma_uint64 startMs = ma_engine_get_time_in_milliseconds(&engine) +
+                                      static_cast<ma_uint64>(startDelaySec * 1000.0f);
+            ma_sound_set_start_time_in_milliseconds(&v.sound, startMs);
+        }
         ma_sound_start(&v.sound);
         return &v;
+    }
+
+    // Weighted-random pick from a sound pool (nullptr if empty).
+    const AudioEventSound* WeightedPick(const std::vector<AudioEventSound>& sounds) {
+        if (sounds.empty()) return nullptr;
+        f32 total = 0.0f;
+        for (const AudioEventSound& s : sounds) total += glm::max(s.weight, 0.0f);
+        const AudioEventSound* pick = &sounds.front();
+        if (total > 0.0f) {
+            std::uniform_real_distribution<f32> dist(0.0f, total);
+            f32 r = dist(rng);
+            for (const AudioEventSound& s : sounds) {
+                r -= glm::max(s.weight, 0.0f);
+                if (r <= 0.0f) {
+                    pick = &s;
+                    break;
+                }
+            }
+        }
+        return pick;
+    }
+
+    // Composite event: spawn one voice per component (each at its own offset/attenuation/bus/DSP),
+    // all sharing one group id so StopEvent(id) stops the whole event. Returns the group id (0 =
+    // nothing played).
+    u32 PostComposite(const AudioEvent& ev, const std::filesystem::path& assetsDir,
+                      const glm::vec3* position) {
+        const u32 groupId = nextVoiceId++;
+        std::uniform_real_distribution<f32> unit(-1.0f, 1.0f);
+        bool any = false;
+        for (const AudioEventComponent& c : ev.components) {
+            if (!c.enabled) continue;
+            const AudioEventSound* pick = WeightedPick(c.sounds);
+            if (!pick || pick->asset.empty()) continue;
+            const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / pick->asset);
+            if (!audio) {
+                HBE_WARN("Audio: event component '{}' sound '{}' failed to load.", c.name,
+                         pick->asset);
+                continue;
+            }
+            const f32 vol = glm::max(0.0f, c.volume + unit(rng) * c.volumeVariance);
+            const f32 pitch = glm::max(0.05f, c.pitch + unit(rng) * c.pitchVariance);
+            glm::vec3 compPos;
+            const glm::vec3* posPtr = nullptr;
+            if (c.spatial && position != nullptr) {
+                compPos = *position + c.offset; // component sits at the event origin + its offset
+                posPtr = &compPos;
+            }
+            Voice* v = StartVoice(audio->pcm.data(), audio->pcm.size(), audio->channels,
+                                  audio->sampleRate, audio->bitsPerSample,
+                                  c.bus.empty() ? ev.bus : c.bus, vol, pitch, c.loop, posPtr,
+                                  c.minDistance, c.maxDistance, c.delaySeconds);
+            if (!v) continue;
+            v->id = groupId;
+            if (v->resSlot >= 0) resonance.SetSourceParams(v->resSlot, c.reverbSend, c.spread);
+            any = true;
+        }
+        return any ? groupId : 0;
     }
 
     ~Impl() {
@@ -684,21 +780,14 @@ std::string AudioSystem::DeviceName() const {
 
 u32 AudioSystem::PostEvent(const AudioEvent& ev, const std::filesystem::path& assetsDir,
                            const glm::vec3* position) {
-    if (!IsAvailable() || ev.sounds.empty()) return 0;
+    if (!IsAvailable()) return 0;
+    // Composite event: spawn one voice per component (each its own offset/attenuation/bus/DSP).
+    if (!ev.components.empty()) return impl_->PostComposite(ev, assetsDir, position);
+    if (ev.sounds.empty()) return 0;
 
-    // Weighted random pick from the event's sound pool.
-    f32 total = 0.0f;
-    for (const AudioEventSound& s : ev.sounds) total += glm::max(s.weight, 0.0f);
-    const AudioEventSound* pick = &ev.sounds.front();
-    if (total > 0.0f) {
-        std::uniform_real_distribution<f32> dist(0.0f, total);
-        f32 r = dist(impl_->rng);
-        for (const AudioEventSound& s : ev.sounds) {
-            r -= glm::max(s.weight, 0.0f);
-            if (r <= 0.0f) { pick = &s; break; }
-        }
-    }
-    if (pick->asset.empty()) return 0;
+    // Flat event: weighted random pick from the event's sound pool.
+    const AudioEventSound* pick = impl_->WeightedPick(ev.sounds);
+    if (!pick || pick->asset.empty()) return 0;
 
     const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / pick->asset);
     if (!audio) {
@@ -723,13 +812,15 @@ u32 AudioSystem::PostEvent(const AudioEvent& ev, const std::filesystem::path& as
 
 void AudioSystem::StopEvent(u32 voiceId) {
     if (!IsAvailable() || voiceId == 0) return;
-    for (auto it = impl_->voices.begin(); it != impl_->voices.end(); ++it) {
+    // Stop EVERY voice with this id: a composite event shares one group id across its components.
+    for (auto it = impl_->voices.begin(); it != impl_->voices.end();) {
         if (it->id == voiceId) {
             ma_sound_uninit(&it->sound);
             impl_->DestroyLpf(*it);
             ma_audio_buffer_uninit(&it->buffer);
-            impl_->voices.erase(it);
-            return;
+            it = impl_->voices.erase(it);
+        } else {
+            ++it;
         }
     }
 }
@@ -827,6 +918,10 @@ void AudioSystem::SetListenerPose(const glm::vec3& pos, const glm::vec3& forward
     ma_engine_listener_set_world_up(&impl_->engine, 0, 0.0f, 1.0f, 0.0f);
     if (impl_->BinauralActive())
         impl_->resonance.SetListener(pos, impl_->listenerFwd, glm::vec3(0.0f, 1.0f, 0.0f));
+}
+
+void AudioSystem::SetRoom(const AcousticRoom& room, bool enabled) {
+    if (impl_) impl_->resonance.SetRoom(room, enabled); // no-op when the backend is unavailable
 }
 
 void AudioSystem::SetMusicGraph(const MusicGraph& graph,
@@ -1054,10 +1149,10 @@ void AudioSystem::Update() {
 void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsDir,
                               const glm::vec3& listenerPos,
                               const glm::vec3& listenerForward, bool gamePlaying,
-                              const std::function<bool(const glm::vec3&, const glm::vec3&)>& segmentBlocked,
+                              const std::function<f32(const glm::vec3&, const glm::vec3&)>& segmentTransmission,
                               f32 dt) {
     if (!IsAvailable()) return;
-    const bool occlude = impl_->occlusion.enabled && static_cast<bool>(segmentBlocked);
+    const bool occlude = impl_->occlusion.enabled && static_cast<bool>(segmentTransmission);
     // Autoplay arms on the edge into "game running" (the runtime is playing from
     // frame 1; the editor only in play mode), so opening/viewing a scene in the
     // editor no longer triggers its audio.
@@ -1177,8 +1272,10 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
             // pre-multiplied by the bus-chain gain because a binaural voice bypasses its own
             // group (Master is still applied by the group the node feeds).
             const f32 occ =
-                occlude ? impl_->ComputeOcclusion(pos, lisPos, segmentBlocked) : 0.0f;
-            impl_->resonance.SetSource(sv.voice.resSlot, pos,
+                occlude ? impl_->ComputeOcclusion(pos, lisPos, segmentTransmission) : 0.0f;
+            const glm::vec3 apparent =
+                occlude ? impl_->DiffractedPosition(scene, pos, lisPos, segmentTransmission) : pos;
+            impl_->resonance.SetSource(sv.voice.resSlot, apparent,
                                        src.volume * impl_->SpatialBusGainToNode(sv.bus), occ,
                                        src.minDistance, src.maxDistance);
         } else {
@@ -1189,7 +1286,7 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
             ma_sound_set_max_distance(snd, glm::max(src.maxDistance, src.minDistance + 0.01f));
             if (occlude)
                 impl_->ApplyOcclusion(
-                    sv.voice, impl_->ComputeOcclusion(pos, lisPos, segmentBlocked), dt);
+                    sv.voice, impl_->ComputeOcclusion(pos, lisPos, segmentTransmission), dt);
             else
                 impl_->ClearOcclusion(sv.voice); // occlusion off -> base volume + open LPF
         }
@@ -1226,14 +1323,17 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
         if (!v.spatial) continue;
         if (v.resSlot >= 0) {
             const f32 occ =
-                occlude ? impl_->ComputeOcclusion(v.worldPos, lisPos, segmentBlocked) : 0.0f;
-            impl_->resonance.SetSource(v.resSlot, v.worldPos,
+                occlude ? impl_->ComputeOcclusion(v.worldPos, lisPos, segmentTransmission) : 0.0f;
+            const glm::vec3 apparent =
+                occlude ? impl_->DiffractedPosition(scene, v.worldPos, lisPos, segmentTransmission)
+                        : v.worldPos;
+            impl_->resonance.SetSource(v.resSlot, apparent,
                                        v.baseVolume * impl_->SpatialBusGainToNode(v.bus), occ,
                                        v.minDist, v.maxDist);
             continue;
         }
         if (occlude)
-            impl_->ApplyOcclusion(v, impl_->ComputeOcclusion(v.worldPos, lisPos, segmentBlocked),
+            impl_->ApplyOcclusion(v, impl_->ComputeOcclusion(v.worldPos, lisPos, segmentTransmission),
                                   dt);
         else if (v.occ != 0.0f || (v.hasLpf && v.curCutoff < Impl::kOpenCutoff - 20.0f))
             impl_->ClearOcclusion(v);

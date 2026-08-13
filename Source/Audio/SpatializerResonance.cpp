@@ -284,6 +284,43 @@ void ResonanceSpatializer::SetSpeakerMode(bool speakers) {
     impl_->api->SetStereoSpeakerMode(speakers);
 }
 
+void ResonanceSpatializer::SetSourceParams(int slot, f32 reverbSend, f32 spreadDeg) {
+    if (!IsReady() || slot < 0 || slot >= kMaxSources) return;
+    const auto id = impl_->sourceId[slot];
+    impl_->api->SetSourceRoomEffectsGain(id, glm::max(reverbSend, 0.0f));
+    impl_->api->SetSoundObjectSpread(id, glm::clamp(spreadDeg, 0.0f, 360.0f));
+}
+
+void ResonanceSpatializer::SetRoom(const AcousticRoom& room, bool enabled) {
+    if (!IsReady()) return;
+    if (!enabled) {
+        impl_->api->EnableRoomEffects(false);
+        return;
+    }
+    vraudio::ReflectionProperties refl; // zero-initialized by its ctor
+    refl.room_position[0] = room.position.x;
+    refl.room_position[1] = room.position.y;
+    refl.room_position[2] = room.position.z;
+    refl.room_rotation[0] = room.rotation.x; // vraudio wants (x,y,z,w)
+    refl.room_rotation[1] = room.rotation.y;
+    refl.room_rotation[2] = room.rotation.z;
+    refl.room_rotation[3] = room.rotation.w;
+    refl.room_dimensions[0] = room.dimensions.x;
+    refl.room_dimensions[1] = room.dimensions.y;
+    refl.room_dimensions[2] = room.dimensions.z;
+    refl.cutoff_frequency = room.reflectionCutoffHz;
+    for (int i = 0; i < 6; ++i) refl.coefficients[i] = room.reflectionCoeff[i];
+    refl.gain = room.reflectionGain;
+    impl_->api->SetReflectionProperties(refl);
+
+    vraudio::ReverbProperties rev; // zero-initialized by its ctor
+    for (int i = 0; i < 9; ++i) rev.rt60_values[i] = room.rt60[i];
+    rev.gain = room.reverbGain;
+    impl_->api->SetReverbProperties(rev);
+
+    impl_->api->EnableRoomEffects(true);
+}
+
 int ResonanceSpatializer::Capacity() { return kMaxSources; }
 
 } // namespace hbe
@@ -305,6 +342,8 @@ void ResonanceSpatializer::ReleaseSource(int) {}
 void ResonanceSpatializer::SetListener(const glm::vec3&, const glm::vec3&, const glm::vec3&) {}
 void ResonanceSpatializer::SetSource(int, const glm::vec3&, f32, f32, f32, f32) {}
 void ResonanceSpatializer::SetSpeakerMode(bool) {}
+void ResonanceSpatializer::SetRoom(const AcousticRoom&, bool) {}
+void ResonanceSpatializer::SetSourceParams(int, f32, f32) {}
 int ResonanceSpatializer::Capacity() { return 0; }
 
 } // namespace hbe

@@ -16,6 +16,9 @@
 #include "Assets/MeshSimplify.h"
 #include "Assets/MeshOptimize.h" // --test-meshopt (import-time GPU geometry optimize)
 #include "Assets/MeshFaceSelect.h"
+#include "Assets/AudioEvent.h"   // --test-acoustics (composite event round-trip)
+#include "Audio/AcousticQuery.h" // --test-acoustics (acoustic materials + resolution)
+#include "Audio/AcousticWorld.h" // --test-acoustics (room-acoustics math)
 #include "Core/Platform.h"
 #include "Assets/SlotIds.h"      // --test-slotids / --migrate-slots (pack slot identity)
 #include "Assets/MusicGraph.h"   // --test-musicvoice (music director lifecycle)
@@ -371,6 +374,17 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-bodyshape") == 0) {
             const bool ok = hbe::bodyshape::SelfTest();
             std::printf("bodyshape %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-acoustics: acoustic-material presets, .hbmat acoustic round-trip, and
+        // entity -> AcousticMaterial resolution + caching (physically-informed audio P1).
+        // Headless, no GPU/window/project.
+        if (std::strcmp(argv[i], "--test-acoustics") == 0) {
+            const bool matOk = hbe::AcousticSelfTest();
+            const bool roomOk = hbe::AcousticRoomSelfTest();
+            const bool evOk = hbe::assets::AudioEventSelfTest();
+            const bool ok = matOk && roomOk && evOk;
+            std::printf("acoustics %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-assetformats: the ASSET REGISTRY's own invariants. Assets/

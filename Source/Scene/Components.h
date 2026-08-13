@@ -875,6 +875,39 @@ struct MusicZone {
     bool active = false;          // runtime state (set by the engine's music-zone update)
 };
 
+// A ROOM / enclosed acoustic space: a box region whose dimensions + wall/floor/ceiling acoustic
+// materials define the reverberation + early reflections heard while the LISTENER is inside it.
+// The highest-priority enabled space containing the listener drives the spatial backend's room
+// acoustics (AcousticWorld); outside all spaces the listener hears no room (dry / outdoors). Box
+// uses this entity's Transform, like MusicZone. Materials are acoustic-preset names (see
+// Assets/AcousticMaterial.h). Part of the physically-informed audio system (see
+// docs/Design-HeartbreakAcoustics.md).
+struct AcousticSpace {
+    glm::vec3 halfExtents{6.0f, 3.0f, 6.0f};              // local box half-size (scaled by world scale)
+    std::string wallMaterial = "Drywall / Sheetrock";    // the four side walls (-x,+x,-z,+z)
+    std::string floorMaterial = "Concrete (sealed)";     // -y face
+    std::string ceilingMaterial = "Acoustic Ceiling Tile"; // +y face
+    f32 reverbGain = 1.0f;      // scales the late-reverb tail level
+    f32 reverbTime = 1.0f;      // scales RT60 (>1 = longer tail)
+    f32 reflectionGain = 1.0f;  // scales the early-reflections level
+    int priority = 0;           // higher wins when spaces overlap
+    bool enabled = true;
+    bool active = false;        // runtime state (set by the room driver; not serialized)
+};
+
+// An ACOUSTIC PORTAL: a doorway / window / opening that lets sound pass through what is
+// otherwise a wall. A box region; when a source->listener transmission ray passes through it, the
+// wall it hits there is treated as this opening instead - `openness` 1 = fully open (sound passes),
+// 0 = closed (uses `closedMaterial`, e.g. a shut door). Lets a dynamic door open/close its acoustic
+// hole without re-authoring geometry. Box uses this entity's Transform. Part of the physically-
+// informed audio system (see docs/Design-HeartbreakAcoustics.md).
+struct AcousticPortal {
+    glm::vec3 halfExtents{0.9f, 1.2f, 0.25f}; // a doorway-ish thin box (local, scaled by world)
+    std::string closedMaterial = "Wood Panel"; // acoustic material when closed (openness 0)
+    f32 openness = 1.0f;        // 0 = shut (closedMaterial), 1 = fully open (sound passes freely)
+    bool enabled = true;
+};
+
 // A path of WORLD-space control points a Spline-mode camera travels along (a
 // Catmull-Rom curve through the points). Reference it by this entity's Name from
 // a CameraComponent's `spline` field.

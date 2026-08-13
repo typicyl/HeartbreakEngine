@@ -11,6 +11,7 @@
 // includes it.
 #pragma once
 
+#include "Audio/AcousticRoom.h" // engine POD for room acoustics (SetRoom)
 #include "Core/Types.h"
 #include "UI/Subtitles.h" // structured caption lines (speaker / text / kind)
 
@@ -128,6 +129,12 @@ public:
     // acoustic computation reads. Cheap; safe to call every frame.
     void SetListenerPose(const glm::vec3& pos, const glm::vec3& forward);
 
+    // Sets (or disables when `enabled` is false) the listener's room acoustics - shoebox early
+    // reflections + late reverb applied to the binaural spatial path. Driven by AcousticWorld from
+    // the AcousticSpace the listener occupies. A no-op on the panning path (miniaudio has no reverb)
+    // and when the Resonance backend is unavailable. See Audio/AcousticRoom.h.
+    void SetRoom(const AcousticRoom& room, bool enabled);
+
     // -- Adaptive music director -------------------------------------------------
     // Interactive music: a graph of STATES (each a set of synced looping LAYERS)
     // that crossfade, with runtime PARAMETERS that fade layers in/out for a smooth,
@@ -177,14 +184,17 @@ public:
     // `gamePlaying` is the simulation state: autoplay sources arm only when the
     // GAME runs (play mode / runtime), so merely viewing a scene in the editor
     // stays silent. The inspector's manual Play button still previews anytime.
-    // `segmentBlocked(a, b)` returns true when world geometry blocks the segment a->b
-    // (the engine wraps a physics raycast). When set and occlusion is enabled, every
-    // spatial voice is attenuated/muffled by obstruction each frame. `dt` drives the
-    // smooth glide of the occlusion amount (0 = snap).
+    // `segmentTransmission(a, b)` returns the fraction of sound energy in [0,1] that reaches b
+    // from a through world geometry: 1 = clear line, 0 = fully blocked. The engine wraps a
+    // MATERIAL-AWARE multi-hit raycast (each intervening wall attenuates by its transmission, and
+    // doorways/openings pass sound), so a source behind concrete is muffled far more than one
+    // behind glass, and sound still leaks through gaps. When set and occlusion is enabled, every
+    // spatial voice is attenuated/muffled by obstruction each frame. `dt` drives the smooth glide
+    // of the occlusion amount (0 = snap).
     void UpdateScene(Scene& scene, const std::filesystem::path& assetsDir,
                      const glm::vec3& listenerPos, const glm::vec3& listenerForward,
                      bool gamePlaying,
-                     const std::function<bool(const glm::vec3&, const glm::vec3&)>& segmentBlocked = {},
+                     const std::function<f32(const glm::vec3&, const glm::vec3&)>& segmentTransmission = {},
                      f32 dt = 0.0f);
 
     bool IsAvailable() const;

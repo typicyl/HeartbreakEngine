@@ -7,6 +7,7 @@
 // edits them in the Asset Viewer and applies them to entities.
 #pragma once
 
+#include "Assets/AcousticMaterial.h"
 #include "Core/Types.h"
 
 #include <glm/glm.hpp>
@@ -46,6 +47,12 @@ struct MaterialAsset {
     std::string aoTex;
     std::string emissiveTex;
     std::string thicknessTex; // SSS transmission thickness (skin)
+
+    // Acoustic properties for physically-informed audio (absorption/scattering/transmission).
+    // `acoustic` is authoritative + serialized; `acousticPreset` is a UI label naming the
+    // preset it came from ("Custom" once hand-edited, "Default" for un-authored materials).
+    AcousticMaterial acoustic;
+    std::string acousticPreset = "Default";
 };
 
 namespace assets {

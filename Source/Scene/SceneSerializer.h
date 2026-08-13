@@ -125,6 +125,10 @@ struct EntityData {
     CameraZone cameraZone;
     bool hasMusicZone = false;
     MusicZone musicZone;
+    bool hasAcousticSpace = false;
+    AcousticSpace acousticSpace;
+    bool hasAcousticPortal = false;
+    AcousticPortal acousticPortal;
     bool hasDialogueActor = false;
     DialogueActor dialogueActor;
     bool hasCameraSpline = false;
