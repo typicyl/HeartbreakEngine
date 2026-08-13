@@ -139,16 +139,11 @@ struct ResonanceSpatializer::Impl {
         accumFill += frames;
 
         // 2) Render as many full Resonance blocks as we have input for.
-        float dbgDryL = 0.0f, dbgDryR = 0.0f;
         while (accumFill >= kBlockSize) {
             for (int s = 0; s < kMaxSources; ++s) {
                 api->SetInterleavedBuffer(sourceId[s], accum[s].data(), 1, kBlockSize);
             }
             api->FillInterleavedOutputBuffer(2, kBlockSize, stereoTmp.data());
-            for (size_t i = 0; i < kBlockSize; ++i) {
-                dbgDryL = std::max(dbgDryL, std::fabs(stereoTmp[i * 2 + 0]));
-                dbgDryR = std::max(dbgDryR, std::fabs(stereoTmp[i * 2 + 1]));
-            }
             RingPush(stereoTmp.data(), kBlockSize);
 
             const size_t rem = accumFill - kBlockSize;
@@ -178,6 +173,7 @@ struct ResonanceSpatializer::Impl {
                 envReverb.SetEnvironment(envTable[e].id, envTable[e].rt60, envTable[e].coupling,
                                          envTable[e].gain);
                 envReverb.SetEnvironmentPreDelay(envTable[e].id, envTable[e].preDelaySec);
+                envReverb.SetEnvironmentPan(envTable[e].id, envTable[e].pan);
             }
             const int ech = inCh > 0 ? inCh : 1;
             for (int s = 0; s < kMaxSources; ++s)
@@ -192,22 +188,6 @@ struct ResonanceSpatializer::Impl {
                 }
             envReverb.Process(envOut.data(), static_cast<int>(frames));
             for (ma_uint32 i = 0; i < frames * 2; ++i) dst[i] += envOut[i];
-        }
-
-        // TEMP DIAGNOSTIC: is the output directional? dryL/dryR = the HRTF render per ear (should
-        // differ for an off-axis source); outL/outR = final (dry + diffuse reverb). If dry differs
-        // but out does not, the reverb is washing out the directional cue.
-        {
-            static int s_dirTick = 0;
-            if ((s_dirTick++ % 180) == 0) {
-                float outL = 0.0f, outR = 0.0f;
-                for (ma_uint32 i = 0; i < frames; ++i) {
-                    outL = std::max(outL, std::fabs(dst[i * 2 + 0]));
-                    outR = std::max(outR, std::fabs(dst[i * 2 + 1]));
-                }
-                HBE_INFO("DirDBG dryL={:.4f} dryR={:.4f} outL={:.4f} outR={:.4f} envOn={}", dbgDryL,
-                         dbgDryR, outL, outR, envReverbEnabled);
-            }
         }
 
         *frameCountIn = frames;

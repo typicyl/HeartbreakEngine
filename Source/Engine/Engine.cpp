@@ -2358,8 +2358,8 @@ int Engine::Run(const EngineConfig& configIn) {
 
         // Room acoustics: drive the listener's reverb + early reflections from the AcousticSpace
         // it occupies (uses this frame's post-camera listener). No-op without binaural audio.
-        acoustics.Update(scene, renderer.GetCamera().Position(), audioAssetsDir, audio,
-                         physics.IsRunning() ? &physics : nullptr,
+        acoustics.Update(scene, renderer.GetCamera().Position(), renderer.GetCamera().Forward(),
+                         audioAssetsDir, audio, physics.IsRunning() ? &physics : nullptr,
                          Project::HasActive() &&
                              Project::Active().Settings().spatialAudio.environmentReverb);
 

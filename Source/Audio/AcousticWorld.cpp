@@ -30,6 +30,9 @@ const int kMaxGraphRooms = 32;
 const int kMaxGraphEdges = 200;
 const f32 kMaxCouplingDistance = 60.0f;
 const f32 kSpeedOfSound = 343.0f; // m/s, for the propagation pre-delay (distance / c)
+// Base level of the multi-environment reverb tail (scaled by each space's reverbGain). Kept below 1
+// so the diffuse tail supports the directional HRTF sound instead of washing it out to mono.
+const f32 kEnvReverbLevel = 0.5f;
 
 #if HBE_HAVE_RESONANCE
 // Translate Heartbreak's engine-side material into the library's material type. (The acoustic
@@ -253,8 +256,14 @@ void AcousticWorld::ClearCaches() {
 
 #if HBE_HAVE_RESONANCE
 void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos,
+                                      const glm::vec3& listenerForward,
                                       const std::filesystem::path& assetsDir, AudioSystem& audio,
                                       const PhysicsWorld* physics, entt::entity listenerRoom) {
+    // Listener right-hand axis (for panning a room's reverb toward the side it is on).
+    glm::vec3 fwd = listenerForward;
+    if (glm::length(fwd) < 1e-4f) fwd = glm::vec3(0.0f, 0.0f, -1.0f);
+    fwd = glm::normalize(fwd);
+    const glm::vec3 listenerRight = glm::normalize(glm::cross(fwd, glm::vec3(0.0f, 1.0f, 0.0f)));
     entt::registry& reg = scene.Registry();
 
     // 1) Collect enabled rooms (bounded) as graph nodes.
@@ -262,6 +271,7 @@ void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos
         entt::entity e;
         glm::vec3 center;
         AcousticRoom room;
+        f32 reverbGain;
     };
     std::vector<RoomNode> rooms;
     const auto addRoom = [&](entt::entity e) {
@@ -270,6 +280,7 @@ void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos
         rn.e = e;
         rn.center = glm::vec3(scene.WorldMatrix(e)[3]);
         rn.room = RoomForSpace(scene, e, sp);
+        rn.reverbGain = sp.reverbGain;
         rooms.push_back(rn);
     };
     // Collect the listener's own room FIRST so the room cap can never drop it: with the environment
@@ -356,7 +367,9 @@ void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos
             env.rt60[b] = rooms[i].room.rt60[b];
             env.coupling[b] = coupling[i * 9 + b];
         }
-        env.gain = 1.0f;
+        // Reverb level sits UNDER the dry so the directional (HRTF) sound is not washed out by the
+        // diffuse tail. Scaled by the space's authored reverbGain (default 1).
+        env.gain = kEnvReverbLevel * std::max(rooms[i].reverbGain, 0.0f);
         // Propagation delay of this room's tail to the listener. The listener is immersed in their
         // OWN room, so its tail is un-delayed (forcing 0 here, like the coupling=1 special-case
         // above; otherwise the distance from the room CENTRE would lag the tail and "breathe" as the
@@ -364,6 +377,16 @@ void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos
         env.preDelaySec = (rooms[i].e == listenerRoom)
                               ? 0.0f
                               : glm::distance(rooms[i].center, listenerPos) / kSpeedOfSound;
+        // Directional pan: the listener's own room surrounds them (0); another room's reverb arrives
+        // from the side that room sits on, relative to where the listener is facing.
+        if (rooms[i].e == listenerRoom) {
+            env.pan = 0.0f;
+        } else {
+            const glm::vec3 toRoom = rooms[i].center - listenerPos;
+            env.pan = glm::length(toRoom) > 1e-3f
+                          ? glm::clamp(glm::dot(glm::normalize(toRoom), listenerRight), -1.0f, 1.0f)
+                          : 0.0f;
+        }
         envs.push_back(env);
     }
 
@@ -387,6 +410,7 @@ void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos
 #endif // HBE_HAVE_RESONANCE
 
 void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
+                           const glm::vec3& listenerForward,
                            const std::filesystem::path& assetsDir, AudioSystem& audio,
                            const PhysicsWorld* physics, bool environmentReverbEnabled) {
     entt::registry& reg = scene.Registry();
@@ -417,10 +441,11 @@ void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
     audio.SetEnvironmentReverbEnabled(environmentReverbEnabled);
 #if HBE_HAVE_RESONANCE
     if (environmentReverbEnabled) {
-        BuildEnvironments(scene, listenerPos, assetsDir, audio, physics, best);
+        BuildEnvironments(scene, listenerPos, listenerForward, assetsDir, audio, physics, best);
     }
 #else
     (void)physics;
+    (void)listenerForward;
 #endif
 
     if (best == entt::null) {

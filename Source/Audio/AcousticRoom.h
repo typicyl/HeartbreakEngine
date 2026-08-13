@@ -41,6 +41,7 @@ struct AcousticEnvironment {
     f32 coupling[9] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // per-band [0,1]
     f32 gain = 1.0f;
     f32 preDelaySec = 0.0f; // propagation delay of this room's tail to the listener (distance / c)
+    f32 pan = 0.0f; // stereo pan [-1,+1]: the direction this room's reverb arrives from (0 = own room)
 };
 
 } // namespace hbe

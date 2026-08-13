@@ -1337,22 +1337,6 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
                                        src.volume * impl_->SpatialBusGainToNode(sv.bus), occ,
                                        src.minDistance, src.maxDistance);
             impl_->resonance.SetSourceEnvironment(sv.voice.resSlot, AcousticSpaceIdAt(scene, pos));
-            {
-                static int s_spatTick = 0;
-                if ((s_spatTick++ % 60) == 0) {
-                    const glm::vec3 toApp = apparent - lisPos;
-                    const glm::vec3 right = glm::normalize(glm::cross(lisFwd, glm::vec3(0, 1, 0)));
-                    const f32 lat = glm::length(toApp) > 1e-3f
-                                        ? glm::dot(glm::normalize(toApp), right)
-                                        : 0.0f;
-                    HBE_INFO("SpatDBG '{}' src=({:.1f},{:.1f},{:.1f}) app=({:.1f},{:.1f},{:.1f}) "
-                             "lis=({:.1f},{:.1f},{:.1f}) fwd=({:.2f},{:.2f},{:.2f}) dist={:.1f} "
-                             "occ={:.2f} lateral={:.2f}(+R/-L)",
-                             src.asset, pos.x, pos.y, pos.z, apparent.x, apparent.y, apparent.z,
-                             lisPos.x, lisPos.y, lisPos.z, lisFwd.x, lisFwd.y, lisFwd.z,
-                             glm::length(pos - lisPos), occ, lat);
-                }
-            }
         } else {
             // miniaudio panning: position + distance; occlusion attenuates + muffles when
             // geometry blocks the path, else base volume with the LPF transparent.

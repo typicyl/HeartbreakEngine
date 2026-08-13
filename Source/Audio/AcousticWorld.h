@@ -37,7 +37,7 @@ public:
     // quieter). The listener's room also drives the single-room path (reflections; its late tail
     // comes from the environment reverb when enabled). `physics` may be null when the game is not
     // simulating (coupling then can't be measured, so only the listener's room contributes).
-    void Update(Scene& scene, const glm::vec3& listenerPos,
+    void Update(Scene& scene, const glm::vec3& listenerPos, const glm::vec3& listenerForward,
                 const std::filesystem::path& assetsDir, AudioSystem& audio,
                 const PhysicsWorld* physics, bool environmentReverbEnabled);
 
@@ -66,6 +66,7 @@ private:
     // AcousticSpace the listener is in (entt::null outdoors). Only defined when the library is built
     // in (the environment reverb is a no-op otherwise).
     void BuildEnvironments(Scene& scene, const glm::vec3& listenerPos,
+                           const glm::vec3& listenerForward,
                            const std::filesystem::path& assetsDir, AudioSystem& audio,
                            const PhysicsWorld* physics, entt::entity listenerRoom);
 
