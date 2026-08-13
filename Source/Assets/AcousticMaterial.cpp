@@ -1,63 +1,47 @@
-// Assets/AcousticMaterial.cpp - the acoustic-material preset library.
+// Assets/AcousticMaterial.cpp - the acoustic-material PRESET LIBRARY is SOURCED FROM the
+// HDS-Resonance acoustics library (hdsr/acoustics.h). Heartbreak owns only the engine-side data
+// representation (the AcousticMaterial struct, used by .hbmat serialization) and adapts the
+// library's API shape; the acoustic MODEL - material tables, room acoustics, propagation - lives
+// in the library so it is reusable by any engine. When the library is not built in
+// (HBE_HAVE_RESONANCE=0) the preset list is empty and callers fall back to defaults.
 #include "Assets/AcousticMaterial.h"
+
+#if HBE_HAVE_RESONANCE
+#include "hdsr/acoustics.h"
+#endif
 
 namespace hbe {
 
+#if HBE_HAVE_RESONANCE
 namespace {
+// Translate a library material into Heartbreak's engine-side representation.
+AcousticMaterial FromHdsr(const hdsr::AcousticMaterial& m) {
+    AcousticMaterial out;
+    for (int b = 0; b < kAcousticBands; ++b)
+        out.absorption[static_cast<usize>(b)] = m.absorption[b];
+    out.scattering = m.scattering;
+    out.transmission = m.transmission;
+    return out;
+}
+} // namespace
+#endif
 
-// absorption bands are 31.25, 62.5, 125, 250, 500, 1k, 2k, 4k, 8k Hz. Values are drawn from
-// common architectural-acoustics absorption tables (extended at the extreme low/high bands),
-// with scattering + transmission authored for Heartbreak. Transmission is broadband: higher =
-// more sound passes through the surface (drives occlusion / cross-room bleed).
-const std::vector<AcousticPreset>& Table() {
-    static const std::vector<AcousticPreset> kPresets = {
-        {"Default",
-         {{{0.10f, 0.10f, 0.10f, 0.11f, 0.12f, 0.13f, 0.14f, 0.15f, 0.16f}}, 0.20f, 0.12f}},
-        // An opening (doorway/window gap): reflects nothing, passes everything.
-        {"Open / Air",
-         {{{1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f}}, 0.00f, 1.00f}},
-        {"Concrete (sealed)",
-         {{{0.01f, 0.01f, 0.01f, 0.01f, 0.02f, 0.02f, 0.02f, 0.03f, 0.03f}}, 0.12f, 0.04f}},
-        {"Brick (bare)",
-         {{{0.02f, 0.02f, 0.03f, 0.03f, 0.03f, 0.04f, 0.05f, 0.07f, 0.07f}}, 0.20f, 0.05f}},
-        {"Wood Panel",
-         {{{0.19f, 0.19f, 0.28f, 0.22f, 0.17f, 0.09f, 0.10f, 0.11f, 0.11f}}, 0.20f, 0.15f}},
-        {"Wood Floor",
-         {{{0.10f, 0.10f, 0.15f, 0.11f, 0.10f, 0.07f, 0.06f, 0.07f, 0.07f}}, 0.15f, 0.10f}},
-        {"Glass (window)",
-         {{{0.30f, 0.30f, 0.35f, 0.25f, 0.18f, 0.12f, 0.07f, 0.05f, 0.05f}}, 0.05f, 0.22f}},
-        {"Glass (thick)",
-         {{{0.15f, 0.15f, 0.18f, 0.06f, 0.04f, 0.03f, 0.02f, 0.02f, 0.02f}}, 0.05f, 0.10f}},
-        {"Metal",
-         {{{0.02f, 0.02f, 0.02f, 0.03f, 0.03f, 0.03f, 0.04f, 0.04f, 0.05f}}, 0.10f, 0.08f}},
-        {"Drywall / Sheetrock",
-         {{{0.28f, 0.28f, 0.29f, 0.10f, 0.05f, 0.04f, 0.07f, 0.09f, 0.09f}}, 0.15f, 0.35f}},
-        {"Plaster (rough)",
-         {{{0.03f, 0.03f, 0.03f, 0.03f, 0.04f, 0.05f, 0.05f, 0.06f, 0.06f}}, 0.25f, 0.08f}},
-        {"Acoustic Ceiling Tile",
-         {{{0.40f, 0.45f, 0.50f, 0.55f, 0.65f, 0.75f, 0.80f, 0.85f, 0.85f}}, 0.35f, 0.40f}},
-        {"Heavy Curtain",
-         {{{0.10f, 0.12f, 0.14f, 0.35f, 0.55f, 0.72f, 0.70f, 0.65f, 0.65f}}, 0.45f, 0.55f}},
-        {"Carpet",
-         {{{0.02f, 0.03f, 0.03f, 0.06f, 0.14f, 0.37f, 0.60f, 0.65f, 0.65f}}, 0.30f, 0.20f}},
-        {"Fiberglass Insulation",
-         {{{0.20f, 0.35f, 0.50f, 0.70f, 0.85f, 0.95f, 0.98f, 0.98f, 0.98f}}, 0.50f, 0.55f}},
-        {"Grass / Soil",
-         {{{0.10f, 0.12f, 0.15f, 0.25f, 0.40f, 0.55f, 0.60f, 0.60f, 0.60f}}, 0.55f, 0.15f}},
-        {"Water Surface",
-         {{{0.01f, 0.01f, 0.01f, 0.01f, 0.02f, 0.02f, 0.02f, 0.03f, 0.03f}}, 0.05f, 0.08f}},
-        {"Marble / Polished Stone",
-         {{{0.01f, 0.01f, 0.01f, 0.01f, 0.01f, 0.02f, 0.02f, 0.02f, 0.02f}}, 0.05f, 0.04f}},
-    };
+const std::vector<AcousticPreset>& AcousticPresets() {
+    static const std::vector<AcousticPreset> kPresets = [] {
+        std::vector<AcousticPreset> v;
+#if HBE_HAVE_RESONANCE
+        // Names are stable static strings owned by the library; the material is copied into the
+        // engine representation.
+        for (int i = 0; i < hdsr::MaterialCount(); ++i)
+            v.push_back({hdsr::MaterialNameAt(i), FromHdsr(*hdsr::MaterialAt(i))});
+#endif
+        return v;
+    }();
     return kPresets;
 }
 
-} // namespace
-
-const std::vector<AcousticPreset>& AcousticPresets() { return Table(); }
-
 const AcousticMaterial* FindAcousticPreset(const std::string& name) {
-    for (const AcousticPreset& p : Table())
+    for (const AcousticPreset& p : AcousticPresets())
         if (name == p.name) return &p.material;
     return nullptr;
 }

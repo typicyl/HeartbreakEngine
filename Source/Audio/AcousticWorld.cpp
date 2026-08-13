@@ -6,6 +6,10 @@
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 
+#if HBE_HAVE_RESONANCE
+#include "hdsr/acoustics.h" // the HDS-Resonance acoustics library (materials/rooms/propagation)
+#endif
+
 #include <glm/gtc/matrix_inverse.hpp>
 
 #include <algorithm>
@@ -18,17 +22,18 @@ namespace hbe {
 
 namespace {
 
-// Average absorption over the 500/1k/2k Hz bands (indices 4,5,6) - the band range the backend
-// uses to derive a broadband reflection coefficient.
-f32 MidAbsorption(const AcousticMaterial& m) {
-    return (m.absorption[4] + m.absorption[5] + m.absorption[6]) / 3.0f;
+#if HBE_HAVE_RESONANCE
+// Translate Heartbreak's engine-side material into the library's material type. (The acoustic
+// MODEL - reflection/RT60/propagation - lives in the library; Heartbreak only translates.)
+hdsr::AcousticMaterial ToHdsr(const AcousticMaterial& m) {
+    hdsr::AcousticMaterial out;
+    for (int b = 0; b < kAcousticBands; ++b)
+        out.absorption[b] = m.absorption[static_cast<usize>(b)];
+    out.scattering = m.scattering;
+    out.transmission = m.transmission;
+    return out;
 }
-
-// Reflection coefficient from absorption: coeff = sqrt(1 - avg_absorption). Matches the backend's
-// shoebox reflection model.
-f32 ReflectionCoefficient(const AcousticMaterial& m) {
-    return std::sqrt(std::max(0.0f, 1.0f - MidAbsorption(m)));
-}
+#endif
 
 // Resolve an AcousticSpace wall material name (a preset) to its AcousticMaterial; unknown -> default.
 AcousticMaterial MaterialByName(const std::string& name) {
@@ -80,48 +85,41 @@ AcousticRoom ComputeAcousticRoom(const glm::vec3& center, const glm::quat& rotat
     r.dimensions = dimensions;
     r.reflectionCutoffHz = 800.0f;
     r.reflectionGain = std::max(reflectionGain, 0.0f);
-
-    // Reflection coefficients, world axes: [-x,+x] = wall, [-y] = floor, [+y] = ceiling, [-z,+z] = wall.
-    const f32 wc = ReflectionCoefficient(wall);
-    r.reflectionCoeff[0] = wc;
-    r.reflectionCoeff[1] = wc;
-    r.reflectionCoeff[2] = ReflectionCoefficient(floor);
-    r.reflectionCoeff[3] = ReflectionCoefficient(ceiling);
-    r.reflectionCoeff[4] = wc;
-    r.reflectionCoeff[5] = wc;
-
-    // Eyring RT60 per octave band from the box volume + per-face absorption.
-    const f32 W = std::max(dimensions.x, 0.1f);
-    const f32 H = std::max(dimensions.y, 0.1f);
-    const f32 D = std::max(dimensions.z, 0.1f);
-    const f32 V = W * H * D;
-    const f32 floorA = W * D;              // -y
-    const f32 ceilA = W * D;               // +y
-    const f32 wallA = 2.0f * W * H + 2.0f * D * H; // the four side walls
-    const f32 S = std::max(floorA + ceilA + wallA, 1e-3f);
-    const f32 timeScale = std::max(reverbTime, 0.0f);
-    // Air absorption per octave band (m, ~20 C / 50 % RH): negligible at low frequency, strong at
-    // high - it shortens the high-frequency reverb tail, so large rooms sound "darker" in their
-    // reverberation. Added to the Eyring denominator as 4*m*V.
-    static const f32 kAir[kAcousticBands] = {0.0000f, 0.0000f, 0.0001f, 0.0003f, 0.0006f,
-                                             0.0010f, 0.0025f, 0.0080f, 0.0260f};
-    for (int b = 0; b < kAcousticBands; ++b) {
-        const f32 A = floorA * floor.absorption[static_cast<usize>(b)] +
-                      ceilA * ceiling.absorption[static_cast<usize>(b)] +
-                      wallA * wall.absorption[static_cast<usize>(b)];
-        const f32 aBar = std::min(std::max(A / S, 0.0f), 0.99f); // clamp: avoid ln(0)
-        const f32 denom = -S * std::log(1.0f - aBar) + 4.0f * kAir[b] * V; // Eyring + air absorption
-        f32 rt = denom > 1e-4f ? (0.161f * V / denom) : 0.0f;
-        rt *= timeScale;
-        r.rt60[b] = std::min(std::max(rt, 0.0f), 12.0f);
-    }
-    // Late-reverb gain: backend default (0.045) scaled by the space's reverb-gain knob.
-    r.reverbGain = 0.045f * std::max(reverbGain, 0.0f);
+    r.reverbGain = 0.0f;
+    for (int i = 0; i < 6; ++i) r.reflectionCoeff[i] = 0.0f;
+    for (int b = 0; b < kAcousticBands; ++b) r.rt60[b] = 0.0f;
+#if HBE_HAVE_RESONANCE
+    // The acoustic model lives in the HDS-Resonance library: translate the per-face materials,
+    // compute reflection coefficients + Eyring RT60 (with air absorption) there, and map the result
+    // onto the engine's room POD. Wall order: [-x,+x]=wall, [-y]=floor, [+y]=ceiling, [-z,+z]=wall.
+    const hdsr::AcousticMaterial hw = ToHdsr(wall);
+    const hdsr::AcousticMaterial hf = ToHdsr(floor);
+    const hdsr::AcousticMaterial hc = ToHdsr(ceiling);
+    const hdsr::AcousticMaterial* walls[6] = {&hw, &hw, &hf, &hc, &hw, &hw};
+    const float dims[3] = {dimensions.x, dimensions.y, dimensions.z};
+    const hdsr::RoomAcoustics ra =
+        hdsr::ComputeRoomAcoustics(dims, walls, reflectionGain, reverbGain, reverbTime);
+    for (int i = 0; i < 6; ++i) r.reflectionCoeff[i] = ra.reflectionCoefficients[i];
+    r.reflectionCutoffHz = ra.cutoffFrequencyHz;
+    r.reflectionGain = ra.reflectionGain;
+    for (int b = 0; b < kAcousticBands; ++b) r.rt60[b] = ra.rt60[b];
+    r.reverbGain = ra.reverbGain;
+#else
+    (void)wall;
+    (void)floor;
+    (void)ceiling;
+    (void)reverbGain;
+    (void)reverbTime;
+#endif
     return r;
 }
 
 f32 PortalTransmission(const AcousticMaterial& closedMaterial, f32 openness) {
+#if HBE_HAVE_RESONANCE
+    return hdsr::PortalTransmission(ToHdsr(closedMaterial), openness);
+#else
     return glm::mix(closedMaterial.transmission, 1.0f, glm::clamp(openness, 0.0f, 1.0f));
+#endif
 }
 
 f32 AcousticWorld::SegmentTransmission(const PhysicsWorld& physics, const Scene& scene,
@@ -132,17 +130,26 @@ f32 AcousticWorld::SegmentTransmission(const PhysicsWorld& physics, const Scene&
     if (len < 1e-4f) return 1.0f;
     std::vector<PhysicsWorld::RayHitAll> hits;
     physics.RaycastAll(a, d, len, hits);
-    f32 trans = 1.0f;
+    // Collect each intervening surface's transmission (an open portal overrides the wall it covers),
+    // then let the library combine them into a total - the propagation model lives in HDS-Resonance,
+    // the geometry query is Heartbreak's.
+    std::vector<float> transmissions;
+    transmissions.reserve(hits.size());
     for (const PhysicsWorld::RayHitAll& h : hits) {
         // Skip hits right at the source or listener ends (self/adjacent geometry).
         if (h.distance <= 0.02f || h.distance >= len - 0.02f) continue;
         f32 t = ResolveEntityAcoustic(scene, h.entity, assetsDir, matCache_).transmission;
         const f32 pt = PortalTransmissionAt(scene, h.point);
         if (pt >= 0.0f) t = pt; // an opening (doorway/window) overrides the wall struck here
-        trans *= glm::clamp(t, 0.0f, 1.0f);
-        if (trans < 1e-3f) return 0.0f; // fully blocked - stop early
+        transmissions.push_back(glm::clamp(t, 0.0f, 1.0f));
     }
-    return glm::clamp(trans, 0.0f, 1.0f);
+#if HBE_HAVE_RESONANCE
+    return hdsr::CombineTransmission(transmissions.data(), static_cast<int>(transmissions.size()));
+#else
+    float prod = 1.0f;
+    for (float t : transmissions) prod *= t;
+    return glm::clamp(prod, 0.0f, 1.0f);
+#endif
 }
 
 void AcousticWorld::ClearCaches() {
@@ -264,6 +271,13 @@ bool AcousticRoomSelfTest() {
     const glm::quat rot(1.0f, 0.0f, 0.0f, 0.0f);
     const glm::vec3 dims(8.0f, 4.0f, 6.0f);
 
+    // The material/room/propagation MODEL now lives in the HDS-Resonance library (tested by
+    // hdsr::SelfTest); these checks validate Heartbreak's translation + wrapper end-to-end. Skip
+    // when the library is not built in (no presets).
+    if (AcousticPresets().empty()) {
+        std::printf("  [acoustic-room] SKIP: HDS-Resonance acoustics library not built in.\n");
+        return true;
+    }
     const AcousticMaterial* marble = FindAcousticPreset("Marble / Polished Stone");
     const AcousticMaterial* open = FindAcousticPreset("Open / Air");
     const AcousticMaterial* fiber = FindAcousticPreset("Fiberglass Insulation");
