@@ -28,12 +28,15 @@ class PhysicsWorld;
 class AcousticWorld {
 public:
     // Drives the listener's room (early reflections + reverb via the single-room path) AND, when
-    // `environmentReverbEnabled`, the MULTI-ENVIRONMENT reverb: every enabled AcousticSpace coupled
-    // to the listener (through portals/propagation, measured with `physics`) is declared as an
-    // active environment so the library mixes each room's own reverb tail by its coupling. The
-    // listener's room drives the single-room path (reflections; its late tail comes from the
-    // environment reverb when enabled). `physics` may be null when the game is not simulating
-    // (coupling then can't be measured, so only the listener's room contributes).
+    // `environmentReverbEnabled`, the MULTI-ENVIRONMENT reverb. It builds a room-to-room PROPAGATION
+    // GRAPH - every enabled AcousticSpace is a node, plus a listener node - with edges carrying the
+    // PER-BAND transmission through the intervening walls/portals (measured with `physics`), and asks
+    // the library (hdsr::SolvePropagation) for each room's best-path per-band coupling to the
+    // listener. Each room is then declared as an environment so the library mixes its own reverb
+    // tail, DARKENED by that per-band coupling (a distant room bleeds in muffled, not merely
+    // quieter). The listener's room also drives the single-room path (reflections; its late tail
+    // comes from the environment reverb when enabled). `physics` may be null when the game is not
+    // simulating (coupling then can't be measured, so only the listener's room contributes).
     void Update(Scene& scene, const glm::vec3& listenerPos,
                 const std::filesystem::path& assetsDir, AudioSystem& audio,
                 const PhysicsWorld* physics, bool environmentReverbEnabled);
@@ -49,6 +52,23 @@ public:
     void ClearCaches();
 
 private:
+    // Per-band sibling of SegmentTransmission: fills `out[9]` with the octave-band transmission from
+    // `a` to `b` (each hit surface's frequency-dependent transmission, portal openings overriding
+    // the wall they cover, combined per band by the library). This carries the spectrum that makes
+    // cross-room bleed muffled rather than merely quiet; it feeds the propagation-graph edges.
+    void SegmentTransmissionBands(const PhysicsWorld& physics, const Scene& scene, const glm::vec3& a,
+                                  const glm::vec3& b, const std::filesystem::path& assetsDir,
+                                  f32 out[9]);
+
+    // Builds the room-to-room propagation graph (rooms + a listener node, edges = per-band
+    // transmission), solves each room's per-band coupling to the listener via hdsr::SolvePropagation,
+    // and declares the coupled rooms as environments (audio.SetEnvironments). `listenerRoom` is the
+    // AcousticSpace the listener is in (entt::null outdoors). Only defined when the library is built
+    // in (the environment reverb is a no-op otherwise).
+    void BuildEnvironments(Scene& scene, const glm::vec3& listenerPos,
+                           const std::filesystem::path& assetsDir, AudioSystem& audio,
+                           const PhysicsWorld* physics, entt::entity listenerRoom);
+
     AcousticMaterialCache matCache_; // per-surface material cache (used by P3 occlusion)
     AcousticRoom lastRoom_{};
     bool lastEnabled_ = false;

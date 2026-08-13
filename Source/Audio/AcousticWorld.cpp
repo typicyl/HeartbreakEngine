@@ -22,6 +22,15 @@ namespace hbe {
 
 namespace {
 
+// Bounds for the per-frame room-to-room propagation graph (an explicit performance budget, not a
+// "loudest room wins" cut). kMaxGraphRooms + 1 listener node must stay <= hdsr::kMaxPropagationRooms;
+// kMaxGraphEdges <= hdsr::kMaxPropagationEdges. Room-to-room edges beyond kMaxCouplingDistance are
+// pruned (far rooms couple negligibly), which also keeps the O(rooms^2) edge raycasts in check.
+const int kMaxGraphRooms = 32;
+const int kMaxGraphEdges = 200;
+const f32 kMaxCouplingDistance = 60.0f;
+const f32 kSpeedOfSound = 343.0f; // m/s, for the propagation pre-delay (distance / c)
+
 #if HBE_HAVE_RESONANCE
 // Translate Heartbreak's engine-side material into the library's material type. (The acoustic
 // MODEL - reflection/RT60/propagation - lives in the library; Heartbreak only translates.)
@@ -55,6 +64,33 @@ f32 PortalTransmissionAt(const Scene& scene, const glm::vec3& point) {
     }
     return best;
 }
+
+#if HBE_HAVE_RESONANCE
+// Per-band sibling of PortalTransmissionAt: if an enabled AcousticPortal contains `point`, fills
+// `out[9]` with the most-open such portal's per-band transmission curve and returns true; else
+// false. (Ranked by the mid band, matching PortalTransmissionAt's "most open wins".)
+bool PortalTransmissionBandsAt(const Scene& scene, const glm::vec3& point, f32 out[9]) {
+    const entt::registry& reg = scene.Registry();
+    bool found = false;
+    f32 bestMid = -1.0f;
+    for (const entt::entity e : reg.view<const AcousticPortal>()) {
+        const AcousticPortal& p = reg.get<const AcousticPortal>(e);
+        if (!p.enabled || !reg.all_of<Transform>(e)) continue;
+        const glm::vec3 local =
+            glm::abs(glm::vec3(glm::inverse(scene.WorldMatrix(e)) * glm::vec4(point, 1.0f)));
+        if (local.x <= p.halfExtents.x && local.y <= p.halfExtents.y && local.z <= p.halfExtents.z) {
+            f32 bands[9];
+            hdsr::PortalTransmissionBands(ToHdsr(MaterialByName(p.closedMaterial)), p.openness, bands);
+            if (bands[4] > bestMid) {
+                bestMid = bands[4];
+                for (int b = 0; b < 9; ++b) out[b] = bands[b];
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+#endif
 
 f32 NearlyEq(f32 a, f32 b) { return std::fabs(a - b) < 1e-4f; }
 
@@ -169,11 +205,186 @@ f32 AcousticWorld::SegmentTransmission(const PhysicsWorld& physics, const Scene&
 #endif
 }
 
+void AcousticWorld::SegmentTransmissionBands(const PhysicsWorld& physics, const Scene& scene,
+                                             const glm::vec3& a, const glm::vec3& b,
+                                             const std::filesystem::path& assetsDir, f32 out[9]) {
+    for (int i = 0; i < 9; ++i) out[i] = 1.0f;
+    const glm::vec3 d = b - a;
+    const f32 len = glm::length(d);
+    if (len < 1e-4f) return;
+    std::vector<PhysicsWorld::RayHitAll> hits;
+    physics.RaycastAll(a, d, len, hits);
+#if HBE_HAVE_RESONANCE
+    // Each intervening surface's per-band transmission curve (an open portal overrides the wall it
+    // covers), combined per band by the library. This is the spectrum SegmentTransmission collapses
+    // to one number; keeping the bands is what makes cross-room bleed muffled, not just quieter.
+    std::vector<float> surfaceBands; // count * 9, row-major
+    surfaceBands.reserve(hits.size() * 9);
+    for (const PhysicsWorld::RayHitAll& h : hits) {
+        if (h.distance <= 0.02f || h.distance >= len - 0.02f) continue; // skip self/adjacent geometry
+        f32 bands[9];
+        if (!PortalTransmissionBandsAt(scene, h.point, bands)) {
+            const AcousticMaterial m = ResolveEntityAcoustic(scene, h.entity, assetsDir, matCache_);
+            hdsr::MaterialTransmissionBands(ToHdsr(m), bands);
+        }
+        for (int bi = 0; bi < 9; ++bi) surfaceBands.push_back(glm::clamp(bands[bi], 0.0f, 1.0f));
+    }
+    const int count = static_cast<int>(surfaceBands.size() / 9);
+    hdsr::CombineTransmissionBands(surfaceBands.empty() ? nullptr : surfaceBands.data(), count, out);
+#else
+    // No library: replicate the broadband product across bands (mirrors SegmentTransmission).
+    f32 prod = 1.0f;
+    for (const PhysicsWorld::RayHitAll& h : hits) {
+        if (h.distance <= 0.02f || h.distance >= len - 0.02f) continue;
+        f32 t = ResolveEntityAcoustic(scene, h.entity, assetsDir, matCache_).transmission;
+        const f32 pt = PortalTransmissionAt(scene, h.point);
+        if (pt >= 0.0f) t = pt;
+        prod *= glm::clamp(t, 0.0f, 1.0f);
+    }
+    for (int i = 0; i < 9; ++i) out[i] = glm::clamp(prod, 0.0f, 1.0f);
+#endif
+}
+
 void AcousticWorld::ClearCaches() {
     matCache_.Clear();
     hasPushed_ = false;
     lastSpace_ = entt::null;
 }
+
+#if HBE_HAVE_RESONANCE
+void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos,
+                                      const std::filesystem::path& assetsDir, AudioSystem& audio,
+                                      const PhysicsWorld* physics, entt::entity listenerRoom) {
+    entt::registry& reg = scene.Registry();
+
+    // 1) Collect enabled rooms (bounded) as graph nodes.
+    struct RoomNode {
+        entt::entity e;
+        glm::vec3 center;
+        AcousticRoom room;
+    };
+    std::vector<RoomNode> rooms;
+    const auto addRoom = [&](entt::entity e) {
+        const AcousticSpace& sp = reg.get<AcousticSpace>(e);
+        RoomNode rn;
+        rn.e = e;
+        rn.center = glm::vec3(scene.WorldMatrix(e)[3]);
+        rn.room = RoomForSpace(scene, e, sp);
+        rooms.push_back(rn);
+    };
+    // Collect the listener's own room FIRST so the room cap can never drop it: with the environment
+    // reverb on its late tail comes ONLY from here (Update zeroes the single-room reverbGain), so a
+    // missing listener environment would leave the player's room with no late reverb at all.
+    if (listenerRoom != entt::null && reg.valid(listenerRoom) &&
+        reg.all_of<AcousticSpace, Transform>(listenerRoom) &&
+        reg.get<AcousticSpace>(listenerRoom).enabled)
+        addRoom(listenerRoom);
+    // Then the rest, in registry order, up to the cap. (In the rare scene with > kMaxGraphRooms
+    // enabled spaces, far rooms beyond the cap are dropped; a source inside one gets no environment
+    // tail - its dry/binaural/occlusion still play - which is graceful degradation, not a crash.)
+    for (const entt::entity e : reg.view<AcousticSpace>()) {
+        if (rooms.size() >= static_cast<size_t>(kMaxGraphRooms)) break;
+        if (e == listenerRoom) continue; // already collected first
+        const AcousticSpace& sp = reg.get<AcousticSpace>(e);
+        if (!sp.enabled || !reg.all_of<Transform>(e)) continue;
+        addRoom(e);
+    }
+
+    const int roomCount = static_cast<int>(rooms.size());
+    std::vector<AcousticEnvironment> envs;
+    if (roomCount == 0) {
+        audio.SetEnvironments(nullptr, 0);
+        return;
+    }
+
+    // 2) Per-band coupling of every room to the listener. Node `roomCount` is the listener node.
+    const int listenerNode = roomCount;
+    const int nodeCount = roomCount + 1;
+    std::vector<float> coupling(static_cast<size_t>(nodeCount) * 9, 0.0f);
+
+    if (physics == nullptr) {
+        // No geometry to measure coupling: only the listener's own room contributes (flat 1).
+        for (int i = 0; i < roomCount; ++i)
+            if (rooms[i].e == listenerRoom)
+                for (int b = 0; b < 9; ++b) coupling[i * 9 + b] = 1.0f;
+    } else {
+        // Build the graph: every room links to the listener node (room center -> listener), and
+        // nearby room pairs link to each other, each edge carrying the per-band transmission through
+        // the intervening walls/portals. The library then finds each room's best-path coupling.
+        std::vector<hdsr::PropagationEdge> edges;
+        for (int i = 0; i < roomCount; ++i) {
+            hdsr::PropagationEdge ed;
+            ed.roomA = i;
+            ed.roomB = listenerNode;
+            ed.distance = glm::distance(rooms[i].center, listenerPos);
+            SegmentTransmissionBands(*physics, scene, rooms[i].center, listenerPos, assetsDir,
+                                     ed.transmission);
+            edges.push_back(ed);
+        }
+        for (int i = 0; i < roomCount && static_cast<int>(edges.size()) < kMaxGraphEdges; ++i)
+            for (int j = i + 1; j < roomCount && static_cast<int>(edges.size()) < kMaxGraphEdges; ++j) {
+                const f32 dist = glm::distance(rooms[i].center, rooms[j].center);
+                if (dist > kMaxCouplingDistance) continue;
+                hdsr::PropagationEdge ed;
+                ed.roomA = i;
+                ed.roomB = j;
+                ed.distance = dist;
+                SegmentTransmissionBands(*physics, scene, rooms[i].center, rooms[j].center, assetsDir,
+                                         ed.transmission);
+                edges.push_back(ed);
+            }
+        hdsr::SolvePropagation(nodeCount, edges.empty() ? nullptr : edges.data(),
+                               static_cast<int>(edges.size()), listenerNode, coupling.data());
+    }
+
+    // 3) The listener's own room is always fully coupled (guard a stray in-room wall hit on the
+    //    room-center -> listener ray).
+    for (int i = 0; i < roomCount; ++i)
+        if (rooms[i].e == listenerRoom)
+            for (int b = 0; b < 9; ++b) coupling[i * 9 + b] = 1.0f;
+
+    // 4) Emit an environment per meaningfully-coupled room (skip the negligibly coupled).
+    for (int i = 0; i < roomCount; ++i) {
+        f32 maxC = 0.0f;
+        for (int b = 0; b < 9; ++b) maxC = std::max(maxC, coupling[i * 9 + b]);
+        if (maxC < 0.03f) continue;
+        AcousticEnvironment env;
+        // Non-negative, stable per valid entity (masks the sign bit so a recycled entity's id is
+        // never negative). Must match AudioSystem's per-voice room id exactly.
+        env.id = static_cast<int>(entt::to_integral(rooms[i].e) & 0x7FFFFFFFu);
+        for (int b = 0; b < 9; ++b) {
+            env.rt60[b] = rooms[i].room.rt60[b];
+            env.coupling[b] = coupling[i * 9 + b];
+        }
+        env.gain = 1.0f;
+        // Propagation delay of this room's tail to the listener. The listener is immersed in their
+        // OWN room, so its tail is un-delayed (forcing 0 here, like the coupling=1 special-case
+        // above; otherwise the distance from the room CENTRE would lag the tail and "breathe" as the
+        // player moves). Other rooms use distance / c; the library clamps to its internal maximum.
+        env.preDelaySec = (rooms[i].e == listenerRoom)
+                              ? 0.0f
+                              : glm::distance(rooms[i].center, listenerPos) / kSpeedOfSound;
+        envs.push_back(env);
+    }
+
+    // 5) The transport table holds 16 environments; if more are coupled, send the most-coupled 16
+    //    (an explicit capacity, not a scene-order truncation). The reverb itself then mixes up to its
+    //    own capacity, dropping the least-coupled beyond that.
+    if (envs.size() > 16u) {
+        std::sort(envs.begin(), envs.end(),
+                  [](const AcousticEnvironment& a, const AcousticEnvironment& b) {
+                      f32 ma = 0.0f, mb = 0.0f;
+                      for (int i = 0; i < 9; ++i) {
+                          ma = std::max(ma, a.coupling[i]);
+                          mb = std::max(mb, b.coupling[i]);
+                      }
+                      return ma > mb;
+                  });
+        envs.resize(16u);
+    }
+    audio.SetEnvironments(envs.empty() ? nullptr : envs.data(), static_cast<int>(envs.size()));
+}
+#endif // HBE_HAVE_RESONANCE
 
 void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
                            const std::filesystem::path& assetsDir, AudioSystem& audio,
@@ -197,37 +408,20 @@ void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
         }
     }
 
-    // Multi-environment reverb topology: declare EVERY enabled space coupled to the listener - the
-    // listener's own room at coupling 1, and each other room by how much of its tail reaches the
-    // listener through portals/propagation (measured with the physics geometry). The library mixes
-    // all of them up to its capacity (not just the loudest). Runs even outdoors (best == null): a
-    // source in a nearby room still leaks its reverb out.
+    // Multi-environment reverb topology: build a room-to-room PROPAGATION GRAPH and let the library
+    // solve each room's best-path, PER-BAND coupling to the listener. Every enabled AcousticSpace is
+    // a node; an extra listener node handles indoor and outdoor uniformly (the listener's own room
+    // links to it through no walls -> coupling ~1). The library mixes all coupled rooms up to its
+    // capacity (not just the loudest), each darkened by its per-band coupling. Runs even outdoors
+    // (best == null): a source in a nearby room still leaks its reverb out through the doorway.
     audio.SetEnvironmentReverbEnabled(environmentReverbEnabled);
+#if HBE_HAVE_RESONANCE
     if (environmentReverbEnabled) {
-        std::vector<AcousticEnvironment> envs;
-        for (const entt::entity e : reg.view<AcousticSpace>()) {
-            const AcousticSpace& sp = reg.get<AcousticSpace>(e);
-            if (!sp.enabled || !reg.all_of<Transform>(e)) continue;
-            f32 coupling = 1.0f;
-            if (e != best) {
-                if (physics == nullptr) continue; // coupling needs geometry queries
-                const glm::vec3 c = glm::vec3(scene.WorldMatrix(e)[3]);
-                coupling = SegmentTransmission(*physics, scene, c, listenerPos, assetsDir);
-                if (coupling < 0.03f) continue; // negligibly coupled -> skip
-            }
-            const AcousticRoom rm = RoomForSpace(scene, e, sp);
-            AcousticEnvironment env;
-            // Non-negative, stable per valid entity (masks the sign bit so a recycled entity's id
-            // is never negative). Must match AudioSystem's per-voice room id exactly.
-            env.id = static_cast<int>(entt::to_integral(e) & 0x7FFFFFFFu);
-            for (int b = 0; b < 9; ++b) env.rt60[b] = rm.rt60[b];
-            env.coupling = coupling;
-            env.gain = 1.0f;
-            envs.push_back(env);
-            if (envs.size() >= 16u) break;
-        }
-        audio.SetEnvironments(envs.empty() ? nullptr : envs.data(), static_cast<int>(envs.size()));
+        BuildEnvironments(scene, listenerPos, assetsDir, audio, physics, best);
     }
+#else
+    (void)physics;
+#endif
 
     if (best == entt::null) {
         // Outdoors / no room: disable room effects (push once on the transition out).

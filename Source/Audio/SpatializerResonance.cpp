@@ -47,6 +47,7 @@ struct ResonanceSpatializer::Impl {
     ma_engine* engine = nullptr;
     vraudio::ResonanceAudioApi* api = nullptr;
     int sampleRate = 48000;
+    int inCh = 2; // node input-bus channel count == engine channels; downmixed to mono per source
     Node node{};
     bool nodeReady = false;
 
@@ -80,6 +81,7 @@ struct ResonanceSpatializer::Impl {
     int envCount = 0;
     int slotEnvId[kMaxSources]; // environment id per source slot; -1 = unassigned
     std::vector<float> envOut;  // one Process block of interleaved stereo reverb
+    std::vector<float> envMono; // per-call mono downmix of one source's input (for env reverb)
 
     void RingPush(const float* stereo, size_t frames) {
         for (size_t i = 0; i < frames; ++i) {
@@ -118,11 +120,18 @@ struct ResonanceSpatializer::Impl {
             return;
         }
 
-        // 1) Append this call's mono frames per source (silence for inactive / null inputs).
+        // 1) Append this call's frames per source, DOWNMIXED to mono (vraudio sources are mono; the
+        //    node's input buses are `inCh`-channel to match the LPF that feeds them). Silence for
+        //    inactive / null inputs.
+        const int ch = inCh > 0 ? inCh : 1;
         for (int s = 0; s < kMaxSources; ++s) {
             float* a = accum[s].data() + accumFill;
             if (active[s].load(std::memory_order_relaxed) && in != nullptr && in[s] != nullptr) {
-                std::memcpy(a, in[s], sizeof(float) * frames);
+                for (ma_uint32 i = 0; i < frames; ++i) {
+                    float sum = 0.0f;
+                    for (int c = 0; c < ch; ++c) sum += in[s][i * ch + c];
+                    a[i] = sum / static_cast<float>(ch);
+                }
             } else {
                 std::memset(a, 0, sizeof(float) * frames);
             }
@@ -130,11 +139,16 @@ struct ResonanceSpatializer::Impl {
         accumFill += frames;
 
         // 2) Render as many full Resonance blocks as we have input for.
+        float dbgDryL = 0.0f, dbgDryR = 0.0f;
         while (accumFill >= kBlockSize) {
             for (int s = 0; s < kMaxSources; ++s) {
                 api->SetInterleavedBuffer(sourceId[s], accum[s].data(), 1, kBlockSize);
             }
             api->FillInterleavedOutputBuffer(2, kBlockSize, stereoTmp.data());
+            for (size_t i = 0; i < kBlockSize; ++i) {
+                dbgDryL = std::max(dbgDryL, std::fabs(stereoTmp[i * 2 + 0]));
+                dbgDryR = std::max(dbgDryR, std::fabs(stereoTmp[i * 2 + 1]));
+            }
             RingPush(stereoTmp.data(), kBlockSize);
 
             const size_t rem = accumFill - kBlockSize;
@@ -154,19 +168,46 @@ struct ResonanceSpatializer::Impl {
         }
 
         // 4) Multi-environment reverb: route each active source into the room it occupies and mix
-        //    EVERY active environment's tail (coupling-weighted, in the library) into the output,
-        //    alongside the vraudio binaural. Off by default -> this block is skipped entirely.
+        //    EVERY active environment's tail into the output, alongside the vraudio binaural. Each
+        //    environment's tail is weighted AND spectrally shaped by its PER-BAND coupling (a distant
+        //    room bleeds in darkened). `coupling` is a 9-band array -> the per-band SetEnvironment
+        //    overload. Off by default -> this block is skipped entirely.
         if (envReverbEnabled && envReverb.IsReady()) {
             envReverb.BeginBlock();
-            for (int e = 0; e < envCount; ++e)
+            for (int e = 0; e < envCount; ++e) {
                 envReverb.SetEnvironment(envTable[e].id, envTable[e].rt60, envTable[e].coupling,
                                          envTable[e].gain);
+                envReverb.SetEnvironmentPreDelay(envTable[e].id, envTable[e].preDelaySec);
+            }
+            const int ech = inCh > 0 ? inCh : 1;
             for (int s = 0; s < kMaxSources; ++s)
                 if (active[s].load(std::memory_order_relaxed) && in != nullptr &&
-                    in[s] != nullptr && slotEnvId[s] >= 0)
-                    envReverb.AddInput(slotEnvId[s], in[s], static_cast<int>(frames));
+                    in[s] != nullptr && slotEnvId[s] >= 0) {
+                    for (ma_uint32 i = 0; i < frames; ++i) {
+                        float sum = 0.0f;
+                        for (int c = 0; c < ech; ++c) sum += in[s][i * ech + c];
+                        envMono[static_cast<size_t>(i)] = sum / static_cast<float>(ech);
+                    }
+                    envReverb.AddInput(slotEnvId[s], envMono.data(), static_cast<int>(frames));
+                }
             envReverb.Process(envOut.data(), static_cast<int>(frames));
             for (ma_uint32 i = 0; i < frames * 2; ++i) dst[i] += envOut[i];
+        }
+
+        // TEMP DIAGNOSTIC: is the output directional? dryL/dryR = the HRTF render per ear (should
+        // differ for an off-axis source); outL/outR = final (dry + diffuse reverb). If dry differs
+        // but out does not, the reverb is washing out the directional cue.
+        {
+            static int s_dirTick = 0;
+            if ((s_dirTick++ % 180) == 0) {
+                float outL = 0.0f, outR = 0.0f;
+                for (ma_uint32 i = 0; i < frames; ++i) {
+                    outL = std::max(outL, std::fabs(dst[i * 2 + 0]));
+                    outR = std::max(outR, std::fabs(dst[i * 2 + 1]));
+                }
+                HBE_INFO("DirDBG dryL={:.4f} dryR={:.4f} outL={:.4f} outR={:.4f} envOn={}", dbgDryL,
+                         dbgDryR, outL, outR, envReverbEnabled);
+            }
         }
 
         *frameCountIn = frames;
@@ -212,11 +253,18 @@ bool ResonanceSpatializer::Init(void* maEngine, void* destNode, u32 sampleRate) 
     // integration enables it; when off, Process skips it entirely).
     impl_->envReverb.Init(static_cast<int>(sampleRate), Impl::kReverbEnvCapacity);
     impl_->envOut.assign(kMaxProcess * 2, 0.0f);
+    impl_->envMono.assign(kMaxProcess, 0.0f);
     for (int s = 0; s < kMaxSources; ++s) impl_->slotEnvId[s] = -1;
     impl_->envCount = 0;
 
+    // The node's input buses MUST match the channel count of what feeds them (the per-voice LPF,
+    // created at ma_engine_get_channels): miniaudio's ma_node_attach_output_bus requires matching
+    // channels and silently fails otherwise - which left every spatial voice unconnected and the
+    // whole binaural path SILENT. The mono vraudio sources are fed by downmixing in Process.
+    impl_->inCh = static_cast<int>(ma_engine_get_channels(impl_->engine));
+    if (impl_->inCh < 1) impl_->inCh = 1;
     ma_uint32 inChannels[kMaxSources];
-    for (int s = 0; s < kMaxSources; ++s) inChannels[s] = 1;
+    for (int s = 0; s < kMaxSources; ++s) inChannels[s] = static_cast<ma_uint32>(impl_->inCh);
     ma_uint32 outChannels[1] = {2};
 
     // Static storage duration (the node keeps a pointer to this vtable for its lifetime).

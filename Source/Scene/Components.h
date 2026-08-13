@@ -612,7 +612,8 @@ struct AudioSource {
     f32 maxDistance = 30.0f; // silent beyond
     bool loop = true;
     bool autoplay = true;
-    bool playing = false; // runtime state (autoplay sets it on first update)
+    bool playing = false;      // runtime state (autoplay sets it on first update)
+    bool autoStarted = false;  // runtime latch: autoplay has fired this play session
 
     static constexpr u32 kNoVoice = 0;
     u32 voiceId = kNoVoice; // managed by AudioSystem; reset to re-create

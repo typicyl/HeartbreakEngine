@@ -30,11 +30,17 @@ struct AcousticRoom {
 // reaches the listener through portals/propagation; 1 = the listener is inside it). `id` is a
 // stable identifier (e.g. an AcousticSpace entity). The library mixes ALL active environments up
 // to its capacity - this is not a "pick the loudest room" selection.
+//
+// `coupling` is PER-BAND (9 octave bands): a distant room reached through walls/doorways couples
+// its low frequencies more than its highs (transmission loss rises with frequency), so its tail
+// bleeds in DARKENED, not merely quieter. The bands come from the room-to-room propagation graph
+// (hdsr::SolvePropagation). A flat curve (all bands equal) is the "just quieter" special case.
 struct AcousticEnvironment {
     int id = -1;
     f32 rt60[9] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    f32 coupling = 0.0f; // fraction of this environment's tail reaching the listener [0,1]
+    f32 coupling[9] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}; // per-band [0,1]
     f32 gain = 1.0f;
+    f32 preDelaySec = 0.0f; // propagation delay of this room's tail to the listener (distance / c)
 };
 
 } // namespace hbe

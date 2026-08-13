@@ -2,6 +2,10 @@
 #include "Audio/AudioSystem.h"
 #include "Audio/SpatializerResonance.h" // optional binaural backend (HDS Resonance fork)
 
+#if HBE_HAVE_RESONANCE
+#include "hdsr/acoustics.h" // diffraction MODEL (portal-based apparent-source repositioning)
+#endif
+
 #include "Assets/AudioEvent.h"
 #include "Assets/MusicGraph.h"
 #include "Assets/UAF.h"
@@ -258,29 +262,42 @@ struct AudioSystem::Impl {
     // Directional diffraction: when the DIRECT path to a source is heavily occluded but an open
     // AcousticPortal offers a clearer path, the sound should appear to come from the DOORWAY, not
     // through the wall. Returns an apparent emit position pulled toward the best open portal (the
-    // true position when the direct path is clear or no portal helps). Reuses the transmission
-    // callback + the scene's portals; position-only, so a wrong guess never silences a voice.
+    // true position when the direct path is clear or no portal helps). The DECISION is the library's
+    // diffraction model (hdsr::DiffractedSourcePosition); Heartbreak only supplies the geometry -
+    // the scene's portals and the physics-backed transmission along each leg. Position-only, so a
+    // wrong guess never silences a voice.
     glm::vec3 DiffractedPosition(Scene& scene, const glm::vec3& src, const glm::vec3& listener,
                                  const std::function<f32(const glm::vec3&, const glm::vec3&)>& transmit) {
         if (!transmit) return src;
+#if HBE_HAVE_RESONANCE
+        // Fast path: if the direct path is mostly clear, skip the portal raycasts entirely. (The
+        // library enforces the same threshold; this only avoids the work.)
         const f32 directT = glm::clamp(transmit(src, listener), 0.0f, 1.0f);
-        if (directT >= 0.5f) return src; // direct path mostly clear -> no diffraction
+        if (directT >= 0.5f) return src;
         entt::registry& reg = scene.Registry();
-        f32 bestScore = directT + 0.15f; // require a meaningfully clearer portal path
-        glm::vec3 best(0.0f);
-        bool found = false;
+        std::vector<hdsr::DiffractionPortal> portals;
         for (const entt::entity e : reg.view<AcousticPortal>()) {
             const AcousticPortal& p = reg.get<AcousticPortal>(e);
-            if (!p.enabled || p.openness < 0.4f || !reg.all_of<Transform>(e)) continue;
+            if (!p.enabled || p.openness < 0.4f || !reg.all_of<Transform>(e)) continue; // pre-filter
             const glm::vec3 c = glm::vec3(scene.WorldMatrix(e)[3]);
-            const f32 t = glm::min(transmit(src, c), transmit(c, listener)) * p.openness;
-            if (t > bestScore) {
-                bestScore = t;
-                best = c;
-                found = true;
-            }
+            hdsr::DiffractionPortal dp;
+            dp.position[0] = c.x; dp.position[1] = c.y; dp.position[2] = c.z;
+            dp.openness = p.openness;
+            dp.srcToPortal = transmit(src, c);
+            dp.portalToListener = transmit(c, listener);
+            portals.push_back(dp);
         }
-        return found ? glm::mix(src, best, glm::clamp(1.0f - directT, 0.3f, 1.0f)) : src;
+        const float s[3] = {src.x, src.y, src.z};
+        const float l[3] = {listener.x, listener.y, listener.z};
+        float out[3];
+        hdsr::DiffractedSourcePosition(s, l, directT, portals.empty() ? nullptr : portals.data(),
+                                       static_cast<int>(portals.size()), out);
+        return glm::vec3(out[0], out[1], out[2]);
+#else
+        (void)scene;
+        (void)listener;
+        return src;
+#endif
     }
 
     // Glide a voice's occlusion toward `target` and apply attenuation + LPF cutoff.
@@ -1185,10 +1202,10 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
                               f32 dt) {
     if (!IsAvailable()) return;
     const bool occlude = impl_->occlusion.enabled && static_cast<bool>(segmentTransmission);
-    // Autoplay arms on the edge into "game running" (the runtime is playing from
-    // frame 1; the editor only in play mode), so opening/viewing a scene in the
-    // editor no longer triggers its audio.
-    const bool gameStarted = gamePlaying && !prevScenePlaying_;
+    // Autoplay LATCHES per source while the game is running (see the AudioSource loop below) rather
+    // than firing only on the single frame physics flips on: entering Play reloads the scene, so an
+    // autoplay source often first appears a frame AFTER that edge and would otherwise never start.
+    // Viewing a scene in the editor (not playing) still triggers no audio.
     prevScenePlaying_ = gamePlaying;
     auto& reg = scene.Registry();
 
@@ -1215,10 +1232,19 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
         AudioSource& src = reg.get<AudioSource>(e);
         if (src.asset.empty()) continue;
 
-        // Start autoplay sources when the game begins (not when the scene is
-        // merely shown in the editor). Manual playback (the inspector Play
-        // button / scripts toggling `playing`) still works for preview.
-        if (gameStarted && src.autoplay) src.playing = true;
+        // Start autoplay sources once the game is running (not when the scene is merely shown in
+        // the editor). Latched: the first frame this source is seen while the game runs it starts,
+        // then re-arms when the game stops (so it plays again next session). This survives the
+        // Play-time scene reload that made the old single-frame edge miss the source. Manual
+        // playback (the inspector Play button / scripts toggling `playing`) still works for preview.
+        if (gamePlaying) {
+            if (src.autoplay && !src.autoStarted) {
+                src.playing = true;
+                src.autoStarted = true;
+            }
+        } else {
+            src.autoStarted = false;
+        }
 
         // (Re)create the voice on first sight or after an asset/bus change.
         auto it = impl_->spatial.find(src.voiceId);
@@ -1311,6 +1337,22 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
                                        src.volume * impl_->SpatialBusGainToNode(sv.bus), occ,
                                        src.minDistance, src.maxDistance);
             impl_->resonance.SetSourceEnvironment(sv.voice.resSlot, AcousticSpaceIdAt(scene, pos));
+            {
+                static int s_spatTick = 0;
+                if ((s_spatTick++ % 60) == 0) {
+                    const glm::vec3 toApp = apparent - lisPos;
+                    const glm::vec3 right = glm::normalize(glm::cross(lisFwd, glm::vec3(0, 1, 0)));
+                    const f32 lat = glm::length(toApp) > 1e-3f
+                                        ? glm::dot(glm::normalize(toApp), right)
+                                        : 0.0f;
+                    HBE_INFO("SpatDBG '{}' src=({:.1f},{:.1f},{:.1f}) app=({:.1f},{:.1f},{:.1f}) "
+                             "lis=({:.1f},{:.1f},{:.1f}) fwd=({:.2f},{:.2f},{:.2f}) dist={:.1f} "
+                             "occ={:.2f} lateral={:.2f}(+R/-L)",
+                             src.asset, pos.x, pos.y, pos.z, apparent.x, apparent.y, apparent.z,
+                             lisPos.x, lisPos.y, lisPos.z, lisFwd.x, lisFwd.y, lisFwd.z,
+                             glm::length(pos - lisPos), occ, lat);
+                }
+            }
         } else {
             // miniaudio panning: position + distance; occlusion attenuates + muffles when
             // geometry blocks the path, else base volume with the LPF transparent.
