@@ -113,6 +113,21 @@ public:
     };
     void SetOcclusion(const OcclusionConfig& cfg);
 
+    // -- Binaural spatial audio (HDS Resonance HRTF) -----------------------------
+    // Selects the 3D spatialization path, pushed each frame from the project's
+    // SpatialAudioSettings. `binaural` on = HRTF rendering for spatial voices (requires the
+    // Resonance backend at build time; otherwise this is a silent no-op and voices stay on
+    // miniaudio panning). `speakerMode` on = loudspeaker output, which switches Resonance to
+    // amplitude panning (HRTF is a headphone technique). The HBE_RESONANCE=1/0 env var, when
+    // present, overrides `binaural` as a developer switch. Default: binaural on, headphones.
+    void SetSpatialMode(bool binaural, bool speakerMode);
+
+    // Sets the authoritative listener (head) pose. Call once per frame AFTER the game camera
+    // resolves (cam::Update), so binaural direction/distance use this frame's camera instead
+    // of last frame's (UpdateScene runs earlier). This is the single listener state every
+    // acoustic computation reads. Cheap; safe to call every frame.
+    void SetListenerPose(const glm::vec3& pos, const glm::vec3& forward);
+
     // -- Adaptive music director -------------------------------------------------
     // Interactive music: a graph of STATES (each a set of synced looping LAYERS)
     // that crossfade, with runtime PARAMETERS that fade layers in/out for a smooth,

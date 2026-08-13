@@ -158,6 +158,17 @@ struct AudioOcclusionSettings {
     f32 spread = 0.7f;            // offset-ray ring radius (m) for gap detection
 };
 
+// Project-wide binaural spatial audio (HDS Resonance HRTF). When enabled, 3D sources are
+// rendered with head-related transfer functions instead of amplitude panning; over speakers
+// the renderer falls back to panning (speakerMode). Requires the Resonance backend at build
+// time - otherwise the engine silently stays on miniaudio panning. Default ON: this is the
+// flagship spatializer. (The HBE_RESONANCE env var, when set, overrides `binaural` as a dev
+// switch.)
+struct SpatialAudioSettings {
+    bool binaural = true;         // HRTF spatialization for 3D sources (vs. amplitude panning)
+    bool speakerMode = false;     // true = loudspeakers (panning), false = headphones (HRTF)
+};
+
 // One device's button/key icon set: id -> texture `.uaf` path (relative to Assets).
 // `id` is a GamepadButton bit (pad devices) or a (u32)Key (keyboard). Sparse - only
 // the buttons the artist supplied art for. See input::PadButtons() / input::KeyName().
@@ -337,6 +348,8 @@ struct ProjectSettings {
     std::vector<AudioBusSetting> audioBuses;
     // Spatial-audio occlusion (geometry muffles/attenuates 3D sources).
     AudioOcclusionSettings occlusion;
+    // Binaural spatial audio (HRTF via HDS Resonance). Default on; see SpatialAudioSettings.
+    SpatialAudioSettings spatialAudio;
     // Adaptive-music graph (.hbmusic, relative to Assets). When set, the runtime
     // installs it on boot and crossfades into `musicStartState` when the game runs.
     std::string musicGraph;

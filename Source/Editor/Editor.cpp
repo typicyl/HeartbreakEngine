@@ -14690,6 +14690,25 @@ void Editor::DrawAudioMixer(Engine& engine) {
         ImGui::EndDisabled();
         if (changed) Project::Active().Save();
     }
+
+    // Binaural spatial audio (HDS Resonance HRTF). Default on; falls back to amplitude
+    // panning when the Resonance backend is unavailable or disabled here. Applied live.
+    ImGui::SeparatorText("Binaural Spatial Audio");
+    {
+        SpatialAudioSettings& sa = settings.spatialAudio;
+        bool changed = ImGui::Checkbox("Binaural (HRTF) 3D audio", &sa.binaural);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Head-related (HRTF) spatialization for 3D sources via HDS\n"
+                              "Resonance. Off = amplitude panning. Needs the Resonance backend\n"
+                              "(otherwise 3D audio stays on panning regardless).");
+        ImGui::BeginDisabled(!sa.binaural);
+        changed |= ImGui::Checkbox("Loudspeaker mode (no HRTF)", &sa.speakerMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("On for stereo speakers - HRTF is a headphone technique, so over\n"
+                              "speakers Resonance switches to panning. Off for headphones.");
+        ImGui::EndDisabled();
+        if (changed) Project::Active().Save();
+    }
     ImGui::End();
 }
 

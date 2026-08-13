@@ -181,6 +181,12 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         o.cutoffHz = it->value("cutoffHz", 700.0f);
         o.spread = it->value("spread", 0.7f);
     }
+    s.spatialAudio = SpatialAudioSettings{};
+    if (const auto it = j.find("spatialAudio"); it != j.end() && it->is_object()) {
+        SpatialAudioSettings& sa = s.spatialAudio;
+        sa.binaural = it->value("binaural", true);
+        sa.speakerMode = it->value("speakerMode", false);
+    }
     s.build = BuildSettings{}; // defaults for projects without a block
     if (const auto it = j.find("build"); it != j.end() && it->is_object()) {
         BuildSettings& b = s.build;
@@ -520,6 +526,10 @@ bool Project::Save() const {
                           {"attenuation", o.attenuation},
                           {"cutoffHz", o.cutoffHz},
                           {"spread", o.spread}};
+    }
+    {
+        const SpatialAudioSettings& sa = settings_.spatialAudio;
+        j["spatialAudio"] = {{"binaural", sa.binaural}, {"speakerMode", sa.speakerMode}};
     }
 
     std::ofstream out(projectFile_);

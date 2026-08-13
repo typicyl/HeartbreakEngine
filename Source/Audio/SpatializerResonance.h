@@ -56,7 +56,15 @@ public:
     void SetListener(const glm::vec3& pos, const glm::vec3& forward, const glm::vec3& up);
     // `occlusion01` is Heartbreak's own multi-ray occlusion result in [0,1]; it is fed to
     // Resonance's per-source occlusion intensity so the bespoke geometry probing is kept.
-    void SetSource(int slot, const glm::vec3& pos, f32 volume, f32 occlusion01);
+    // `minDist`/`maxDist` forward the engine's authored distance range so Resonance's
+    // distance attenuation matches the source's falloff instead of its own built-in defaults.
+    void SetSource(int slot, const glm::vec3& pos, f32 volume, f32 occlusion01,
+                   f32 minDist, f32 maxDist);
+
+    // Loudspeaker mode: HRTF is a headphone technique, so over stereo speakers Resonance
+    // switches to amplitude panning (which also avoids HRTF coloring and is cheaper). Maps
+    // straight to vraudio SetStereoSpeakerMode.
+    void SetSpeakerMode(bool speakers);
 
     // Max number of simultaneous spatial voices the pool supports.
     static int Capacity();

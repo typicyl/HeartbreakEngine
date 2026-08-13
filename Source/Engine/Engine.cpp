@@ -2132,8 +2132,12 @@ int Engine::Run(const EngineConfig& configIn) {
         // test so 3D sources are attenuated/muffled by geometry (multi-ray leaks
         // through gaps). Only fed while the game runs (colliders live then).
         if (Project::HasActive()) {
-            const AudioOcclusionSettings& os = Project::Active().Settings().occlusion;
+            const ProjectSettings& psettings = Project::Active().Settings();
+            const AudioOcclusionSettings& os = psettings.occlusion;
             audio.SetOcclusion({os.enabled, os.rays, os.attenuation, os.cutoffHz, os.spread});
+            // Binaural spatial audio (HRTF) mode + speaker/headphone, live from the project.
+            const SpatialAudioSettings& sa = psettings.spatialAudio;
+            audio.SetSpatialMode(sa.binaural, sa.speakerMode);
         }
         std::function<bool(const glm::vec3&, const glm::vec3&)> segBlocked;
         if (physics.IsRunning()) {
@@ -2344,6 +2348,12 @@ int Engine::Run(const EngineConfig& configIn) {
             }
         }
         prevGameCamEnabled = gameCameraEnabled_;
+
+        // Authoritative spatial-audio listener: the game camera has now resolved for this
+        // frame (cam::Update above), so push the current-frame head pose. audio.UpdateScene
+        // ran earlier with last frame's camera; this refreshes the binaural head + miniaudio
+        // listener so 3D direction/distance track the camera without a frame of lag.
+        audio.SetListenerPose(renderer.GetCamera().Position(), renderer.GetCamera().Forward());
 
         // Particles: simulate (spawn + integrate) and build this frame's billboards
         // against the camera basis. Emit even in the editor so emitters preview live.

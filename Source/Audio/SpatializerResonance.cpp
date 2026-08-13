@@ -266,12 +266,22 @@ void ResonanceSpatializer::SetListener(const glm::vec3& pos, const glm::vec3& fo
 }
 
 void ResonanceSpatializer::SetSource(int slot, const glm::vec3& pos, f32 volume,
-                                     f32 occlusion01) {
+                                     f32 occlusion01, f32 minDist, f32 maxDist) {
     if (!IsReady() || slot < 0 || slot >= kMaxSources) return;
     const auto id = impl_->sourceId[slot];
     impl_->api->SetSourcePosition(id, pos.x, pos.y, pos.z);
     impl_->api->SetSourceVolume(id, volume);
     impl_->api->SetSoundObjectOcclusionIntensity(id, glm::clamp(occlusion01, 0.0f, 1.0f));
+    // Forward Heartbreak's authored distance range (logarithmic rolloff) so a spatial voice
+    // attenuates over its own minDistance..maxDistance instead of Resonance's defaults.
+    const f32 lo = glm::max(minDist, 0.1f);
+    const f32 hi = glm::max(maxDist, lo + 0.2f);
+    impl_->api->SetSourceDistanceModel(id, vraudio::kLogarithmic, lo, hi);
+}
+
+void ResonanceSpatializer::SetSpeakerMode(bool speakers) {
+    if (!IsReady()) return;
+    impl_->api->SetStereoSpeakerMode(speakers);
 }
 
 int ResonanceSpatializer::Capacity() { return kMaxSources; }
@@ -293,7 +303,8 @@ void* ResonanceSpatializer::InputNode() const { return nullptr; }
 int ResonanceSpatializer::AcquireSource() { return -1; }
 void ResonanceSpatializer::ReleaseSource(int) {}
 void ResonanceSpatializer::SetListener(const glm::vec3&, const glm::vec3&, const glm::vec3&) {}
-void ResonanceSpatializer::SetSource(int, const glm::vec3&, f32, f32) {}
+void ResonanceSpatializer::SetSource(int, const glm::vec3&, f32, f32, f32, f32) {}
+void ResonanceSpatializer::SetSpeakerMode(bool) {}
 int ResonanceSpatializer::Capacity() { return 0; }
 
 } // namespace hbe
