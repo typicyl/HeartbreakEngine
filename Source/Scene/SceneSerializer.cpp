@@ -409,6 +409,7 @@ SceneData HeaderOf(const SceneEnvironment& env) {
     h.shadowDistance = env.shadowDistance;
     h.giSource = env.giSource;
     h.navSource = env.navSource;
+    h.navEnabled = env.navEnabled;
     // Slot identity survives file -> live scene -> save. Without this hop a save to
     // a NEW path (Save As, a migration, a headless tool) silently strips the asset's
     // permanent pack slot, renumbering it at the next cook. SaveScene also carries
@@ -553,6 +554,9 @@ json BuildSceneJson(const Scene& scene,
     root["post"] = PostToJson(hdr.post);
     if (!hdr.giSource.empty()) root["giSource"] = hdr.giSource;
     if (!hdr.navSource.empty()) root["navSource"] = hdr.navSource;
+    // Written only when true so scenes that never opted in stay byte-identical (and
+    // an absent key parses back to the default-off state).
+    if (hdr.navEnabled) root["navEnabled"] = true;
     // Slot identity survives the round trip (see SceneData::packSlot). Written only
     // when the source carried one, so a never-stamped scene stays byte-identical.
     if (hdr.packSlot != SceneData::kNoPackSlot) root["packSlot"] = hdr.packSlot;
@@ -1424,6 +1428,9 @@ void ParseSceneJson(const json& root, SceneData& out) {
     out.ambientIntensity = root.value("ambientIntensity", 1.0f);
     out.giSource = root.value("giSource", std::string());
     out.navSource = root.value("navSource", std::string());
+    // Default OFF, including for existing scenes that predate this key and carry a
+    // navSource: navigation no longer streams on boot unless the scene opts in.
+    out.navEnabled = root.value("navEnabled", false);
     if (const auto ps = root.find("packSlot"); ps != root.end() && ps->is_number_unsigned())
         out.packSlot = ps->get<u32>();
     // Absent = a file written before these existed; 0 means "unidentified", which the
@@ -2345,6 +2352,20 @@ static void WritePaintCanvases(Scene& scene, const fs::path& assetsDir,
                      pc.source);
             continue;
         }
+        // A canvas box-downsampled at stream-in (project maxStreamedPaintResolution) is a
+        // LOWER-res proxy of the on-disk .hbpaint; writing it back would destroy the
+        // authored resolution. Keep the reference, never rewrite the file. To edit such a
+        // canvas, raise/clear the cap so it loads at full resolution.
+        // Only protect an EXISTING higher-res file. A brand-new canvas (isNew: a
+        // clone/paste/prefab-drop that just minted its own source) has no original on
+        // disk, so skipping it would silently lose the clone's paint - write it instead
+        // (at the reduced res, which is all we have for a streamed-capped source).
+        if (pc.resCapped && !isNew) {
+            HBE_WARN("Scene: paint canvas '{}' was downsampled by the streamed-paint cap - "
+                     "the file is NOT rewritten (raise the cap to edit at full res).",
+                     pc.source);
+            continue;
+        }
         if (onlyNew && !isNew) continue;
         if (!paint::Save(assetsDir / pc.source, pc))
             HBE_WARN("Scene: failed to write paint canvas '{}'.", pc.source);
@@ -2584,6 +2605,77 @@ void CacheUploadedMesh(const std::string& key, rhi::MeshHandle mesh, const AABB&
     CachePutMesh(key, mesh, bounds, std::string());
 }
 
+// MARK-SWEEP VRAM reclaim: destroy every CACHED mesh/texture that NO live entity still
+// references, and drop it from the shared caches so a later stream-in re-creates it. Called
+// after a streaming despawn. SAFE because it only frees CACHE VALUES (generated resources -
+// UI targets, probe maps, morph atlases, water meshes - are never cached, so they cannot be
+// swept), and the MARK is COMPREHENSIVE over every component that can hold a GPU handle, so
+// it can never free something still in use (marking a non-cached handle is harmless; missing
+// a cached one would be a use-after-free, hence the belt-and-suspenders coverage). The RHI
+// destroy is itself deferred a few frames, so even an in-flight draw is safe. Main thread.
+void TrimUnreferencedGpu(Scene& scene, Renderer& renderer) {
+    entt::registry& reg = scene.Registry();
+    std::unordered_set<u64> liveMesh, liveTex;
+    const auto tex = [&](rhi::TextureHandle h) { if (h.IsValid()) liveTex.insert(h.index); };
+    const auto msh = [&](rhi::MeshHandle h) { if (h.IsValid()) liveMesh.insert(h.id); };
+    for (auto&& [e, mi] : reg.view<MeshInstance>().each()) {
+        msh(mi.mesh);
+        tex(mi.albedoTexture); tex(mi.normalTexture); tex(mi.mrTexture);
+        tex(mi.aoTexture); tex(mi.emissiveTexture); tex(mi.thicknessTexture);
+    }
+    for (auto&& [e, pc] : reg.view<PaintComponent>().each()) { tex(pc.colorTex); tex(pc.matTex); }
+    for (auto&& [e, tc] : reg.view<TerrainComponent>().each()) {
+        tex(tc.holeMaskTex); tex(tc.splatWeightTex);
+        for (int i = 0; i < 4; ++i) {
+            tex(tc.splatAlbedoTex[i]); tex(tc.splatNormalTex[i]); tex(tc.splatMRTex[i]);
+        }
+    }
+    for (auto&& [e, dc] : reg.view<DecalComponent>().each()) { tex(dc.albedo); tex(dc.normal); tex(dc.mr); }
+    for (auto&& [e, uc] : reg.view<UICanvas>().each()) tex(uc.rtTexture);
+    for (auto&& [e, rp] : reg.view<ReflectionProbe>().each()) { tex(rp.irradiance); tex(rp.prefiltered); }
+    for (auto&& [e, wc] : reg.view<WaterComponent>().each()) msh(wc.mesh);
+    for (auto&& [e, ms] : reg.view<MorphState>().each()) tex(ms.morphTexture);
+
+    std::vector<rhi::MeshHandle> meshDead;
+    std::vector<rhi::TextureHandle> texDead;
+    {
+        std::lock_guard<std::mutex> lk(CachesMutex());
+        auto& C = Caches();
+        for (auto it = C.mesh.begin(); it != C.mesh.end();) {
+            if (it->second.IsValid() && !liveMesh.count(it->second.id)) {
+                meshDead.push_back(it->second);
+                C.bounds.erase(it->first);
+                C.submeshMat.erase(it->first);
+                it = C.mesh.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = C.textures.begin(); it != C.textures.end();) {
+            if (it->second.IsValid() && !liveTex.count(it->second.index)) {
+                texDead.push_back(it->second);
+                it = C.textures.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = C.paint.begin(); it != C.paint.end();) {
+            const rhi::TextureHandle col = it->second.first, mat = it->second.second;
+            const bool used = (col.IsValid() && liveTex.count(col.index)) ||
+                              (mat.IsValid() && liveTex.count(mat.index));
+            if (!used) {
+                if (col.IsValid()) texDead.push_back(col);
+                if (mat.IsValid()) texDead.push_back(mat);
+                it = C.paint.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (rhi::MeshHandle h : meshDead) renderer.DestroyMesh(h);
+    for (rhi::TextureHandle h : texDead) renderer.DestroyTexture(h);
+}
+
 namespace {
 // The slice's row list. `indices == nullptr` = the whole file, which is the
 // shipping full-file path; a non-null pointer means a slice is active even at
@@ -2639,12 +2731,24 @@ bool ResolveMorphAtlas(Renderer& renderer, StagedAssets& staged,
 void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets& out,
                  const u32* indices, u32 count) {
     const SliceView slice{indices, count, data.entities.size()};
+    // Optional per-project cap that box-downsamples oversized streamed paint canvases at
+    // load (reversible - the .hbpaint keeps its authored resolution). Read once here; a
+    // benign read of a value that is fixed for the streaming session (StageAssets runs on
+    // worker threads). 0 = no cap.
+    const u32 paintCap =
+        Project::HasActive() ? Project::Active().Settings().maxStreamedPaintResolution : 0u;
     // Anything already resident in the persistent Instantiate caches skips its
     // disk IO entirely (snapshots restore instantly on undo/redo).
     const auto stageTexture = [&](const std::string& tex) {
         if (tex.empty() || out.textures.contains(tex)) return;
         if (CacheHasTexture(tex)) return; // GPU-resident
         if (std::optional<uaf::Texture> t = uaf::ReadTexture(assetsDir / tex)) {
+            // Build the mip chain HERE, on this worker thread. Instantiate's
+            // UploadStagedTexture calls GenerateMips too, but it no-ops once mipCount>1,
+            // so this simply MOVES the per-texture mip generation off the finalize/main
+            // thread - the dominant cost when a material-heavy shard streams in (measured
+            // ~700ms cold finalize = material-texture mip-gen + upload, not paint).
+            assets::GenerateMips(*t);
             out.textures.emplace(tex, std::move(*t));
         }
     };
@@ -2669,13 +2773,23 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         if (i >= data.entities.size()) continue; // bad slice index (warned in Instantiate)
         const EntityData& d = data.entities[i];
         stageMaterial(d.materialAsset);
-        // Surface-paint canvases (CPU file IO only; uploaded in Instantiate).
+        // Surface-paint canvases. Load the .hbpaint AND do the heavy flatten + dilate +
+        // mip-chain build HERE, on this worker thread (paint::Prepare), so Instantiate
+        // only has to upload. Without this a shard of N painted meshes flattened+mipped N
+        // 1024^2 canvases in a single finalize frame (measured ~200 ms on a real level).
         if (d.hasPaint && !d.paintSource.empty() && !out.paints.contains(d.paintSource)) {
             PaintComponent canvas;
-            if (paint::Load(assetsDir / d.paintSource, canvas))
+            if (paint::Load(assetsDir / d.paintSource, canvas)) {
+                // Cap the resolution FIRST (cheap once, on this worker), so the far more
+                // expensive flatten+dilate+mip in Prepare - and the later upload+VRAM -
+                // all run at the reduced size (O(res^2), so 1024->256 is ~16x less).
+                if (paintCap > 0 && canvas.resolution > paintCap)
+                    paint::Downsample(canvas, paintCap);
+                paint::Prepare(canvas); // CPU-only; leaves prepared{Color,Material,Mips}
                 out.paints.emplace(d.paintSource, std::move(canvas));
-            else
+            } else {
                 HBE_WARN("Scene: missing paint canvas '{}'.", d.paintSource);
+            }
         }
     }
 
@@ -2814,6 +2928,7 @@ void ApplyEnvironment(Scene& scene, Renderer& renderer, const SceneData& data) {
     // (re)loads the .hbnav when it changes; set it here (before the GI early-return
     // below) so it is always applied on load.
     env.navSource = data.navSource;
+    env.navEnabled = data.navEnabled;
     // Load the cached GI volume (.hbgi) so baked GI lights the scene without a
     // re-bake.
     //
@@ -3010,6 +3125,24 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                         const MeshData& md = mit->second[submesh];
                         mi.mesh = renderer.UploadMesh(md);
                         ComputeBounds(md, bounds.min, bounds.max);
+                        // Upload this submesh's distance LODs (v9) and register them for
+                        // runtime selection. Fresh-upload path only: a cache HIT above already
+                        // has its LODs registered (the Renderer table persists with the base
+                        // handle). RegisterMeshLods gives the base ownership so a streaming
+                        // reclaim frees the LODs with it. Headless (no device) uploads are
+                        // invalid, so this no-ops exactly like the base upload does.
+                        if (mi.mesh.IsValid() && !md.lods.empty()) {
+                            std::vector<rhi::MeshHandle> lodHandles;
+                            lodHandles.reserve(md.lods.size());
+                            for (const MeshLod& lod : md.lods) {
+                                MeshData lm;
+                                lm.vertices = lod.vertices;
+                                lm.indices = lod.indices;
+                                if (const rhi::MeshHandle lh = renderer.UploadMesh(lm); lh.IsValid())
+                                    lodHandles.push_back(lh);
+                            }
+                            renderer.RegisterMeshLods(mi.mesh, lodHandles);
+                        }
                         mi.albedoTexture = loadTexture(md.material.baseColorTex);
                         mi.normalTexture = loadTexture(md.material.normalTex);
                         mi.mrTexture = loadTexture(md.material.mrTex);
@@ -3172,6 +3305,9 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             if (haveCanvas) {           // metadata always comes from the scene
                 pc.layers = pit->second.layers;
                 pc.activeLayer = pit->second.activeLayer;
+                // Carry the streamed-paint downsample flag onto the runtime component so a
+                // save can never write this shrunk copy over the higher-res .hbpaint.
+                pc.resCapped = pit->second.resCapped;
             }
             // The pixels are UNKNOWN, not empty. WritePaintCanvases skips a canvas
             // carrying this flag, so a save cannot write an EMPTY `.hbpaint` over a
@@ -3200,7 +3336,16 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             if (haveCanvas && !pkey.empty()) CacheGetPaint(pkey, pc.colorTex, pc.matTex);
             PaintComponent& placed = reg.emplace<PaintComponent>(e, std::move(pc));
             if (haveCanvas) {
-                paint::Sync(renderer, placed); // upload (first time) or update (respawn)
+                // The heavy flatten+mip work was already done off the main thread in
+                // StageAssets (paint::Prepare), so here we only UPLOAD (async) - this is
+                // what keeps a big painted shard from stalling the finalize frame. A
+                // canvas that Prepare produced nothing for (empty layers) falls back to
+                // the full Sync.
+                if (pit->second.preparedMips > 0)
+                    paint::UploadPrepared(renderer, placed, pit->second.preparedColor,
+                                          pit->second.preparedMaterial, pit->second.preparedMips);
+                else
+                    paint::Sync(renderer, placed);
                 if (!pkey.empty() && placed.colorTex.IsValid() && placed.matTex.IsValid())
                     CachePutPaint(pkey, placed.colorTex, placed.matTex);
             }

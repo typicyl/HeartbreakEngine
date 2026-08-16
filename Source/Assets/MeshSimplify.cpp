@@ -1,6 +1,10 @@
 #include "Assets/MeshSimplify.h"
 
 #include "Assets/MeshDerive.h"
+#include "Assets/MeshOptimize.h"
+#include "Assets/UAF.h" // MeshLodSelfTest: v9 mesh round-trip
+
+#include <filesystem>
 
 #include <algorithm>
 #include <cmath>
@@ -412,6 +416,31 @@ f32 MaxDeviation(const MeshData& reduced, const MeshData& original) {
 }
 } // namespace
 
+void BuildLodChain(MeshData& md, const LodChainSettings& s) {
+    md.lods.clear();
+    // Morphed meshes keep only full detail: Simplify drops morph targets, so a decimated LOD
+    // would animate its face against geometry that no longer exists.
+    if (!md.morphTargets.empty() || md.Empty()) return;
+    usize lastIdx = md.indices.size(); // strictly-decreasing gate (LOD0 is the ceiling)
+    for (f32 ratio : s.ratios) {
+        SimplifySettings ss = s.quality;
+        ss.ratio = ratio;
+        SimplifyStats stats;
+        MeshData reduced = Simplify(md, ss, &stats);
+        const usize ridx = reduced.indices.size();
+        // Skip a level that didn't reduce past the previous one (or hit the floor): a
+        // duplicate wastes VRAM and adds a pointless distance switch.
+        if (ridx == 0 || ridx >= lastIdx) continue;
+        OptimizeForGpu(reduced); // vertex-cache/overdraw/fetch order, same as LOD0 at import
+        MeshLod lod;
+        lod.vertices = std::move(reduced.vertices);
+        lod.indices  = std::move(reduced.indices);
+        md.lods.push_back(std::move(lod));
+        lastIdx = ridx;
+        if (stats.outputTriangles <= s.quality.minTriangles) break; // no point going finer-ratio
+    }
+}
+
 bool SimplifySelfTest() {
     g_fails = 0;
 
@@ -543,6 +572,79 @@ bool SimplifySelfTest() {
                     "grid reduces for almost no error, boundaries are constrained, flips are "
                     "rejected, skin weights survive, morphs are dropped rather than corrupted, "
                     "and the same mesh always reduces identically\n");
+    return g_fails == 0;
+}
+
+bool MeshLodSelfTest() {
+    g_fails = 0;
+
+    // ---- generation: LODs are produced, strictly decreasing, LOD0 left untouched ----
+    {
+        MeshData m = Sphere(24, 32, 1.0f);
+        const std::vector<u32> lod0Idx = m.indices;      // snapshot: prove non-destructive
+        const usize lod0Verts = m.vertices.size();
+        BuildLodChain(m);
+        Check(!m.lods.empty(), "a dense sphere must produce at least one LOD");
+        Check(m.indices == lod0Idx && m.vertices.size() == lod0Verts,
+              "BuildLodChain must NOT modify LOD0 (the source geometry)");
+        usize prev = lod0Idx.size();
+        bool decreasing = true;
+        for (const MeshLod& lod : m.lods) {
+            if (lod.indices.empty() || lod.indices.size() >= prev) { decreasing = false; break; }
+            prev = lod.indices.size();
+        }
+        Check(decreasing, "each LOD must have strictly fewer triangles than the previous level");
+    }
+
+    // ---- determinism: re-import must not churn the asset ----
+    {
+        MeshData a = Sphere(20, 28, 1.0f), b = Sphere(20, 28, 1.0f);
+        BuildLodChain(a);
+        BuildLodChain(b);
+        bool same = a.lods.size() == b.lods.size();
+        for (usize i = 0; same && i < a.lods.size(); ++i)
+            same = a.lods[i].indices == b.lods[i].indices &&
+                   a.lods[i].vertices.size() == b.lods[i].vertices.size();
+        Check(same, "BuildLodChain must be deterministic");
+    }
+
+    // ---- morph meshes are excluded (a decimated topology can't carry morph deltas) ----
+    {
+        MeshData m = Sphere(16, 20, 1.0f);
+        MorphTarget mt;
+        mt.name = "jawOpen";
+        mt.posDelta.assign(m.vertices.size(), glm::vec3(0.0f, 0.1f, 0.0f));
+        m.morphTargets.push_back(std::move(mt));
+        BuildLodChain(m);
+        Check(m.lods.empty(), "a morph-bearing mesh must get NO LODs");
+    }
+
+    // ---- v9 .uaf round-trip: LODs survive write+read exactly ----
+    {
+        MeshData m = Sphere(20, 24, 1.0f);
+        BuildLodChain(m);
+        Check(!m.lods.empty(), "round-trip fixture needs LODs");
+        const Model model{m};
+        const std::filesystem::path tmp =
+            std::filesystem::temp_directory_path() / "hbe_meshlod_roundtrip.uaf";
+        Check(uaf::WriteMesh(tmp, model), "WriteMesh (v9) must succeed");
+        const std::optional<Model> back = uaf::ReadMesh(tmp);
+        Check(back.has_value() && back->size() == 1, "ReadMesh must return the one submesh");
+        if (back && back->size() == 1) {
+            const MeshData& r = (*back)[0];
+            bool exact = r.lods.size() == m.lods.size();
+            for (usize i = 0; exact && i < m.lods.size(); ++i)
+                exact = r.lods[i].indices == m.lods[i].indices &&
+                        r.lods[i].vertices.size() == m.lods[i].vertices.size();
+            Check(exact, "each LOD's geometry must survive the round-trip byte-exact");
+        }
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+    }
+
+    if (g_fails == 0)
+        std::printf("meshlod: LODs generate strictly-decreasing + deterministic, LOD0 is left "
+                    "intact, morph meshes are excluded, and the v9 .uaf round-trips exactly\n");
     return g_fails == 0;
 }
 

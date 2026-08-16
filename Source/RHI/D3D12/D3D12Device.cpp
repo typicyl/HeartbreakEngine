@@ -95,6 +95,13 @@ DXGI_FORMAT ToDXGIFormat(Format f) {
         case Format::R32G32B32A32_FLOAT:  return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case Format::D32_FLOAT:           return DXGI_FORMAT_D32_FLOAT;
         case Format::D24_UNORM_S8_UINT:   return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        case Format::BC1_UNORM:           return DXGI_FORMAT_BC1_UNORM;
+        case Format::BC1_SRGB:            return DXGI_FORMAT_BC1_UNORM_SRGB;
+        case Format::BC4_UNORM:           return DXGI_FORMAT_BC4_UNORM;
+        case Format::BC5_UNORM:           return DXGI_FORMAT_BC5_UNORM;
+        case Format::BC6H_UFLOAT:         return DXGI_FORMAT_BC6H_UF16;
+        case Format::BC7_UNORM:           return DXGI_FORMAT_BC7_UNORM;
+        case Format::BC7_SRGB:            return DXGI_FORMAT_BC7_UNORM_SRGB;
         default:                          return DXGI_FORMAT_UNKNOWN;
     }
 }
@@ -381,6 +388,13 @@ u32 BytesPerPixel(Format f) {
         case Format::B8G8R8A8_SRGB:      return 4;
         case Format::R16G16B16A16_FLOAT: return 8;
         case Format::R32G32B32A32_FLOAT: return 16;
+        // Block-compressed formats have no bytes-PER-PIXEL: 0 is a sentinel so any caller that
+        // wrongly treats a BC texture as linear allocates 0 (an obvious failure) instead of a
+        // plausible-but-wrong size. The staging walk uses rhi::MipCopyRows (block-aware) instead.
+        case Format::BC1_UNORM: case Format::BC1_SRGB:
+        case Format::BC4_UNORM: case Format::BC5_UNORM:
+        case Format::BC6H_UFLOAT:
+        case Format::BC7_UNORM: case Format::BC7_SRGB: return 0;
         default:                         return 4;
     }
 }
@@ -431,6 +445,9 @@ public:
     void* MapGpuBuffer(GpuBufferHandle handle) override;
     bool ReadGpuBuffer(GpuBufferHandle handle, void* dst, u32 bytes) override;
     void DestroyGpuBuffer(GpuBufferHandle handle) override;
+    void DestroyMesh(MeshHandle handle) override;
+    void DestroyTexture(TextureHandle handle) override;
+    bool SupportsResourceReclaim() const override { return true; }
     ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
     void QueueCompute(const ComputeDispatch& d) override;
     void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
@@ -884,12 +901,51 @@ private:
     // so the compute splat can bind the volume for writing (VV2). 0 = no UAV.
     std::unordered_map<u32, u32> volumeUav_;
 
-    // Synchronous texture-upload command objects.
+    // --- VRAM RECLAIM (deferred, non-blocking) ------------------------------
+    // Streaming despawn calls DestroyMesh/DestroyTexture. The GPU may still reference the
+    // resource in in-flight frames, so it is NOT freed immediately (that would need a
+    // WaitForGpuIdle, a per-despawn stall): it is parked here with the frame it becomes
+    // safe to release (frameCounter_ + a full swapchain cycle of margin), then its bindless
+    // slot / meshes_ index is recycled for a later Create. RetireFrees() runs each
+    // BeginFrame. Only ever touched on the main thread (like every Create/Destroy here).
+    u64 frameCounter_ = 0;
+    struct PendingTexFree { ComPtr<ID3D12Resource> res; u32 slot; u64 freeFrame; };
+    std::vector<PendingTexFree> pendingTexFree_;
+    std::vector<u32> texSlotFree_; // reclaimed bindless slots, reused by CreateTexture
+    struct PendingMeshFree { GpuMesh mesh; u32 meshId; u64 freeFrame; };
+    std::vector<PendingMeshFree> pendingMeshFree_;
+    std::vector<u32> meshFree_; // reclaimed meshes_ indices (0-based), reused by CreateMesh
+    void RetireFrees();
+
+    // Synchronous texture-upload command objects (Update* / buffer paths still block).
     ComPtr<ID3D12CommandAllocator>    uploadAlloc_;
     ComPtr<ID3D12GraphicsCommandList> uploadList_;
     ComPtr<ID3D12Fence> uploadFence_;
     HANDLE uploadEvent_ = nullptr;
     u64    uploadFenceValue_ = 0;
+
+    // ASYNCHRONOUS (non-blocking) uploads for CreateMesh / CreateTexture - the two
+    // uploads on the streaming finalize path. The old code blocked on the GPU after
+    // EVERY resource, so a shard streaming in serialized dozens of CPU->GPU->CPU
+    // round-trips into one ~10 ms frame stall. Now each upload submits on the graphics
+    // queue and returns immediately; its staging buffers + command allocator are held
+    // until the GPU passes the upload fence, then retired once per frame. Each batch
+    // owns its OWN allocator so the still-synchronous sites above can keep resetting
+    // the shared uploadAlloc_ without racing an in-flight async copy. Uploads happen on
+    // the main thread only (the streamer stages on workers but finalizes here), so no
+    // locking is needed. Reuses uploadFence_/uploadFenceValue_ (one graphics queue ->
+    // fence values signal monotonically in submission order, so both paths share it).
+    struct UploadBatch {
+        ComPtr<ID3D12CommandAllocator>    alloc;
+        ComPtr<ID3D12GraphicsCommandList> list;
+        std::vector<ComPtr<ID3D12Resource>> staging; // alive until `fence` passes
+        u64 fence = 0;
+    };
+    std::vector<UploadBatch> asyncUploadInFlight_;
+    std::vector<UploadBatch> asyncUploadFree_;
+    UploadBatch BeginAsyncUpload();           // an open command list, ready to record
+    void        EndAsyncUpload(UploadBatch&& b); // Close + Execute + Signal, no wait
+    void        RetireAsyncUploads();         // free staging for completed uploads
 
     // -- ImGui ---------------------------------------------------------------
     ComPtr<ID3D12DescriptorHeap> imguiSrvHeap_;
@@ -1160,6 +1216,13 @@ void D3D12Device::ReportDeviceLost(const char* what, HRESULT hr) {
 }
 
 void D3D12Device::BeginFrame() {
+    // Reclaim staging buffers from async uploads whose GPU copy has completed. Also
+    // done inside BeginAsyncUpload, so a burst self-limits; this releases the last
+    // batch's memory even on an idle frame with no new uploads.
+    RetireAsyncUploads();
+    // Advance the frame clock + release meshes/textures whose deferred-destroy window
+    // has elapsed (VRAM reclaim), recycling their slots/indices.
+    RetireFrees();
 #if HBE_EDITOR
     // Apply a pending viewport (offscreen target) resize.
     //
@@ -1578,8 +1641,18 @@ bool D3D12Device::CreateBindlessResources() {
 }
 
 TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
-    if (!bindlessHeap_ || !desc.pixels || bindlessNextSlot_ >= kMaxBindlessTextures) return {};
-    const u32 slot = bindlessNextSlot_++;
+    if (!bindlessHeap_ || !desc.pixels) return {};
+    // Reuse a bindless slot reclaimed by DestroyTexture before growing the high-water mark,
+    // so a long streaming session recycles slots instead of exhausting the 4096 cap.
+    u32 slot;
+    if (!texSlotFree_.empty()) {
+        slot = texSlotFree_.back();
+        texSlotFree_.pop_back();
+    } else if (bindlessNextSlot_ < kMaxBindlessTextures) {
+        slot = bindlessNextSlot_++;
+    } else {
+        return {};
+    }
     const DXGI_FORMAT fmt = ToDXGIFormat(desc.format);
     const u32 bpp = BytesPerPixel(desc.format);
     const u32 mipCount = desc.mipCount < 1 ? 1 : desc.mipCount;
@@ -1598,7 +1671,7 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
     if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&tex)))) {
-        --bindlessNextSlot_;
+        texSlotFree_.push_back(slot); // return the slot for reuse
         return {};
     }
 
@@ -1611,7 +1684,7 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
                                    numRows.data(), rowSizes.data(), &totalBytes);
 
     ComPtr<ID3D12Resource> staging = CreateUploadBuffer(device_.Get(), totalBytes);
-    if (!staging) { --bindlessNextSlot_; return {}; }
+    if (!staging) { texSlotFree_.push_back(slot); return {}; }
 
     u8* mapped = nullptr;
     D3D12_RANGE noRead{0, 0};
@@ -1631,9 +1704,10 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
     }
     staging->Unmap(0, nullptr);
 
-    // Record + execute the per-mip copies, then wait (synchronous upload).
-    uploadAlloc_->Reset();
-    uploadList_->Reset(uploadAlloc_.Get(), nullptr);
+    // Async upload: record the per-mip copies + the SRV transition, submit on the
+    // graphics queue, and return WITHOUT blocking (the staging buffer rides the batch
+    // until the fence passes). No per-texture round-trip stall while streaming.
+    UploadBatch up = BeginAsyncUpload();
     for (u32 mip = 0; mip < mipCount; ++mip) {
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = tex.Get();
@@ -1643,21 +1717,13 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
         srcLoc.pResource = staging.Get();
         srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         srcLoc.PlacedFootprint = footprints[mip];
-        uploadList_->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+        up.list->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
     }
     auto toSRV = TransitionBarrier(tex.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    uploadList_->ResourceBarrier(1, &toSRV);
-    uploadList_->Close();
-    ID3D12CommandList* lists[] = {uploadList_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-
-    const u64 fv = ++uploadFenceValue_;
-    queue_->Signal(uploadFence_.Get(), fv);
-    if (uploadFence_->GetCompletedValue() < fv) {
-        uploadFence_->SetEventOnCompletion(fv, uploadEvent_);
-        ::WaitForSingleObjectEx(uploadEvent_, INFINITE, FALSE);
-    }
+    up.list->ResourceBarrier(1, &toSRV);
+    up.staging.push_back(std::move(staging));
+    EndAsyncUpload(std::move(up));
 
     D3D12_CPU_DESCRIPTOR_HANDLE h = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
     h.ptr += static_cast<SIZE_T>(slot) * bindlessDescSize_;
@@ -1775,11 +1841,14 @@ void D3D12Device::UpdateTexture(TextureHandle handle, const TextureDesc& desc) {
     }
     staging->Unmap(0, nullptr);
 
-    uploadAlloc_->Reset();
-    uploadList_->Reset(uploadAlloc_.Get(), nullptr);
+    // Async in-place update: record on a pooled command list and submit WITHOUT blocking;
+    // the staging buffer rides the batch until the fence passes (same as CreateTexture).
+    // This removes the per-texture GPU round-trip that made a despawn/respawn of a painted
+    // shard (re-adopted texture handles -> UpdateTexture) serialize dozens of stalls.
+    UploadBatch up = BeginAsyncUpload();
     auto toCopy = TransitionBarrier(tex, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                     D3D12_RESOURCE_STATE_COPY_DEST);
-    uploadList_->ResourceBarrier(1, &toCopy);
+    up.list->ResourceBarrier(1, &toCopy);
     for (u32 mip = 0; mip < mipCount; ++mip) {
         D3D12_TEXTURE_COPY_LOCATION dst{};
         dst.pResource = tex;
@@ -1789,20 +1858,13 @@ void D3D12Device::UpdateTexture(TextureHandle handle, const TextureDesc& desc) {
         srcLoc.pResource = staging.Get();
         srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         srcLoc.PlacedFootprint = footprints[mip];
-        uploadList_->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+        up.list->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
     }
     auto toSRV = TransitionBarrier(tex, D3D12_RESOURCE_STATE_COPY_DEST,
                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    uploadList_->ResourceBarrier(1, &toSRV);
-    uploadList_->Close();
-    ID3D12CommandList* lists[] = {uploadList_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-    const u64 fv = ++uploadFenceValue_;
-    queue_->Signal(uploadFence_.Get(), fv);
-    if (uploadFence_->GetCompletedValue() < fv) {
-        uploadFence_->SetEventOnCompletion(fv, uploadEvent_);
-        ::WaitForSingleObjectEx(uploadEvent_, INFINITE, FALSE);
-    }
+    up.list->ResourceBarrier(1, &toSRV);
+    up.staging.push_back(std::move(staging));
+    EndAsyncUpload(std::move(up));
 }
 
 bool D3D12Device::CreateMeshPipeline() {
@@ -3607,6 +3669,59 @@ void* D3D12Device::AllocConstants(u64 size, D3D12_GPU_VIRTUAL_ADDRESS& outGpuAdd
     return constantCpu_[frameIndex_] + aligned;
 }
 
+// Move any async uploads whose GPU work has completed back to the free pool,
+// releasing their staging buffers. Cheap (one fence read); safe to call any frame.
+void D3D12Device::RetireAsyncUploads() {
+    if (!uploadFence_) return;
+    const u64 done = uploadFence_->GetCompletedValue();
+    for (usize i = 0; i < asyncUploadInFlight_.size();) {
+        if (asyncUploadInFlight_[i].fence <= done) {
+            asyncUploadInFlight_[i].staging.clear(); // GPU is done reading these
+            asyncUploadFree_.push_back(std::move(asyncUploadInFlight_[i]));
+            asyncUploadInFlight_[i] = std::move(asyncUploadInFlight_.back());
+            asyncUploadInFlight_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Acquire a fresh, OPEN command list for a non-blocking upload. Reuses a retired
+// batch when one is free (its allocator's GPU work is complete, so Reset is legal),
+// else allocates a new one. The pool self-limits to the in-flight upload depth.
+D3D12Device::UploadBatch D3D12Device::BeginAsyncUpload() {
+    RetireAsyncUploads();
+    UploadBatch b;
+    if (!asyncUploadFree_.empty()) {
+        b = std::move(asyncUploadFree_.back());
+        asyncUploadFree_.pop_back();
+        b.staging.clear();
+        b.alloc->Reset();
+        b.list->Reset(b.alloc.Get(), nullptr);
+    } else {
+        device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                        IID_PPV_ARGS(&b.alloc));
+        device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, b.alloc.Get(),
+                                   nullptr, IID_PPV_ARGS(&b.list)); // starts OPEN
+    }
+    return b;
+}
+
+// Close the caller-recorded list, submit it on the graphics queue, and defer the
+// batch (staging + allocator) for retirement once the upload fence passes. Does NOT
+// block. The resource is ready when first sampled because the recorder ends the list
+// with the COPY_DEST -> read-state transition barrier (which flushes the copy and
+// establishes the dependency), and the list is executed before any later draw list on
+// the same queue - exactly as the old blocking path did, minus the CPU stall.
+void D3D12Device::EndAsyncUpload(UploadBatch&& b) {
+    b.list->Close();
+    ID3D12CommandList* lists[] = {b.list.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    b.fence = ++uploadFenceValue_;
+    queue_->Signal(uploadFence_.Get(), b.fence);
+    asyncUploadInFlight_.push_back(std::move(b));
+}
+
 MeshHandle D3D12Device::CreateMesh(const hbe::MeshData& mesh) {
     if (mesh.Empty()) return {};
 
@@ -3639,26 +3754,22 @@ MeshHandle D3D12Device::CreateMesh(const hbe::MeshData& mesh) {
     std::memcpy(p, mesh.indices.data(), ibSize);
     iStage->Unmap(0, nullptr);
 
-    uploadAlloc_->Reset();
-    uploadList_->Reset(uploadAlloc_.Get(), nullptr);
-    uploadList_->CopyBufferRegion(gm.vertexBuffer.Get(), 0, vStage.Get(), 0, vbSize);
-    uploadList_->CopyBufferRegion(gm.indexBuffer.Get(), 0, iStage.Get(), 0, ibSize);
+    // Async upload: record the copies + state transitions, submit on the graphics
+    // queue, and return WITHOUT blocking. The staging buffers ride the batch until the
+    // GPU passes the fence, so there is no per-mesh round-trip stall while streaming.
+    UploadBatch up = BeginAsyncUpload();
+    up.list->CopyBufferRegion(gm.vertexBuffer.Get(), 0, vStage.Get(), 0, vbSize);
+    up.list->CopyBufferRegion(gm.indexBuffer.Get(), 0, iStage.Get(), 0, ibSize);
     D3D12_RESOURCE_BARRIER barriers[2] = {
         TransitionBarrier(gm.vertexBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                           D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER),
         TransitionBarrier(gm.indexBuffer.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                           D3D12_RESOURCE_STATE_INDEX_BUFFER),
     };
-    uploadList_->ResourceBarrier(2, barriers);
-    uploadList_->Close();
-    ID3D12CommandList* lists[] = {uploadList_.Get()};
-    queue_->ExecuteCommandLists(1, lists);
-    const u64 fv = ++uploadFenceValue_;
-    queue_->Signal(uploadFence_.Get(), fv);
-    if (uploadFence_->GetCompletedValue() < fv) {
-        uploadFence_->SetEventOnCompletion(fv, uploadEvent_);
-        ::WaitForSingleObjectEx(uploadEvent_, INFINITE, FALSE);
-    }
+    up.list->ResourceBarrier(2, barriers);
+    up.staging.push_back(std::move(vStage));
+    up.staging.push_back(std::move(iStage));
+    EndAsyncUpload(std::move(up));
 
     gm.vbv.BufferLocation = gm.vertexBuffer->GetGPUVirtualAddress();
     gm.vbv.SizeInBytes = static_cast<UINT>(vbSize);
@@ -3676,6 +3787,14 @@ MeshHandle D3D12Device::CreateMesh(const hbe::MeshData& mesh) {
     gm.vbCapacity = vbAlloc;
     gm.ibCapacity = ibAlloc;
     gm.indexCount = mesh.IndexCount();
+    // Reuse a meshes_ slot reclaimed by DestroyMesh before growing the vector, so a long
+    // streaming session recycles indices instead of leaking one per despawned mesh.
+    if (!meshFree_.empty()) {
+        const u32 idx = meshFree_.back();
+        meshFree_.pop_back();
+        meshes_[idx] = std::move(gm);
+        return MeshHandle{idx + 1}; // 1-based id
+    }
     meshes_.push_back(std::move(gm));
     return MeshHandle{static_cast<u32>(meshes_.size())}; // 1-based id
 }
@@ -3965,6 +4084,64 @@ void D3D12Device::DestroyGpuBuffer(GpuBufferHandle handle) {
     }
     b->alive = false;
     gpuBufferFree_.push_back(handle.id - 1);
+}
+
+// Runs once per BeginFrame. Advances the frame clock and releases anything whose deferral
+// window has passed (no in-flight frame can still reference it), recycling its slot/index.
+void D3D12Device::RetireFrees() {
+    ++frameCounter_;
+    for (usize i = 0; i < pendingTexFree_.size();) {
+        if (pendingTexFree_[i].freeFrame <= frameCounter_) {
+            texSlotFree_.push_back(pendingTexFree_[i].slot); // recycle the bindless slot
+            pendingTexFree_[i] = std::move(pendingTexFree_.back()); // releases the ComPtr -> VRAM freed
+            pendingTexFree_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    for (usize i = 0; i < pendingMeshFree_.size();) {
+        if (pendingMeshFree_[i].freeFrame <= frameCounter_) {
+            meshFree_.push_back(pendingMeshFree_[i].meshId); // recycle the meshes_ index
+            pendingMeshFree_[i] = std::move(pendingMeshFree_.back()); // releases the GpuMesh
+            pendingMeshFree_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+void D3D12Device::DestroyTexture(TextureHandle handle) {
+    if (!handle.IsValid()) return;
+    const u32 slot = handle.index;
+    const auto it = slotTextures_.find(slot);
+    if (it == slotTextures_.end()) return; // not a reclaimable slot texture, or already gone
+    ID3D12Resource* res = it->second.resource;
+    // Detach the owning ComPtr out of the keep-alive vector (swap-erase).
+    ComPtr<ID3D12Resource> owned;
+    for (usize k = 0; k < textures_.size(); ++k) {
+        if (textures_[k].Get() == res) {
+            owned = std::move(textures_[k]);
+            textures_[k] = std::move(textures_.back());
+            textures_.pop_back();
+            break;
+        }
+    }
+    slotTextures_.erase(it);
+    volumeUav_.erase(slot);
+    // Defer: an in-flight frame may still sample it, and the bindless descriptor at `slot`
+    // must not be overwritten by a reuse until the GPU is done with the old resource.
+    pendingTexFree_.push_back({std::move(owned), slot, frameCounter_ + kMaxBackBuffers + 1});
+}
+
+void D3D12Device::DestroyMesh(MeshHandle handle) {
+    if (!handle.IsValid() || handle.id == 0 || handle.id > meshes_.size()) return;
+    const u32 idx = handle.id - 1;
+    GpuMesh& gm = meshes_[idx];
+    if (!gm.vertexBuffer && !gm.indexBuffer) return; // already freed
+    // Park the whole GpuMesh until no in-flight frame can reference it, then recycle the
+    // index. Clearing meshes_[idx] here leaves an empty slot CreateMesh reuses.
+    pendingMeshFree_.push_back({std::move(gm), idx, frameCounter_ + kMaxBackBuffers + 1});
+    meshes_[idx] = GpuMesh{};
 }
 
 ComputePipelineHandle D3D12Device::CreateComputePipeline(const ComputePipelineDesc& desc) {

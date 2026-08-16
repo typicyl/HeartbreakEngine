@@ -258,6 +258,22 @@ void Flatten(PaintComponent& p);
 // flush; the default is on for all the one-shot call sites (fill/layer/undo/load).
 void Sync(Renderer& renderer, PaintComponent& p, bool dilateEdges = true);
 
+// Split of Sync for streaming: Prepare does the CPU half (flatten + dilate + mip chains)
+// with NO GPU work, so it can run on a worker during StageAssets; UploadPrepared does the
+// GPU half (async texture upload) on the main thread in Instantiate. Together they keep a
+// streamed shard full of painted meshes from flattening+mipping every 1024^2 canvas in
+// one finalize frame. Prepare fills p.prepared{Color,Material,Mips}; preparedMips==0 means
+// it produced nothing (empty layers) and the caller should fall back to Sync.
+void Prepare(PaintComponent& p);
+void UploadPrepared(Renderer& renderer, PaintComponent& p, const std::vector<u8>& color,
+                    const std::vector<u8>& material, u32 mips);
+
+// Box-downsample every layer to <= target (repeated 2x halving; colour averaged in
+// linear space). Edits only the in-memory layer buffers - the .hbpaint on disk keeps
+// its authored resolution, so it is fully reversible. Used on the streaming path (via a
+// project cap) to cut the O(resolution^2) paint finalize cost of dense painted clusters.
+void Downsample(PaintComponent& p, u32 target);
+
 // `.hbpaint` binary persistence (magic + version + resolution + both buffers).
 // ONE stroke as opaque bytes, for the collaboration wire (Collab/Protocol.h's
 // MsgPaintOp::strokeBlob). Shares its field order with the `.hbpaint` writer - see

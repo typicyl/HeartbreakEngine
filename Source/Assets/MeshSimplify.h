@@ -57,6 +57,22 @@ struct SimplifyStats {
 // name and skin binding are carried over. The input is not modified.
 MeshData Simplify(const MeshData& src, const SimplifySettings& s, SimplifyStats* out = nullptr);
 
+// LOD-chain generation config: the reduction ratios for LOD1..N (each a fraction of the
+// ORIGINAL triangle count, strictly decreasing) plus the shared per-level quality guards.
+struct LodChainSettings {
+    std::vector<f32> ratios = {0.5f, 0.25f, 0.1f};
+    SimplifySettings quality; // minTriangles / maxErrorFraction / preventFlips carried to each
+};
+
+// Fills md.lods with reduced, GPU-optimized copies of md (LOD1..N). NON-DESTRUCTIVE: md's own
+// vertices/indices (LOD0) are never modified. A level that fails to reduce further than the
+// previous one is skipped, and generation stops once the triangle floor is hit. NO-OP for a
+// mesh that carries morph targets - Simplify drops morphs, so a morphed mesh must keep only its
+// full-detail level (facial animation would break on a decimated topology). Replaces any
+// existing md.lods. Deterministic (Simplify + OptimizeForGpu are both deterministic).
+void BuildLodChain(MeshData& md, const LodChainSettings& s = {});
+
 bool SimplifySelfTest(); // --test-simplify
+bool MeshLodSelfTest();  // --test-meshlod: BuildLodChain + v9 .uaf round-trip
 
 } // namespace hbe::mesh

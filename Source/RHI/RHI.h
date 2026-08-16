@@ -60,7 +60,58 @@ enum class Format {
     R32G32B32A32_FLOAT,
     D32_FLOAT,
     D24_UNORM_S8_UINT,
+    // Block-compressed (BC) formats: 4x4-texel blocks. APPENDED so the existing values (0..8)
+    // never shift - uaf::Texture stores Format as a u32 on disk, so reordering would silently
+    // reinterpret every shipped texture. sRGB is a DISTINCT format (Vulkan _SRGB_BLOCK / D3D12
+    // _UNORM_SRGB), exactly like the R8G8B8A8 UNORM/SRGB split. BC1/BC4 = 8 bytes/block; the
+    // rest = 16. See IsBlockCompressed / BlockBytes / MipCopyRows below.
+    BC1_UNORM,   // RGB(+1-bit A), 4bpp - opt-in low-color only
+    BC1_SRGB,
+    BC4_UNORM,   // single channel (R), 4bpp
+    BC5_UNORM,   // two channel (RG) - tangent-space normals, near-lossless
+    BC6H_UFLOAT, // HDR RGB, 8bpp
+    BC7_UNORM,   // RGBA, 8bpp - near-lossless color
+    BC7_SRGB,
 };
+
+// True for the 4x4-block BC formats. A block-compressed texture must use block-based staging
+// math (ceil(w/4) x ceil(h/4) blocks) and must NEVER route through a bytes-per-pixel path.
+inline bool IsBlockCompressed(Format f) {
+    switch (f) {
+        case Format::BC1_UNORM: case Format::BC1_SRGB:
+        case Format::BC4_UNORM: case Format::BC5_UNORM:
+        case Format::BC6H_UFLOAT:
+        case Format::BC7_UNORM: case Format::BC7_SRGB: return true;
+        default: return false;
+    }
+}
+
+// Bytes per 4x4 block for a BC format (0 for non-BC). BC1/BC4 = 8; BC5/BC6H/BC7 = 16.
+inline u32 BlockBytes(Format f) {
+    switch (f) {
+        case Format::BC1_UNORM: case Format::BC1_SRGB:
+        case Format::BC4_UNORM: return 8u;
+        case Format::BC5_UNORM: case Format::BC6H_UFLOAT:
+        case Format::BC7_UNORM: case Format::BC7_SRGB: return 16u;
+        default: return 0u;
+    }
+}
+
+// The tight source-walk geometry of ONE mip level of `w x h` in `format`, correct for BOTH
+// block-compressed and uncompressed layouts: `rowBytes` bytes per row, `rowCount` rows, so the
+// mip is `rowBytes * rowCount` tightly-packed bytes. Written ONCE here (not duplicated per
+// backend) so D3D12's manual source walk and Vulkan's staging/offset math cannot diverge on the
+// sub-4x4 tail mips. `bppUncompressed` is the backend's bytes-per-pixel for non-BC formats.
+inline void MipCopyRows(Format format, u32 w, u32 h, u32 bppUncompressed,
+                        u64& rowBytes, u32& rowCount) {
+    if (IsBlockCompressed(format)) {
+        rowBytes = static_cast<u64>((w + 3u) / 4u) * BlockBytes(format); // one block-row
+        rowCount = (h + 3u) / 4u;                                        // block rows
+    } else {
+        rowBytes = static_cast<u64>(w) * bppUncompressed;
+        rowCount = h;
+    }
+}
 
 struct RenderDeviceDesc {
     GraphicsAPI api = GraphicsAPI::D3D12;
@@ -963,6 +1014,22 @@ public:
     // Releases a buffer. Waits for GPU idle first (the buffer may still be
     // referenced by in-flight command lists), so treat it as a load-time call.
     virtual void DestroyGpuBuffer(GpuBufferHandle) {}
+
+    // Release a mesh / texture created by CreateMesh / CreateTexture, reclaiming its
+    // VRAM. NON-BLOCKING: the resource is deferred a few frames (until no in-flight frame
+    // can reference it) and its handle id / bindless slot is recycled for a later Create.
+    // The CALLER guarantees no live draw references the handle (streaming despawn proves
+    // this with a mark-sweep against every resident entity). Default no-op: a backend that
+    // has not implemented reclaim simply leaks, exactly as before.
+    virtual void DestroyMesh(MeshHandle) {}
+    virtual void DestroyTexture(TextureHandle) {}
+
+    // True when DestroyMesh/DestroyTexture actually free VRAM (and recycle the handle).
+    // The streaming reclaim sweep only runs when this is true: on a backend that still
+    // no-ops the destroys, dropping resources from the shared cache would force a re-upload
+    // on the next respawn AND leak the old resource, so such a backend keeps the old
+    // never-reclaim behaviour untouched until it implements real reclaim.
+    virtual bool SupportsResourceReclaim() const { return false; }
 
     // Builds a compute pipeline from a precompiled kernel. Invalid handle when
     // the shader is missing or the backend has no compute.

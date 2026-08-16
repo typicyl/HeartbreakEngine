@@ -976,11 +976,57 @@ void Streamer::StageJob(void* arg) {
     self->inFlight_.fetch_sub(1, std::memory_order_release);
 }
 
+// Worker-thread staging for an AUTHORING respawn - mirrors StageJob but sources the
+// captured snapshot (the author's edits) instead of the level file, so the editor's
+// respawn no longer parses + generates mips + decodes textures synchronously on the main
+// thread (the ~1.5s editor load spike). Finalize then only has to instantiate + upload.
+void Streamer::SnapshotStageJob(void* arg) {
+    ShardRuntime* sr = static_cast<ShardRuntime*>(arg);
+    Streamer* self = sr->owner;
+    salvage::RegionState next = salvage::RegionState::Ready;
+    try {
+        sr->staged = scene::StagedAssets{}; // stage into a cleared buffer (SALVAGE 3)
+        auto data = std::make_unique<scene::SceneData>();
+        if (scene::ParseSceneString(sr->authorSnapshot, *data)) {
+            scene::StageAssets(*data, self->assetsDir_, sr->staged);
+            sr->snapshotData = std::move(data); // Finalize instantiates from this
+        } else {
+            // Corrupt snapshot: drop it so Finalize falls back to the file slice - the same
+            // fallback SpawnAuthorSnapshot always had (edits inside that zone are lost).
+            HBE_WARN("TagStream: authoring snapshot for '{}' did not parse; respawning from "
+                     "the file (edits inside that zone are lost).",
+                     sr->desc.tag);
+            sr->authorSnapshot.clear();
+            sr->snapshotData.reset();
+        }
+    } catch (const std::exception& e) {
+        HBE_ERROR("TagStream: snapshot staging '{}' threw: {}", sr->desc.tag, e.what());
+        sr->staged = scene::StagedAssets{};
+        sr->snapshotData.reset();
+        next = salvage::RegionState::Failed;
+    } catch (...) {
+        sr->staged = scene::StagedAssets{};
+        sr->snapshotData.reset();
+        next = salvage::RegionState::Failed;
+    }
+    sr->state.store(static_cast<int>(next), std::memory_order_release);
+    self->inFlight_.fetch_sub(1, std::memory_order_release);
+}
+
 void Streamer::Finalize(Scene& scene, Renderer& renderer, u32 i) {
     ShardRuntime& sr = *shards_[i];
     std::vector<entt::entity> created;
-    scene::Instantiate(scene, renderer, source_, sr.staged, scene::LoadMode::Additive, &created,
-                       /*sceneTag*/ {}, SlicePtr(sr.rows), static_cast<u32>(sr.rows.size()));
+    if (sr.snapshotData) {
+        // AUTHORING respawn: instantiate the whole captured snapshot (staged off the main
+        // thread by SnapshotStageJob), not a slice of the level file. Frees it after use.
+        scene::Instantiate(scene, renderer, *sr.snapshotData, sr.staged,
+                           scene::LoadMode::Additive, &created);
+        sr.snapshotData.reset();
+    } else {
+        scene::Instantiate(scene, renderer, source_, sr.staged, scene::LoadMode::Additive,
+                           &created, /*sceneTag*/ {}, SlicePtr(sr.rows),
+                           static_cast<u32>(sr.rows.size()));
+    }
     entt::registry& reg = scene.Registry();
     for (const entt::entity e : created)
         if (reg.valid(e)) reg.emplace_or_replace<StreamShard>(e, StreamShard{i});
@@ -1316,8 +1362,22 @@ void Streamer::Update(Scene& scene, Renderer& renderer, const std::vector<glm::v
         // one zone at a time, so a synchronous spawn here is the same cost
         // SpawnAllShards already pays on every save.
         if (authoring_ && !sr.authorSnapshot.empty()) {
-            const u32 idx = i;
-            timeStructural([&] { SpawnShard(scene, renderer, idx); });
+            // Stage the SNAPSHOT (the author's edits, not the file) off the main thread
+            // when the job system is up, so the editor's respawn does its parse + mip-gen +
+            // texture decode on a worker and only the cheap instantiate/upload lands on the
+            // main thread. Without this the editor took a ~1.5s synchronous load hitch on
+            // every zone respawn. Falls back to the fully-synchronous path when there is no
+            // job system (a headless tool / self-test).
+            if (jobs::IsInitialized()) {
+                sr.state.store(static_cast<int>(salvage::RegionState::Loading),
+                               std::memory_order_release);
+                ++stats_.asyncStages;
+                inFlight_.fetch_add(1, std::memory_order_acquire);
+                jobs::RunDetached(&Streamer::SnapshotStageJob, &sr, jobs::Priority::Normal);
+            } else {
+                const u32 idx = i;
+                timeStructural([&] { SpawnShard(scene, renderer, idx); });
+            }
             continue;
         }
         sr.state.store(static_cast<int>(salvage::RegionState::Loading), std::memory_order_release);
@@ -1338,6 +1398,19 @@ void Streamer::Update(Scene& scene, Renderer& renderer, const std::vector<glm::v
         const u32 idx = i;
         timeStructural([&] { DespawnShard(scene, idx); });
     }
+    // Reclaim the GPU memory of any cached mesh/texture the just-despawned entities were
+    // the LAST users of (a mark-sweep over all resident entities). Once per Update after
+    // despawns - not per-despawn. RUNTIME ONLY: in the editor, cached handles are also
+    // referenced by non-entity holders (asset previews, thumbnails, the material editor)
+    // that the entity-only mark can't see, so sweeping there could free something still in
+    // use; the editor also keeps content resident for editing. This is the fix for
+    // 'streaming despawn reclaims ZERO VRAM' - the leak only matters in a long play session.
+    // Only sweep on a backend that truly frees VRAM in DestroyMesh/DestroyTexture. On one
+    // that still no-ops them, dropping resources from the shared cache would force a re-upload
+    // on the next respawn (and leak the old handle), which is strictly worse than never
+    // reclaiming - so leave the cache intact there until that backend implements reclaim.
+    if (!authoring_ && !policyOut_.unload.empty() && renderer.SupportsResourceReclaim())
+        scene::TrimUnreferencedGpu(scene, renderer);
 }
 
 bool Streamer::IsSettled(const std::vector<glm::vec3>& foci) const {

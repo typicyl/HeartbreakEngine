@@ -2098,11 +2098,19 @@ int Engine::Run(const EngineConfig& configIn) {
             const auto _nt = clock::now();
             const std::filesystem::path navAssets =
                 Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
-            const std::string& navSrc = scene.Environment().navSource;
+            // Navigation is OPT-IN per scene (SceneEnvironment::navEnabled, default off) so a
+            // scene with a baked navmesh does NOT stream nav on every boot. When disabled we
+            // feed an empty source, which unloads any navmesh that was previously streaming
+            // (Load(assets, "") -> Unload) and skips all per-frame nav work.
+            const bool navOn = scene.Environment().navEnabled;
+            static const std::string kNoNav;
+            const std::string& navSrc = navOn ? scene.Environment().navSource : kNoNav;
             if (navSrc != navWorld_.SourcePath()) navWorld_.Load(navAssets, navSrc);
-            if (physics.IsRunning()) nav::SyncObstacles(scene, navWorld_);
-            navWorld_.Update(StreamFoci(scene, renderer), dt);
-            if (physics.IsRunning()) nav::UpdateAgents(scene, navWorld_, dt);
+            if (navOn) {
+                if (physics.IsRunning()) nav::SyncObstacles(scene, navWorld_);
+                navWorld_.Update(StreamFoci(scene, renderer), dt);
+                if (physics.IsRunning()) nav::UpdateAgents(scene, navWorld_, dt);
+            }
             // The nav band has its own accumulator: its cost is driven by agent count and
             // by tile streaming, not by scene size, and the acceptance criterion is a
             // per-frame millisecond budget - so it needs a number here to be checkable.

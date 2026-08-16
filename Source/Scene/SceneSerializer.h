@@ -253,6 +253,7 @@ struct SceneData {
     f32 shadowDistance = 150.0f;
     std::string giSource; // cached .hbgi GI volume (rel to Assets)
     std::string navSource; // cached .hbnav navmesh (rel to Assets)
+    bool navEnabled = false; // opt-in: load/stream the navmesh on boot (default off)
     // The scene's PERMANENT pack slot (top-level "packSlot"; see Assets/SlotIds.h).
     // kNoPackSlot = the file carries none (slot 0 is a VALID slot - Tree=0 in the
     // owner-spec test - so absence needs a sentinel, not zero). Parsed and re-emitted
@@ -525,6 +526,14 @@ void ClearInstantiateCaches();
 // leaked for the process lifetime, once per stroke. `bounds` must be the bounds of
 // the same data (Instantiate hands them straight to the AABB component on a hit).
 void CacheUploadedMesh(const std::string& key, rhi::MeshHandle mesh, const AABB& bounds);
+
+// VRAM RECLAIM. Destroy every CACHED mesh/texture that no live entity in `scene` still
+// references (a mark-sweep over the shared Instantiate caches), reclaiming their GPU memory
+// and recycling their bindless slots. Call this AFTER a streaming despawn (the only place
+// that removes entities in bulk). Safe: it only frees cache values and marks every
+// GPU-handle-bearing component, so it can never free a resource still in use; the RHI
+// destroy is itself deferred a few frames. Main thread only.
+void TrimUnreferencedGpu(Scene& scene, Renderer& renderer);
 
 // How many blendshape delta atlases have been built AND uploaded since process
 // start (or the last ClearInstantiateCaches). Diagnostic, and the observable pin on

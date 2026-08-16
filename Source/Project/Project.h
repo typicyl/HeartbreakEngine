@@ -315,6 +315,25 @@ struct ProjectSettings {
     bool menuWorld = false;
     std::string menuCamera;
     std::string menuTag;
+
+    // Streamed surface-paint canvases whose authored resolution exceeds this are box-
+    // downsampled to it AT LOAD, on the streaming staging path (paint::Downsample). The
+    // on-disk .hbpaint keeps its full authored resolution, so this is fully REVERSIBLE:
+    // raise it to restore quality with zero re-authoring. 0 = no cap. The paint finalize
+    // cost is O(resolution^2) (flatten/mip/staging-memcpy/VRAM), so 1024->256 is ~16x
+    // less. Set this when a dense cluster of painted meshes streams in as one shard and
+    // hitches. Matches the .value() fallback in Project.cpp (the two-places-default rule).
+    u32 maxStreamedPaintResolution = 0;
+
+    // Generate distance LODs at import for eligible STATIC meshes (quadric decimation,
+    // mesh::BuildLodChain). Fully NON-DESTRUCTIVE: LOD0 is the imported source geometry and the
+    // reduced levels ship alongside it in the same `.uaf` (v9); morph/skinned meshes are always
+    // excluded (Simplify drops morphs + welds UV seams). Runtime picks a level by projected
+    // screen size, so near geometry always draws LOD0 at native resolution. Default ON - it
+    // attacks the CPU-submit bottleneck (distant meshes collapse to few triangles + instance) at
+    // no near-quality cost. Turn off to import full-detail only; existing assets need a re-import
+    // or `--generate-mesh-lods` to gain LODs. Matches the .value() fallback in Project.cpp.
+    bool meshLodEnabled = true;
     // THE game UI: ONE `.hbui` DOCUMENT PER SCREEN (MainMenu / Settings / Loading
     // / HUD / Pause ...), each holding that screen's UIPanel subtree. EVERY entry
     // is opened at boot and stays RESIDENT for the process lifetime - nothing here

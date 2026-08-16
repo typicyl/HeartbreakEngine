@@ -270,6 +270,20 @@ bool ReadMeshPayload(BinaryReader& r, u32 version, Model* outModel, Rig* outRig)
                 md.morphTargets.push_back(std::move(mt));
             }
         }
+        // v9: distance LODs. Read unconditionally (like morphs) so the trailing rig
+        // stays aligned in the sequential stream even when outModel is null (ReadRig).
+        if (version >= 9) {
+            u32 lodCount = 0;
+            r.Pod(lodCount);
+            if (!r.Ok()) return false;
+            for (u32 l = 0; l < lodCount; ++l) {
+                MeshLod lod;
+                r.Vec(lod.vertices);
+                r.Vec(lod.indices);
+                if (!r.Ok()) return false;
+                md.lods.push_back(std::move(lod));
+            }
+        }
         if (!r.Ok()) return false;
         if (outModel) outModel->push_back(std::move(md));
     }
@@ -301,6 +315,13 @@ bool WriteMesh(const std::filesystem::path& path, const Model& model, u64 guid,
             w.Str(mt.name);
             w.Vec(mt.posDelta);
             w.Vec(mt.nrmDelta);
+        }
+        // v9: distance LODs (0 for meshes with none). Written after morphs so a v8
+        // reader stops cleanly at the morph block and a v9 reader picks these up.
+        w.Pod(static_cast<u32>(md.lods.size()));
+        for (const MeshLod& lod : md.lods) {
+            w.Vec(lod.vertices);
+            w.Vec(lod.indices);
         }
     }
     const u32 hasRig = (rig && rig->Valid()) ? 1u : 0u;

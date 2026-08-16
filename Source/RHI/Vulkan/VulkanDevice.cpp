@@ -305,6 +305,9 @@ public:
     void* MapGpuBuffer(GpuBufferHandle handle) override;
     bool ReadGpuBuffer(GpuBufferHandle handle, void* dst, u32 bytes) override;
     void DestroyGpuBuffer(GpuBufferHandle handle) override;
+    void DestroyMesh(MeshHandle handle) override;
+    void DestroyTexture(TextureHandle handle) override;
+    bool SupportsResourceReclaim() const override { return true; }
     ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
     void QueueCompute(const ComputeDispatch& d) override;
     void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
@@ -415,6 +418,29 @@ private:
     VkSemaphore      imageAvailable_[kMaxFramesInFlight]{};
     VkFence          inFlight_[kMaxFramesInFlight]{};
     std::vector<VkSemaphore> renderFinished_;
+
+    // ASYNCHRONOUS (non-blocking) uploads for CreateMesh / CreateTexture - the two
+    // uploads on the streaming finalize path. The old code did vkQueueWaitIdle after
+    // EVERY resource, draining the WHOLE graphics queue per mesh/texture, so a shard
+    // streaming in serialized dozens of full queue-idles into one multi-ms frame stall.
+    // Now each upload submits with its own fence and returns immediately; its staging
+    // buffers + command buffer are retired once the fence signals (checked per frame).
+    // Command buffers come from commandPool_ (RESET_COMMAND_BUFFER_BIT, so per-frame
+    // command-buffer begins never disturb an in-flight upload buffer) and are pooled for
+    // reuse. Main-thread only (the streamer stages on workers, finalizes here).
+    struct UploadBatchVk {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        std::vector<VkBuffer> stagingBuffers;       // destroyed once `fence` signals
+        std::vector<VkDeviceMemory> stagingMemory;  // freed once `fence` signals
+    };
+    std::vector<UploadBatchVk> asyncUploadsVk_;  // in-flight
+    std::vector<VkCommandBuffer> asyncCmdPool_;  // free, reusable command buffers
+    std::vector<VkFence> asyncFencePool_;        // free, reset fences
+    UploadBatchVk BeginAsyncUpload();            // a command buffer already recording
+    void          EndAsyncUpload(UploadBatchVk&& b); // end + submit with fence, no wait
+    void          RetireAsyncUploads();          // reclaim completed uploads
+    void          DestroyAsyncUploads();         // shutdown drain (call after GPU idle)
 
     // Mesh pipeline + descriptors.
     VkDescriptorSetLayout descriptorLayout_ = VK_NULL_HANDLE;
@@ -706,6 +732,21 @@ private:
     VkSampler clampSampler_ = VK_NULL_HANDLE; // immutable, set 0 binding 2
 
     std::vector<GpuMeshVk> meshes_;
+
+    // -- Streaming VRAM reclaim (mirror of the D3D12 deferred-free path) -----
+    // DestroyMesh/DestroyTexture park the GPU object here for kMaxFramesInFlight+1 frames
+    // (so no in-flight frame can still reference it) before it is actually destroyed and
+    // its handle / bindless slot recycled. See RetireResourceFrees, run from BeginFrame.
+    u64  reclaimFrameCounter_ = 0;
+    std::vector<u32> meshFreeVk_;   // recycled meshes_ indices (0-based), reused by CreateMesh
+    std::vector<u32> texSlotFreeVk_; // recycled bindless slots, reused by CreateTexture
+    struct PendingMeshFreeVk { GpuMeshVk mesh; u32 meshIdx; u64 freeFrame; };
+    struct PendingTexFreeVk {
+        VkImage image; VkDeviceMemory memory; VkImageView view; u32 slot; u64 freeFrame;
+    };
+    std::vector<PendingMeshFreeVk> pendingMeshFreeVk_;
+    std::vector<PendingTexFreeVk>  pendingTexFreeVk_;
+    void RetireResourceFrees();
 
     // -- Bindless textures (set 1) ------------------------------------------
     static constexpr u32 kMaxBindlessTextures = 4096;
@@ -1061,6 +1102,12 @@ bool VulkanDevice::CreateLogicalDevice() {
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(physical_, &supported);
     features.samplerAnisotropy = supported.samplerAnisotropy;
+    // Per-attachment color write masks: the MRT scene passes write only the lit target while
+    // masking off the G-buffer + velocity attachments (attachment[0] RGBA, [1]/[2] mask 0), so
+    // the blend attachments differ across a single framebuffer - which REQUIRES independentBlend
+    // (else VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605). Core-optional but
+    // universally supported on desktop; guarded so a device without it still creates cleanly.
+    features.independentBlend = supported.independentBlend;
 
     // Bindless: descriptor indexing (core in Vulkan 1.2). Enable runtime arrays,
     // non-uniform indexing, partially-bound + update-after-bind, variable count.
@@ -1684,8 +1731,23 @@ bool VulkanDevice::CreateBindlessResources() {
 }
 
 TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
-    if (!desc.pixels || bindlessNextSlot_ >= kMaxBindlessTextures) return {};
-    const u32 slot = bindlessNextSlot_++;
+    if (!desc.pixels) return {};
+    // Reuse a bindless slot reclaimed by DestroyTexture before growing the high-water mark,
+    // so a long streaming session recycles slots instead of exhausting the 4096-slot table.
+    u32 slot;
+    bool slotRecycled = false;
+    if (!texSlotFreeVk_.empty()) {
+        slot = texSlotFreeVk_.back();
+        texSlotFreeVk_.pop_back();
+        slotRecycled = true;
+    } else {
+        if (bindlessNextSlot_ >= kMaxBindlessTextures) return {};
+        slot = bindlessNextSlot_++;
+    }
+    // Give the slot back on any failure below, to the free-list or the high-water mark.
+    const auto giveBackSlot = [&] {
+        if (slotRecycled) texSlotFreeVk_.push_back(slot); else --bindlessNextSlot_;
+    };
     const VkFormat fmt = ToVkFormat(desc.format);
     const u32 bpp = BytesPerPixel(desc.format);
     const u32 mipCount = desc.mipCount < 1 ? 1 : desc.mipCount;
@@ -1703,7 +1765,7 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
     if (!CreateBuffer(total, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                       staging, stagingMem)) {
-        --bindlessNextSlot_;
+        giveBackSlot();
         return {};
     }
     void* p = nullptr;
@@ -1734,7 +1796,7 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
         if (tex.memory) vkFreeMemory(device_, tex.memory, nullptr);
         vkDestroyBuffer(device_, staging, nullptr);
         vkFreeMemory(device_, stagingMem, nullptr);
-        --bindlessNextSlot_; // give the slot back, exactly as D3D12 does
+        giveBackSlot(); // give the slot back, exactly as D3D12 does
         return {};
     };
     if (vkCreateImage(device_, &ici, nullptr, &tex.image) != VK_SUCCESS) {
@@ -1754,15 +1816,11 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
     if (vkBindImageMemory(device_, tex.image, tex.memory, 0) != VK_SUCCESS)
         return abandon("vkBindImageMemory");
 
-    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = commandPool_;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device_, &cbai, &cmd);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    // Async upload: acquire a recording command buffer (BeginAsyncUpload already began
+    // it) + a fence; the copy submits without blocking and its staging is retired once
+    // the fence signals.
+    UploadBatchVk up = BeginAsyncUpload();
+    VkCommandBuffer cmd = up.cmd;
 
     const VkImageSubresourceRange fullRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, mipCount, 0, 1};
     auto transition = [&](VkImageLayout o, VkImageLayout n, VkAccessFlags sa, VkAccessFlags da,
@@ -1798,16 +1856,9 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
     transition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_); // simple synchronous upload
-    vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, stagingMem, nullptr);
+    up.stagingBuffers.push_back(staging);
+    up.stagingMemory.push_back(stagingMem);
+    EndAsyncUpload(std::move(up)); // ends recording, submits on the queue, no wait
 
     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = tex.image;
@@ -1982,15 +2033,10 @@ void VulkanDevice::UpdateTexture(TextureHandle handle, const TextureDesc& desc) 
     std::memcpy(p, desc.pixels, static_cast<usize>(total));
     vkUnmapMemory(device_, stagingMem);
 
-    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = commandPool_;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device_, &cbai, &cmd);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    // Async in-place update (non-blocking): removes the per-texture vkQueueWaitIdle that
+    // made a despawn/respawn of a painted shard serialize dozens of full queue drains.
+    UploadBatchVk up = BeginAsyncUpload();
+    VkCommandBuffer cmd = up.cmd;
 
     const VkImageSubresourceRange fullRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, mipCount, 0, 1};
     auto transition = [&](VkImageLayout o, VkImageLayout n, VkAccessFlags sa, VkAccessFlags da,
@@ -2026,16 +2072,9 @@ void VulkanDevice::UpdateTexture(TextureHandle handle, const TextureDesc& desc) 
     transition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_); // simple synchronous upload (matches CreateTexture)
-    vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
-    vkDestroyBuffer(device_, staging, nullptr);
-    vkFreeMemory(device_, stagingMem, nullptr);
+    up.stagingBuffers.push_back(staging);
+    up.stagingMemory.push_back(stagingMem);
+    EndAsyncUpload(std::move(up)); // ends recording, submits on the queue, no wait
 }
 
 bool VulkanDevice::CreateMeshPipeline() {
@@ -4066,6 +4105,15 @@ void VulkanDevice::DrawShadowPass(const SceneView& view, const DrawItem* items, 
 
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline_);
 
+    // Set 1 = the bindless texture table. shadowPipeline_ is MeshPBR's VSMain (VS-only), whose
+    // facial-morph path STATICALLY references gTextures (set 1, Common.hlsli binding(1,1)) even
+    // though gMorphTexIndex==0 skips the sample at runtime - "statically uses" is a compile-time
+    // SPIR-V property, so set 1 must be bound or the shadow draw trips VUID-vkCmdDrawIndexed-None
+    // -08600. Persistent set, no dynamic offset; bound ONCE here (set 0 is rebound per-draw below
+    // with its dynamic offset - firstSet=1 never disturbs set 0). Mirrors the main pass bind.
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+                            &bindlessSet_, 0, nullptr);
+
     // The object arena is shared with DrawScene, which (re)writes the full UBO
     // at the same offsets afterwards; both GPU passes read the final contents.
     // The UBO writes happen once; every cascade reuses the same dynamic offsets.
@@ -4197,6 +4245,159 @@ MeshHandle VulkanDevice::CreateMeshReserved(const hbe::MeshData& initial, u32 ve
     return h;
 }
 
+// Reclaim async uploads whose GPU work has finished: destroy their staging buffers,
+// reset + pool the fence, and pool the command buffer for reuse. Cheap; runs per frame.
+void VulkanDevice::RetireAsyncUploads() {
+    for (usize i = 0; i < asyncUploadsVk_.size();) {
+        UploadBatchVk& b = asyncUploadsVk_[i];
+        if (vkGetFenceStatus(device_, b.fence) == VK_SUCCESS) {
+            for (VkBuffer buf : b.stagingBuffers) vkDestroyBuffer(device_, buf, nullptr);
+            for (VkDeviceMemory m : b.stagingMemory) vkFreeMemory(device_, m, nullptr);
+            vkResetFences(device_, 1, &b.fence);
+            asyncFencePool_.push_back(b.fence);
+            asyncCmdPool_.push_back(b.cmd); // reset-able pool -> reuse via begin
+            asyncUploadsVk_[i] = std::move(asyncUploadsVk_.back());
+            asyncUploadsVk_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Streaming despawn released this mesh: park its buffers until no in-flight frame can
+// reference them (RetireResourceFrees), then recycle the meshes_ index. Non-blocking.
+void VulkanDevice::DestroyMesh(MeshHandle handle) {
+    if (!handle.IsValid() || handle.id == 0 || handle.id > meshes_.size()) return;
+    const u32 idx = handle.id - 1;
+    GpuMeshVk& gm = meshes_[idx];
+    if (!gm.vertexBuffer && !gm.indexBuffer) return; // already freed / never allocated
+    pendingMeshFreeVk_.push_back({gm, idx, reclaimFrameCounter_ + kMaxFramesInFlight + 1});
+    meshes_[idx] = GpuMeshVk{}; // the pending entry owns the handles now; null the source
+}
+
+// Streaming despawn released this bindless texture. The image/view/memory and the
+// descriptor slot are all deferred: an in-flight frame may still sample slot `index`, so
+// neither the resource nor the slot may be reused until the GPU has drained past it.
+void VulkanDevice::DestroyTexture(TextureHandle handle) {
+    if (!handle.IsValid()) return;
+    const u32 slot = handle.index;
+    const auto imgIt = slotImages_.find(slot);
+    if (imgIt == slotImages_.end()) return; // not a reclaimable bindless texture, or already gone
+    if (volumeStorageView_.count(slot)) return; // volume texture: owns extra views, never streamed
+    const VkImage image = imgIt->second;
+    // textures_ is a flat vector (creation order), NOT slot-indexed - recover the owning
+    // memory + sampled view by matching the image, then swap-erase the record.
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkImageView view = VK_NULL_HANDLE;
+    for (usize k = 0; k < textures_.size(); ++k) {
+        if (textures_[k].image == image) {
+            memory = textures_[k].memory;
+            view = textures_[k].view;
+            textures_[k] = textures_.back();
+            textures_.pop_back();
+            break;
+        }
+    }
+    slotViews_.erase(slot);
+    slotImages_.erase(slot);
+    slotImageInfo_.erase(slot);
+    uiTextureIds_.erase(slot);
+    pendingTexFreeVk_.push_back({image, memory, view, slot,
+                                 reclaimFrameCounter_ + kMaxFramesInFlight + 1});
+}
+
+// Run once per BeginFrame: actually destroy resources parked >= kMaxFramesInFlight+1 frames
+// ago (past every in-flight reference) and recycle their handles / bindless slots.
+void VulkanDevice::RetireResourceFrees() {
+    ++reclaimFrameCounter_;
+    for (usize i = 0; i < pendingTexFreeVk_.size();) {
+        PendingTexFreeVk& p = pendingTexFreeVk_[i];
+        if (p.freeFrame <= reclaimFrameCounter_) {
+            if (p.view) vkDestroyImageView(device_, p.view, nullptr);
+            if (p.image) vkDestroyImage(device_, p.image, nullptr);
+            if (p.memory) vkFreeMemory(device_, p.memory, nullptr);
+            texSlotFreeVk_.push_back(p.slot); // recycle the bindless slot for a later CreateTexture
+            pendingTexFreeVk_[i] = pendingTexFreeVk_.back();
+            pendingTexFreeVk_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+    for (usize i = 0; i < pendingMeshFreeVk_.size();) {
+        PendingMeshFreeVk& p = pendingMeshFreeVk_[i];
+        if (p.freeFrame <= reclaimFrameCounter_) {
+            GpuMeshVk& m = p.mesh;
+            if (m.vertexBuffer) vkDestroyBuffer(device_, m.vertexBuffer, nullptr);
+            if (m.vertexMemory) vkFreeMemory(device_, m.vertexMemory, nullptr);
+            if (m.indexBuffer) vkDestroyBuffer(device_, m.indexBuffer, nullptr);
+            if (m.indexMemory) vkFreeMemory(device_, m.indexMemory, nullptr);
+            if (m.strokeBuffer) vkDestroyBuffer(device_, m.strokeBuffer, nullptr);
+            if (m.strokeMemory) vkFreeMemory(device_, m.strokeMemory, nullptr);
+            meshFreeVk_.push_back(p.meshIdx); // recycle the meshes_ index for a later CreateMesh
+            pendingMeshFreeVk_[i] = pendingMeshFreeVk_.back();
+            pendingMeshFreeVk_.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
+// Acquire a command buffer (already in the recording state) + a fence for a
+// non-blocking upload. Reuses pooled objects when available, else allocates.
+VulkanDevice::UploadBatchVk VulkanDevice::BeginAsyncUpload() {
+    RetireAsyncUploads();
+    UploadBatchVk b;
+    if (!asyncCmdPool_.empty()) {
+        b.cmd = asyncCmdPool_.back();
+        asyncCmdPool_.pop_back();
+    } else {
+        VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbai.commandPool = commandPool_;
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        vkAllocateCommandBuffers(device_, &cbai, &b.cmd);
+    }
+    if (!asyncFencePool_.empty()) {
+        b.fence = asyncFencePool_.back();
+        asyncFencePool_.pop_back();
+    } else {
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        vkCreateFence(device_, &fci, nullptr, &b.fence);
+    }
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT; // implicit reset on this pool
+    vkBeginCommandBuffer(b.cmd, &bi);
+    return b;
+}
+
+// End recording and submit on the graphics queue with the batch's fence. Does NOT
+// block: the staging buffers are retired later, once the fence signals. The
+// transfer->read memory dependency for later same-queue draws is carried by the
+// barrier each recorder puts at the tail of its command buffer (the mesh memory
+// barrier / the texture layout transition), NOT by submission order alone.
+void VulkanDevice::EndAsyncUpload(UploadBatchVk&& b) {
+    vkEndCommandBuffer(b.cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &b.cmd;
+    vkQueueSubmit(queue_, 1, &si, b.fence);
+    asyncUploadsVk_.push_back(std::move(b));
+}
+
+// Shutdown drain: destroy every staging buffer + fence still tracked. The GPU must be
+// idle first (the caller waits). Command buffers are released with commandPool_.
+void VulkanDevice::DestroyAsyncUploads() {
+    for (UploadBatchVk& b : asyncUploadsVk_) {
+        for (VkBuffer buf : b.stagingBuffers) vkDestroyBuffer(device_, buf, nullptr);
+        for (VkDeviceMemory m : b.stagingMemory) vkFreeMemory(device_, m, nullptr);
+        if (b.fence) vkDestroyFence(device_, b.fence, nullptr);
+    }
+    asyncUploadsVk_.clear();
+    for (VkFence f : asyncFencePool_) vkDestroyFence(device_, f, nullptr);
+    asyncFencePool_.clear();
+    asyncCmdPool_.clear();
+}
+
 MeshHandle VulkanDevice::CreateMesh(const hbe::MeshData& mesh) {
     if (mesh.Empty()) return {};
 
@@ -4232,35 +4433,43 @@ MeshHandle VulkanDevice::CreateMesh(const hbe::MeshData& mesh) {
     std::memcpy(p, mesh.indices.data(), ibSize);
     vkUnmapMemory(device_, iStageMem);
 
-    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = commandPool_;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(device_, &cbai, &cmd);
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    // Async upload: record the copies into a pooled command buffer and submit without
+    // blocking; the staging buffers ride the batch until the fence signals.
+    UploadBatchVk up = BeginAsyncUpload();
     VkBufferCopy vCopy{0, 0, vbSize};
     VkBufferCopy iCopy{0, 0, ibSize};
-    vkCmdCopyBuffer(cmd, vStage, gm.vertexBuffer, 1, &vCopy);
-    vkCmdCopyBuffer(cmd, iStage, gm.indexBuffer, 1, &iCopy);
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
-    vkFreeCommandBuffers(device_, commandPool_, 1, &cmd);
-    vkDestroyBuffer(device_, vStage, nullptr);
-    vkFreeMemory(device_, vStageMem, nullptr);
-    vkDestroyBuffer(device_, iStage, nullptr);
-    vkFreeMemory(device_, iStageMem, nullptr);
+    vkCmdCopyBuffer(up.cmd, vStage, gm.vertexBuffer, 1, &vCopy);
+    vkCmdCopyBuffer(up.cmd, iStage, gm.indexBuffer, 1, &iCopy);
+    // Make the transfer writes AVAILABLE + VISIBLE to the vertex-input stage of later
+    // draws. This barrier at the tail of the upload command buffer is the memory
+    // dependency the removed vkQueueWaitIdle used to provide: same-queue submission
+    // order alone orders execution but does NOT synchronize a transfer-write ->
+    // vertex/index-fetch RAW hazard across separate submissions. (The texture path gets
+    // the equivalent guarantee from its TRANSFER_DST -> SHADER_READ_ONLY image barrier.)
+    VkMemoryBarrier meshBarrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    meshBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    meshBarrier.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT;
+    vkCmdPipelineBarrier(up.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 1, &meshBarrier, 0, nullptr, 0,
+                         nullptr);
+    up.stagingBuffers.push_back(vStage);
+    up.stagingBuffers.push_back(iStage);
+    up.stagingMemory.push_back(vStageMem);
+    up.stagingMemory.push_back(iStageMem);
+    EndAsyncUpload(std::move(up));
 
     gm.indexCount = mesh.IndexCount();
     gm.vbSize = vbAlloc; // ALLOCATED, not uploaded - UpdateMesh tests against this
     gm.ibSize = ibAlloc;
 
+    // Reuse a meshes_ index reclaimed by DestroyMesh before growing the vector, so a long
+    // streaming session recycles slots instead of leaving a graveyard of empty records.
+    if (!meshFreeVk_.empty()) {
+        const u32 idx = meshFreeVk_.back();
+        meshFreeVk_.pop_back();
+        meshes_[idx] = gm;
+        return MeshHandle{idx + 1};
+    }
     meshes_.push_back(gm);
     return MeshHandle{static_cast<u32>(meshes_.size())};
 }
@@ -4325,6 +4534,13 @@ bool VulkanDevice::UpdateMesh(MeshHandle handle, const hbe::MeshData& mesh) {
 void VulkanDevice::BeginFrame() {
     frameActive_ = false;
     renderPassActive_ = false;
+    // Reclaim staging from async uploads whose GPU copy has finished. Also done inside
+    // BeginAsyncUpload (so a burst self-limits); this frees the last batch on idle frames.
+    RetireAsyncUploads();
+    // Actually free streaming-despawned meshes/textures parked long enough ago. Runs
+    // BEFORE the swapchain early-return (and each frame regardless) so its monotonic frame
+    // counter always advances - the counter, not this call site, is what guarantees safety.
+    RetireResourceFrees();
     if (swapchain_ == VK_NULL_HANDLE) return;
 
 #if HBE_EDITOR
@@ -6568,6 +6784,29 @@ VulkanDevice::~VulkanDevice() {
 #if HBE_EDITOR
     ShutdownUI();
 #endif
+
+    // GPU is idle -> safe to destroy any async-upload staging + fences still tracked
+    // (their command buffers are released when commandPool_ is destroyed below).
+    DestroyAsyncUploads();
+
+    // Drain streaming-reclaim resources still parked (removed from meshes_/textures_ but
+    // not yet retired) - the GPU is idle by now, so free them immediately or they leak.
+    for (PendingMeshFreeVk& p : pendingMeshFreeVk_) {
+        GpuMeshVk& m = p.mesh;
+        if (m.vertexBuffer) vkDestroyBuffer(device_, m.vertexBuffer, nullptr);
+        if (m.vertexMemory) vkFreeMemory(device_, m.vertexMemory, nullptr);
+        if (m.indexBuffer) vkDestroyBuffer(device_, m.indexBuffer, nullptr);
+        if (m.indexMemory) vkFreeMemory(device_, m.indexMemory, nullptr);
+        if (m.strokeBuffer) vkDestroyBuffer(device_, m.strokeBuffer, nullptr);
+        if (m.strokeMemory) vkFreeMemory(device_, m.strokeMemory, nullptr);
+    }
+    pendingMeshFreeVk_.clear();
+    for (PendingTexFreeVk& p : pendingTexFreeVk_) {
+        if (p.view) vkDestroyImageView(device_, p.view, nullptr);
+        if (p.image) vkDestroyImage(device_, p.image, nullptr);
+        if (p.memory) vkFreeMemory(device_, p.memory, nullptr);
+    }
+    pendingTexFreeVk_.clear();
 
     for (GpuMeshVk& m : meshes_) {
         if (m.vertexBuffer) vkDestroyBuffer(device_, m.vertexBuffer, nullptr);

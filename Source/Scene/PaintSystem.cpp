@@ -12,6 +12,7 @@
 #include "Scene/TerrainSystem.h" // heightfield raycast + layout for RaycastTerrain
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -187,7 +188,86 @@ void SizeLayer(PaintLayer& l, u32 resolution) {
         l.material[i + 2] = kNeutralHeight; // height 0.5
     }
 }
+
+// sRGB->linear LUT for colour-correct box averaging when downsampling (matches the mip
+// filter in AssetLoader). Built once; the magic-static init is thread-safe under the
+// concurrent first use that streaming (worker threads) implies.
+const f32* SrgbLut() {
+    static const std::array<f32, 256> lut = [] {
+        std::array<f32, 256> t{};
+        for (int i = 0; i < 256; ++i) {
+            const f32 s = i / 255.0f;
+            t[static_cast<usize>(i)] =
+                s <= 0.04045f ? s / 12.92f : std::pow((s + 0.055f) / 1.055f, 2.4f);
+        }
+        return t;
+    }();
+    return lut.data();
+}
+inline u8 EncodeSrgb8(f32 l) {
+    l = l < 0.0f ? 0.0f : (l > 1.0f ? 1.0f : l);
+    const f32 s = l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+    const f32 v = s * 255.0f + 0.5f;
+    return static_cast<u8>(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v));
+}
+// One 2x2 box-filter halving of a res x res RGBA8 buffer. Colour channels average in
+// LINEAR space (srgb=true) to avoid darkening; material/alpha average raw.
+std::vector<u8> HalveRGBA8(const std::vector<u8>& src, u32 res, bool srgb) {
+    const u32 w = std::max(1u, res / 2);
+    std::vector<u8> dst(static_cast<usize>(w) * w * 4, 0);
+    const f32* lut = SrgbLut();
+    for (u32 y = 0; y < w; ++y) {
+        const u32 y0 = std::min(y * 2, res - 1), y1 = std::min(y * 2 + 1, res - 1);
+        for (u32 x = 0; x < w; ++x) {
+            const u32 x0 = std::min(x * 2, res - 1), x1 = std::min(x * 2 + 1, res - 1);
+            const u8* a = &src[(static_cast<usize>(y0) * res + x0) * 4];
+            const u8* b = &src[(static_cast<usize>(y0) * res + x1) * 4];
+            const u8* c = &src[(static_cast<usize>(y1) * res + x0) * 4];
+            const u8* e = &src[(static_cast<usize>(y1) * res + x1) * 4];
+            u8* o = &dst[(static_cast<usize>(y) * w + x) * 4];
+            for (int ch = 0; ch < 4; ++ch) {
+                if (srgb && ch < 3)
+                    o[ch] = EncodeSrgb8((lut[a[ch]] + lut[b[ch]] + lut[c[ch]] + lut[e[ch]]) *
+                                        0.25f);
+                else
+                    o[ch] = static_cast<u8>(
+                        (static_cast<u32>(a[ch]) + b[ch] + c[ch] + e[ch] + 2) / 4);
+            }
+        }
+    }
+    return dst;
+}
 } // namespace
+
+// Box-downsample every layer to <= `target` (repeated 2x halving). Reversible at the
+// source: it edits only the in-memory layer buffers, never the .hbpaint on disk, so
+// raising the cap later restores full quality with no re-authoring. Used on the
+// STREAMING path to cut the O(resolution^2) flatten/mip/upload/VRAM cost of a dense
+// cluster of painted meshes (1024->256 is 16x less). NOT called on the authoring path.
+void Downsample(PaintComponent& p, u32 target) {
+    if (target < 16) target = 16;
+    if (p.resolution <= target || p.layers.empty()) return;
+    // The actual size reached by pow-2 halving until <= target (all layers share it).
+    u32 finalRes = p.resolution;
+    while (finalRes > target) finalRes = std::max(1u, finalRes / 2);
+    if (finalRes >= p.resolution) return;
+    const usize n = static_cast<usize>(p.resolution) * p.resolution * 4;
+    for (PaintLayer& L : p.layers) {
+        if (L.color.size() != n || L.material.size() != n) continue; // malformed: leave it
+        u32 r = p.resolution;
+        while (r > target) {
+            L.color = HalveRGBA8(L.color, r, /*srgb=*/true);
+            L.material = HalveRGBA8(L.material, r, /*srgb=*/false);
+            r = std::max(1u, r / 2);
+        }
+    }
+    p.resolution = finalRes;
+    // Mark it so a scene save can NEVER write this shrunk copy over the higher-res
+    // .hbpaint on disk (WritePaintCanvases skips resCapped, like canvasMissing). Do NOT
+    // set dirty: the streaming path uploads via preparedColor/Material, and dirty would
+    // wrongly invite a re-Sync / a save.
+    p.resCapped = true;
+}
 
 int AddLayer(PaintComponent& p, const std::string& name) {
     PaintLayer l;
@@ -1007,6 +1087,67 @@ void Sync(Renderer& renderer, PaintComponent& p, bool dilateEdges) {
     // Colour as sRGB (pigment averages in linear); material as UNORM.
     upload(p.flatColor, rhi::Format::R8G8B8A8_SRGB, p.colorTex);
     upload(p.flatMaterial, rhi::Format::R8G8B8A8_UNORM, p.matTex);
+    p.gpuReady = p.colorTex.IsValid() && p.matTex.IsValid();
+    p.dirty = false;
+}
+
+// Worker-thread half of Sync: flatten + edge-dilate + build the mip chains, with NO GPU
+// work, storing the upload-ready buffers on the canvas (preparedColor/Material/Mips).
+// Run during StageAssets so the heavy per-canvas CPU cost is OFF the main thread; the
+// finalize then only uploads (paint::UploadPrepared). Safe on a job thread: it touches
+// only `p`'s own buffers and a local uaf::Texture. Matches Sync's dilation exactly so the
+// look is identical.
+void Prepare(PaintComponent& p) {
+    p.preparedMips = 0;
+    p.preparedColor.clear();
+    p.preparedMaterial.clear();
+    if (p.layers.empty()) return; // nothing to composite (missing / blank canvas)
+    Flatten(p);
+    constexpr int kEdgePadding = 4; // must match Sync's DilateEdges call
+    DilateEdges(p.flatColor, static_cast<i32>(p.resolution), kEdgePadding);
+    DilateEdges(p.flatMaterial, static_cast<i32>(p.resolution), kEdgePadding);
+    const auto mipChain = [&](const std::vector<u8>& flat, u32& outMips) {
+        uaf::Texture tex;
+        tex.width = p.resolution;
+        tex.height = p.resolution;
+        tex.mipCount = 1;
+        tex.pixels = flat;         // copy; GenerateMips appends the chain
+        assets::GenerateMips(tex);
+        outMips = tex.mipCount;
+        return std::move(tex.pixels);
+    };
+    u32 cMips = 0, mMips = 0;
+    p.preparedColor = mipChain(p.flatColor, cMips);
+    p.preparedMaterial = mipChain(p.flatMaterial, mMips);
+    p.preparedMips = cMips; // colour + material share dimensions -> equal mip counts
+    (void)mMips;
+    // The single-mip flats are redundant now (the chains carry the base). An in-editor
+    // edit re-flattens from `layers`, so nothing authored is lost.
+    p.flatColor.clear();
+    p.flatColor.shrink_to_fit();
+    p.flatMaterial.clear();
+    p.flatMaterial.shrink_to_fit();
+}
+
+// Main-thread half of Sync: upload the prepared (already flattened + mip-chained) buffers.
+// The texture creates are async (RHI upload pool), so this does not block. Instantiate
+// uses this for canvases that paint::Prepare processed during staging.
+void UploadPrepared(Renderer& renderer, PaintComponent& p, const std::vector<u8>& color,
+                    const std::vector<u8>& material, u32 mips) {
+    const auto upload = [&](const std::vector<u8>& px, rhi::Format fmt,
+                            rhi::TextureHandle& handle) {
+        rhi::TextureDesc desc;
+        desc.width = p.resolution;
+        desc.height = p.resolution;
+        desc.format = fmt;
+        desc.mipCount = mips;
+        desc.pixels = px.data();
+        desc.debugName = "PaintCanvas";
+        if (handle.IsValid()) renderer.UpdateTexture(handle, desc);
+        else handle = renderer.UploadTexture(desc);
+    };
+    upload(color, rhi::Format::R8G8B8A8_SRGB, p.colorTex);
+    upload(material, rhi::Format::R8G8B8A8_UNORM, p.matTex);
     p.gpuReady = p.colorTex.IsValid() && p.matTex.IsValid();
     p.dirty = false;
 }

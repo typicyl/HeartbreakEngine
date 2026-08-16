@@ -4,6 +4,7 @@
 #include "Assets/AssetFormats.h" // the single source of truth for source formats
 #include "Assets/MaterialAsset.h"
 #include "Assets/MeshOptimize.h" // import-time GPU geometry optimization (meshoptimizer)
+#include "Assets/MeshSimplify.h"  // import-time distance-LOD generation (quadric decimation)
 #include "Assets/ModelLoader.h"
 #include "Assets/SlotIds.h" // the pack slot is assigned HERE, at import
 #include "Assets/UAF.h"
@@ -429,6 +430,23 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
     // Materials above only touch refs, never geometry, so this is safe to run last.
     for (MeshData& md : *model)
         mesh::OptimizeForGpu(md);
+
+    // Distance LODs (v9), generated NON-DESTRUCTIVELY alongside LOD0 (the reordered source).
+    // Opt-in project setting (default on). Skinned models are excluded whole (hero quality +
+    // Simplify welds UV seams); morph submeshes are excluded per-submesh inside BuildLodChain.
+    // Deterministic, so re-import reproduces byte-identical LODs.
+    const bool genLods =
+        Project::HasActive() && Project::Active().Settings().meshLodEnabled && !rig.Valid();
+    if (genLods) {
+        u32 lodded = 0;
+        for (MeshData& md : *model) {
+            mesh::BuildLodChain(md); // no-op for morph submeshes / already-tiny meshes
+            if (!md.lods.empty()) ++lodded;
+        }
+        if (lodded > 0)
+            HBE_INFO("Importer: generated distance LODs for {}/{} submesh(es) of '{}'.",
+                     lodded, model->size(), out.filename().string());
+    }
 
     return uaf::WriteMesh(out, *model, GenGuid(), rig.Valid() ? &rig : nullptr);
 }

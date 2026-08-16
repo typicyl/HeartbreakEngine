@@ -72,6 +72,19 @@ bool Instanceable(const rhi::DrawItem& it) {
              (rhi::MaterialFlag_Transparent | rhi::MaterialFlag_TerrainSplat));
 }
 
+// Looser instanceability for the SHADOW-ONLY tail. The depth-only shadow pass ignores
+// material AND paint (it rasterizes geometry+transform only), so - unlike the scene-pass
+// Instanceable above - a PAINTED caster CAN share a run. Only per-instance GEOMETRY
+// deformation (skinning/morph) or the special transparent/splat passes block it. Grouping
+// the tail by mesh.id alone (below) with this predicate collapses a cluster of the same
+// mesh with per-object paint (e.g. hundreds of ground-decal planes) from N shadow draws
+// into ONE - the single biggest driver of the shadow draw-call count on dense scenes.
+bool ShadowInstanceable(const rhi::DrawItem& it) {
+    return it.boneCount == 0 && it.morphCount == 0 &&
+           !(it.materialFlags &
+             (rhi::MaterialFlag_Transparent | rhi::MaterialFlag_TerrainSplat));
+}
+
 // Material-key equality for run grouping: everything the ObjectCB carries
 // besides the per-instance transforms.
 bool SameMaterial(const rhi::DrawItem& a, const rhi::DrawItem& b) {
@@ -178,6 +191,53 @@ void Renderer::UpdateTexture(rhi::TextureHandle handle, const rhi::TextureDesc& 
     if (device_) device_->UpdateTexture(handle, desc);
 }
 
+void Renderer::DestroyMesh(rhi::MeshHandle handle) {
+    if (!device_ || !handle.IsValid()) return;
+    // A base mesh owns its distance-LOD handles: free them together, so a streaming reclaim of
+    // the base leaves no orphaned LOD GPU buffers and no stale LOD-table entry (whose base id
+    // could later be recycled by a different mesh and wrongly inherit these levels).
+    if (const auto it = meshLods_.find(handle.id); it != meshLods_.end()) {
+        for (const LodEntry& e : it->second) {
+            if (e.handle.IsValid()) {
+                device_->DestroyMesh(e.handle);
+                meshBounds_.erase(e.handle.id);
+            }
+        }
+        meshLods_.erase(it);
+    }
+    device_->DestroyMesh(handle);
+    meshBounds_.erase(handle.id); // drop the culling bounds recorded for this id
+}
+
+void Renderer::RegisterMeshLods(rhi::MeshHandle base, const std::vector<rhi::MeshHandle>& lods) {
+    if (!base.IsValid() || lods.empty()) return;
+    // Thresholds on the FOV-normalized screen metric (see the selection block): the projected
+    // fraction of the viewport half-height an object covers. LOD1 kicks in below kFirstSwitch,
+    // each further level at half the previous. Resolution- AND fov-independent (a screen
+    // fraction, so a zoomed/scoped narrow-fov view keeps near-full detail), honoring the
+    // native-res "keep quality" mandate. 0.242 == the old radius/dist 0.14 preserved at the
+    // default 60-deg fovY (x 1/tan(30deg) == 1.732), so default-fov behavior is unchanged.
+    constexpr f32 kFirstSwitch = 0.242f;
+    constexpr f32 kFalloff = 0.5f;
+    std::vector<LodEntry> entries;
+    entries.reserve(lods.size());
+    f32 threshold = kFirstSwitch;
+    for (rhi::MeshHandle h : lods) {
+        if (!h.IsValid()) continue;
+        entries.push_back({h, threshold});
+        threshold *= kFalloff;
+    }
+    if (!entries.empty()) meshLods_[base.id] = std::move(entries);
+}
+
+void Renderer::DestroyTexture(rhi::TextureHandle handle) {
+    if (device_) device_->DestroyTexture(handle);
+}
+
+bool Renderer::SupportsResourceReclaim() const {
+    return device_ && device_->SupportsResourceReclaim();
+}
+
 bool Renderer::SupportsScene() const {
     return device_ && device_->SupportsSceneRendering();
 }
@@ -276,6 +336,47 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         stats_.drawn = visibleCount;
         stats_.culled = itemCount - visibleCount;
 
+        // --- Distance LODs: swap each drawable to the coarsest level whose projected screen
+        // coverage still justifies it. Runs AFTER the cull for two reasons: the cull sees stable
+        // LOD0 bounds (near-identical to any LOD, and the full extent is the safe choice), and the
+        // two halves get treated differently. The VISIBLE prefix [0,visibleCount) is what the main
+        // AND shadow passes read at the SAME index, so it gets one handle (camera LOD) - the
+        // index-coupling invariant above is preserved. The off-screen SUFFIX is shadow-only, so it
+        // is floored one level finer than the coarsest, or a far off-screen caster would throw its
+        // faceted low-poly silhouette into a near shadow. Near geometry keeps LOD0 (native-res
+        // detail preserved). Skinned/morph and LOD-less draws are skipped -> cheap no-op when no
+        // LODs exist. The metric is FOV-normalized (screen fraction, not raw angular size) so a
+        // zoomed/scoped narrow-fov view keeps near-full detail.
+        if (meshLodEnabled_ && !meshLods_.empty() && itemCount > 0) {
+            const glm::vec3 camPos = view.cameraPos;
+            const f32 invTanHalfFov = 1.0f / glm::max(glm::tan(0.5f * camera_.FovY()), 1e-4f);
+            const auto pickLod = [&](rhi::DrawItem& it, bool shadowOnly) {
+                if (it.boneCount > 0 || it.morphCount > 0) return;
+                const auto lit = meshLods_.find(it.mesh.id);
+                if (lit == meshLods_.end()) return;
+                const auto bit = meshBounds_.find(it.mesh.id);
+                if (bit == meshBounds_.end()) return;
+                const glm::vec3 worldCenter =
+                    glm::vec3(it.transform * glm::vec4(bit->second.center, 1.0f));
+                const f32 scale = glm::max(glm::length(glm::vec3(it.transform[0])),
+                                           glm::max(glm::length(glm::vec3(it.transform[1])),
+                                                    glm::length(glm::vec3(it.transform[2]))));
+                const f32 radius = glm::length(bit->second.extent) * scale;
+                const f32 dist = glm::length(camPos - worldCenter);
+                const f32 screen = (radius / glm::max(dist, 1e-3f)) * invTanHalfFov;
+                const u32 total = static_cast<u32>(lit->second.size());
+                const u32 n = (shadowOnly && total > 1) ? total - 1 : total;
+                rhi::MeshHandle sel{};
+                for (u32 k = 0; k < n; ++k) {
+                    if (screen < lit->second[k].switchBelow) sel = lit->second[k].handle;
+                    else break;
+                }
+                if (sel.IsValid()) it.mesh = sel;
+            };
+            for (u32 i = 0; i < visibleCount; ++i) pickLod(drawItems_[i], /*shadowOnly*/ false);
+            for (u32 i = visibleCount; i < itemCount; ++i) pickLod(drawItems_[i], /*shadowOnly*/ true);
+        }
+
         // Sort the VISIBLE prefix for submission coherence: opaque first (matches
         // the backends' two-pass split), grouped by mesh (enables the IA-rebind
         // skip + instancing runs), then front-to-back within a mesh (early-Z).
@@ -334,13 +435,16 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         }
         for (u32 i = visibleCount; i < itemCount;) {
             drawItems_[i].instanceRun = 1;
-            if (!Instanceable(drawItems_[i])) {
+            if (!ShadowInstanceable(drawItems_[i])) {
                 ++i;
                 continue;
             }
+            // Group by MESH ALONE (not SameMaterial): the tail is shadow-only and the
+            // depth pass is material/paint-agnostic, so same-mesh casters with different
+            // materials/paint fold into ONE instanced shadow draw instead of N singles.
             u32 runEnd = i + 1;
-            while (runEnd < itemCount && Instanceable(drawItems_[runEnd]) &&
-                   SameMaterial(drawItems_[i], drawItems_[runEnd]))
+            while (runEnd < itemCount && ShadowInstanceable(drawItems_[runEnd]) &&
+                   drawItems_[runEnd].mesh.id == drawItems_[i].mesh.id)
                 ++runEnd;
             const u32 runLen = runEnd - i;
             if (runLen > 1) {

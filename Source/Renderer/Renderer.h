@@ -46,6 +46,28 @@ public:
     // surface painting); the desc must match the texture's created layout.
     void UpdateTexture(rhi::TextureHandle handle, const rhi::TextureDesc& desc);
 
+    // Release a mesh / texture (reclaim its VRAM). NON-BLOCKING: deferred a few frames by
+    // the backend, then its slot is recycled. The CALLER guarantees no live entity still
+    // references the handle (see scene::TrimUnreferencedGpu, the streaming despawn sweep).
+    void DestroyMesh(rhi::MeshHandle handle);
+    void DestroyTexture(rhi::TextureHandle handle);
+
+    // True when DestroyMesh/DestroyTexture actually free VRAM on the active backend.
+    // The streaming reclaim sweep is a no-op (skipped) when this is false, so a backend
+    // without real reclaim keeps its resources cached instead of dropping-then-re-uploading.
+    bool SupportsResourceReclaim() const;
+
+    // Register the distance-LOD chain for a base mesh (`base` == LOD0). `lods` are the already-
+    // uploaded reduced levels in order of DECREASING detail (LOD1..N). Distance selection then
+    // swaps a draw's handle to the coarsest level whose projected screen size still covers it.
+    // The Renderer takes OWNERSHIP: DestroyMesh(base) also frees every registered LOD handle, so
+    // a streaming reclaim of the base cannot orphan LOD GPU buffers or leave a stale table entry
+    // whose base id could later be recycled by a different mesh.
+    void RegisterMeshLods(rhi::MeshHandle base, const std::vector<rhi::MeshHandle>& lods);
+    // Debug/override toggle for distance-LOD selection (default on). Off = always draw LOD0.
+    void SetMeshLodEnabled(bool on) { meshLodEnabled_ = on; }
+    bool MeshLodEnabled() const { return meshLodEnabled_; }
+
     // True if the active backend can render geometry (vs. clear-only).
     bool SupportsScene() const;
 
@@ -254,6 +276,16 @@ private:
         glm::vec3 extent{0.0f}; // half-size
     };
     std::unordered_map<u32, MeshBounds> meshBounds_;
+    // Distance-LOD table: base (LOD0) handle id -> its reduced levels, each with the projected
+    // screen-size (bounding-sphere radius / camera distance) BELOW which that level is selected.
+    // Thresholds strictly decrease down the vector, so selection is a short walk. Empty for
+    // meshes without LODs (the common case), so LOD selection is a cheap no-op for them.
+    struct LodEntry {
+        rhi::MeshHandle handle;
+        f32 switchBelow = 0.0f; // use this level when screenSize < switchBelow (and >= the next)
+    };
+    std::unordered_map<u32, std::vector<LodEntry>> meshLods_;
+    bool meshLodEnabled_ = true;
     FrameStats stats_;
     bool cullingEnabled_ = true;
     bool orbitEnabled_ = true;

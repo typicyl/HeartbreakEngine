@@ -99,6 +99,10 @@ struct SceneEnvironment {
     // per-scene identity that survives file -> live scene -> save; the Engine's NavWorld
     // streams tiles from it independently of the level's own geometry streaming.
     std::string navSource;
+    // Navigation is OPT-IN per scene (default off): a scene with a baked navSource does
+    // NOT load/stream its navmesh on boot unless this is set. Baking turns it on. The
+    // Engine's nav sim band gates NavWorld load + agent steering on this flag.
+    bool navEnabled = false;
     // The scene FILE's permanent pack slot, carried through load so a live save can
     // re-emit it (0xFFFFFFFF = none; slot 0 is valid). Packaging identity, not
     // rendering state - it rides here because the environment is the one thing that

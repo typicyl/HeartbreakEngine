@@ -357,6 +357,14 @@ int main(int argc, char** argv) {
             std::printf("simplify %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
+        // --test-meshlod: import-time distance-LOD generation (BuildLodChain) + the v9 .uaf
+        // round-trip. Proves LODs are strictly decreasing, deterministic, LOD0 is left intact,
+        // morph meshes are excluded, and the LOD chain survives write+read. Headless.
+        if (std::strcmp(argv[i], "--test-meshlod") == 0) {
+            const bool ok = hbe::mesh::MeshLodSelfTest();
+            std::printf("meshlod %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
         // --test-meshopt: import-time GPU geometry optimize (meshoptimizer). Proves the
         // surface is preserved, morph deltas stay glued to their vertices through the
         // reorder, the cache order improves, the weld collapses duplicates, and it is

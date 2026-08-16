@@ -27,7 +27,12 @@ inline constexpr char kMagic[4] = {'U', 'A', 'F', '1'};
 //     animation was dead on the FIRST spawn, not just on a respawn. Reads are
 //     version-gated, so every existing v1-v7 asset still loads (with no morphs,
 //     exactly as it behaves today); re-import a character to get its blendshapes.
-inline constexpr u32 kVersion = 8; // v8: Mesh carries blendshape/morph targets
+// v9: Mesh gains per-submesh distance LODs (a u32 count + that many reduced
+//     {vertices,indices} sets, written after the morph block). Generated at import
+//     by mesh::BuildLodChain and shipped ALONGSIDE the full-detail geometry - LOD0 is
+//     the submesh itself. Version-gated: every v1-v8 asset still loads (no LODs);
+//     re-import (or --generate-mesh-lods) to add them.
+inline constexpr u32 kVersion = 9; // v9: Mesh carries distance LODs
 
 // A `.uaf` header optionally carries the asset's PACK SLOT (see Assets/SlotIds.h)
 // as a u32 right after the guid. Its presence is a FLAG BIT on the version word,

@@ -225,8 +225,23 @@ static std::string g_layoutIniPath;
 static bool g_hadSavedLayout = false;
 
 void Editor::EnableLayoutPersistence(const char* iniPath) {
-    g_layoutIniPath = iniPath ? iniPath : "";
     std::error_code ec;
+    if (iniPath && *iniPath) {
+        // A bare filename ("HeartbreakEditor.ini") is resolved by ImGui against the process
+        // CWD, which is launch-method dependent (the Hub spawns the editor with a null
+        // lpCurrentDirectory, so it inherits the Hub's CWD). That scattered the layout .ini
+        // across directories, so a saved layout was never found on the next boot and the
+        // default DockBuilder arrangement clobbered it. Anchor a relative path to the stable
+        // per-user data dir instead (same fix the Hub already uses for its own layout).
+        std::filesystem::path p(iniPath);
+        if (p.is_relative()) {
+            const std::filesystem::path dir = platform::UserDataDir();
+            if (!dir.empty()) p = dir / p;
+        }
+        g_layoutIniPath = p.string();
+    } else {
+        g_layoutIniPath.clear();
+    }
     g_hadSavedLayout = !g_layoutIniPath.empty() && std::filesystem::exists(g_layoutIniPath, ec);
     ImGui::GetIO().IniFilename = g_layoutIniPath.empty() ? nullptr : g_layoutIniPath.c_str();
 }
@@ -4340,7 +4355,32 @@ void Editor::UpdateArtTool(Engine& engine) {
     if (pc) {
         // Existing canvas: respect lock / hidden / layer masks.
         const bool layerMasked = paintActiveLayer_ != "All" && pc->layer != paintActiveLayer_;
-        if (pc->locked || !pc->enabled || layerMasked) {
+        if (pc->resCapped) {
+            // This is a streamed, downsampled PROXY of a higher-res .hbpaint (the
+            // project's streamed-paint cap). Editing it can't be saved (the writer
+            // refuses to overwrite the full-res original), so block the brush and say
+            // why, rather than silently discarding the strokes at the next save.
+            if (lmbDown) {
+                SetSaveStatus("This canvas is downsampled by the streamed-paint cap - raise "
+                              "'Streamed paint cap' in Project Settings to paint at full res.",
+                              true);
+                paintConsumedClick_ = true;
+            }
+            if (!lmbDown) paintStroking_ = false;
+            paintHasLast_ = false;
+            return;
+        }
+        if (pc->locked) {
+            // A locked canvas can't be painted. This is the ONE case where a paint
+            // click is allowed to change the selection: clicking a LOCKED object
+            // selects it (so the user can find / unlock / inspect it) - matching the
+            // rule "painting doesn't select the object unless it's specifically locked".
+            if (lmbDown) { selected_ = paintEntity; paintConsumedClick_ = true; }
+            if (!lmbDown) paintStroking_ = false;
+            paintHasLast_ = false;
+            return;
+        }
+        if (!pc->enabled || layerMasked) {
             if (!lmbDown) paintStroking_ = false;
             paintHasLast_ = false;
             return;
@@ -4425,7 +4465,9 @@ void Editor::UpdateArtTool(Engine& engine) {
             paintHasLast_ = false;
             paintSyncTick_ = 0;
             paintTarget_ = paintEntity;
-            selected_ = paintEntity; // painting selects the object (selection feedback)
+            // Painting no longer changes the selection (a click on a LOCKED object above
+            // is the only paint action that does), so painting a surface never steals
+            // selection / inspector focus from whatever the user was working on.
             // Begin recording this stroke into the database (committed on release).
             curStroke_ = paint::Stroke{};
             curStroke_.type = paint::StrokeType::Path;
@@ -5845,14 +5887,30 @@ entt::entity Editor::SpawnMeshAsset(Scene& scene, Renderer& renderer,
         ComputeBounds(md, mn, mx);
         scene.Registry().emplace<AABB>(e, AABB{mn, mx});
 
-        // Static box collider fitted to the mesh bounds (scenery default);
-        // switch shape/motion in the Inspector for gameplay objects.
+        // Collider default: a STATIC triangle-mesh collider matching the imported
+        // geometry, so props collide on their real silhouette instead of a bounding
+        // box. Switch shape/motion in the Inspector for gameplay objects. The AABB
+        // half-extents/centre are still filled as the fallback used if the user later
+        // switches the shape back to Box.
         RigidBody rb;
-        rb.shape = RigidBody::Shape::Box;
         rb.motion = RigidBody::Motion::Static;
         rb.halfExtents = glm::max((mx - mn) * 0.5f, glm::vec3(0.01f));
-        rb.centerOffset = (mn + mx) * 0.5f;
         rb.radius = glm::max(rb.halfExtents.x, glm::max(rb.halfExtents.y, rb.halfExtents.z));
+        if (!skinned && !md.vertices.empty() && !md.indices.empty()) {
+            // Exact mesh collider, in mesh-local space. Verts are already local-
+            // positioned, so centerOffset stays 0 (a non-zero offset would double-
+            // shift a mesh collider). Not serialized - rebuilt from the mesh on load.
+            rb.shape = RigidBody::Shape::Mesh;
+            rb.centerOffset = glm::vec3(0.0f);
+            rb.collisionVertices.reserve(md.vertices.size());
+            for (const Vertex& v : md.vertices) rb.collisionVertices.push_back(v.position);
+            rb.collisionIndices = md.indices;
+        } else {
+            // Skinned mesh (a rest-pose triangle collider would be wrong once it
+            // animates) or degenerate geometry: keep a box fitted to the bounds.
+            rb.shape = RigidBody::Shape::Box;
+            rb.centerOffset = (mn + mx) * 0.5f;
+        }
         scene.Registry().emplace<RigidBody>(e, rb);
 
         bmin = glm::min(bmin, mn);
@@ -8059,6 +8117,25 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     rb.centerOffset = (box->min + box->max) * 0.5f;
                     rb.radius = glm::max(rb.halfExtents.x,
                                          glm::max(rb.halfExtents.y, rb.halfExtents.z));
+                }
+                // Default to the entity's real mesh geometry (not a bounding box) when it
+                // has a non-skinned CPU mesh: an exact triangle collider (Static motion)
+                // or its convex hull (Dynamic, since Jolt has no dynamic triangle mesh).
+                // The AABB box above stays as the fallback (no mesh, or a skinned mesh
+                // whose rest-pose triangles would be wrong once it animates).
+                if (const MeshData* md = GetCpuMesh(scene, sel);
+                    md && !md->vertices.empty() && !md->indices.empty()) {
+                    const bool skinned = std::any_of(
+                        md->vertices.begin(), md->vertices.end(),
+                        [](const Vertex& v) { return v.weights[0] > 0.0f; });
+                    if (!skinned) {
+                        rb.shape = RigidBody::Shape::Mesh;
+                        rb.centerOffset = glm::vec3(0.0f); // verts already local-positioned
+                        rb.collisionVertices.reserve(md->vertices.size());
+                        for (const Vertex& v : md->vertices)
+                            rb.collisionVertices.push_back(v.position);
+                        rb.collisionIndices = md->indices;
+                    }
                 }
                 reg.emplace<RigidBody>(sel, rb);
             }
@@ -18540,6 +18617,24 @@ void Editor::DrawSceneManager(Engine& engine) {
             }
         }
     }
+
+    // Streamed surface-paint resolution cap: box-downsample canvases larger than this as
+    // they stream in. The .hbpaint on disk keeps its authored resolution, so this is
+    // reversible - raise it to restore quality. Cuts the O(res^2) paint finalize cost when
+    // a dense painted cluster streams in as one shard. See maxStreamedPaintResolution.
+    {
+        const u32 caps[] = {0u, 256u, 512u, 1024u, 2048u};
+        int capIdx = 0;
+        for (int i = 0; i < 5; ++i)
+            if (project.Settings().maxStreamedPaintResolution == caps[i]) capIdx = i;
+        if (ImGui::Combo("Streamed paint cap", &capIdx,
+                         "No cap\0" "256\0" "512\0" "1024\0" "2048\0")) {
+            project.Settings().maxStreamedPaintResolution = caps[capIdx];
+            project.Save();
+        }
+        ImGui::TextDisabled("Downsamples big painted canvases at stream-in (reversible; the");
+        ImGui::TextDisabled(".hbpaint on disk is untouched). Lowers a painted cluster's hitch.");
+    }
     ImGui::Separator();
 
     if (sceneList_.empty()) {
@@ -20345,6 +20440,9 @@ void Editor::DrawNavigation(Engine& engine) {
                 StampNewAsset(outAbs);
                 PushUndo(scene); // assigning navSource is a scene edit
                 env.navSource = rel;
+                // Baking implies opting this scene into navigation-on-load (nav is off by
+                // default); the user just asked for a navmesh, so turn it on.
+                env.navEnabled = true;
                 // Drop the loaded navmesh so the per-frame sync reloads the fresh bake.
                 world.Unload();
                 navStatus_ = "Baked " + std::to_string(r.tileColumns) + " tile column(s) from " +
@@ -20362,12 +20460,28 @@ void Editor::DrawNavigation(Engine& engine) {
 
     // --- Streamed navmesh state + test path ------------------------------------
     ImGui::SeparatorText("Streamed navmesh (Detour)");
+    {
+        // Opt-in gate: navigation is off by default so a scene with a baked navmesh
+        // doesn't stream nav on every boot. Snapshot BEFORE applying so Ctrl+Z reverts.
+        SceneEnvironment& env = scene.Environment();
+        bool navOn = env.navEnabled;
+        if (ImGui::Checkbox("Enable navigation on load", &navOn)) {
+            PushUndo(scene);
+            env.navEnabled = navOn;
+            if (!navOn) world.Unload(); // stop streaming immediately when turned off
+        }
+        if (env.navEnabled && env.navSource.empty())
+            ImGui::TextDisabled("(enabled, but no navmesh baked yet - bake above)");
+    }
     if (world.Loaded()) {
         ImGui::Text("Loaded '%s': %d/%d tile column(s) resident.", world.SourcePath().c_str(),
                     world.ResidentTileColumns(), world.TotalTileColumns());
     } else if (!scene.Environment().navSource.empty()) {
-        ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "navSource set but not loaded (status %u).",
-                           static_cast<u32>(world.Status()));
+        if (scene.Environment().navEnabled)
+            ImGui::TextColored(ImVec4(1, 0.6f, 0.2f, 1), "navSource set but not loaded (status %u).",
+                               static_cast<u32>(world.Status()));
+        else
+            ImGui::TextDisabled("Navmesh baked, but navigation is disabled for this scene.");
     } else {
         ImGui::TextDisabled("No navmesh (bake one, then Save the scene).");
     }

@@ -60,6 +60,16 @@ struct MorphTarget {
     std::vector<glm::vec3> nrmDelta; // size == vertices.size() (may be empty)
 };
 
+// One reduced level-of-detail: the same 72-byte vertex layout, fewer of them. Generated
+// at import by mesh::BuildLodChain (quadric decimation) and stored ALONGSIDE the full-detail
+// mesh - never replacing it. LOD0 is the owning MeshData itself; these are LOD1..N in order
+// of decreasing triangle count. Carries no material/name/morphs: those are shared with LOD0
+// (the material is per-instance; morphs are deliberately absent, see MeshSimplify.h).
+struct MeshLod {
+    std::vector<Vertex> vertices;
+    std::vector<u32>    indices;
+};
+
 // One drawable submesh: interleaved vertices + 32-bit indices + a material.
 struct MeshData {
     std::vector<Vertex> vertices;
@@ -67,6 +77,7 @@ struct MeshData {
     Material            material;
     std::string         name;
     std::vector<MorphTarget> morphTargets; // blendshapes (empty for most meshes)
+    std::vector<MeshLod>     lods;          // v9: distance LODs (empty = full detail only)
 
     u32 VertexCount() const { return static_cast<u32>(vertices.size()); }
     u32 IndexCount()  const { return static_cast<u32>(indices.size()); }

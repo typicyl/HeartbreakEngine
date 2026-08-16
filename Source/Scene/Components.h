@@ -352,6 +352,16 @@ struct PaintComponent {
     std::vector<u8> flatColor;      // RGB albedo, A coverage
     std::vector<u8> flatMaterial;   // R metal, G rough, B height, A coverage
 
+    // STAGING-ONLY, thread-built (not serialized, empty on a runtime component): the
+    // fully-prepared upload buffers - flattened, edge-dilated, and mip-chained - computed
+    // OFF the main thread by paint::Prepare during StageAssets. Instantiate then only
+    // UPLOADS them (async), so streaming a shard full of painted meshes no longer
+    // flattens+mips dozens of 1024^2 canvases in one finalize frame (the ~200ms stall).
+    // preparedMips == 0 means "not prepared" -> Instantiate falls back to paint::Sync.
+    std::vector<u8> preparedColor;    // sRGB, mip-chained
+    std::vector<u8> preparedMaterial; // UNORM, mip-chained
+    u32 preparedMips = 0;
+
     bool enabled = true;            // show the paint (per-object visibility toggle)
     bool locked = false;            // mask: ignore brush strokes on this object
     bool reliefEnabled = true;      // apply the painted height as a normal deformation
@@ -382,6 +392,13 @@ struct PaintComponent {
     // recoverable broken reference into permanent loss. Runtime only, never
     // serialized.
     bool canvasMissing = false;
+
+    // This runtime canvas was BOX-DOWNSAMPLED at stream-in (paint::Downsample, driven by
+    // the project's maxStreamedPaintResolution cap). The on-disk .hbpaint is HIGHER
+    // resolution, so this in-memory copy must NEVER be written back - WritePaintCanvases
+    // skips it, exactly like canvasMissing, so a save can't destroy the authored original.
+    // Runtime only, never serialized.
+    bool resCapped = false;
 };
 
 // References a `.hbmat` material asset (path relative to Assets/). When

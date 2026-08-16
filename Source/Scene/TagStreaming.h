@@ -174,6 +174,12 @@ struct ShardRuntime {
     // and player-progress deltas are the wrong shape for authored edits anyway. Empty
     // until the first authoring despawn, so a shipping runtime never allocates it.
     std::string authorSnapshot;
+    // AUTHORING async respawn: the snapshot parsed to SceneData on the STAGING WORKER, so
+    // the heavy StageAssets (mip-gen etc.) runs off the main thread exactly like the file
+    // path - without this the editor did a synchronous parse+stage+upload on respawn (a
+    // ~1.5s load hitch). When set, Finalize instantiates from THIS instead of the sliced
+    // source file. Freed by Finalize after use. Null on a shipping (non-authoring) runtime.
+    std::unique_ptr<scene::SceneData> snapshotData;
     bool failWarned = false; // a Failed shard warns once, then stays quiet
     // Already counted as a deferred finalize. Without it the counter increments once per
     // Ready shard per missed FRAME, so four shards ready together read as six deferrals
@@ -501,6 +507,12 @@ private:
     bool SpawnAuthorSnapshot(Scene& scene, Renderer& renderer, u32 i);
     // The staging job body (worker thread). `arg` is a ShardRuntime*.
     static void StageJob(void* arg);
+    // Authoring respawn staging (worker thread): parse the shard's authorSnapshot into
+    // ShardRuntime::snapshotData and StageAssets it, so the editor's respawn does its
+    // mip-gen/decode off the main thread (Finalize then only uploads). `arg` is a
+    // ShardRuntime*. Leaves snapshotData null (and clears authorSnapshot) if it will not
+    // parse, so Finalize falls back to the file slice.
+    static void SnapshotStageJob(void* arg);
     // Blocks until no staging job is in flight. MAIN THREAD ONLY.
     void DrainInFlight() const;
     f32 NearestFocusDistance(u32 shard, const std::vector<glm::vec3>& foci) const;
