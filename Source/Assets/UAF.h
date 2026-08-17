@@ -83,6 +83,11 @@ struct Audio {
 // Returns the asset type recorded in a `.uaf` file (Unknown on error).
 AssetType PeekType(const std::filesystem::path& path);
 
+// Reads a `.uaf`'s header (type + PAYLOAD version + guid) without paging the payload (assets
+// can be hundreds of MB). Returns false on a missing/corrupt/short file. The asset auto-upgrade
+// uses this to find files below `kVersion` and re-write them in place, preserving their guid.
+bool PeekHeader(const std::filesystem::path& path, AssetType& type, u32& version, u64& guid);
+
 bool WriteTexture(const std::filesystem::path& path, const Texture& tex, u64 guid = 0);
 std::optional<Texture> ReadTexture(const std::filesystem::path& path);
 // Reads ONLY a texture's width/height (skips the pixel payload). VFS-aware

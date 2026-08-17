@@ -123,6 +123,41 @@ cbuffer FrameConstants : register(b0)
     float  gEdgeFade;        // metres of soft depth-fade where water meets geometry
 };
 
+// OpenPBR Surface parameters appended to the per-object constants (P2). Mirror of
+// rhi::GpuSurfaceMaterialExt in Source/RHI/GpuMaterial.h - 11 x 16 bytes, every float3 starting a
+// 16-byte row so HLSL cbuffer packing matches the C++ layout. The metallic-roughness-era material
+// values (base color / metalness / roughness / emissive / subsurface / coat) still live in their
+// legacy ObjectConstants fields below; MeshPBR's LoadOpenPBRMaterial() gathers both into one view.
+struct OpenPBRMaterialExt
+{
+    float  geometry_opacity;
+    float  base_weight;
+    float  base_diffuse_roughness;
+    float  specular_weight;
+    float3 specular_color; float specular_ior;
+    float  specular_roughness_anisotropy;
+    float  specular_anisotropy_rotation;
+    float  coat_ior;
+    float  coat_affect_color;
+    float3 coat_color; float coat_affect_roughness;
+    float  coat_roughness_anisotropy;
+    float  fuzz_weight;
+    float  fuzz_roughness;
+    float  subsurface_weight;
+    float3 fuzz_color; float subsurface_scatter_anisotropy;
+    float3 subsurface_radius_scale; float transmission_weight;
+    float3 transmission_color; float transmission_depth;
+    float3 transmission_scatter; float transmission_scatter_anisotropy;
+    float  transmission_dispersion_scale;
+    float  transmission_dispersion_abbe_number;
+    float  thin_film_weight;
+    float  thin_film_thickness;
+    float  thin_film_ior;
+    float  thin_walled;
+    float  _padExt0;
+    float  _padExt1;
+};
+
 // Per-object constants.
 cbuffer ObjectConstants : register(b1)
 {
@@ -195,6 +230,9 @@ cbuffer ObjectConstants : register(b1)
     float    gClearcoatRoughness; // clear layer roughness (low = wet/glossy)
     float    _padCc0;
     float    _padCc1;
+    // Appended OpenPBR Surface parameters (P2). Zero-init keeps every pre-P2 draw byte-identical;
+    // MeshPBR reads these via LoadOpenPBRMaterial (OpenPBRSurface.hlsli).
+    OpenPBRMaterialExt gMatExt;
 };
 
 // Per-frame joint palettes (every skinned draw appends its global*inverseBind

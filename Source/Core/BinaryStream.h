@@ -3,6 +3,8 @@
 
 #include "Core/Types.h"
 
+#include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -48,8 +50,16 @@ public:
     // std::filesystem::rename over an existing file is atomic on NTFS, so a reader
     // either sees the whole old file or the whole new one, never a half-written mix.
     bool SaveToFile(const std::filesystem::path& path) const {
+        // Unique temp name per (process, call): two processes writing the SAME target (e.g. two
+        // editor instances auto-upgrading one project) must not interleave-write ONE `.tmp` and
+        // then rename a corrupt mix. The static's address is ASLR-distinct per process; the counter
+        // separates calls within a process. The rename below stays atomic on NTFS.
+        static std::atomic<std::uint64_t> ctr{0};
+        const std::uint64_t uniq =
+            static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&ctr)) +
+            (ctr.fetch_add(1, std::memory_order_relaxed) + 1);
         std::filesystem::path tmp = path;
-        tmp += ".tmp";
+        tmp += "." + std::to_string(uniq) + ".tmp";
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
             if (!out) return false;

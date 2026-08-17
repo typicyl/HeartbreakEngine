@@ -53,7 +53,9 @@ VSOutput VSMain(VSInput input)
 // Reconstructs a world-space normal from the tangent-space normal map.
 float3 ApplyNormalMap(float3 N, float4 T, float2 uv)
 {
-    float3 tangentNormal = gNormalMap.Sample(gLinearSampler, uv).xyz * 2.0f - 1.0f;
+    // Reconstruct Z from XY (BC5 normal maps store only R,G; exact for uncompressed too).
+    float2 nxy = gNormalMap.Sample(gLinearSampler, uv).xy * 2.0f - 1.0f;
+    float3 tangentNormal = float3(nxy, sqrt(saturate(1.0f - dot(nxy, nxy))));
     float3 n = normalize(N);
     float3 t = normalize(T.xyz - n * dot(n, T.xyz)); // Gram-Schmidt
     float3 b = cross(n, t) * T.w;

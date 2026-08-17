@@ -299,21 +299,13 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
                 item.prevBones = pit->second.data();
             curPalette_.try_emplace(poseOwner, an->palette);
         }
-        item.baseColor = instance.baseColor;
-        item.metallic = instance.metallic;
-        item.roughness = instance.roughness;
+        item.surface = instance.surface; // full OpenPBR material-value copy
         item.albedoTexture = instance.albedoTexture;
         item.normalTexture = instance.normalTexture;
         item.mrTexture = instance.mrTexture;
         item.aoTexture = instance.aoTexture;
         item.emissiveTexture = instance.emissiveTexture;
-        item.emissiveColor = instance.emissiveColor;
-        item.emissiveIntensity = instance.emissiveIntensity;
-        item.subsurfaceColor = instance.subsurfaceColor;
-        item.subsurfaceRadius = instance.subsurfaceRadius;
         item.thicknessTexture = instance.thicknessTexture;
-        item.clearcoat = instance.clearcoat;
-        item.clearcoatRoughness = instance.clearcoatRoughness;
         item.materialFlags = instance.materialFlags;
         // Facial blendshapes: fill the top-8 active channels from a resolved MorphState
         // (channel name -> atlas row via targetNames; weights from the driver/schematic).
@@ -360,7 +352,7 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
                 if (const TerrainComponent* tc = registry_.try_get<TerrainComponent>(par->entity)) {
                     // Live terrain roughness (the inspector slider takes effect without a
                     // chunk rebuild; also the splat roughness floor reads this).
-                    item.roughness = tc->roughness;
+                    item.surface.specular_roughness = tc->roughness;
                     // HoleMaskUsable, not !empty(): a stale (wrong-sized) mask is
                     // ignored by terrain::IsHole and therefore by the collider, so
                     // flagging the shader to clip against a stale texture would show
@@ -377,7 +369,7 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
                             item.splatRough[li]  = tc->splatRoughFactor[li];
                         }
                         item.emissiveTexture = tc->splatWeightTex; // weight mask
-                        item.subsurfaceRadius = tc->splatTile;     // overload: tile scale
+                        item.surface.subsurface_radius = tc->splatTile;     // overload: tile scale
                         item.materialFlags |= rhi::MaterialFlag_TerrainSplat;
                     }
                 }
@@ -1078,11 +1070,11 @@ void SpawnStress(Scene& scene, Renderer& renderer, u32 count, bool sharedMesh) {
                 scene.Registry().emplace<Transform>(e, t);
                 MeshInstance mi;
                 mi.mesh = handle;
-                mi.baseColor = {0.8f, 0.8f, 0.85f, 1.0f};
+                mi.surface.base_color = {0.8f, 0.8f, 0.85f, 1.0f};
                 // Shared mode = ONE material too (varied materials would split the
                 // instancing runs, defeating the measurement rig).
-                mi.metallic = sharedMesh ? 0.0f : ((x & 1u) ? 1.0f : 0.0f);
-                mi.roughness = sharedMesh
+                mi.surface.base_metalness = sharedMesh ? 0.0f : ((x & 1u) ? 1.0f : 0.0f);
+                mi.surface.specular_roughness = sharedMesh
                                    ? 0.5f
                                    : glm::clamp(0.1f + 0.8f * (static_cast<f32>(y) / side),
                                                 0.05f, 1.0f);
@@ -1173,10 +1165,10 @@ bool LoadModel(Scene& scene, Renderer& renderer, const std::string& path) {
         scene.Registry().emplace<Parent>(e, Parent{root});
         MeshInstance mi;
         mi.mesh = handle;
-        mi.baseColor = meshData.material.baseColor;
-        mi.metallic  = meshData.material.metallic;
-        mi.roughness = meshData.material.roughness;
-        mi.emissiveColor = meshData.material.emissive;
+        mi.surface.base_color = meshData.material.baseColor;
+        mi.surface.base_metalness  = meshData.material.metallic;
+        mi.surface.specular_roughness = meshData.material.roughness;
+        mi.surface.emission_color = meshData.material.emissive;
         scene.Registry().emplace<MeshInstance>(e, mi);
         glm::vec3 mn, mx;
         ComputeBounds(meshData, mn, mx);

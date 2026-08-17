@@ -7,6 +7,7 @@
 #include "Assets/Mesh.h"
 #include "Assets/StrokeGen.h"
 #include "Core/Log.h"
+#include "RHI/GpuMaterial.h" // GpuSurfaceMaterialExt (appended OpenPBR params)
 
 #ifndef WIN32_LEAN_AND_MEAN
 #  define WIN32_LEAN_AND_MEAN
@@ -97,6 +98,8 @@ DXGI_FORMAT ToDXGIFormat(Format f) {
         case Format::D24_UNORM_S8_UINT:   return DXGI_FORMAT_D24_UNORM_S8_UINT;
         case Format::BC1_UNORM:           return DXGI_FORMAT_BC1_UNORM;
         case Format::BC1_SRGB:            return DXGI_FORMAT_BC1_UNORM_SRGB;
+        case Format::BC3_UNORM:           return DXGI_FORMAT_BC3_UNORM;
+        case Format::BC3_SRGB:            return DXGI_FORMAT_BC3_UNORM_SRGB;
         case Format::BC4_UNORM:           return DXGI_FORMAT_BC4_UNORM;
         case Format::BC5_UNORM:           return DXGI_FORMAT_BC5_UNORM;
         case Format::BC6H_UFLOAT:         return DXGI_FORMAT_BC6H_UF16;
@@ -321,6 +324,8 @@ struct ObjectCB {
     f32 clearcoatRoughness = 0.08f;
     f32 _padCc0 = 0.0f;
     f32 _padCc1 = 0.0f;
+    // Appended OpenPBR Surface params (P2). Mirror of OpenPBRMaterialExt in Common.hlsli.
+    GpuSurfaceMaterialExt matExt;
 };
 
 // Copies a DrawItem's blendshape fields into the object CB (bindless atlas index +
@@ -340,22 +345,23 @@ inline void FillMorphCB(ObjectCB& ocb, const DrawItem& it) {
 inline void FillObjectMaterial(ObjectCB& ocb, const DrawItem& it) {
     ocb.model = it.transform;
     ocb.normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(it.transform))));
-    ocb.baseColor = it.baseColor;
-    ocb.metallic = it.metallic;
-    ocb.roughness = it.roughness;
+    ocb.baseColor = it.surface.base_color;
+    ocb.metallic = it.surface.base_metalness;
+    ocb.roughness = it.surface.specular_roughness;
     ocb.albedoIndex = it.albedoTexture.index;
     ocb.normalIndex = it.normalTexture.index;
     ocb.mrIndex = it.mrTexture.index;
     FillMorphCB(ocb, it); // facial blendshapes (bindless delta atlas)
     ocb.aoIndex = it.aoTexture.index;
     ocb.flags = it.materialFlags;
-    ocb.subsurfaceColor = it.subsurfaceColor;
-    ocb.subsurfaceRadius = it.subsurfaceRadius;
+    ocb.subsurfaceColor = it.surface.subsurface_color;
+    ocb.subsurfaceRadius = it.surface.subsurface_radius;
     ocb.thicknessIndex = it.thicknessTexture.index;
-    ocb.clearcoat = it.clearcoat;
-    ocb.clearcoatRoughness = it.clearcoatRoughness;
-    ocb.emissiveColor = it.emissiveColor;
-    ocb.emissiveIntensity = it.emissiveIntensity;
+    ocb.clearcoat = it.surface.coat_weight;
+    ocb.clearcoatRoughness = it.surface.coat_roughness;
+    ocb.emissiveColor = it.surface.emission_color;
+    ocb.emissiveIntensity = it.surface.emission_luminance;
+    FillSurfaceMaterialExt(ocb.matExt, it.surface);
     ocb.emissiveIndex = it.emissiveTexture.index;
     ocb.paintColorIndex = it.paintColorTexture.index;
     ocb.paintHeightIndex = it.paintHeightTexture.index;
@@ -392,6 +398,7 @@ u32 BytesPerPixel(Format f) {
         // wrongly treats a BC texture as linear allocates 0 (an obvious failure) instead of a
         // plausible-but-wrong size. The staging walk uses rhi::MipCopyRows (block-aware) instead.
         case Format::BC1_UNORM: case Format::BC1_SRGB:
+        case Format::BC3_UNORM: case Format::BC3_SRGB:
         case Format::BC4_UNORM: case Format::BC5_UNORM:
         case Format::BC6H_UFLOAT:
         case Format::BC7_UNORM: case Format::BC7_SRGB: return 0;
@@ -448,6 +455,7 @@ public:
     void DestroyMesh(MeshHandle handle) override;
     void DestroyTexture(TextureHandle handle) override;
     bool SupportsResourceReclaim() const override { return true; }
+    bool SupportsBlockCompression() const override { return true; } // BC is core in D3D12
     ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
     void QueueCompute(const ComputeDispatch& d) override;
     void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
@@ -1654,7 +1662,6 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
         return {};
     }
     const DXGI_FORMAT fmt = ToDXGIFormat(desc.format);
-    const u32 bpp = BytesPerPixel(desc.format);
     const u32 mipCount = desc.mipCount < 1 ? 1 : desc.mipCount;
 
     D3D12_RESOURCE_DESC td{};
@@ -1668,9 +1675,12 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
     td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     const D3D12_HEAP_PROPERTIES def = HeapProps(D3D12_HEAP_TYPE_DEFAULT);
     ComPtr<ID3D12Resource> tex;
-    if (FAILED(device_->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td,
-                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                                IID_PPV_ARGS(&tex)))) {
+    if (const HRESULT hr = device_->CreateCommittedResource(
+            &def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&tex)); FAILED(hr)) {
+        HBE_ERROR("[D3D12] CreateTexture: CreateCommittedResource failed (fmt={}, {}x{} mip{}, hr=0x{:08x})",
+                  static_cast<int>(desc.format), desc.width, desc.height, mipCount,
+                  static_cast<u32>(hr));
         texSlotFree_.push_back(slot); // return the slot for reuse
         return {};
     }
@@ -1684,23 +1694,31 @@ TextureHandle D3D12Device::CreateTexture(const TextureDesc& desc) {
                                    numRows.data(), rowSizes.data(), &totalBytes);
 
     ComPtr<ID3D12Resource> staging = CreateUploadBuffer(device_.Get(), totalBytes);
-    if (!staging) { texSlotFree_.push_back(slot); return {}; }
+    if (!staging) {
+        HBE_ERROR("[D3D12] CreateTexture: staging alloc failed (fmt={}, {} bytes)",
+                  static_cast<int>(desc.format), static_cast<u64>(totalBytes));
+        texSlotFree_.push_back(slot);
+        return {};
+    }
 
     u8* mapped = nullptr;
     D3D12_RANGE noRead{0, 0};
     staging->Map(0, &noRead, reinterpret_cast<void**>(&mapped));
     const u8* src = static_cast<const u8*>(desc.pixels);
     for (u32 mip = 0; mip < mipCount; ++mip) {
-        const u32 mw = (std::max)(1u, desc.width >> mip);
-        const u32 mh = (std::max)(1u, desc.height >> mip);
-        const u64 srcRowBytes = static_cast<u64>(mw) * bpp;
+        // GetCopyableFootprints reports the TIGHT source geometry for THIS format, block-aware:
+        // rowSizes[mip] is the unpadded row size (blocksX*blockBytes for BC, w*bpp otherwise) and
+        // numRows[mip] is the row (block-row) count. Using them means one code path serves both
+        // linear and BC textures - no bytes-per-pixel assumption, no sub-4x4 tail-mip special case.
+        const u64 srcRowBytes = rowSizes[mip];
+        const u32 rows = numRows[mip];
         u8* dstBase = mapped + footprints[mip].Offset;
-        for (u32 row = 0; row < numRows[mip]; ++row) {
+        for (u32 row = 0; row < rows; ++row) {
             std::memcpy(dstBase + static_cast<u64>(row) * footprints[mip].Footprint.RowPitch,
                         src + static_cast<u64>(row) * srcRowBytes,
                         static_cast<usize>(srcRowBytes));
         }
-        src += static_cast<u64>(mh) * srcRowBytes; // next mip (tightly packed source)
+        src += srcRowBytes * rows; // next mip (tightly packed source), block-aware
     }
     staging->Unmap(0, nullptr);
 
@@ -1804,7 +1822,6 @@ void D3D12Device::UpdateTexture(TextureHandle handle, const TextureDesc& desc) {
     const auto it = slotTextures_.find(handle.index);
     if (it == slotTextures_.end() || !it->second.resource) return;
     ID3D12Resource* tex = it->second.resource;
-    const u32 bpp = BytesPerPixel(desc.format);
     const u32 mipCount = desc.mipCount < 1 ? 1 : desc.mipCount;
 
     // The in-place path requires the new data to match the created texture's
@@ -1828,16 +1845,16 @@ void D3D12Device::UpdateTexture(TextureHandle handle, const TextureDesc& desc) {
     staging->Map(0, &noRead, reinterpret_cast<void**>(&mapped));
     const u8* src = static_cast<const u8*>(desc.pixels);
     for (u32 mip = 0; mip < mipCount; ++mip) {
-        const u32 mw = (std::max)(1u, desc.width >> mip);
-        const u32 mh = (std::max)(1u, desc.height >> mip);
-        const u64 srcRowBytes = static_cast<u64>(mw) * bpp;
+        // Block-aware tight source geometry from the footprint (see CreateTexture).
+        const u64 srcRowBytes = rowSizes[mip];
+        const u32 rows = numRows[mip];
         u8* dstBase = mapped + footprints[mip].Offset;
-        for (u32 row = 0; row < numRows[mip]; ++row) {
+        for (u32 row = 0; row < rows; ++row) {
             std::memcpy(dstBase + static_cast<u64>(row) * footprints[mip].Footprint.RowPitch,
                         src + static_cast<u64>(row) * srcRowBytes,
                         static_cast<usize>(srcRowBytes));
         }
-        src += static_cast<u64>(mh) * srcRowBytes;
+        src += srcRowBytes * rows;
     }
     staging->Unmap(0, nullptr);
 
@@ -4492,22 +4509,23 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
             ObjectCB ocb{};
             ocb.model = it.transform;
             ocb.normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(it.transform))));
-            ocb.baseColor = it.baseColor;
-            ocb.metallic = it.metallic;
-            ocb.roughness = it.roughness;
+            ocb.baseColor = it.surface.base_color;
+            ocb.metallic = it.surface.base_metalness;
+            ocb.roughness = it.surface.specular_roughness;
             ocb.albedoIndex = it.albedoTexture.index;
             ocb.normalIndex = it.normalTexture.index;
             ocb.mrIndex = it.mrTexture.index;
             FillMorphCB(ocb, it); // facial blendshapes (bindless delta atlas)
             ocb.aoIndex = it.aoTexture.index;
             ocb.flags = it.materialFlags;
-            ocb.subsurfaceColor = it.subsurfaceColor;
-            ocb.subsurfaceRadius = it.subsurfaceRadius;
+            ocb.subsurfaceColor = it.surface.subsurface_color;
+            ocb.subsurfaceRadius = it.surface.subsurface_radius;
             ocb.thicknessIndex = it.thicknessTexture.index;
-            ocb.clearcoat = it.clearcoat;
-            ocb.clearcoatRoughness = it.clearcoatRoughness;
-            ocb.emissiveColor = it.emissiveColor;
-            ocb.emissiveIntensity = it.emissiveIntensity;
+            ocb.clearcoat = it.surface.coat_weight;
+            ocb.clearcoatRoughness = it.surface.coat_roughness;
+            ocb.emissiveColor = it.surface.emission_color;
+            ocb.emissiveIntensity = it.surface.emission_luminance;
+            FillSurfaceMaterialExt(ocb.matExt, it.surface);
             ocb.emissiveIndex = it.emissiveTexture.index;
             ocb.paintColorIndex = it.paintColorTexture.index;
             ocb.paintHeightIndex = it.paintHeightTexture.index;
@@ -5534,21 +5552,22 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
             ObjectCB ocb{};
             ocb.model = it.transform;
             ocb.normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(it.transform))));
-            ocb.baseColor = it.baseColor;
-            ocb.metallic = it.metallic;
-            ocb.roughness = it.roughness;
+            ocb.baseColor = it.surface.base_color;
+            ocb.metallic = it.surface.base_metalness;
+            ocb.roughness = it.surface.specular_roughness;
             ocb.albedoIndex = it.albedoTexture.index;
             ocb.normalIndex = it.normalTexture.index;
             ocb.mrIndex = it.mrTexture.index;
             FillMorphCB(ocb, it); // facial blendshapes (bindless delta atlas)
             ocb.aoIndex = it.aoTexture.index;
             ocb.flags = it.materialFlags;
-            ocb.subsurfaceColor = it.subsurfaceColor;
-            ocb.subsurfaceRadius = it.subsurfaceRadius;
-            ocb.clearcoat = it.clearcoat;
-            ocb.clearcoatRoughness = it.clearcoatRoughness;
-            ocb.emissiveColor = it.emissiveColor;
-            ocb.emissiveIntensity = it.emissiveIntensity;
+            ocb.subsurfaceColor = it.surface.subsurface_color;
+            ocb.subsurfaceRadius = it.surface.subsurface_radius;
+            ocb.clearcoat = it.surface.coat_weight;
+            ocb.clearcoatRoughness = it.surface.coat_roughness;
+            ocb.emissiveColor = it.surface.emission_color;
+            ocb.emissiveIntensity = it.surface.emission_luminance;
+            FillSurfaceMaterialExt(ocb.matExt, it.surface);
             ocb.emissiveIndex = it.emissiveTexture.index;
             ocb.prevModel = it.transform; // preview needs no motion vectors
             std::memcpy(dst, &ocb, sizeof(ocb));

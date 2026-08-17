@@ -168,13 +168,13 @@ void UpdateWorldSurfaces(Scene& scene, Renderer& renderer) {
                                                           scene.UIAuthoringView());
         if (MeshInstance* mi = reg.try_get<MeshInstance>(c.surface)) {
             mi->mesh = shown ? SharedPageMesh(renderer) : rhi::MeshHandle{};
-            mi->baseColor = {1.0f, 1.0f, 1.0f, 1.0f};
-            mi->metallic = 0.0f;
-            mi->roughness = 0.9f; // matte paper
+            mi->surface.base_color = {1.0f, 1.0f, 1.0f, 1.0f};
+            mi->surface.base_metalness = 0.0f;
+            mi->surface.specular_roughness = 0.9f; // matte paper
             mi->albedoTexture = c.rtTexture; // LIT like a printed page
             // Optional readability floor in dark scenes; 0 keeps pure paper.
             mi->emissiveTexture = c.emissive > 0.0f ? c.rtTexture : rhi::TextureHandle{};
-            mi->emissiveColor = glm::vec3(c.emissive);
+            mi->surface.emission_color = glm::vec3(c.emissive);
             // OPAQUE + PainterlyExempt, deliberately NOT Transparent: the opaque
             // pass encodes the painterly/censor exempt mask in alpha (MeshPBR
             // mbits), which MaterialFlag_Transparent would override with coverage

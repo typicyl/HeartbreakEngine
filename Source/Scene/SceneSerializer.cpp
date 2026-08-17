@@ -662,16 +662,16 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         if (const MeshInstance* mi = reg.try_get<MeshInstance>(e)) {
             const MeshRef* ref = reg.try_get<MeshRef>(e);
             je["mesh"] = {{"source", ref ? ref->source : std::string()},
-                          {"baseColor", ToJson(mi->baseColor)},
-                          {"metallic", mi->metallic},
-                          {"roughness", mi->roughness},
+                          {"baseColor", ToJson(mi->surface.base_color)},
+                          {"metallic", mi->surface.base_metalness},
+                          {"roughness", mi->surface.specular_roughness},
                           {"flags", mi->materialFlags},
-                          {"subsurfaceColor", ToJson(mi->subsurfaceColor)},
-                          {"subsurfaceRadius", mi->subsurfaceRadius},
-                          {"clearcoat", mi->clearcoat},
-                          {"clearcoatRoughness", mi->clearcoatRoughness},
-                          {"emissiveColor", ToJson(mi->emissiveColor)},
-                          {"emissiveIntensity", mi->emissiveIntensity}};
+                          {"subsurfaceColor", ToJson(mi->surface.subsurface_color)},
+                          {"subsurfaceRadius", mi->surface.subsurface_radius},
+                          {"clearcoat", mi->surface.coat_weight},
+                          {"clearcoatRoughness", mi->surface.coat_roughness},
+                          {"emissiveColor", ToJson(mi->surface.emission_color)},
+                          {"emissiveIntensity", mi->surface.emission_luminance}};
             if (const MaterialRef* mat = reg.try_get<MaterialRef>(e)) {
                 je["mesh"]["material"] = mat->asset;
             }
@@ -2737,17 +2737,27 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
     // worker threads). 0 = no cap.
     const u32 paintCap =
         Project::HasActive() ? Project::Active().Settings().maxStreamedPaintResolution : 0u;
+    // Opt-in BC texture compression: read once (fixed for the streaming session). When on AND the
+    // backend can sample BC, prefer the `.bc.uaf` sibling; otherwise the uncompressed source.
+    const bool bcTextures =
+        Project::HasActive() && Project::Active().Settings().textureCompression;
     // Anything already resident in the persistent Instantiate caches skips its
     // disk IO entirely (snapshots restore instantly on undo/redo).
     const auto stageTexture = [&](const std::string& tex) {
         if (tex.empty() || out.textures.contains(tex)) return;
         if (CacheHasTexture(tex)) return; // GPU-resident
-        if (std::optional<uaf::Texture> t = uaf::ReadTexture(assetsDir / tex)) {
-            // Build the mip chain HERE, on this worker thread. Instantiate's
-            // UploadStagedTexture calls GenerateMips too, but it no-ops once mipCount>1,
-            // so this simply MOVES the per-texture mip generation off the finalize/main
-            // thread - the dominant cost when a material-heavy shard streams in (measured
-            // ~700ms cold finalize = material-texture mip-gen + upload, not paint).
+        std::optional<uaf::Texture> t;
+        // Prefer the pre-mipped BC variant when enabled + supported; fall back to the uncompressed
+        // `.uaf` when it is off, the device lacks BC, or no variant exists (non-mult-4 / not baked).
+        if (bcTextures && assets::BlockCompressionAvailable())
+            t = uaf::ReadTexture(assetsDir / assets::BcVariantName(tex));
+        if (!t) t = uaf::ReadTexture(assetsDir / tex);
+        if (t) {
+            // Build the mip chain HERE, on this worker thread (no-op for a BC payload, which
+            // already ships mips). Instantiate's UploadStagedTexture calls GenerateMips too, but it
+            // no-ops once mipCount>1, so this simply MOVES the per-texture mip generation off the
+            // finalize/main thread - the dominant cost when a material-heavy shard streams in
+            // (measured ~700ms cold finalize = material-texture mip-gen + upload, not paint).
             assets::GenerateMips(*t);
             out.textures.emplace(tex, std::move(*t));
         }
@@ -3093,16 +3103,16 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasMesh && !d.meshSource.empty() &&
             !(d.hasCharacterRig && !d.characterRig.asset.empty())) {
             MeshInstance mi;
-            mi.baseColor = d.baseColor;
-            mi.metallic = d.metallic;
-            mi.roughness = d.roughness;
+            mi.surface.base_color = d.baseColor;
+            mi.surface.base_metalness = d.metallic;
+            mi.surface.specular_roughness = d.roughness;
             mi.materialFlags = d.materialFlags;
-            mi.subsurfaceColor = d.subsurfaceColor;
-            mi.subsurfaceRadius = d.subsurfaceRadius;
-            mi.clearcoat = d.clearcoat;
-            mi.clearcoatRoughness = d.clearcoatRoughness;
-            mi.emissiveColor = d.emissiveColor;
-            mi.emissiveIntensity = d.emissiveIntensity;
+            mi.surface.subsurface_color = d.subsurfaceColor;
+            mi.surface.subsurface_radius = d.subsurfaceRadius;
+            mi.surface.coat_weight = d.clearcoat;
+            mi.surface.coat_roughness = d.clearcoatRoughness;
+            mi.surface.emission_color = d.emissiveColor;
+            mi.surface.emission_luminance = d.emissiveIntensity;
 
             AABB bounds{glm::vec3(-0.5f), glm::vec3(0.5f)};
             std::string submeshMaterial; // mesh-baked .hbmat ref (import-time)
@@ -3161,12 +3171,12 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                 if (auto mit = staged.materials.find(materialRef);
                     mit != staged.materials.end()) {
                     const MaterialAsset& mat = mit->second;
-                    mi.baseColor = mat.baseColor;
-                    mi.metallic = mat.metallic;
-                    mi.roughness = mat.roughness;
-                    mi.emissiveColor = mat.emissiveColor;
-                    mi.emissiveIntensity = mat.emissiveIntensity;
-                    mi.subsurfaceColor = mat.subsurfaceColor;
+                    mi.surface.base_color = mat.surface.base_color;
+                    mi.surface.base_metalness = mat.surface.base_metalness;
+                    mi.surface.specular_roughness = mat.surface.specular_roughness;
+                    mi.surface.emission_color = mat.surface.emission_color;
+                    mi.surface.emission_luminance = mat.surface.emission_luminance;
+                    mi.surface.subsurface_color = mat.surface.subsurface_color;
                     mi.materialFlags = mat.flags;
                     mi.albedoTexture = loadTexture(mat.albedoTex);
                     mi.normalTexture = loadTexture(mat.normalTex);
@@ -3361,7 +3371,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                     tc.splatAlbedoTex[li] = loadTexture(mit->second.albedoTex);
                     tc.splatNormalTex[li] = loadTexture(mit->second.normalTex);
                     tc.splatMRTex[li] = loadTexture(mit->second.mrTex);
-                    tc.splatRoughFactor[li] = mit->second.roughness;
+                    tc.splatRoughFactor[li] = mit->second.surface.specular_roughness;
                 }
             }
         }
@@ -3886,10 +3896,10 @@ bool SceneSliceSelfTest() {
     {
         MaterialAsset a;
         a.name = "A";
-        a.roughness = 0.25f;
+        a.surface.specular_roughness = 0.25f;
         MaterialAsset b;
         b.name = "B";
-        b.roughness = 0.75f;
+        b.surface.specular_roughness = 0.75f;
         expect(assets::SaveMaterial(dir / "Materials" / "A.hbmat", a) &&
                    assets::SaveMaterial(dir / "Materials" / "B.hbmat", b),
                "write two scratch .hbmat assets (one per slice)");

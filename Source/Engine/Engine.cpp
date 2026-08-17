@@ -46,6 +46,7 @@
 #include "UI/UIAnimation.h"
 #include "UI/UIWorld.h"
 #include "Renderer/Renderer.h"
+#include "Assets/AssetLoader.h" // assets::SetBlockCompressionAvailable (P6 BC variant gating)
 #include "RHI/RHIFactory.h"
 #include "Scene/FacialSystem.h"
 #include "Scene/Scene.h"
@@ -1153,6 +1154,9 @@ int Engine::Run(const EngineConfig& configIn) {
     input_ = &input;
     physics_ = &physics;
     audio_ = &audio;
+    // Record BC (block-compressed) texture support once, so worker-thread streaming can decide
+    // whether to load a `.bc.uaf` variant (P6). Constant after init; atomic for the worker readers.
+    assets::SetBlockCompressionAvailable(renderer.SupportsBlockCompression());
 
     bool sceneBuilt = false;
 
@@ -1423,8 +1427,8 @@ int Engine::Run(const EngineConfig& configIn) {
             scene.Registry().emplace<Transform>(b, bt);
             MeshInstance mi;
             mi.mesh = ballMesh;
-            mi.baseColor = {0.85f, 0.35f, 0.2f, 1.0f};
-            mi.roughness = 0.4f;
+            mi.surface.base_color = {0.85f, 0.35f, 0.2f, 1.0f};
+            mi.surface.specular_roughness = 0.4f;
             scene.Registry().emplace<MeshInstance>(b, mi);
             RigidBody rb;
             rb.shape = RigidBody::Shape::Sphere;

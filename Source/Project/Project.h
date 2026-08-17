@@ -334,6 +334,14 @@ struct ProjectSettings {
     // no near-quality cost. Turn off to import full-detail only; existing assets need a re-import
     // or `--generate-mesh-lods` to gain LODs. Matches the .value() fallback in Project.cpp.
     bool meshLodEnabled = true;
+
+    // Bake BC (block-compressed) texture variants at import and load them at runtime. LOSSY, so
+    // default OFF: enable to trade a small quality loss for ~4-6x less texture VRAM + upload
+    // bandwidth (BC3 color / BC5 normals / BC4 single / BC1 low). NON-DESTRUCTIVE: the compressed
+    // `Foo.bc.uaf` sits beside the untouched `Foo.uaf`, and the runtime falls back to the
+    // uncompressed source when this is off, when the backend lacks BC, or for a non-mult-4
+    // texture. Existing assets gain BC on RE-IMPORT. Matches the .value() fallback in Project.cpp.
+    bool textureCompression = false;
     // THE game UI: ONE `.hbui` DOCUMENT PER SCREEN (MainMenu / Settings / Loading
     // / HUD / Pause ...), each holding that screen's UIPanel subtree. EVERY entry
     // is opened at boot and stays RESIDENT for the process lifetime - nothing here

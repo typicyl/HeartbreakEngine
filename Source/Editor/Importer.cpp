@@ -3,9 +3,11 @@
 
 #include "Assets/AssetFormats.h" // the single source of truth for source formats
 #include "Assets/MaterialAsset.h"
+#include "Assets/AssetLoader.h"   // assets::GenerateMips (mip-then-compress for BC bake)
 #include "Assets/MeshOptimize.h" // import-time GPU geometry optimization (meshoptimizer)
 #include "Assets/MeshSimplify.h"  // import-time distance-LOD generation (quadric decimation)
 #include "Assets/ModelLoader.h"
+#include "Editor/TextureCompress.h" // import-time BC texture compression (opt-in)
 #include "Assets/SlotIds.h" // the pack slot is assigned HERE, at import
 #include "Assets/UAF.h"
 #include "Core/Log.h"
@@ -56,7 +58,31 @@ bool ImportFont(const fs::path& src, const fs::path& out) {
     return uaf::WriteFont(out, bytes, GenGuid());
 }
 
-bool ImportTexture(const fs::path& src, const fs::path& out, bool srgb) {
+// Non-destructive BC bake (opt-in): mip-then-compress a COPY of the imported RGBA8 texture and
+// write it beside the untouched `out` as `<stem>.bc.uaf`. Skipped when compression is off, on a
+// non-RGBA8 (HDR) input, or a non-mult-4 texture (CompressToBC refuses those -> stays uncompressed).
+void MaybeBakeBC(const uaf::Texture& rgba, const fs::path& out, tex::BCKind kind, bool srgb) {
+    const fs::path bcOut = out.parent_path() / (out.stem().string() + ".bc.uaf");
+    std::error_code ec;
+    // EVERY path that does not (re)write a BC variant must delete a pre-existing one, or a stale
+    // sibling from an earlier import (different content/size, or baked when compression was on)
+    // outlives its source and gets packed + loaded in place of the current texture.
+    if (!Project::HasActive() || !Project::Active().Settings().textureCompression ||
+        kind == tex::BCKind::None) {
+        fs::remove(bcOut, ec);
+        return;
+    }
+    uaf::Texture mipped = rgba;        // BC ships pre-baked mips (can't mip a block format on GPU)
+    assets::GenerateMips(mipped);
+    std::optional<uaf::Texture> bc = tex::CompressToBC(mipped, kind, srgb);
+    if (!bc) { fs::remove(bcOut, ec); return; } // non-mult-4 / refused: drop any stale sibling
+    if (uaf::WriteTexture(bcOut, *bc, GenGuid()))
+        HBE_INFO("Importer: baked BC variant '{}' ({} mips, format {}).",
+                 bcOut.filename().string(), bc->mipCount, bc->format);
+}
+
+bool ImportTexture(const fs::path& src, const fs::path& out, bool srgb,
+                   tex::BCKind bcKind = tex::BCKind::None) { // standalone: role unknown, keep RGBA8
     int w = 0, h = 0, channels = 0;
 
     // HDR sources (.hdr/.exr-ish) carry values outside [0,1]; keep them as
@@ -96,13 +122,15 @@ bool ImportTexture(const fs::path& src, const fs::path& out, bool srgb) {
     tex.pixels.assign(pixels, pixels + static_cast<usize>(w) * h * 4);
     stbi_image_free(pixels);
 
+    MaybeBakeBC(tex, out, bcKind, srgb); // non-destructive BC sibling (opt-in)
     return uaf::WriteTexture(out, tex, GenGuid());
 }
 
 // Writes a texture embedded in a model file (glb / embedded FBX) to `.uaf`.
 // Compressed payloads (PNG/JPG bytes) are decoded from memory; raw payloads are
 // already RGBA8.
-bool ImportEmbeddedTexture(const EmbeddedTexture& emb, const fs::path& out, bool srgb) {
+bool ImportEmbeddedTexture(const EmbeddedTexture& emb, const fs::path& out, bool srgb,
+                           tex::BCKind bcKind = tex::BCKind::None) {
     uaf::Texture tex;
     if (emb.compressed) {
         int w = 0, h = 0, channels = 0;
@@ -129,6 +157,7 @@ bool ImportEmbeddedTexture(const EmbeddedTexture& emb, const fs::path& out, bool
     tex.format =
         static_cast<u32>(srgb ? rhi::Format::R8G8B8A8_SRGB : rhi::Format::R8G8B8A8_UNORM);
     tex.mipCount = 1;
+    MaybeBakeBC(tex, out, bcKind, srgb); // non-destructive BC sibling (opt-in)
     return uaf::WriteTexture(out, tex, GenGuid());
 }
 
@@ -277,7 +306,7 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
 
     // Imports a referenced texture (external file) and rewrites the ref to the
     // resulting `.uaf`'s Assets-relative path. Dedupes across submeshes.
-    auto importTex = [&](std::string& ref, bool srgb) {
+    auto importTex = [&](std::string& ref, bool srgb, tex::BCKind bcKind = tex::BCKind::ColorRGBA) {
         if (ref.empty()) return;
         const std::string original = ref;
         if (auto it = done.find(original); it != done.end()) { ref = it->second; return; }
@@ -297,7 +326,7 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
             }
             const fs::path uafPath =
                 importDir / (out.stem().string() + "_tex" + original.substr(1) + ".uaf");
-            if (!fs::exists(uafPath, ec) && !ImportEmbeddedTexture(*emb, uafPath, srgb)) {
+            if (!fs::exists(uafPath, ec) && !ImportEmbeddedTexture(*emb, uafPath, srgb, bcKind)) {
                 done[original] = "";
                 ref.clear();
                 return;
@@ -329,7 +358,7 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
                     continue;
                 }
                 const fs::path uafPath = importDir / (fs::path(base).stem().string() + ".uaf");
-                if (fs::exists(uafPath, ec) || ImportEmbeddedTexture(e, uafPath, srgb)) {
+                if (fs::exists(uafPath, ec) || ImportEmbeddedTexture(e, uafPath, srgb, bcKind)) {
                     done[original] = toRel(uafPath);
                     ref = done[original];
                     return;
@@ -343,7 +372,7 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
         }
         const std::string uafName = resolved.stem().string() + ".uaf";
         const fs::path uafPath = importDir / uafName;
-        if (!fs::exists(uafPath, ec) && !ImportTexture(resolved, uafPath, srgb)) {
+        if (!fs::exists(uafPath, ec) && !ImportTexture(resolved, uafPath, srgb, bcKind)) {
             done[original] = "";
             ref.clear();
             return;
@@ -380,11 +409,14 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
             m.metallicTex.clear();
             m.roughnessTex.clear();
         }
-        importTex(m.baseColorTex, true); // sRGB
-        importTex(m.normalTex, false);
-        importTex(m.mrTex, false);
-        importTex(m.aoTex, false);
-        importTex(m.emissiveTex, true); // emissive maps are sRGB-authored
+        importTex(m.baseColorTex, true, tex::BCKind::ColorRGBA); // sRGB color -> BC3
+        importTex(m.normalTex, false, tex::BCKind::NormalRG);    // tangent normals -> BC5 (+shader Z)
+        // Metal-roughness (G=rough, B=metal are INDEPENDENT) and occlusion are left uncompressed:
+        // BC3 forces both MR channels onto one endpoint line (banding + cross-channel bleed), and a
+        // clean BC5 remap would need a lockstep shader/packing migration. Quality > the small saving.
+        importTex(m.mrTex, false, tex::BCKind::None);
+        importTex(m.aoTex, false, tex::BCKind::None);
+        importTex(m.emissiveTex, true, tex::BCKind::ColorRGBA);  // emissive sRGB -> BC3
     }
 
     // Generate a `.hbmat` asset per unique material so the model's materials
@@ -404,10 +436,10 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
             }
             MaterialAsset mat;
             mat.name = name;
-            mat.baseColor = md.material.baseColor;
-            mat.metallic = md.material.metallic;
-            mat.roughness = md.material.roughness;
-            mat.emissiveColor = md.material.emissive;
+            mat.surface.base_color = md.material.baseColor;
+            mat.surface.base_metalness = md.material.metallic;
+            mat.surface.specular_roughness = md.material.roughness;
+            mat.surface.emission_color = md.material.emissive;
             mat.albedoTex = md.material.baseColorTex;
             mat.normalTex = md.material.normalTex;
             mat.mrTex = md.material.mrTex;
@@ -546,6 +578,172 @@ std::optional<fs::path> Import(const fs::path& src, const fs::path& assetsDir) {
     }
     HBE_INFO("Importer: '{}' -> '{}'", src.filename().string(), out.filename().string());
     return out;
+}
+
+UpgradeReport UpgradeAssets(const fs::path& assetsDir, const fs::path& manifestPath) {
+    UpgradeReport rep;
+    std::error_code ec;
+    if (!fs::exists(assetsDir, ec)) return rep;
+
+    const bool genLods = Project::HasActive() && Project::Active().Settings().meshLodEnabled;
+    const bool bcTex = Project::HasActive() && Project::Active().Settings().textureCompression;
+
+    // Material texture roles gathered from EVERY mesh (a loose texture `.uaf` carries no role, so
+    // the BC bake must learn baseColor-vs-normal from the materials that reference it). First role
+    // wins; MR/AO are deliberately never noted (kept uncompressed).
+    std::unordered_map<std::string, tex::BCKind> texRoles;
+    const auto noteRole = [&](const std::string& ref, tex::BCKind kind) {
+        if (!ref.empty()) texRoles.emplace(ref, kind);
+    };
+
+    for (auto it = fs::recursive_directory_iterator(assetsDir, ec);
+         it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file()) continue;
+        const fs::path& p = it->path();
+        if (p.extension() != ".uaf") continue;
+        if (p.stem().extension() == ".bc") continue; // a generated `foo.bc.uaf` - its source drives it
+        uaf::AssetType type = uaf::AssetType::Unknown;
+        u32 version = 0;
+        u64 guid = 0;
+        if (!uaf::PeekHeader(p, type, version, guid)) continue;
+        ++rep.scanned;
+        if (type != uaf::AssetType::Mesh) continue;
+
+        // A current mesh only needs reading when the texture pass wants its material roles;
+        // otherwise skip the (potentially large) payload load entirely.
+        const bool outdated = version < uaf::kVersion;
+        if (!outdated && !bcTex) continue;
+
+        std::optional<Model> model = uaf::ReadMesh(p);
+        if (!model) continue;
+        if (bcTex) {
+            for (const MeshData& md : *model) {
+                noteRole(md.material.baseColorTex, tex::BCKind::ColorRGBA);
+                noteRole(md.material.normalTex, tex::BCKind::NormalRG);
+                noteRole(md.material.emissiveTex, tex::BCKind::ColorRGBA);
+            }
+        }
+        if (!outdated) continue;
+
+        // Re-write at the current version, PRESERVING identity: guid + rig round-trip through
+        // WriteMesh. The pack slot embedded in the file is the TIER-1 authority (it lives in the
+        // asset precisely so the manifest can be absent/stale on a fresh clone), and WriteMesh
+        // resets it to unassigned - so capture it FIRST and restore it verbatim afterwards, rather
+        // than re-deriving from the manifest (which would renumber the asset and reshuffle packs
+        // whenever the manifest is missing). Fall back to StampAsset only if it truly had no slot.
+        const u32 oldSlot = slots::ReadSlot(p).value_or(slots::kUnassigned);
+        std::optional<Rig> rig = uaf::ReadRig(p);
+        const bool skinned = rig && rig->Valid();
+        if (genLods && !skinned)
+            for (MeshData& md : *model)
+                mesh::BuildLodChain(md); // no-op for morph submeshes
+        if (uaf::WriteMesh(p, *model, guid, skinned ? &*rig : nullptr)) {
+            if (oldSlot != slots::kUnassigned)
+                slots::WriteSlot(p, oldSlot); // restore the asset's own id, manifest-independent
+            else
+                slots::StampAsset(assetsDir, manifestPath, p); // never had one -> assign fresh
+            ++rep.meshesUpgraded;
+        }
+    }
+
+    // Bake a role-correct BC sibling for any material texture that lacks one (opt-in).
+    if (bcTex) {
+        for (const auto& [ref, kind] : texRoles) {
+            const fs::path texPath = assetsDir / fs::path(ref);
+            const fs::path bcPath = texPath.parent_path() / (texPath.stem().string() + ".bc.uaf");
+            if (fs::exists(bcPath, ec)) continue; // already baked
+            std::optional<uaf::Texture> t = uaf::ReadTexture(texPath);
+            if (!t) continue;
+            const bool srgb = static_cast<rhi::Format>(t->format) == rhi::Format::R8G8B8A8_SRGB;
+            MaybeBakeBC(*t, texPath, kind, srgb); // writes .bc.uaf when enabled + RGBA8 + mult-4
+            if (fs::exists(bcPath, ec)) {
+                slots::StampAsset(assetsDir, manifestPath, bcPath);
+                ++rep.texturesBaked;
+            }
+        }
+    }
+
+    if (rep.changedAnything())
+        HBE_INFO("Assets: upgraded {} mesh(es) to v{} + baked {} BC texture(s) ({} .uaf scanned).",
+                 rep.meshesUpgraded, uaf::kVersion, rep.texturesBaked, rep.scanned);
+    return rep;
+}
+
+bool UpgradeSelfTest() {
+    u32 fails = 0;
+    const auto check = [&](bool ok, const char* what) {
+        if (!ok) { std::fprintf(stderr, "upgrade FAIL: %s\n", what); ++fails; }
+    };
+    const fs::path dir = fs::temp_directory_path() / "hbe_upgrade_test";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir, ec);
+    const fs::path manifest = dir / "slots.uapmanifest";
+    const fs::path meshPath = dir / "mesh.uaf";
+
+    // A 16x16 subdivided quad - enough triangles that BuildLodChain can actually reduce.
+    MeshData md;
+    constexpr int N = 16;
+    for (int y = 0; y <= N; ++y)
+        for (int x = 0; x <= N; ++x) {
+            Vertex v;
+            v.position = {static_cast<f32>(x) / N, 0.0f, static_cast<f32>(y) / N};
+            v.normal = {0.0f, 1.0f, 0.0f};
+            md.vertices.push_back(v);
+        }
+    for (u32 y = 0; y < N; ++y)
+        for (u32 x = 0; x < N; ++x) {
+            const u32 i0 = y * (N + 1) + x, i1 = i0 + 1, i2 = i0 + (N + 1), i3 = i2 + 1;
+            md.indices.insert(md.indices.end(), {i0, i2, i1, i1, i2, i3});
+        }
+    const u64 guid = 0x1234ABCDu;
+    check(uaf::WriteMesh(meshPath, Model{md}, guid), "WriteMesh must succeed");
+    const u32 slot = slots::StampAsset(dir, manifest, meshPath); // assign + embed a pack slot
+    check(slot != slots::kUnassigned, "the fixture mesh must get a pack slot");
+    // DELETE the manifest so the test proves the EMBEDDED slot (tier-1) is preserved on its own -
+    // the exact fresh-clone / missing-manifest condition the wipe-then-restamp bug renumbered under.
+    fs::remove(manifest, ec);
+
+    // Patch the payload version (low byte of the version word at offset 4) down one, so the file
+    // reads as out-of-date without changing anything else.
+    {
+        std::fstream f(meshPath, std::ios::in | std::ios::out | std::ios::binary);
+        f.seekp(4);
+        const u8 older = static_cast<u8>(uaf::kVersion - 1);
+        f.write(reinterpret_cast<const char*>(&older), 1);
+    }
+    uaf::AssetType ty = uaf::AssetType::Unknown;
+    u32 ver = 0;
+    u64 g = 0;
+    check(uaf::PeekHeader(meshPath, ty, ver, g) && ver == uaf::kVersion - 1 && g == guid,
+          "patched mesh must peek as one version old with its guid intact");
+
+    const UpgradeReport rep = UpgradeAssets(dir, manifest);
+    check(rep.meshesUpgraded == 1, "exactly one mesh must be upgraded");
+
+    // Now current version, guid + slot preserved, and (LODs enabled) LODs generated.
+    u32 ver2 = 0;
+    u64 g2 = 0;
+    check(uaf::PeekHeader(meshPath, ty, ver2, g2), "upgraded mesh must still read");
+    check(ver2 == uaf::kVersion, "mesh must now be at the current version");
+    check(g2 == guid, "guid must be preserved across the upgrade");
+    check(slots::ReadSlot(meshPath).value_or(slots::kUnassigned) == slot,
+          "the embedded pack slot must survive the upgrade even with the manifest deleted");
+    if (const std::optional<Model> back = uaf::ReadMesh(meshPath);
+        back && back->size() == 1 && Project::HasActive() &&
+        Project::Active().Settings().meshLodEnabled) {
+        check(!(*back)[0].lods.empty(), "an upgraded eligible mesh must gain LODs");
+    }
+
+    const UpgradeReport rep2 = UpgradeAssets(dir, manifest);
+    check(rep2.meshesUpgraded == 0, "a second upgrade of a current project must be a no-op");
+
+    fs::remove_all(dir, ec);
+    if (fails == 0)
+        std::printf("upgrade: an out-of-date mesh migrates to v%u in place, keeps its guid + pack "
+                    "slot, still reads back, and re-running is a no-op\n", uaf::kVersion);
+    return fails == 0;
 }
 
 } // namespace hbe::importer

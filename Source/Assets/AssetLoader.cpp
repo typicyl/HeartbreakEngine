@@ -5,7 +5,9 @@
 #include "Renderer/Renderer.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <string>
 
 namespace hbe::assets {
 
@@ -103,6 +105,21 @@ void GenerateMips(uaf::Texture& tex) {
     tex.pixels = std::move(all);
     tex.mipCount = mips;
 }
+
+namespace {
+std::atomic<bool> g_bcAvailable{false};
+} // namespace
+
+std::string BcVariantName(const std::string& uafRef) {
+    static const std::string kExt = ".uaf";
+    if (uafRef.size() > kExt.size() &&
+        uafRef.compare(uafRef.size() - kExt.size(), kExt.size(), kExt) == 0) {
+        return uafRef.substr(0, uafRef.size() - kExt.size()) + ".bc.uaf";
+    }
+    return uafRef;
+}
+void SetBlockCompressionAvailable(bool v) { g_bcAvailable.store(v, std::memory_order_relaxed); }
+bool BlockCompressionAvailable() { return g_bcAvailable.load(std::memory_order_relaxed); }
 
 rhi::TextureHandle LoadTexture(Renderer& renderer, const std::filesystem::path& uaf) {
     std::optional<uaf::Texture> tex = uaf::ReadTexture(uaf);

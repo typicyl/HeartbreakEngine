@@ -3214,9 +3214,9 @@ std::string Editor::EnsureStrokeMaterial() {
     MaterialAsset m;
     m.name = "Stroke";
     m.albedoTex = tipRel;
-    m.baseColor = brushColor_;   // tint; .a = stroke opacity
-    m.metallic = brushMetallic_;
-    m.roughness = brushRoughness_;
+    m.surface.base_color = brushColor_;   // tint; .a = stroke opacity
+    m.surface.base_metalness = brushMetallic_;
+    m.surface.specular_roughness = brushRoughness_;
     // Free-standing strokes float just off the surface; casting a shadow back
     // onto it looks wrong, so they don't cast by default.
     m.flags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow;
@@ -3305,12 +3305,12 @@ std::string Editor::EnsureRibbonMaterial() {
     // the sun/lights/IBL shade and tint it and shadows darken it, like any surface.
     // A small emissive FLOOR (same texture, dim) keeps the paint readable in shadow
     // or at night so it never crushes to black; lighting dominates above it.
-    m.baseColor = brushColor_; // .a = stroke opacity
-    m.metallic = brushMetallic_;
-    m.roughness = brushRoughness_;
+    m.surface.base_color = brushColor_; // .a = stroke opacity
+    m.surface.base_metalness = brushMetallic_;
+    m.surface.specular_roughness = brushRoughness_;
     m.emissiveTex = tipRel;
-    m.emissiveColor = glm::vec3(brushColor_) * 0.12f; // self-lit floor
-    m.emissiveIntensity = 1.0f;
+    m.surface.emission_color = glm::vec3(brushColor_) * 0.12f; // self-lit floor
+    m.surface.emission_luminance = 1.0f;
     // NoShadow: free-floating strokes shouldn't cast onto the surface they hover over
     // (they still RECEIVE the shadowed sun + lights, so they react to lighting).
     // DepthWrite: the stroke writes depth + velocity so depth of field + TAA treat it
@@ -3366,7 +3366,7 @@ void Editor::SpawnStroke(Engine& engine, const glm::vec3& hitWorld, const glm::v
     const std::optional<MaterialAsset> mat = assets::LoadMaterial(assets / matRel);
     MeshInstance mi;
     mi.mesh = strokeQuadMesh_;
-    mi.baseColor = brushColor_;
+    mi.surface.base_color = brushColor_;
     if (mat) assets::ApplyMaterial(renderer, assets, *mat, mi, textureCache_);
     reg.emplace<MeshInstance>(e, mi);
     reg.emplace<MeshRef>(e, MeshRef{"prim:plane"});
@@ -3513,7 +3513,7 @@ void Editor::BuildSplineStroke(Engine& engine) {
         matRel.empty() ? std::nullopt : assets::LoadMaterial(assets / matRel);
     MeshInstance mi;
     mi.mesh = handle;
-    mi.baseColor = brushColor_;
+    mi.surface.base_color = brushColor_;
     if (mat) assets::ApplyMaterial(renderer, assets, *mat, mi, textureCache_);
     reg.emplace<MeshInstance>(e, mi);
     const std::string meshKey = "uaf:" + meshRel + "#0";
@@ -3912,9 +3912,9 @@ void Editor::DrawArtEditor(Engine& engine) {
         for (const std::string& mp : ListAssetsByExt(".hbmat")) {
             if (ImGui::Selectable(mp.c_str())) {
                 if (auto mat = assets::LoadMaterial(Project::Active().AssetsDir() / mp)) {
-                    brushColor_ = mat->baseColor;
-                    brushMetallic_ = mat->metallic;
-                    brushRoughness_ = mat->roughness;
+                    brushColor_ = mat->surface.base_color;
+                    brushMetallic_ = mat->surface.base_metalness;
+                    brushRoughness_ = mat->surface.specular_roughness;
                     brushPaintMaterial_ = true;
                 }
             }
@@ -5862,15 +5862,15 @@ entt::entity Editor::SpawnMeshAsset(Scene& scene, Renderer& renderer,
             }
         }
         if (!scene.Registry().all_of<MaterialRef>(e)) {
-            mi.baseColor = md.material.baseColor;
-            mi.metallic = md.material.metallic;
-            mi.roughness = md.material.roughness;
+            mi.surface.base_color = md.material.baseColor;
+            mi.surface.base_metalness = md.material.metallic;
+            mi.surface.specular_roughness = md.material.roughness;
             mi.albedoTexture = loadTex(md.material.baseColorTex);
             mi.normalTexture = loadTex(md.material.normalTex);
             mi.mrTexture = loadTex(md.material.mrTex);
             mi.aoTexture = loadTex(md.material.aoTex);
             mi.emissiveTexture = loadTex(md.material.emissiveTex);
-            mi.emissiveColor = md.material.emissive;
+            mi.surface.emission_color = md.material.emissive;
         }
         scene.Registry().emplace<MeshInstance>(e, mi);
 
@@ -6526,8 +6526,8 @@ entt::entity Editor::CreateEntityPrim(Scene& scene, Renderer& renderer, int prim
         EnsurePrimitives(renderer);
         MeshInstance mi;
         mi.mesh = (prim == 1) ? cubeMesh_ : sphereMesh_;
-        mi.baseColor = {0.8f, 0.8f, 0.82f, 1.0f};
-        mi.roughness = 0.5f;
+        mi.surface.base_color = {0.8f, 0.8f, 0.82f, 1.0f};
+        mi.surface.specular_roughness = 0.5f;
         scene.Registry().emplace<MeshInstance>(e, mi);
         scene.Registry().emplace<MeshRef>(
             e, MeshRef{prim == 1 ? "prim:cube" : "prim:sphere"});
@@ -6557,8 +6557,8 @@ entt::entity Editor::CreateMeshEntity(Scene& scene, Renderer& renderer, const ch
     if (md.vertices.empty()) return e; // unknown prim -> empty entity
     MeshInstance mi;
     mi.mesh = renderer.UploadMesh(md);
-    mi.baseColor = {0.8f, 0.8f, 0.82f, 1.0f};
-    mi.roughness = 0.5f;
+    mi.surface.base_color = {0.8f, 0.8f, 0.82f, 1.0f};
+    mi.surface.specular_roughness = 0.5f;
     reg.emplace<MeshInstance>(e, mi);
     reg.emplace<MeshRef>(e, MeshRef{std::string("prim:") + prim});
     glm::vec3 bmin, bmax;
@@ -7157,8 +7157,8 @@ void Editor::DrawHierarchy(Engine& engine) {
             if (!md.vertices.empty()) {
                 MeshInstance mi;
                 mi.mesh = renderer.UploadMesh(md);
-                mi.baseColor = {0.30f, 0.55f, 0.95f, 1.0f};
-                mi.roughness = 0.6f;
+                mi.surface.base_color = {0.30f, 0.55f, 0.95f, 1.0f};
+                mi.surface.specular_roughness = 0.6f;
                 reg.emplace<MeshInstance>(e, mi);
                 reg.emplace<MeshRef>(e, MeshRef{"prim:capsule"});
                 glm::vec3 bmin, bmax;
@@ -7186,8 +7186,8 @@ void Editor::DrawHierarchy(Engine& engine) {
                 if (!fmd.vertices.empty()) {
                     MeshInstance fmi;
                     fmi.mesh = renderer.UploadMesh(fmd);
-                    fmi.baseColor = {0.40f, 0.42f, 0.45f, 1.0f};
-                    fmi.roughness = 0.9f;
+                    fmi.surface.base_color = {0.40f, 0.42f, 0.45f, 1.0f};
+                    fmi.surface.specular_roughness = 0.9f;
                     reg.emplace<MeshInstance>(floor, fmi);
                     reg.emplace<MeshRef>(floor, MeshRef{"prim:cube"});
                     glm::vec3 bmin, bmax;
@@ -7942,7 +7942,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     MeshData md = mesh::GeneratePrimitive(chosen);
                     MeshInstance mi;
                     mi.mesh = renderer.UploadMesh(md);
-                    mi.baseColor = {0.8f, 0.8f, 0.82f, 1.0f};
+                    mi.surface.base_color = {0.8f, 0.8f, 0.82f, 1.0f};
                     reg.emplace<MeshInstance>(sel, mi);
                     reg.emplace_or_replace<MeshRef>(sel, MeshRef{std::string("prim:") + chosen});
                     glm::vec3 bmin, bmax;
@@ -8648,15 +8648,15 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                         PushUndo(scene);
                         MaterialAsset mat;
                         mat.name = created.stem().string();
-                        mat.baseColor = mi->baseColor;
-                        mat.metallic = mi->metallic;
-                        mat.roughness = mi->roughness;
-                        mat.emissiveColor = mi->emissiveColor;
-                        mat.emissiveIntensity = mi->emissiveIntensity;
-                        mat.subsurfaceColor = mi->subsurfaceColor;
-                        mat.subsurfaceRadius = mi->subsurfaceRadius;
-                        mat.clearcoat = mi->clearcoat;
-                        mat.clearcoatRoughness = mi->clearcoatRoughness;
+                        mat.surface.base_color = mi->surface.base_color;
+                        mat.surface.base_metalness = mi->surface.base_metalness;
+                        mat.surface.specular_roughness = mi->surface.specular_roughness;
+                        mat.surface.emission_color = mi->surface.emission_color;
+                        mat.surface.emission_luminance = mi->surface.emission_luminance;
+                        mat.surface.subsurface_color = mi->surface.subsurface_color;
+                        mat.surface.subsurface_radius = mi->surface.subsurface_radius;
+                        mat.surface.coat_weight = mi->surface.coat_weight;
+                        mat.surface.coat_roughness = mi->surface.coat_roughness;
                         mat.flags = mi->materialFlags;
                         assets::SaveMaterial(created, mat);
                         StampNewAsset(created); // CreateMaterialAsset wrote it; re-stamp is a no-op
@@ -8668,20 +8668,20 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 }
                 ImGui::Separator();
             }
-            DrawMaterialPresetCombo(mi->materialFlags, mi->metallic, mi->roughness,
-                                    mi->subsurfaceColor, mi->subsurfaceRadius,
+            DrawMaterialPresetCombo(mi->materialFlags, mi->surface.base_metalness, mi->surface.specular_roughness,
+                                    mi->surface.subsurface_color, mi->surface.subsurface_radius,
                                     [&] { PushUndo(scene); });
-            ImGui::ColorEdit4("Base Color", glm::value_ptr(mi->baseColor));
+            ImGui::ColorEdit4("Base Color", glm::value_ptr(mi->surface.base_color));
             undoOnActivate();
-            ImGui::SliderFloat("Metallic", &mi->metallic, 0.0f, 1.0f);
+            ImGui::SliderFloat("Metallic", &mi->surface.base_metalness, 0.0f, 1.0f);
             undoOnActivate();
-            ImGui::SliderFloat("Roughness", &mi->roughness, 0.04f, 1.0f);
+            ImGui::SliderFloat("Roughness", &mi->surface.specular_roughness, 0.04f, 1.0f);
             undoOnActivate();
 
-            ImGui::ColorEdit3("Emissive", glm::value_ptr(mi->emissiveColor));
+            ImGui::ColorEdit3("Emissive", glm::value_ptr(mi->surface.emission_color));
             undoOnActivate();
-            if (mi->emissiveColor != glm::vec3(0.0f)) {
-                ImGui::DragFloat("Emissive Intensity", &mi->emissiveIntensity, 0.05f,
+            if (mi->surface.emission_color != glm::vec3(0.0f)) {
+                ImGui::DragFloat("Emissive Intensity", &mi->surface.emission_luminance, 0.05f,
                                  0.0f, 100.0f);
                 undoOnActivate();
             }
@@ -8693,19 +8693,19 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 else     mi->materialFlags &= ~static_cast<u32>(rhi::MaterialFlag_Subsurface);
             }
             if (sss) {
-                ImGui::ColorEdit3("Subsurface Color", glm::value_ptr(mi->subsurfaceColor));
+                ImGui::ColorEdit3("Subsurface Color", glm::value_ptr(mi->surface.subsurface_color));
                 undoOnActivate();
-                ImGui::SliderFloat("Scatter radius", &mi->subsurfaceRadius, 0.1f, 4.0f, "%.2f");
+                ImGui::SliderFloat("Scatter radius", &mi->surface.subsurface_radius, 0.1f, 4.0f, "%.2f");
                 undoOnActivate();
             }
             // Clearcoat: a wet/oily clear layer (sweat, wet skin, wet eyes, varnish).
-            ImGui::SliderFloat("Clearcoat", &mi->clearcoat, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Clearcoat", &mi->surface.coat_weight, 0.0f, 1.0f, "%.2f");
             undoOnActivate();
             if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Wet/oily clear layer over the material.\n"
                                   "0 = dry. Raise for sweat, wet skin, wet eyes, varnish.");
-            if (mi->clearcoat > 0.0f) {
-                ImGui::SliderFloat("Clearcoat roughness", &mi->clearcoatRoughness, 0.02f, 0.5f, "%.2f");
+            if (mi->surface.coat_weight > 0.0f) {
+                ImGui::SliderFloat("Clearcoat roughness", &mi->surface.coat_roughness, 0.02f, 0.5f, "%.2f");
                 undoOnActivate();
             }
             const auto flagToggle = [&](const char* label, u32 bit) {
@@ -9485,7 +9485,7 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                         tr->splatAlbedoTex[i] = load(m->albedoTex);
                         tr->splatNormalTex[i] = load(m->normalTex);
                         tr->splatMRTex[i] = load(m->mrTex);
-                        tr->splatRoughFactor[i] = m->roughness;
+                        tr->splatRoughFactor[i] = m->surface.specular_roughness;
                     }
                 };
                 for (int i = 0; i < 4; ++i) {
@@ -14991,7 +14991,7 @@ std::filesystem::path Editor::MaterialFromTexture(const std::filesystem::path& t
     MaterialAsset mat;
     mat.name = prefix;
     mat.albedoTex = Project::Active().RelativeAssetPath(texture);
-    mat.roughness = 0.8f; // sensible non-shiny default until maps say otherwise
+    mat.surface.specular_roughness = 0.8f; // sensible non-shiny default until maps say otherwise
 
     // Sibling maps in the same folder, matched by prefix + role keywords.
     const std::string prefixLower = Lower(prefix);
@@ -15006,15 +15006,15 @@ std::filesystem::path Editor::MaterialFromTexture(const std::filesystem::path& t
         } else if (mat.mrTex.empty() && (nameLower.find("roughness") != std::string::npos ||
                                          nameLower.find("metal") != std::string::npos)) {
             mat.mrTex = rel;
-            mat.metallic = 1.0f; // factors multiply the map (glTF convention)
-            mat.roughness = 1.0f;
+            mat.surface.base_metalness = 1.0f; // factors multiply the map (glTF convention)
+            mat.surface.specular_roughness = 1.0f;
         } else if (mat.aoTex.empty() && (nameLower.find("occlusion") != std::string::npos ||
                                          EndsWithNoCase(nameLower, "_ao"))) {
             mat.aoTex = rel;
         } else if (mat.emissiveTex.empty() &&
                    nameLower.find("emiss") != std::string::npos) {
             mat.emissiveTex = rel;
-            mat.emissiveColor = glm::vec3(1.0f);
+            mat.surface.emission_color = glm::vec3(1.0f);
         }
     }
 
@@ -17369,10 +17369,10 @@ void Editor::RebuildPreviewGpu(Engine& engine) {
                 assets::ApplyMaterial(renderer, assetsDir, *mat, mi, textureCache_);
             }
         } else {
-            mi.baseColor = md.material.baseColor;
-            mi.metallic = md.material.metallic;
-            mi.roughness = md.material.roughness;
-            mi.emissiveColor = md.material.emissive;
+            mi.surface.base_color = md.material.baseColor;
+            mi.surface.base_metalness = md.material.metallic;
+            mi.surface.specular_roughness = md.material.roughness;
+            mi.surface.emission_color = md.material.emissive;
             mi.albedoTexture = loadTex(md.material.baseColorTex);
             mi.normalTexture = loadTex(md.material.normalTex);
             mi.mrTexture = loadTex(md.material.mrTex);
@@ -17623,10 +17623,10 @@ void Editor::EnsureMeshPreview(Engine& engine) {
                 assets::ApplyMaterial(renderer, assetsDir, *mat, mi, textureCache_);
             }
         } else {
-            mi.baseColor = md.material.baseColor;
-            mi.metallic = md.material.metallic;
-            mi.roughness = md.material.roughness;
-            mi.emissiveColor = md.material.emissive;
+            mi.surface.base_color = md.material.baseColor;
+            mi.surface.base_metalness = md.material.metallic;
+            mi.surface.specular_roughness = md.material.roughness;
+            mi.surface.emission_color = md.material.emissive;
             mi.albedoTexture = loadTex(md.material.baseColorTex);
             mi.normalTexture = loadTex(md.material.normalTex);
             mi.mrTexture = loadTex(md.material.mrTex);
@@ -17818,8 +17818,8 @@ void Editor::DrawAssetViewer(Engine& engine) {
             matPreviewKey = key;
             matPreviewStale = false;
             const glm::vec3 tint =
-                glm::clamp(glm::vec3(editedMat_.baseColor) +
-                               editedMat_.emissiveColor * editedMat_.emissiveIntensity * 0.25f,
+                glm::clamp(glm::vec3(editedMat_.surface.base_color) +
+                               editedMat_.surface.emission_color * editedMat_.surface.emission_luminance * 0.25f,
                            glm::vec3(0.02f), glm::vec3(1.0f));
             Model sphere{mesh::GenerateSphere(0.5f, 32, 16)};
             const auto px = editor::RasterizeMeshThumbnail(sphere, 192, tint);
@@ -17838,14 +17838,14 @@ void Editor::DrawAssetViewer(Engine& engine) {
             editedMat_.name = nameBuf;
             edited = true;
         }
-        if (DrawMaterialPresetCombo(editedMat_.flags, editedMat_.metallic, editedMat_.roughness,
-                                    editedMat_.subsurfaceColor, editedMat_.subsurfaceRadius))
+        if (DrawMaterialPresetCombo(editedMat_.flags, editedMat_.surface.base_metalness, editedMat_.surface.specular_roughness,
+                                    editedMat_.surface.subsurface_color, editedMat_.surface.subsurface_radius))
             edited = true;
-        edited |= ImGui::ColorEdit4("Base Color", glm::value_ptr(editedMat_.baseColor));
-        edited |= ImGui::SliderFloat("Metallic", &editedMat_.metallic, 0.0f, 1.0f);
-        edited |= ImGui::SliderFloat("Roughness", &editedMat_.roughness, 0.04f, 1.0f);
-        edited |= ImGui::ColorEdit3("Emissive", glm::value_ptr(editedMat_.emissiveColor));
-        edited |= ImGui::DragFloat("Emissive Intensity", &editedMat_.emissiveIntensity,
+        edited |= ImGui::ColorEdit4("Base Color", glm::value_ptr(editedMat_.surface.base_color));
+        edited |= ImGui::SliderFloat("Metallic", &editedMat_.surface.base_metalness, 0.0f, 1.0f);
+        edited |= ImGui::SliderFloat("Roughness", &editedMat_.surface.specular_roughness, 0.04f, 1.0f);
+        edited |= ImGui::ColorEdit3("Emissive", glm::value_ptr(editedMat_.surface.emission_color));
+        edited |= ImGui::DragFloat("Emissive Intensity", &editedMat_.surface.emission_luminance,
                                    0.05f, 0.0f, 100.0f);
         bool sss = (editedMat_.flags & rhi::MaterialFlag_Subsurface) != 0u;
         if (ImGui::Checkbox("Subsurface (skin)", &sss)) {
@@ -17855,14 +17855,14 @@ void Editor::DrawAssetViewer(Engine& engine) {
         }
         if (sss) {
             edited |= ImGui::ColorEdit3("Subsurface Color",
-                                        glm::value_ptr(editedMat_.subsurfaceColor));
-            edited |= ImGui::SliderFloat("Scatter radius", &editedMat_.subsurfaceRadius,
+                                        glm::value_ptr(editedMat_.surface.subsurface_color));
+            edited |= ImGui::SliderFloat("Scatter radius", &editedMat_.surface.subsurface_radius,
                                          0.1f, 4.0f, "%.2f");
         }
         // Clearcoat (wet/oily clear layer: sweat, wet skin, wet eyes, varnish).
-        edited |= ImGui::SliderFloat("Clearcoat", &editedMat_.clearcoat, 0.0f, 1.0f, "%.2f");
-        if (editedMat_.clearcoat > 0.0f)
-            edited |= ImGui::SliderFloat("Clearcoat roughness", &editedMat_.clearcoatRoughness,
+        edited |= ImGui::SliderFloat("Clearcoat", &editedMat_.surface.coat_weight, 0.0f, 1.0f, "%.2f");
+        if (editedMat_.surface.coat_weight > 0.0f)
+            edited |= ImGui::SliderFloat("Clearcoat roughness", &editedMat_.surface.coat_roughness,
                                          0.02f, 0.5f, "%.2f");
         const auto matFlag = [&](const char* label, u32 bit) {
             bool on = (editedMat_.flags & bit) != 0u;
@@ -18329,20 +18329,20 @@ void Editor::DrawAssetViewer(Engine& engine) {
                     const MeshInstance& mi = previewInstances_[i];
                     rhi::DrawItem item;
                     item.mesh = previewMeshes_[i];
-                    item.baseColor = mi.baseColor;
-                    item.metallic = mi.metallic;
-                    item.roughness = mi.roughness;
+                    item.surface.base_color = mi.surface.base_color;
+                    item.surface.base_metalness = mi.surface.base_metalness;
+                    item.surface.specular_roughness = mi.surface.specular_roughness;
                     item.albedoTexture = mi.albedoTexture;
                     item.normalTexture = mi.normalTexture;
                     item.mrTexture = mi.mrTexture;
                     item.aoTexture = mi.aoTexture;
                     item.emissiveTexture = mi.emissiveTexture;
-                    item.emissiveColor = mi.emissiveColor;
-                    item.emissiveIntensity = mi.emissiveIntensity;
-                    item.subsurfaceColor = mi.subsurfaceColor;
-                    item.subsurfaceRadius = mi.subsurfaceRadius;
-                    item.clearcoat = mi.clearcoat;
-                    item.clearcoatRoughness = mi.clearcoatRoughness;
+                    item.surface.emission_color = mi.surface.emission_color;
+                    item.surface.emission_luminance = mi.surface.emission_luminance;
+                    item.surface.subsurface_color = mi.surface.subsurface_color;
+                    item.surface.subsurface_radius = mi.surface.subsurface_radius;
+                    item.surface.coat_weight = mi.surface.coat_weight;
+                    item.surface.coat_roughness = mi.surface.coat_roughness;
                     item.thicknessTexture = mi.thicknessTexture;
                     item.materialFlags = mi.materialFlags;
                     previewDraw_.push_back(item);
@@ -18357,11 +18357,11 @@ void Editor::DrawAssetViewer(Engine& engine) {
                 if (faceSelectMode_ && faceHighlightMesh_.IsValid() && faceHighlightTris_ > 0) {
                     rhi::DrawItem hl;
                     hl.mesh = faceHighlightMesh_;
-                    hl.baseColor = glm::vec4(1.0f, 0.45f, 0.05f, 1.0f);
-                    hl.emissiveColor = glm::vec3(1.0f, 0.45f, 0.05f);
-                    hl.emissiveIntensity = 3.0f;
-                    hl.roughness = 1.0f;
-                    hl.metallic = 0.0f;
+                    hl.surface.base_color = glm::vec4(1.0f, 0.45f, 0.05f, 1.0f);
+                    hl.surface.emission_color = glm::vec3(1.0f, 0.45f, 0.05f);
+                    hl.surface.emission_luminance = 3.0f;
+                    hl.surface.specular_roughness = 1.0f;
+                    hl.surface.base_metalness = 0.0f;
                     previewDraw_.push_back(hl);
                 }
                 renderer.SetPreviewScene(pv, previewDraw_);
@@ -18397,10 +18397,10 @@ void Editor::DrawAssetViewer(Engine& engine) {
                         md.material.materialAsset.clear();
                         previewMeshDirty_ = true;
                         previewInstances_[i] = MeshInstance{};
-                        previewInstances_[i].baseColor = md.material.baseColor;
-                        previewInstances_[i].metallic = md.material.metallic;
-                        previewInstances_[i].roughness = md.material.roughness;
-                        previewInstances_[i].emissiveColor = md.material.emissive;
+                        previewInstances_[i].surface.base_color = md.material.baseColor;
+                        previewInstances_[i].surface.base_metalness = md.material.metallic;
+                        previewInstances_[i].surface.specular_roughness = md.material.roughness;
+                        previewInstances_[i].surface.emission_color = md.material.emissive;
                     }
                     for (const std::string& choice : matChoices) {
                         if (ImGui::Selectable(choice.c_str(),
@@ -19799,8 +19799,13 @@ bool Editor::OpenProject(const std::filesystem::path& hbproj) {
     OnProjectChanged();
     showProjectManager_ = false;
     if (hubMode_) {
+        // Hub relaunches a detached editor for this project; that boot runs the auto-upgrade.
         LaunchEditorDetached(Project::Active().ProjectFile());
         if (engine_) engine_->Quit();
+    } else {
+        // In-place open (no relaunch): bring the project's assets up to the current spec now, so
+        // the session that keeps running loads the upgraded assets. Idempotent + preserves identity.
+        importer::UpgradeAssets(Project::Active().AssetsDir(), Project::Active().SlotManifestPath());
     }
     return true;
 }

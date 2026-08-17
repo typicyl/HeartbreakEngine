@@ -4,6 +4,7 @@
 // the bindless texture array by per-object index (0 = use the constant factor).
 #include "Common.hlsli"
 #include "BRDF.hlsli"
+#include "OpenPBRSurface.hlsli"
 
 struct VSInput
 {
@@ -134,7 +135,11 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 // Perturbs the world normal with a tangent-space normal map.
 float3 ApplyNormalMap(float3 N, float4 T, float2 uv)
 {
-    float3 tn = SampleBindless(gNormalIndex, uv).xyz * 2.0f - 1.0f;
+    // Reconstruct Z from XY rather than reading the stored blue channel: BC5 normal maps carry
+    // only R,G (blue = 0), and for a unit tangent-space normal Z = sqrt(1 - X^2 - Y^2). This is
+    // exact for uncompressed RGBA8 normals too (Z is derived, not read), so it is format-agnostic.
+    float2 nxy = SampleBindless(gNormalIndex, uv).xy * 2.0f - 1.0f;
+    float3 tn = float3(nxy, sqrt(saturate(1.0f - dot(nxy, nxy))));
     float3 n = normalize(N);
     float3 t = normalize(T.xyz - n * dot(n, T.xyz)); // Gram-Schmidt
     float3 b = cross(n, t) * T.w;
@@ -145,7 +150,7 @@ float3 ApplyNormalMap(float3 N, float4 T, float2 uv)
 // light's incoming radiance at the shaded point; subsurface materials get a
 // colored wrapped diffuse (light bleeds past the terminator, red furthest).
 float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
-                   float metallic, float roughness, float3 F0, float NdotV,
+                   float metallic, float roughness, float3 dielF0, float NdotV,
                    float curvature, float thickness, float3 tangentWS)
 {
     float3 Hv = normalize(V + L);
@@ -166,8 +171,11 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     // also lets more of the reddened SSS diffuse survive at the silhouette (kdDirect
     // below is 1-Ft), where skin should redden most.
     if ((gMaterialFlags & (HBE_MAT_SUBSURFACE | HBE_MAT_EYE)) != 0u) f90s = min(f90s, 0.5f);
-    float3 F90  = max(f90s.xxx, F0);
-    float3 Ft   = F0 + (F90 - F0) * pow(saturate(1.0f - VdotH), 5.0f);
+    float3 F90   = max(f90s.xxx, dielF0);
+    // OpenPBR base dielectric Fresnel (Schlick from the IOR-derived dielF0). cloth/hair use this;
+    // the default specular branch below blends in the F82-tint metal Fresnel by metalness.
+    float3 Fdiel = FresnelSchlickF90(VdotH, dielF0, F90);
+    float3 Ft    = Fdiel;
     float3 specular;
     if ((gMaterialFlags & HBE_MAT_CLOTH) != 0u)
     {
@@ -197,6 +205,10 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     }
     else
     {
+        // OpenPBR base: one GGX lobe whose Fresnel blends the dielectric response (Fdiel) with the
+        // F82-tint metal response by metalness. metallic 0 + white specular_color == the old look.
+        float3 Fmetal = FresnelF82Tint(VdotH, albedo, gMatExt.specular_color);
+        Ft = lerp(Fdiel, Fmetal, metallic);
         float Dt = DistributionGGX(NdotH, roughness);
         float Gt = GeometrySmith(NdotV, NdotL, roughness);
         specular = (Dt * Gt * Ft) / max(4.0f * NdotV * NdotL, EPSILON) * radiance * NdotL;
@@ -215,7 +227,8 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
         }
     }
 
-    float3 diffuseResponse = NdotL.xxx;
+    // OpenPBR diffuse shape: energy-preserving Oren-Nayar (base_diffuse_roughness); sigma 0 == Lambert.
+    float3 diffuseResponse = OrenNayarDiffuse(NdotL, NdotV, dot(L, V), gMatExt.base_diffuse_roughness).xxx;
     float3 transmission = 0.0f.xxx;
     if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u)
     {
@@ -239,7 +252,7 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
         transmission = gSubsurfaceColor * (transDot * (1.0f - thickness) * 0.35f) * radiance;
     }
     float3 kdDirect = (1.0f - Ft) * (1.0f - metallic);
-    float3 diffuse = kdDirect * albedo / PI * diffuseResponse * radiance;
+    float3 diffuse = kdDirect * gMatExt.base_weight * albedo / PI * diffuseResponse * radiance;
     float3 result = diffuse + specular + transmission;
 
     // Clearcoat: a thin CLEAR dielectric layer over the whole material (wet skin,
@@ -249,12 +262,16 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     // sheen takes over. Gated on gClearcoat, so a dry material pays nothing.
     if (gClearcoat > 0.0f)
     {
-        const float ccF = (0.04f + 0.96f * pow(saturate(1.0f - VdotH), 5.0f)) * saturate(gClearcoat);
+        // OpenPBR coat: dielectric microfacet layer, F0 from coat_ior (default 1.5 -> 0.04), over
+        // the base; coat_color tints the light reaching the layers beneath it.
+        const float ccF0 = IorToF0(gMatExt.coat_ior);
+        const float ccF = (ccF0 + (1.0f - ccF0) * pow(saturate(1.0f - VdotH), 5.0f)) * saturate(gClearcoat);
         const float ccRough = max(gClearcoatRoughness, 0.02f);
         const float ccD = DistributionGGX(NdotH, ccRough);
         const float ccG = GeometrySmith(NdotV, NdotL, ccRough);
         const float ccSpec = (ccD * ccG * ccF) / max(4.0f * NdotV * NdotL, EPSILON) * NdotL;
-        result = result * (1.0f - ccF) + (ccSpec * radiance);
+        const float3 ccTint = lerp(1.0f.xxx, gMatExt.coat_color, saturate(gClearcoat));
+        result = result * (1.0f - ccF) * ccTint + (ccSpec * radiance);
     }
     return result;
 }
@@ -384,8 +401,9 @@ PSOutput PSMain(VSOutput input)
             float wl = wt[Li] / wsum;
             uint ai = gSplatAlbedo[Li], ni = gSplatNormal[Li], mi = gSplatMR[Li];
             a  += ((ai != 0u) ? SampleBindless(ai, tuv).rgb : 0.5f.xxx) * wl;
-            n  += ((ni != 0u) ? (SampleBindless(ni, tuv).xyz * 2.0f - 1.0f)
-                              : float3(0.0f, 0.0f, 1.0f)) * wl;
+            // Z reconstructed from XY (BC5-safe; exact for uncompressed). ni==0 -> flat (0,0,1).
+            float2 snxy = (ni != 0u) ? (SampleBindless(ni, tuv).xy * 2.0f - 1.0f) : float2(0.0f, 0.0f);
+            n  += float3(snxy, sqrt(saturate(1.0f - dot(snxy, snxy)))) * wl;
             // glTF MR: blue = metallic, green = roughness. Roughness is the MR map's
             // green (1 if the layer has no MR map) TIMES the material's roughness factor,
             // so cranking a layer material's roughness actually mattes the terrain.
@@ -679,16 +697,17 @@ PSOutput PSMain(VSOutput input)
 
     // --- Direct lighting ----------------------------------------------------
     float  NdotV = max(dot(N, V), EPSILON);
-    float3 F0 = lerp(0.04f.xxx, albedo, metallic);
-    // Skin's IOR (~1.4) gives a LOWER base reflectance than the 0.04 dielectric
-    // default; the extra 0.012 reads as a bright, waxy sheen on a face.
-    if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u) F0 = lerp(0.028f.xxx, albedo, metallic);
+    // OpenPBR dielectric F0 from the specular IOR (default 1.5 -> 0.04), scaled by specular_weight
+    // and tinted by specular_color. Skin keeps its slightly lower waxy reflectance (<= 0.028).
+    float3 dielF0 = (IorToF0(gMatExt.specular_ior) * gMatExt.specular_weight) * gMatExt.specular_color;
+    if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u) dielF0 = min(dielF0, 0.028f.xxx);
+    float3 F0 = lerp(dielF0, albedo, metallic); // mixed dielectric/metal F0 for the ambient split-sum
 
     // Sun (one directional light, shadowed).
     float3 L = normalize(gLightDirWS);
     float  shadow = ShadowFactor(input.positionWS, max(dot(N, L), 0.0f));
     float3 Lo = ShadeDirect(N, V, L, gLightColor * gLightIntensity, albedo,
-                            metallic, roughness, F0, NdotV, curvature, thickness,
+                            metallic, roughness, dielF0, NdotV, curvature, thickness,
                             input.tangentWS.xyz) * shadow;
 
     // Punctual lights: point (0), spot (1), rect/area (2).
@@ -741,7 +760,7 @@ PSOutput PSMain(VSOutput input)
         if (atten <= 0.0f)
             continue;
         Lo += ShadeDirect(N, V, Lp, light.color * light.intensity * atten, albedo,
-                          metallic, roughness, F0, NdotV, curvature, thickness,
+                          metallic, roughness, dielF0, NdotV, curvature, thickness,
                           input.tangentWS.xyz);
     }
 
@@ -840,8 +859,9 @@ PSOutput PSMain(VSOutput input)
     // NdotV so the sheen rims the silhouette - exactly where wet skin catches light.
     if (gClearcoat > 0.0f)
     {
+        const float ccF0a = IorToF0(gMatExt.coat_ior);
         const float ccFa =
-            (0.04f + 0.96f * pow(saturate(1.0f - NdotV), 5.0f)) * saturate(gClearcoat);
+            (ccF0a + (1.0f - ccF0a) * pow(saturate(1.0f - NdotV), 5.0f)) * saturate(gClearcoat);
         float3 ccEnv = (gPrefilteredIndex != 0)
             ? SampleBindlessLod(gPrefilteredIndex, uvR,
                                 max(gClearcoatRoughness, 0.02f) * gPrefilteredMaxLod).rgb
@@ -881,7 +901,7 @@ PSOutput PSMain(VSOutput input)
     // coverage = base alpha * albedo-texture alpha; the transparent pass blends them
     // over the lit scene (this overrides the mask for those rare dynamic decals).
     if ((gMaterialFlags & HBE_MAT_TRANSPARENT) != 0u)
-        outAlpha = saturate(gBaseColorFactor.a * albedoTex.a);
+        outAlpha = saturate(gMatExt.geometry_opacity * albedoTex.a); // OpenPBR geometry_opacity (== legacy baseColor.a)
 
     PSOutput o;
     o.color    = float4(color, outAlpha);

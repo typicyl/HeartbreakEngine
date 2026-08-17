@@ -249,7 +249,19 @@ ClosureResult ComputeClosure(const fs::path& assetsDir, const ClosureOptions& op
 
     std::deque<std::string> work;
     const auto push = [&](const std::string& key) {
-        if (result.included.insert(key).second) work.push_back(key);
+        if (!result.included.insert(key).second) return;
+        work.push_back(key);
+        // P6: a texture's BC variant `<stem>.bc.uaf` is generated beside `<stem>.uaf` but is
+        // referenced by NOBODY (materials name the uncompressed `.uaf`). Pack it whenever its
+        // source is included, or a "pack only referenced" cook drops it and the runtime BC path
+        // silently falls back to uncompressed in the shipped build - the VRAM win would evaporate.
+        // Only a texture actually HAS a sibling on disk; a mesh `.uaf` simply won't match fs::exists.
+        if (key.ends_with(".uaf") && !key.ends_with(".bc.uaf")) {
+            const std::string bc = key.substr(0, key.size() - 4) + ".bc.uaf";
+            std::error_code bcec;
+            if (fs::exists(assetsDir / bc, bcec) && result.included.insert(bc).second)
+                work.push_back(bc);
+        }
     };
     // One report line per (file, string), not per occurrence: a texture missing
     // from 400 entities is one problem, not 400.

@@ -261,6 +261,7 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/UIEditor.cpp"
     "Source/Editor/Importer.cpp"
+    "Source/Editor/TextureCompress.cpp"
     "Source/Editor/MeshThumbnail.cpp"
     "Source/Editor/MovieRender.cpp"
     "Source/Editor/MovieEncoder.cpp"

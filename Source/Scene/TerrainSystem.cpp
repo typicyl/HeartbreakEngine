@@ -340,9 +340,9 @@ void Update(Scene& scene, Renderer& renderer) {
                 reg.emplace<Transform>(ce, Transform{});
                 MeshInstance mi;
                 mi.mesh = renderer.UploadMesh(md);
-                mi.baseColor = t.color;
-                mi.metallic = 0.0f;
-                mi.roughness = t.roughness;
+                mi.surface.base_color = t.color;
+                mi.surface.base_metalness = 0.0f;
+                mi.surface.specular_roughness = t.roughness;
                 reg.emplace<MeshInstance>(ce, mi);
                 glm::vec3 bmin, bmax;
                 ComputeBounds(md, bmin, bmax);

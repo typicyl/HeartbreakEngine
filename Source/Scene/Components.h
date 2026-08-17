@@ -250,9 +250,9 @@ struct ParticleEmitter {
 // Renders a GPU mesh with a metallic-roughness material.
 struct MeshInstance {
     rhi::MeshHandle mesh;
-    glm::vec4 baseColor{1.0f};
-    f32 metallic  = 0.0f;
-    f32 roughness = 0.5f;
+    // Physically-based material VALUES (OpenPBR Surface). Textures stay layer-specific as
+    // bindless handles; SurfaceParams owns values only (see RHI/SurfaceMaterial.h).
+    SurfaceParams surface;
     // Bindless texture indices (0 = none).
     rhi::TextureHandle albedoTexture;
     rhi::TextureHandle normalTexture;
@@ -260,12 +260,6 @@ struct MeshInstance {
     rhi::TextureHandle aoTexture;
     rhi::TextureHandle emissiveTexture;
     rhi::TextureHandle thicknessTexture; // SSS transmission thickness (0 = none)
-    glm::vec3 emissiveColor{0.0f};
-    f32 emissiveIntensity = 1.0f;
-    glm::vec3 subsurfaceColor{0.85f, 0.2f, 0.16f}; // deep crimson (blood), not sunburn orange
-    f32 subsurfaceRadius = 1.0f;          // SSS scatter scale
-    f32 clearcoat = 0.0f;                 // wet/oily clear layer strength (0 = off)
-    f32 clearcoatRoughness = 0.08f;       // clear layer roughness (low = wet/glossy)
     u32 materialFlags = rhi::MaterialFlag_None;
 };
 

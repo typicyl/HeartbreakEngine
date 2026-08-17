@@ -15,6 +15,8 @@
 #include "Assets/MeshGenerator.h" // --skin-preview (headless skin sphere render)
 #include "Assets/MeshSimplify.h"
 #include "Assets/MeshOptimize.h" // --test-meshopt (import-time GPU geometry optimize)
+#include "Editor/TextureCompress.h" // --test-bc / --test-bc-encode (BC texture compression)
+#include "Assets/AssetLoader.h"     // assets::GenerateMips (--test-bc)
 #include "Assets/MeshFaceSelect.h"
 #include "Assets/AudioEvent.h"   // --test-acoustics (composite event round-trip)
 #include "Audio/AcousticQuery.h" // --test-acoustics (acoustic materials + resolution)
@@ -363,6 +365,22 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-meshlod") == 0) {
             const bool ok = hbe::mesh::MeshLodSelfTest();
             std::printf("meshlod %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-bc-encode: BC texture encoding (stb_dxt) - block math + exact packed size for a
+        // non-multiple-of-4 mipped image. CPU-only, no GPU/window/project. The GPU upload of the
+        // encoded blocks is covered by --test-bc (needs a device).
+        if (std::strcmp(argv[i], "--test-bc-encode") == 0) {
+            const bool ok = hbe::tex::CompressSelfTest();
+            std::printf("bc-encode %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-upgrade: the asset auto-upgrade migrates an out-of-date mesh .uaf to the current
+        // version in place, keeping its guid + pack slot, generating LODs, and is idempotent.
+        // CPU-only, no GPU/window (uses a temp project setting). Headless.
+        if (std::strcmp(argv[i], "--test-upgrade") == 0) {
+            const bool ok = hbe::importer::UpgradeSelfTest();
+            std::printf("upgrade %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-meshopt: import-time GPU geometry optimize (meshoptimizer). Proves the
@@ -1559,6 +1577,27 @@ int main(int argc, char** argv) {
         return created ? 0 : 1;
     }
 
+    // --upgrade-assets: bring every out-of-date `.uaf` under the project's Assets/ up to the
+    // current spec IN PLACE and non-destructively (meshes -> v9 + LODs; material textures -> BC
+    // when enabled), preserving each asset's guid + pack slot. Then exit. Idempotent - safe to run
+    // repeatedly. Scripted equivalent of the automatic upgrade the editor runs on project open.
+    {
+        bool doUpgrade = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--upgrade-assets") == 0) doUpgrade = true;
+        if (doUpgrade) {
+            if (!hbe::Project::HasActive()) {
+                std::printf("--upgrade-assets requires --project\n");
+                return 1;
+            }
+            const hbe::importer::UpgradeReport r = hbe::importer::UpgradeAssets(
+                hbe::Project::Active().AssetsDir(), hbe::Project::Active().SlotManifestPath());
+            std::printf("upgrade-assets: %u scanned, %u mesh(es) -> v%u, %u BC texture(s) baked\n",
+                        r.scanned, r.meshesUpgraded, hbe::uaf::kVersion, r.texturesBaked);
+            return 0;
+        }
+    }
+
     // --test-readback: render a few editor frames offscreen at an ODD resolution,
     // read the frame back to CPU, write it to a PNG, and exit. Proves the GPU
     // readback path (row-pitch de-pad + canonical RGBA channel order) on the active
@@ -1688,13 +1727,13 @@ int main(int argc, char** argv) {
             for (const Cfg& c : cfgs) {
                 hbe::MeshInstance mi;
                 mi.mesh = sphere;
-                mi.baseColor = skinTone;
-                mi.roughness = c.roughness;
-                mi.metallic = 0.0f;
-                mi.subsurfaceColor = {0.85f, 0.2f, 0.16f};
-                mi.subsurfaceRadius = c.radius;
-                mi.clearcoat = c.cc;              // wet sheen on the rightmost sphere
-                mi.clearcoatRoughness = 0.06f;
+                mi.surface.base_color = skinTone;
+                mi.surface.specular_roughness = c.roughness;
+                mi.surface.base_metalness = 0.0f;
+                mi.surface.subsurface_color = {0.85f, 0.2f, 0.16f};
+                mi.surface.subsurface_radius = c.radius;
+                mi.surface.coat_weight = c.cc;              // wet sheen on the rightmost sphere
+                mi.surface.coat_roughness = 0.06f;
                 if (c.sss) mi.materialFlags |= hbe::rhi::MaterialFlag_Subsurface;
                 const entt::entity ent = scene.CreateEntity("SkinSphere");
                 hbe::Transform tf;
@@ -1711,9 +1750,9 @@ int main(int argc, char** argv) {
                 const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
                 hbe::MeshInstance gi;
                 gi.mesh = plane;
-                gi.baseColor = {0.5f, 0.5f, 0.5f, 1.0f};
-                gi.roughness = 0.9f;
-                gi.metallic = 0.0f;
+                gi.surface.base_color = {0.5f, 0.5f, 0.5f, 1.0f};
+                gi.surface.specular_roughness = 0.9f;
+                gi.surface.base_metalness = 0.0f;
                 const entt::entity g = scene.CreateEntity("Ground");
                 hbe::Transform gt;
                 gt.position = {0.0f, -0.5f, 0.0f};
@@ -1812,8 +1851,8 @@ int main(int argc, char** argv) {
                 const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
                 hbe::MeshInstance gi;
                 gi.mesh = plane;
-                gi.baseColor = {0.42f, 0.37f, 0.30f, 1.0f};
-                gi.roughness = 0.95f;
+                gi.surface.base_color = {0.42f, 0.37f, 0.30f, 1.0f};
+                gi.surface.specular_roughness = 0.95f;
                 const entt::entity g = scene.CreateEntity("Floor");
                 hbe::Transform gt;
                 gt.position = {0.0f, -2.5f, 0.0f};
@@ -1832,8 +1871,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 3; ++i) {
                 hbe::MeshInstance mi;
                 mi.mesh = cube;
-                mi.baseColor = {0.88f, 0.88f, 0.90f, 1.0f};
-                mi.roughness = 0.6f;
+                mi.surface.base_color = {0.88f, 0.88f, 0.90f, 1.0f};
+                mi.surface.specular_roughness = 0.6f;
                 const entt::entity c = scene.CreateEntity("HalfCube");
                 hbe::Transform t;
                 t.position = {-7.0f + i * 7.0f, -0.15f, -6.0f};
@@ -1846,8 +1885,8 @@ int main(int argc, char** argv) {
             for (int i = 0; i < 4; ++i) {
                 hbe::MeshInstance mi;
                 mi.mesh = cube;
-                mi.baseColor = {0.95f, 0.95f, 0.98f, 1.0f};
-                mi.roughness = 0.5f;
+                mi.surface.base_color = {0.95f, 0.95f, 0.98f, 1.0f};
+                mi.surface.specular_roughness = 0.5f;
                 const entt::entity c = scene.CreateEntity("Mover");
                 hbe::Transform t;
                 t.position = {-6.0f + i * 4.0f, 1.6f, 2.0f};
@@ -1943,8 +1982,8 @@ int main(int argc, char** argv) {
             const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
             hbe::MeshInstance gi;
             gi.mesh = plane;
-            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
-            gi.roughness = 0.9f;
+            gi.surface.base_color = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.surface.specular_roughness = 0.9f;
             const entt::entity g = scene.CreateEntity("Ground");
             hbe::Transform gt;
             gt.position = {32.0f, -2.0f, 32.0f};
@@ -2020,8 +2059,8 @@ int main(int argc, char** argv) {
             const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
             hbe::MeshInstance gi;
             gi.mesh = plane;
-            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
-            gi.roughness = 0.9f;
+            gi.surface.base_color = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.surface.specular_roughness = 0.9f;
             const entt::entity g = scene.CreateEntity("Ground");
             hbe::Transform gt;
             gt.position = {0.0f, -0.02f, 0.0f};
@@ -2112,8 +2151,8 @@ int main(int argc, char** argv) {
             const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
             hbe::MeshInstance gi;
             gi.mesh = plane;
-            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
-            gi.roughness = 0.9f;
+            gi.surface.base_color = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.surface.specular_roughness = 0.9f;
             const entt::entity g = scene.CreateEntity("Ground");
             hbe::Transform gt;
             gt.position = {0.0f, -0.02f, 0.0f};
@@ -2212,8 +2251,8 @@ int main(int argc, char** argv) {
             const hbe::rhi::MeshHandle plane = e.GetRenderer().UploadMesh(pm);
             hbe::MeshInstance gi;
             gi.mesh = plane;
-            gi.baseColor = {0.34f, 0.36f, 0.40f, 1.0f};
-            gi.roughness = 0.9f;
+            gi.surface.base_color = {0.34f, 0.36f, 0.40f, 1.0f};
+            gi.surface.specular_roughness = 0.9f;
             const entt::entity g = scene.CreateEntity("Ground");
             hbe::Transform gt;
             gt.position = {0.0f, -0.02f, 0.0f};
@@ -2457,6 +2496,88 @@ int main(int argc, char** argv) {
         });
         gcEngine.Run(config);
         std::printf("gpucompute %s (%s)\n", t.pass ? "PASS" : "FAIL", t.why);
+        return t.pass ? 0 : 1;
+    }
+
+    // --test-bc: prove BC (block-compressed) texture STAGING on the ACTIVE backend (--d3d12 /
+    // --vulkan). Encodes a synthetic mipped RGBA8 gradient (non-multiple-of-4 => edge + sub-4x4
+    // tail blocks) to BC3/BC5/BC4/BC1 via the same stb_dxt path import uses, uploads each through
+    // the RHI (exercising the block-aware staging: row pitch, per-mip offset, tail mips), and
+    // checks every handle is valid. Under --validation this is what catches a wrong block-size or
+    // offset on either backend. Needs a real device; short engine session, no project.
+    bool testBC = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-bc") == 0) testBC = true;
+    if (testBC) {
+        struct BCTest {
+            int frame = 0;
+            bool done = false, pass = false;
+            const char* why = "no result";
+            std::vector<hbe::rhi::TextureHandle> handles;
+        };
+        static BCTest t;
+        static std::vector<hbe::uaf::Texture> bcTex;
+        {
+            // Two sizes: 64x64 (power-of-2, multiple-of-4) and 70x50 (NPOT, non-mult-4) - both
+            // mipped to 1x1 - to exercise edge/tail blocks and any dimension constraint.
+            const auto makeRGBA = [](hbe::u32 W, hbe::u32 H) {
+                hbe::uaf::Texture rgba;
+                rgba.width = W; rgba.height = H; rgba.mipCount = 1;
+                rgba.format = static_cast<hbe::u32>(hbe::rhi::Format::R8G8B8A8_UNORM);
+                for (hbe::u32 y = 0; y < H; ++y)
+                    for (hbe::u32 x = 0; x < W; ++x) {
+                        rgba.pixels.push_back(static_cast<hbe::u8>(x * 3));
+                        rgba.pixels.push_back(static_cast<hbe::u8>(y * 5));
+                        rgba.pixels.push_back(static_cast<hbe::u8>((x + y) * 2));
+                        rgba.pixels.push_back(255);
+                    }
+                hbe::assets::GenerateMips(rgba);
+                return rgba;
+            };
+            for (const auto dims : {std::pair<hbe::u32, hbe::u32>{64, 64}, {70, 50}}) {
+                const hbe::uaf::Texture rgba = makeRGBA(dims.first, dims.second);
+                for (const hbe::tex::BCKind kind :
+                     {hbe::tex::BCKind::ColorRGBA, hbe::tex::BCKind::NormalRG,
+                      hbe::tex::BCKind::SingleChannel, hbe::tex::BCKind::ColorRGB}) {
+                    if (auto bc = hbe::tex::CompressToBC(rgba, kind, /*srgb*/ false))
+                        bcTex.push_back(std::move(*bc));
+                }
+            }
+        }
+        hbe::Engine bcEngine;
+        bcEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+        });
+        bcEngine.SetOnFrame([](hbe::Engine& e) {
+            auto& r = e.GetRenderer();
+            if (t.done) return;
+            if (++t.frame == 2) {
+                if (!r.SupportsBlockCompression()) {
+                    t.why = "backend reports no BC support (skipped)";
+                    t.pass = true; t.done = true; e.Quit(); return;
+                }
+                for (const hbe::uaf::Texture& bt : bcTex) {
+                    hbe::rhi::TextureDesc d{};
+                    d.width = bt.width; d.height = bt.height; d.mipCount = bt.mipCount;
+                    d.format = static_cast<hbe::rhi::Format>(bt.format);
+                    d.pixels = bt.pixels.data();
+                    d.debugName = "BCTest";
+                    t.handles.push_back(r.UploadTexture(d));
+                }
+                t.pass = !t.handles.empty();
+                for (const auto h : t.handles)
+                    if (!h.IsValid()) { t.pass = false; t.why = "a BC upload returned an invalid handle"; }
+                if (t.pass) t.why = "ok";
+            } else if (t.frame >= 8) {
+                for (const auto h : t.handles) r.DestroyTexture(h); // exercise BC destroy too
+                t.done = true; e.Quit();
+            } else if (t.frame > 120) {
+                t.why = "timed out"; t.done = true; e.Quit();
+            }
+        });
+        bcEngine.Run(config);
+        std::printf("bc %s (%s, %zu textures)\n", t.pass ? "PASS" : "FAIL", t.why, bcTex.size());
         return t.pass ? 0 : 1;
     }
 
@@ -3765,6 +3886,18 @@ int main(int argc, char** argv) {
             }
         });
         return mvEngine.Run(config);
+    }
+
+    // AUTO-UPGRADE: before the editing session loads any assets, bring every out-of-date `.uaf`
+    // in the project up to the current spec IN PLACE (meshes -> v9 + LODs; material textures -> BC
+    // when enabled), preserving each asset's guid + pack slot. This is what lets an old project
+    // gain the current feature set without re-importing anything. Idempotent, so a current project
+    // pays only a header-peek per asset. Reached only by the real editor session - every CLI op
+    // (--import / --pack / --upgrade-assets / --test-*) returns above this.
+    if (hbe::Project::HasActive()) {
+        const hbe::importer::UpgradeReport r = hbe::importer::UpgradeAssets(
+            hbe::Project::Active().AssetsDir(), hbe::Project::Active().SlotManifestPath());
+        (void)r; // UpgradeAssets already logs a summary when it changes anything
     }
 
     hbe::Engine engine;

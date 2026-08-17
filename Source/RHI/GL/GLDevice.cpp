@@ -550,10 +550,10 @@ public:
             glUniformMatrix4fv(uModel_, 1, GL_FALSE, glm::value_ptr(it.transform));
             glm::mat3 nrm = glm::inverseTranspose(glm::mat3(it.transform));
             glUniformMatrix3fv(uNormalMat_, 1, GL_FALSE, glm::value_ptr(nrm));
-            glUniform4fv(uBaseColor_, 1, glm::value_ptr(it.baseColor));
-            glUniform1f(uMetallic_, it.metallic);
-            glUniform1f(uRoughness_, it.roughness);
-            glm::vec3 emis = it.emissiveColor * it.emissiveIntensity;
+            glUniform4fv(uBaseColor_, 1, glm::value_ptr(it.surface.base_color));
+            glUniform1f(uMetallic_, it.surface.base_metalness);
+            glUniform1f(uRoughness_, it.surface.specular_roughness);
+            glm::vec3 emis = it.surface.emission_color * it.surface.emission_luminance;
             glUniform3fv(uEmissive_, 1, glm::value_ptr(emis));
             glUniform1i(uHasAlbedo_, BindMaterial(0, it.albedoTexture) ? 1 : 0);
             glUniform1i(uHasNormal_, BindMaterial(1, it.normalTexture) ? 1 : 0);

@@ -544,8 +544,8 @@ bool Editor::SceneSaveSelfTest(const fs::path& sceneFile) {
             reg.emplace<Transform>(mesh);
             reg.emplace<MeshRef>(mesh, MeshRef{"prim:cube"});
             MeshInstance mi;
-            mi.baseColor = {0.1f, 0.2f, 0.3f, 1.0f};
-            mi.roughness = 0.77f;
+            mi.surface.base_color = {0.1f, 0.2f, 0.3f, 1.0f};
+            mi.surface.specular_roughness = 0.77f;
             reg.emplace<MeshInstance>(mesh, mi);
             reg.emplace<Character>(mesh, Character{}); // asset == ""
 

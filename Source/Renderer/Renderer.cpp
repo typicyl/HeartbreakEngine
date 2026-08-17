@@ -88,19 +88,18 @@ bool ShadowInstanceable(const rhi::DrawItem& it) {
 // Material-key equality for run grouping: everything the ObjectCB carries
 // besides the per-instance transforms.
 bool SameMaterial(const rhi::DrawItem& a, const rhi::DrawItem& b) {
+    // SurfaceParams::operator== is the COMPLETE OpenPBR value comparison (base/specular/coat/
+    // fuzz/subsurface/transmission/thin-film/emission). This is stricter than the old
+    // field-by-field list, which omitted clearcoat - two draws differing only in clearcoat
+    // used to instance together and wear the run head's coat; the whole-struct compare fixes it.
     return a.mesh.id == b.mesh.id && a.materialFlags == b.materialFlags &&
-           a.baseColor == b.baseColor && a.metallic == b.metallic &&
-           a.roughness == b.roughness &&
+           a.surface == b.surface &&
            a.albedoTexture.index == b.albedoTexture.index &&
            a.normalTexture.index == b.normalTexture.index &&
            a.mrTexture.index == b.mrTexture.index &&
            a.aoTexture.index == b.aoTexture.index &&
            a.emissiveTexture.index == b.emissiveTexture.index &&
            a.thicknessTexture.index == b.thicknessTexture.index &&
-           a.emissiveColor == b.emissiveColor &&
-           a.emissiveIntensity == b.emissiveIntensity &&
-           a.subsurfaceColor == b.subsurfaceColor &&
-           a.subsurfaceRadius == b.subsurfaceRadius &&
            a.surfaceStrokes == b.surfaceStrokes;
 }
 
@@ -236,6 +235,10 @@ void Renderer::DestroyTexture(rhi::TextureHandle handle) {
 
 bool Renderer::SupportsResourceReclaim() const {
     return device_ && device_->SupportsResourceReclaim();
+}
+
+bool Renderer::SupportsBlockCompression() const {
+    return device_ && device_->SupportsBlockCompression();
 }
 
 bool Renderer::SupportsScene() const {

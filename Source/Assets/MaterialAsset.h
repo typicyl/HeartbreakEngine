@@ -9,6 +9,7 @@
 
 #include "Assets/AcousticMaterial.h"
 #include "Core/Types.h"
+#include "RHI/SurfaceMaterial.h" // hbe::SurfaceParams (OpenPBR material values)
 
 #include <glm/glm.hpp>
 
@@ -26,19 +27,11 @@ namespace rhi { struct TextureHandle; }
 
 struct MaterialAsset {
     std::string name = "Material";
-    glm::vec4 baseColor{1.0f};
-    f32 metallic = 0.0f;
-    f32 roughness = 0.5f;
-    glm::vec3 emissiveColor{0.0f};
-    f32 emissiveIntensity = 1.0f;
-    // Scatter/transmission tint. A deep crimson reads as blood under the skin; the old
-    // {1.0, 0.3, 0.2} was a sunburn ORANGE that looked artificial (the "Skin" preset sets
-    // this too). Only the transmission + no-LUT fallback use it; the pre-integrated LUT
-    // carries its own d'Eon profile.
-    glm::vec3 subsurfaceColor{0.85f, 0.2f, 0.16f};
-    f32 subsurfaceRadius = 1.0f; // SSS scatter scale (skin)
-    f32 clearcoat = 0.0f;        // wet/oily clear layer strength (0 = off)
-    f32 clearcoatRoughness = 0.08f; // clear layer roughness (low = wet/glossy)
+    // Physically-based material VALUES (OpenPBR Surface parameter set). The legacy flat
+    // fields (baseColor/metallic/roughness/emissive*/subsurface*/clearcoat*) now live here
+    // under OpenPBR names; see RHI/SurfaceMaterial.h for the legacy->OpenPBR mapping. The
+    // subsurface tint default stays the deep-crimson blood colour the Skin preset relies on.
+    SurfaceParams surface;
     u32 flags = 0; // rhi::MaterialFlags
     // `.uaf` texture references, relative to the project's Assets/ (empty = none).
     std::string albedoTex;

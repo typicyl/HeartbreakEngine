@@ -10,6 +10,7 @@
 #include "Assets/Mesh.h"
 #include "Assets/StrokeGen.h"
 #include "Core/Log.h"
+#include "RHI/GpuMaterial.h" // GpuSurfaceMaterialExt (appended OpenPBR params)
 
 #include <vulkan/vulkan.h> // core only: the platform macro lives in VulkanSurface_Win32.cpp now
 
@@ -63,6 +64,15 @@ VkFormat ToVkFormat(Format f) {
         case Format::R32G32B32A32_FLOAT: return VK_FORMAT_R32G32B32A32_SFLOAT;
         case Format::D32_FLOAT:          return VK_FORMAT_D32_SFLOAT;
         case Format::D24_UNORM_S8_UINT:  return VK_FORMAT_D24_UNORM_S8_UINT;
+        case Format::BC1_UNORM:          return VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+        case Format::BC1_SRGB:           return VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+        case Format::BC3_UNORM:          return VK_FORMAT_BC3_UNORM_BLOCK;
+        case Format::BC3_SRGB:           return VK_FORMAT_BC3_SRGB_BLOCK;
+        case Format::BC4_UNORM:          return VK_FORMAT_BC4_UNORM_BLOCK;
+        case Format::BC5_UNORM:          return VK_FORMAT_BC5_UNORM_BLOCK;
+        case Format::BC6H_UFLOAT:        return VK_FORMAT_BC6H_UFLOAT_BLOCK;
+        case Format::BC7_UNORM:          return VK_FORMAT_BC7_UNORM_BLOCK;
+        case Format::BC7_SRGB:           return VK_FORMAT_BC7_SRGB_BLOCK;
         default:                         return VK_FORMAT_UNDEFINED;
     }
 }
@@ -233,6 +243,8 @@ struct ObjectUBO {
     f32 clearcoatRoughness = 0.08f;
     f32 _padCc0 = 0.0f;
     f32 _padCc1 = 0.0f;
+    // Appended OpenPBR Surface params (P2). Mirror of OpenPBRMaterialExt in Common.hlsli.
+    GpuSurfaceMaterialExt matExt;
 };
 
 // Copies a DrawItem's blendshape fields into the object UBO (bindless atlas index +
@@ -261,6 +273,13 @@ u32 BytesPerPixel(Format f) {
         case Format::B8G8R8A8_SRGB:      return 4;
         case Format::R16G16B16A16_FLOAT: return 8;
         case Format::R32G32B32A32_FLOAT: return 16;
+        // BC formats are block-based: 0 is a sentinel (see the D3D12 twin). CreateTexture uses
+        // rhi::MipCopyRows / rhi::MipByteSize for block-aware staging, never this per-pixel size.
+        case Format::BC1_UNORM: case Format::BC1_SRGB:
+        case Format::BC3_UNORM: case Format::BC3_SRGB:
+        case Format::BC4_UNORM: case Format::BC5_UNORM:
+        case Format::BC6H_UFLOAT:
+        case Format::BC7_UNORM: case Format::BC7_SRGB: return 0;
         default:                         return 4;
     }
 }
@@ -308,6 +327,7 @@ public:
     void DestroyMesh(MeshHandle handle) override;
     void DestroyTexture(TextureHandle handle) override;
     bool SupportsResourceReclaim() const override { return true; }
+    bool SupportsBlockCompression() const override { return bcSupported_; }
     ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
     void QueueCompute(const ComputeDispatch& d) override;
     void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
@@ -738,6 +758,7 @@ private:
     // (so no in-flight frame can still reference it) before it is actually destroyed and
     // its handle / bindless slot recycled. See RetireResourceFrees, run from BeginFrame.
     u64  reclaimFrameCounter_ = 0;
+    bool bcSupported_ = false; // textureCompressionBC feature (set at device creation)
     std::vector<u32> meshFreeVk_;   // recycled meshes_ indices (0-based), reused by CreateMesh
     std::vector<u32> texSlotFreeVk_; // recycled bindless slots, reused by CreateTexture
     struct PendingMeshFreeVk { GpuMeshVk mesh; u32 meshIdx; u64 freeFrame; };
@@ -1108,6 +1129,10 @@ bool VulkanDevice::CreateLogicalDevice() {
     // (else VUID-VkPipelineColorBlendStateCreateInfo-pAttachments-00605). Core-optional but
     // universally supported on desktop; guarded so a device without it still creates cleanly.
     features.independentBlend = supported.independentBlend;
+    // Block-compressed (BC/DXT) sampling. Near-universal on desktop; if a device lacks it, BC
+    // texture variants are refused at load and the uncompressed .uaf is used (SupportsBlockCompression).
+    features.textureCompressionBC = supported.textureCompressionBC;
+    bcSupported_ = supported.textureCompressionBC == VK_TRUE;
 
     // Bindless: descriptor indexing (core in Vulkan 1.2). Enable runtime arrays,
     // non-uniform indexing, partially-bound + update-after-bind, variable count.
@@ -1752,12 +1777,13 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
     const u32 bpp = BytesPerPixel(desc.format);
     const u32 mipCount = desc.mipCount < 1 ? 1 : desc.mipCount;
 
-    // Tightly-packed staging size across all mips.
+    // Tightly-packed staging size across all mips - block-aware (BC mips round up to whole 4x4
+    // blocks), so a BC7/BC5/BC1 upload sizes and offsets correctly instead of via bytes/pixel.
     VkDeviceSize total = 0;
     for (u32 mip = 0; mip < mipCount; ++mip) {
         const u32 mw = std::max(1u, desc.width >> mip);
         const u32 mh = std::max(1u, desc.height >> mip);
-        total += static_cast<VkDeviceSize>(mw) * mh * bpp;
+        total += static_cast<VkDeviceSize>(MipByteSize(desc.format, mw, mh, bpp));
     }
 
     VkBuffer staging = VK_NULL_HANDLE;
@@ -1845,10 +1871,10 @@ TextureHandle VulkanDevice::CreateTexture(const TextureDesc& desc) {
         const u32 mh = std::max(1u, desc.height >> mip);
         VkBufferImageCopy& r = regions[mip];
         r = {};
-        r.bufferOffset = offset;
+        r.bufferOffset = offset; // block-aligned (BC block sizes 8/16 are multiples of 4)
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-        r.imageExtent = {mw, mh, 1};
-        offset += static_cast<VkDeviceSize>(mw) * mh * bpp;
+        r.imageExtent = {mw, mh, 1}; // texels; Vulkan derives the block count for BC formats
+        offset += static_cast<VkDeviceSize>(MipByteSize(desc.format, mw, mh, bpp));
     }
     vkCmdCopyBufferToImage(cmd, staging, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                            mipCount, regions.data());
@@ -2019,7 +2045,7 @@ void VulkanDevice::UpdateTexture(TextureHandle handle, const TextureDesc& desc) 
     for (u32 mip = 0; mip < mipCount; ++mip) {
         const u32 mw = std::max(1u, desc.width >> mip);
         const u32 mh = std::max(1u, desc.height >> mip);
-        total += static_cast<VkDeviceSize>(mw) * mh * bpp;
+        total += static_cast<VkDeviceSize>(MipByteSize(desc.format, mw, mh, bpp));
     }
 
     VkBuffer staging = VK_NULL_HANDLE;
@@ -2061,10 +2087,10 @@ void VulkanDevice::UpdateTexture(TextureHandle handle, const TextureDesc& desc) 
         const u32 mh = std::max(1u, desc.height >> mip);
         VkBufferImageCopy& r = regions[mip];
         r = {};
-        r.bufferOffset = offset;
+        r.bufferOffset = offset; // block-aligned (BC block sizes 8/16 are multiples of 4)
         r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, 1};
-        r.imageExtent = {mw, mh, 1};
-        offset += static_cast<VkDeviceSize>(mw) * mh * bpp;
+        r.imageExtent = {mw, mh, 1}; // texels; Vulkan derives the block count for BC formats
+        offset += static_cast<VkDeviceSize>(MipByteSize(desc.format, mw, mh, bpp));
     }
     vkCmdCopyBufferToImage(cmd, staging, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                            mipCount, regions.data());
@@ -5465,22 +5491,23 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         ObjectUBO ocb{};
         ocb.model = it.transform;
         ocb.normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(it.transform))));
-        ocb.baseColor = it.baseColor;
-        ocb.metallic = it.metallic;
-        ocb.roughness = it.roughness;
+        ocb.baseColor = it.surface.base_color;
+        ocb.metallic = it.surface.base_metalness;
+        ocb.roughness = it.surface.specular_roughness;
         ocb.albedoIndex = it.albedoTexture.index;
         ocb.normalIndex = it.normalTexture.index;
         FillMorphUBO(ocb, it); // facial blendshapes (bindless delta atlas)
         ocb.mrIndex = it.mrTexture.index;
         ocb.aoIndex = it.aoTexture.index;
         ocb.flags = it.materialFlags;
-        ocb.subsurfaceColor = it.subsurfaceColor;
-        ocb.subsurfaceRadius = it.subsurfaceRadius;
+        ocb.subsurfaceColor = it.surface.subsurface_color;
+        ocb.subsurfaceRadius = it.surface.subsurface_radius;
         ocb.thicknessIndex = it.thicknessTexture.index;
-        ocb.clearcoat = it.clearcoat;
-        ocb.clearcoatRoughness = it.clearcoatRoughness;
-        ocb.emissiveColor = it.emissiveColor;
-        ocb.emissiveIntensity = it.emissiveIntensity;
+        ocb.clearcoat = it.surface.coat_weight;
+        ocb.clearcoatRoughness = it.surface.coat_roughness;
+        ocb.emissiveColor = it.surface.emission_color;
+        ocb.emissiveIntensity = it.surface.emission_luminance;
+        FillSurfaceMaterialExt(ocb.matExt, it.surface);
         ocb.emissiveIndex = it.emissiveTexture.index;
         ocb.paintColorIndex = it.paintColorTexture.index;
         ocb.paintHeightIndex = it.paintHeightTexture.index;
@@ -6707,21 +6734,22 @@ void VulkanDevice::DrawPreviewScene(const SceneView& view, const DrawItem* items
         ObjectUBO ocb{};
         ocb.model = it.transform;
         ocb.normalMatrix = glm::mat4(glm::transpose(glm::inverse(glm::mat3(it.transform))));
-        ocb.baseColor = it.baseColor;
-        ocb.metallic = it.metallic;
-        ocb.roughness = it.roughness;
+        ocb.baseColor = it.surface.base_color;
+        ocb.metallic = it.surface.base_metalness;
+        ocb.roughness = it.surface.specular_roughness;
         ocb.albedoIndex = it.albedoTexture.index;
         ocb.normalIndex = it.normalTexture.index;
         FillMorphUBO(ocb, it); // facial blendshapes (bindless delta atlas)
         ocb.mrIndex = it.mrTexture.index;
         ocb.aoIndex = it.aoTexture.index;
         ocb.flags = it.materialFlags;
-        ocb.subsurfaceColor = it.subsurfaceColor;
-        ocb.subsurfaceRadius = it.subsurfaceRadius;
-        ocb.clearcoat = it.clearcoat;
-        ocb.clearcoatRoughness = it.clearcoatRoughness;
-        ocb.emissiveColor = it.emissiveColor;
-        ocb.emissiveIntensity = it.emissiveIntensity;
+        ocb.subsurfaceColor = it.surface.subsurface_color;
+        ocb.subsurfaceRadius = it.surface.subsurface_radius;
+        ocb.clearcoat = it.surface.coat_weight;
+        ocb.clearcoatRoughness = it.surface.coat_roughness;
+        ocb.emissiveColor = it.surface.emission_color;
+        ocb.emissiveIntensity = it.surface.emission_luminance;
+        FillSurfaceMaterialExt(ocb.matExt, it.surface);
         ocb.emissiveIndex = it.emissiveTexture.index;
         ocb.prevModel = it.transform; // preview needs no motion vectors
 

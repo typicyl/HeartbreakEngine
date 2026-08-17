@@ -346,10 +346,28 @@ bool SaveRememberedSlots(const fs::path& manifestPath, const std::map<std::strin
 
     std::error_code ec;
     if (!manifestPath.parent_path().empty()) fs::create_directories(manifestPath.parent_path(), ec);
-    std::ofstream file(manifestPath, std::ios::trunc);
-    if (!file) return false;
-    file << j.dump(2);
-    return static_cast<bool>(file);
+    // Write atomically (temp + rename), like the embedded-slot writers: a crash or disk-full while
+    // truncating in place would leave a corrupt manifest, and LoadRememberedSlots treats a corrupt
+    // manifest as EMPTY - which (for any format that can't embed its id) silently forgets every
+    // remembered slot and renumbers the packs on the next cook.
+    fs::path tmp = manifestPath;
+    tmp += ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::trunc);
+        if (!file) return false;
+        file << j.dump(2);
+        if (!file) {
+            file.close();
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    fs::rename(tmp, manifestPath, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    return true;
 }
 
 // --- Stamping ---------------------------------------------------------------

@@ -458,9 +458,9 @@ std::string StrokeSignature(const Scene& s, entt::entity e) {
         "mesh=%s mat=%s rgba=%.3f,%.3f,%.3f,%.3f flags=%u mr=%.3f/%.3f "
         "aabb=%.3f,%.3f,%.3f..%.3f,%.3f,%.3f world=%.4f,%.4f,%.4f tag=%u group=%u",
         mr ? mr->source.c_str() : "-", mat ? mat->asset.c_str() : "-",
-        mi ? mi->baseColor.r : -1.0f, mi ? mi->baseColor.g : -1.0f,
-        mi ? mi->baseColor.b : -1.0f, mi ? mi->baseColor.a : -1.0f,
-        mi ? mi->materialFlags : 0u, mi ? mi->metallic : -1.0f, mi ? mi->roughness : -1.0f,
+        mi ? mi->surface.base_color.r : -1.0f, mi ? mi->surface.base_color.g : -1.0f,
+        mi ? mi->surface.base_color.b : -1.0f, mi ? mi->surface.base_color.a : -1.0f,
+        mi ? mi->materialFlags : 0u, mi ? mi->surface.base_metalness : -1.0f, mi ? mi->surface.specular_roughness : -1.0f,
         bb ? bb->min.x : 0.0f, bb ? bb->min.y : 0.0f, bb ? bb->min.z : 0.0f,
         bb ? bb->max.x : 0.0f, bb ? bb->max.y : 0.0f, bb ? bb->max.z : 0.0f, wp.x, wp.y,
         wp.z, tg ? static_cast<unsigned>(tg->id) : 0u,
@@ -478,9 +478,9 @@ entt::entity MakeStroke(Scene& s, const glm::vec3& worldPos, const std::string& 
     t.position = worldPos;
     reg.emplace<Transform>(e, t);
     MeshInstance mi;
-    mi.baseColor = glm::vec4(0.8f, 0.2f, 0.35f, 0.9f);
-    mi.metallic = 0.1f;
-    mi.roughness = 0.7f;
+    mi.surface.base_color = glm::vec4(0.8f, 0.2f, 0.35f, 0.9f);
+    mi.surface.base_metalness = 0.1f;
+    mi.surface.specular_roughness = 0.7f;
     mi.materialFlags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow;
     reg.emplace<MeshInstance>(e, mi);
     reg.emplace<MeshRef>(e, MeshRef{meshSrc});
@@ -528,9 +528,9 @@ bool SelfTest() {
         fs::create_directories(dir / "Strokes", ec);
         MaterialAsset m;
         m.name = "Stroke";
-        m.baseColor = glm::vec4(0.8f, 0.2f, 0.35f, 0.9f);
-        m.metallic = 0.1f;
-        m.roughness = 0.7f;
+        m.surface.base_color = glm::vec4(0.8f, 0.2f, 0.35f, 0.9f);
+        m.surface.base_metalness = 0.1f;
+        m.surface.specular_roughness = 0.7f;
         m.flags = rhi::MaterialFlag_Transparent | rhi::MaterialFlag_NoShadow;
         expect(assets::SaveMaterial(dir / matRel, m), "write the test stroke material");
     }

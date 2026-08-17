@@ -122,6 +122,24 @@ AssetType PeekType(const std::filesystem::path& path) {
     return ReadHeader(r);
 }
 
+bool PeekHeader(const std::filesystem::path& path, AssetType& type, u32& version, u64& guid) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    u8 hdr[kHeaderSizeWithSlot] = {};
+    in.read(reinterpret_cast<char*>(hdr), kHeaderSizeWithSlot);
+    const usize got = static_cast<usize>(in.gcount());
+    if (got < kHeaderSize) return false;
+    BinaryReader r(hdr, got);
+    u32 v = 0;
+    u64 g = 0;
+    const AssetType t = ReadHeader(r, &v, &g);
+    if (t == AssetType::Unknown) return false;
+    type = t;
+    version = v;
+    guid = g;
+    return true;
+}
+
 // --- Texture ---------------------------------------------------------------
 bool WriteTexture(const std::filesystem::path& path, const Texture& tex, u64 guid) {
     BinaryWriter w;

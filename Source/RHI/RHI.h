@@ -16,6 +16,7 @@
 #pragma once
 
 #include "Core/Types.h"
+#include "RHI/SurfaceMaterial.h" // hbe::SurfaceParams (per-material OpenPBR values)
 
 #include <glm/glm.hpp>
 
@@ -67,10 +68,12 @@ enum class Format {
     // rest = 16. See IsBlockCompressed / BlockBytes / MipCopyRows below.
     BC1_UNORM,   // RGB(+1-bit A), 4bpp - opt-in low-color only
     BC1_SRGB,
+    BC3_UNORM,   // RGBA (DXT5), 8bpp - the color default (good quality, PS3/RSX-native)
+    BC3_SRGB,
     BC4_UNORM,   // single channel (R), 4bpp
     BC5_UNORM,   // two channel (RG) - tangent-space normals, near-lossless
-    BC6H_UFLOAT, // HDR RGB, 8bpp
-    BC7_UNORM,   // RGBA, 8bpp - near-lossless color
+    BC6H_UFLOAT, // HDR RGB, 8bpp (no CPU encoder yet; enum + sampling only)
+    BC7_UNORM,   // RGBA, 8bpp - highest-quality color (no CPU encoder yet; enum + sampling only)
     BC7_SRGB,
 };
 
@@ -79,6 +82,7 @@ enum class Format {
 inline bool IsBlockCompressed(Format f) {
     switch (f) {
         case Format::BC1_UNORM: case Format::BC1_SRGB:
+        case Format::BC3_UNORM: case Format::BC3_SRGB:
         case Format::BC4_UNORM: case Format::BC5_UNORM:
         case Format::BC6H_UFLOAT:
         case Format::BC7_UNORM: case Format::BC7_SRGB: return true;
@@ -86,11 +90,12 @@ inline bool IsBlockCompressed(Format f) {
     }
 }
 
-// Bytes per 4x4 block for a BC format (0 for non-BC). BC1/BC4 = 8; BC5/BC6H/BC7 = 16.
+// Bytes per 4x4 block for a BC format (0 for non-BC). BC1/BC4 = 8; BC3/BC5/BC6H/BC7 = 16.
 inline u32 BlockBytes(Format f) {
     switch (f) {
         case Format::BC1_UNORM: case Format::BC1_SRGB:
         case Format::BC4_UNORM: return 8u;
+        case Format::BC3_UNORM: case Format::BC3_SRGB:
         case Format::BC5_UNORM: case Format::BC6H_UFLOAT:
         case Format::BC7_UNORM: case Format::BC7_SRGB: return 16u;
         default: return 0u;
@@ -111,6 +116,15 @@ inline void MipCopyRows(Format format, u32 w, u32 h, u32 bppUncompressed,
         rowBytes = static_cast<u64>(w) * bppUncompressed;
         rowCount = h;
     }
+}
+
+// Tight byte size of one `w x h` mip of `format` (block-aware). `bppUncompressed` is the
+// backend's bytes-per-pixel for the non-BC case (ignored for BC).
+inline u64 MipByteSize(Format format, u32 w, u32 h, u32 bppUncompressed) {
+    u64 rowBytes = 0;
+    u32 rowCount = 0;
+    MipCopyRows(format, w, h, bppUncompressed, rowBytes, rowCount);
+    return rowBytes * rowCount;
 }
 
 struct RenderDeviceDesc {
@@ -578,26 +592,22 @@ enum MaterialFlags : u32 {
     MaterialFlag_Water = 1u << 11,
 };
 
-// One mesh instance to draw with a metallic-roughness material.
+// One mesh instance to draw with an OpenPBR Surface material.
 struct DrawItem {
     MeshHandle mesh;
     glm::mat4  transform{1.0f};
-    glm::vec4  baseColor{1.0f};
-    f32        metallic  = 0.0f;
-    f32        roughness = 0.5f;
+    // Physically-based material VALUES (OpenPBR Surface parameter set). Textures below stay
+    // as bindless handles - SurfaceParams owns values only (see RHI/SurfaceMaterial.h). The
+    // GPU packer reads the legacy-equivalent fields (base_color/geometry_opacity/base_metalness/
+    // specular_roughness/subsurface_*/coat_*/emission_*) and emits the same ObjectConstants bytes.
+    SurfaceParams surface;
     // Bindless texture indices (0 = use the constant factor / no map).
     TextureHandle albedoTexture;
     TextureHandle normalTexture;
     TextureHandle mrTexture;   // glTF packing: B = metallic, G = roughness
     TextureHandle aoTexture;
     TextureHandle emissiveTexture;
-    glm::vec3  emissiveColor{0.0f};   // linear radiance added after lighting
-    f32        emissiveIntensity = 1.0f;
-    glm::vec3  subsurfaceColor{1.0f, 0.3f, 0.2f};
-    f32        subsurfaceRadius = 1.0f;    // scatter scale (curvature multiplier)
     TextureHandle thicknessTexture;        // back-light transmission thickness (0 = none)
-    f32        clearcoat = 0.0f;           // clearcoat lobe strength (0 = off; wet/sweat/varnish)
-    f32        clearcoatRoughness = 0.08f; // clear layer roughness (low = wet/glossy)
     u32        materialFlags = MaterialFlag_None;
 
     // Art Editor surface paint: a per-object paint canvas composited over the
@@ -1030,6 +1040,11 @@ public:
     // on the next respawn AND leak the old resource, so such a backend keeps the old
     // never-reclaim behaviour untouched until it implements real reclaim.
     virtual bool SupportsResourceReclaim() const { return false; }
+
+    // True when the backend can create/sample BC (block-compressed) textures. Core on D3D12;
+    // gated on the textureCompressionBC feature on Vulkan. When false, load-time variant
+    // resolution must fall back to the uncompressed .uaf (never hand a BC desc to CreateTexture).
+    virtual bool SupportsBlockCompression() const { return false; }
 
     // Builds a compute pipeline from a precompiled kernel. Invalid handle when
     // the shader is missing or the backend has no compute.

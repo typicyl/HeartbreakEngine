@@ -57,6 +57,10 @@ public:
     // without real reclaim keeps its resources cached instead of dropping-then-re-uploading.
     bool SupportsResourceReclaim() const;
 
+    // True when the backend can create/sample BC textures (core on D3D12, feature-gated on
+    // Vulkan). Load-time variant resolution uses this to decide whether to load a BC .uaf.
+    bool SupportsBlockCompression() const;
+
     // Register the distance-LOD chain for a base mesh (`base` == LOD0). `lods` are the already-
     // uploaded reduced levels in order of DECREASING detail (LOD1..N). Distance selection then
     // swaps a draw's handle to the coarsest level whose projected screen size still covers it.

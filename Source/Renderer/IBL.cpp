@@ -554,7 +554,7 @@ std::vector<Tri3> GatherSceneTris(const Scene& scene, const std::filesystem::pat
         // Tint the bounce by the surface's base colour (texture-average ignored).
         curAlbedo = glm::vec3(0.5f);
         if (const MeshInstance* mi = reg.try_get<const MeshInstance>(e))
-            curAlbedo = glm::clamp(glm::vec3(mi->baseColor), glm::vec3(0.0f), glm::vec3(1.0f));
+            curAlbedo = glm::clamp(glm::vec3(mi->surface.base_color), glm::vec3(0.0f), glm::vec3(1.0f));
         if (src.rfind("prim:", 0) == 0) {
             MeshData md = mesh::GeneratePrimitive(src.substr(5));
             if (!md.vertices.empty()) addMesh(md, world);
@@ -706,7 +706,7 @@ std::vector<BakeLight> GatherBakeLights(const Scene& scene) {
     }
     for (const entt::entity e : reg.view<const Transform, const MeshInstance>()) {
         const auto& mi = reg.get<const MeshInstance>(e);
-        const glm::vec3 em = mi.emissiveColor * mi.emissiveIntensity;
+        const glm::vec3 em = mi.surface.emission_color * mi.surface.emission_luminance;
         const f32 lum = glm::dot(em, glm::vec3(0.2126f, 0.7152f, 0.0722f));
         if (lum < 0.02f) continue;
         lights.push_back({glm::vec3(scene.WorldMatrix(e)[3]), em, glm::vec3(0, -1, 0), 2.5f,

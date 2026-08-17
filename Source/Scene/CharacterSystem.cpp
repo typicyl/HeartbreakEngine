@@ -74,10 +74,10 @@ void ApplyPartMaterial(Renderer& renderer, const fs::path& assetsDir, Cached& c,
         }
     }
     if (md) {
-        mi.baseColor = md->material.baseColor;
-        mi.metallic = md->material.metallic;
-        mi.roughness = md->material.roughness;
-        mi.emissiveColor = md->material.emissive;
+        mi.surface.base_color = md->material.baseColor;
+        mi.surface.base_metalness = md->material.metallic;
+        mi.surface.specular_roughness = md->material.roughness;
+        mi.surface.emission_color = md->material.emissive;
         const auto tex = [&](const std::string& rel) -> rhi::TextureHandle {
             if (rel.empty()) return {};
             if (const auto it = c.texCache.find(rel); it != c.texCache.end()) return it->second;
