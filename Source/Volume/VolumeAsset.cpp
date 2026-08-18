@@ -1,10 +1,11 @@
 // Source/Volume/VolumeAsset.cpp - see the header.
 #include "Volume/VolumeAsset.h"
 
+#include "Assets/VFS.h" // pack-aware reads (a shipped .hbvol lives inside a .uap)
 #include "Volume/VolumeFormat.h"
 
 #include <cstring>
-#include <fstream>
+#include <fstream> // ReadHbvolSourceHash (editor-side stale-bake check on a build-cache path)
 
 namespace hbe::volume {
 
@@ -77,14 +78,15 @@ bool VolumeAsset::Load(const std::uint8_t* data, std::size_t size) {
 }
 
 bool VolumeAsset::LoadFile(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) return false;
-    const std::streamsize n = f.tellg();
-    if (n <= 0) return false;
-    f.seekg(0);
-    std::vector<std::uint8_t> buf(static_cast<std::size_t>(n));
-    if (!f.read(reinterpret_cast<char*>(buf.data()), n)) return false;
-    return Load(buf.data(), buf.size());
+    // Pack-aware: a shipped build serves `.hbvol` from a mounted `.uap`, so the read MUST
+    // go through the VFS. A bare std::ifstream (what this used to be) cannot see inside a
+    // pack, so every packed volume silently failed to load in shipped builds - the exact
+    // "raw ifstream => vanished when packed" bug already fixed for .hbgi/.hbprobe/.hbfrac.
+    // vfs::ReadFile falls back to loose disk (editor / an absolute preview path) and to a
+    // filename search, so loose and packed both resolve.
+    if (auto bytes = vfs::ReadFile(std::filesystem::path(path)))
+        return Load(bytes->data(), bytes->size());
+    return false;
 }
 
 int VolumeAsset::FieldIndex(const std::string& name) const {

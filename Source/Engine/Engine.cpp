@@ -2519,8 +2519,18 @@ int Engine::Run(const EngineConfig& configIn) {
             bool fedVolume = false;
             for (const entt::entity e : scene.Registry().view<Transform, VolumeComponent>()) {
                 VolumeComponent& vc = scene.Registry().get<VolumeComponent>(e);
-                if (vc.cacheHandle == volume::VolumeCache::kInvalid && !vc.source.empty())
-                    vc.cacheHandle = vcache.Acquire(vc.source); // non-blocking; kicks async load
+                if (vc.cacheHandle == volume::VolumeCache::kInvalid && !vc.source.empty()) {
+                    // Resolve the Assets-relative source against the project's Assets/ dir so
+                    // the VFS resolves it straight to a mounted pack entry (a bare relative
+                    // path would only resolve via the slower filename fallback). Loose/editor
+                    // runs land on disk the same way.
+                    const std::string src =
+                        Project::HasActive()
+                            ? (Project::Active().AssetsDir() / std::filesystem::path(vc.source))
+                                  .string()
+                            : vc.source;
+                    vc.cacheHandle = vcache.Acquire(src); // non-blocking; kicks async load
+                }
                 // Advance the (serialized) playhead only when the sim is RUNNING (play mode / shipped
                 // runtime). In editor EDIT mode physics is stopped, so this stays frozen - otherwise
                 // idle editing + Save All would bake a non-deterministic vc.time into the .hbscene

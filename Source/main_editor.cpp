@@ -8,6 +8,9 @@
 //                         [--validation] [--model <path>]
 #include "Assets/AssetFormats.h" // --test-assetformats (the registry's own invariants)
 #include "Assets/Compression.h"  // --test-compress (the portable zstd/zlib codec seam)
+#include "Assets/MeshCodec.h"    // --test-meshcodec (quantized + meshopt geometry codec)
+#include "Assets/UAF.h"          // --test-audiocodec (v11 compressed-source audio)
+#include "Assets/CookStats.h"    // --cook-stats / --test-cookstats (why is this build big?)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
 #include "Assets/MaterialXInterop.h" // --test-openpbr (.hbmat/.mtlx round-trip + variant routing)
 #include "Assets/SeamWeld.h"
@@ -474,6 +477,42 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-slotids") == 0) {
             const bool ok = hbe::slots::SlotIdSelfTest();
             std::printf("slotids %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-uapv5: the v5 PACK-FORMAT gate. Cooks a synthetic corpus (with a
+        // byte-identical pair) and proves round-trip decode, aligned blob offsets, the
+        // per-entry content hash, within-pack dedup, deterministic re-cook (byte-
+        // identical packs = patchability), and that a legacy v4 pack still opens.
+        // Headless; builds/deletes its own temp. Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-uapv5") == 0) {
+            const bool ok = hbe::uap::PackSelfTest();
+            std::printf("uapv5 %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-meshcodec: the v10 GEOMETRY-CODEC gate. Round-trips static + skinned
+        // geometry through quantize + meshopt encode/decode and asserts positions within
+        // the quant epsilon, indices exact, tangent handedness + joints exact, weights
+        // sum to ~1, and deterministic bytes. Headless. Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-meshcodec") == 0) {
+            const bool ok = hbe::meshcodec::SelfTest();
+            std::printf("meshcodec %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-audiocodec: the v11 AUDIO gate. Proves the .uaf stores the compressed
+        // SOURCE (not decoded PCM), decodes back on load, survives a metadata read-modify-
+        // write, and that legacy raw-PCM assets still round-trip. Headless (synthesizes a
+        // WAV, no file needed). Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-audiocodec") == 0) {
+            const bool ok = hbe::uaf::AudioSelfTest();
+            std::printf("audiocodec %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-cookstats: the cook-analysis gate. Synthesizes a tiny project, runs the
+        // "why is this build big" report, and asserts it renders with categories + dedup.
+        // Headless. Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-cookstats") == 0) {
+            const bool ok = hbe::cookstats::SelfTest();
+            std::printf("cookstats %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-vfxstack: prove the VFX attribute model + module-stack core
@@ -1373,6 +1412,29 @@ int main(int argc, char** argv) {
                         dryRun ? "DRY RUN (nothing written)" : "done",
                         st.files, st.stamped, st.already, st.failed);
             return st.failed == 0 ? 0 : 1;
+        }
+    }
+
+    // --cook-stats: cook the open project's Assets into a TEMP dir and print where the
+    // bytes go (per-type source vs packed size + ratio, dedup savings, pack sizes, the
+    // largest assets). Read-only w.r.t. the project (uses a copy of the slot ledger).
+    // Answers "why is this game N GB" with data. Requires --project.
+    {
+        bool wantStats = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--cook-stats") == 0) wantStats = true;
+        if (wantStats) {
+            if (!hbe::Project::HasActive()) {
+                std::printf("--cook-stats requires --project <file.hbproj>\n");
+                return 1;
+            }
+            const hbe::Project& proj = hbe::Project::Active();
+            std::string text;
+            const bool ok = hbe::cookstats::Report(proj.AssetsDir(), proj.SlotManifestPath(),
+                                                   proj.Settings().name, text);
+            if (ok) std::printf("%s\n", text.c_str());
+            else std::printf("cook-stats: cook failed (see log).\n");
+            return ok ? 0 : 1;
         }
     }
 

@@ -1,9 +1,16 @@
 // Assets/UAF.cpp
 #include "Assets/UAF.h"
+#include "Assets/MeshCodec.h" // v10 quantized + meshopt-encoded geometry blocks
 #include "Assets/VFS.h"
 #include "Core/BinaryStream.h"
 #include "Core/Log.h"
 
+// miniaudio decoder - declarations only; MINIAUDIO_IMPLEMENTATION (the WAV/MP3/FLAC
+// decoders) lives in Audio/AudioSystem.cpp, in the same static library. Used to decode a
+// v11 asset's stored compressed source back into PCM at load time.
+#include <miniaudio.h>
+
+#include <cmath>
 #include <cstring>
 
 namespace {
@@ -255,8 +262,13 @@ bool ReadMeshPayload(BinaryReader& r, u32 version, Model* outModel, Rig* outRig)
     r.Pod(count);
     for (u32 i = 0; i < count; ++i) {
         MeshData md;
-        if (version >= 5) {
+        if (version >= 10) {
+            // v10: quantized + meshopt-encoded geometry, dequantized back to the exact
+            // 72-byte Vertex here (static meshes get zeroed skinning).
+            if (!meshcodec::ReadGeometry(r, md.vertices, md.indices)) return false;
+        } else if (version >= 5) {
             r.Vec(md.vertices);
+            r.Vec(md.indices);
         } else {
             // v1-v4: convert packed legacy vertices (skinning fields default).
             std::vector<LegacyVertex> legacy;
@@ -268,8 +280,8 @@ bool ReadMeshPayload(BinaryReader& r, u32 version, Model* outModel, Rig* outRig)
                 md.vertices[v].tangent = legacy[v].tangent;
                 md.vertices[v].uv = legacy[v].uv;
             }
+            r.Vec(md.indices);
         }
-        r.Vec(md.indices);
         if (!ReadMaterial(r, md.material, version)) return false;
         r.Str(md.name);
         // v8: blendshape / morph targets. Read unconditionally (not only when
@@ -296,8 +308,12 @@ bool ReadMeshPayload(BinaryReader& r, u32 version, Model* outModel, Rig* outRig)
             if (!r.Ok()) return false;
             for (u32 l = 0; l < lodCount; ++l) {
                 MeshLod lod;
-                r.Vec(lod.vertices);
-                r.Vec(lod.indices);
+                if (version >= 10) {
+                    if (!meshcodec::ReadGeometry(r, lod.vertices, lod.indices)) return false;
+                } else {
+                    r.Vec(lod.vertices);
+                    r.Vec(lod.indices);
+                }
                 if (!r.Ok()) return false;
                 md.lods.push_back(std::move(lod));
             }
@@ -321,26 +337,27 @@ bool WriteMesh(const std::filesystem::path& path, const Model& model, u64 guid,
     WriteHeader(w, AssetType::Mesh, guid);
     w.Pod(static_cast<u32>(model.size()));
     for (const MeshData& md : model) {
-        w.Vec(md.vertices);
-        w.Vec(md.indices);
+        // v10: quantized + meshopt-encoded geometry (was a raw 72-byte Vertex dump).
+        // Vertices are NOT reordered by the codec, so the morph deltas below stay
+        // index-parallel.
+        meshcodec::WriteGeometry(w, md.vertices, md.indices);
         WriteMaterial(w, md.material);
         w.Str(md.name);
-        // v8: blendshapes. The importer has always produced these (ModelLoader
-        // converts aiAnimMesh absolute positions to deltas); until v8 they were
-        // never written, so scene::BuildMorphAtlas had nothing to build from.
+        // v8: blendshapes. Kept RAW - deltas are not unit vectors (oct-encoding is wrong
+        // for them), they are index-parallel to the vertices, and they appear on few
+        // meshes. The importer has always produced these (ModelLoader converts aiAnimMesh
+        // absolute positions to deltas).
         w.Pod(static_cast<u32>(md.morphTargets.size()));
         for (const MorphTarget& mt : md.morphTargets) {
             w.Str(mt.name);
             w.Vec(mt.posDelta);
             w.Vec(mt.nrmDelta);
         }
-        // v9: distance LODs (0 for meshes with none). Written after morphs so a v8
-        // reader stops cleanly at the morph block and a v9 reader picks these up.
+        // v9/v10: distance LODs. Each LOD is a compact geometry block too (LODs are
+        // always static - skinned meshes are excluded from LOD generation - so this is a
+        // pure win). Written after morphs so the trailing rig stays aligned.
         w.Pod(static_cast<u32>(md.lods.size()));
-        for (const MeshLod& lod : md.lods) {
-            w.Vec(lod.vertices);
-            w.Vec(lod.indices);
-        }
+        for (const MeshLod& lod : md.lods) meshcodec::WriteGeometry(w, lod.vertices, lod.indices);
     }
     const u32 hasRig = (rig && rig->Valid()) ? 1u : 0u;
     w.Pod(hasRig);
@@ -387,6 +404,38 @@ const char* ToString(AudioKind k) {
     return "SFX";
 }
 
+namespace {
+// v11 storage-mode selector, written after speaker (0 = raw PCM, 1 = compressed source).
+constexpr u32 kAudioStorePcm = 0;
+constexpr u32 kAudioStoreSource = 1;
+
+// Decodes compressed source bytes (wav/mp3/flac) to interleaved 16-bit PCM via miniaudio,
+// filling channels/sampleRate from the stream. Mirrors the importer's decode, but from a
+// memory buffer at load time. Returns false on an undecodable/empty source.
+bool DecodeAudioSource(const std::vector<u8>& src, u32& channels, u32& sampleRate,
+                       std::vector<u8>& pcm) {
+    if (src.empty()) return false;
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
+    ma_decoder dec;
+    if (ma_decoder_init_memory(src.data(), src.size(), &cfg, &dec) != MA_SUCCESS) return false;
+    channels = dec.outputChannels;
+    sampleRate = dec.outputSampleRate;
+    const ma_uint64 kChunkFrames = 8192;
+    std::vector<i16> chunk(static_cast<usize>(kChunkFrames) * (channels ? channels : 1));
+    for (;;) {
+        ma_uint64 got = 0;
+        if (ma_decoder_read_pcm_frames(&dec, chunk.data(), kChunkFrames, &got) != MA_SUCCESS ||
+            got == 0)
+            break;
+        const u8* b = reinterpret_cast<const u8*>(chunk.data());
+        pcm.insert(pcm.end(), b, b + static_cast<usize>(got) * channels * sizeof(i16));
+        if (got < kChunkFrames) break;
+    }
+    ma_decoder_uninit(&dec);
+    return !pcm.empty();
+}
+} // namespace
+
 bool WriteAudio(const std::filesystem::path& path, const Audio& audio, u64 guid) {
     BinaryWriter w;
     WriteHeader(w, AssetType::Audio, guid);
@@ -396,7 +445,17 @@ bool WriteAudio(const std::filesystem::path& path, const Audio& audio, u64 guid)
     w.Pod(static_cast<u32>(audio.kind)); // v6
     w.Str(audio.caption);                // v6
     w.Str(audio.speaker);                // v7
-    w.Vec(audio.pcm);
+    // v11: store the compressed SOURCE when we have it (much smaller than decoded PCM);
+    // otherwise fall back to raw PCM exactly as v7 did (procedurally-generated clips, and
+    // the reference test fixtures, have no source file).
+    if (!audio.encoded.empty()) {
+        w.Pod<u32>(kAudioStoreSource);
+        w.Pod<u32>(audio.encodedFormat);
+        w.Vec(audio.encoded);
+    } else {
+        w.Pod<u32>(kAudioStorePcm);
+        w.Vec(audio.pcm);
+    }
     if (!w.SaveToFile(path)) {
         HBE_ERROR("UAF: failed to write audio '{}'.", path.string());
         return false;
@@ -444,9 +503,138 @@ std::optional<Audio> ReadAudio(const std::filesystem::path& path) {
         r.Str(a.caption);
     }
     if (version >= 7) r.Str(a.speaker); // caption speaker name
-    r.Vec(a.pcm);
+    if (version >= 11) {
+        u32 mode = kAudioStorePcm;
+        r.Pod(mode);
+        if (mode == kAudioStoreSource) {
+            r.Pod(a.encodedFormat);
+            r.Vec(a.encoded);
+            if (!r.Ok()) return std::nullopt;
+            u32 ch = a.channels, sr = a.sampleRate;
+            if (!DecodeAudioSource(a.encoded, ch, sr, a.pcm)) {
+                HBE_ERROR("UAF: failed to decode stored audio source in '{}'.", path.string());
+                return std::nullopt;
+            }
+            a.channels = ch;
+            a.sampleRate = sr;
+            a.bitsPerSample = 16; // miniaudio decodes to signed-16 PCM
+        } else {
+            r.Vec(a.pcm);
+        }
+    } else {
+        r.Vec(a.pcm); // v1-v10: raw PCM
+    }
     if (!r.Ok()) return std::nullopt;
     return a;
+}
+
+// ---------------------------------------------------------------------------
+// Audio self-test (--test-audiocodec)
+// ---------------------------------------------------------------------------
+namespace {
+void PutLE(std::vector<u8>& b, u32 v, int bytes) {
+    for (int i = 0; i < bytes; ++i) b.push_back(static_cast<u8>((v >> (8 * i)) & 0xFF));
+}
+// A minimal PCM WAV (RIFF) around interleaved 16-bit samples - a valid source miniaudio
+// decodes, so the test needs no real audio file on disk.
+std::vector<u8> MakeWav(u32 channels, u32 sampleRate, const std::vector<i16>& samples) {
+    const u32 dataBytes = static_cast<u32>(samples.size() * sizeof(i16));
+    std::vector<u8> b;
+    b.insert(b.end(), {'R', 'I', 'F', 'F'});
+    PutLE(b, 36 + dataBytes, 4);
+    b.insert(b.end(), {'W', 'A', 'V', 'E', 'f', 'm', 't', ' '});
+    PutLE(b, 16, 4);                                   // fmt chunk size
+    PutLE(b, 1, 2);                                    // PCM
+    PutLE(b, channels, 2);
+    PutLE(b, sampleRate, 4);
+    PutLE(b, sampleRate * channels * 2, 4);            // byte rate
+    PutLE(b, channels * 2, 2);                         // block align
+    PutLE(b, 16, 2);                                   // bits per sample
+    b.insert(b.end(), {'d', 'a', 't', 'a'});
+    PutLE(b, dataBytes, 4);
+    const u8* s = reinterpret_cast<const u8*>(samples.data());
+    b.insert(b.end(), s, s + dataBytes);
+    return b;
+}
+} // namespace
+
+bool AudioSelfTest() {
+    u32 fails = 0;
+    const auto check = [&](bool ok, const char* what) {
+        if (!ok) { HBE_ERROR("audiocodec: FAIL - {}", what); ++fails; }
+    };
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "hbe_audiocodec_test";
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    // 0.25s stereo sine as the "source" WAV.
+    const u32 ch = 2, sr = 22050;
+    std::vector<i16> samples(sr / 4 * ch);
+    for (u32 i = 0; i < sr / 4; ++i) {
+        const i16 s = static_cast<i16>(std::sin(i * 0.1f) * 12000.0f);
+        samples[i * 2] = s;
+        samples[i * 2 + 1] = static_cast<i16>(-s);
+    }
+    const std::vector<u8> wav = MakeWav(ch, sr, samples);
+
+    // v11 encoded-source path: WriteAudio must store the ENCODED bytes, NOT the (here
+    // deliberately huge) PCM, and ReadAudio must decode the source back to PCM.
+    {
+        Audio a;
+        a.encoded = wav;
+        a.encodedFormat = 1; // wav
+        a.kind = AudioKind::Voiceline;
+        a.caption = "hello";
+        a.speaker = "Nyx";
+        a.pcm.assign(1u << 20, 0); // 1 MB dummy that must NOT be written to disk
+        const std::filesystem::path p = dir / "clip.uaf";
+        check(WriteAudio(p, a, 0x55), "WriteAudio (encoded) must succeed");
+        const u64 fileSize = std::filesystem::file_size(p, ec);
+        check(fileSize < wav.size() + 4096, "the .uaf must store the SOURCE, not the 1 MB PCM");
+
+        const std::optional<Audio> back = ReadAudio(p);
+        check(back.has_value(), "ReadAudio must succeed");
+        if (back) {
+            check(back->channels == ch && back->sampleRate == sr, "metadata survives");
+            check(back->kind == AudioKind::Voiceline && back->caption == "hello" &&
+                      back->speaker == "Nyx",
+                  "kind/caption/speaker survive");
+            check(!back->pcm.empty(), "source decoded back to PCM on load");
+            check(back->encoded == wav, "the source bytes are preserved for re-save");
+            // read-modify-write (the editor's caption edit) must keep the compact form.
+            Audio edit = *back;
+            edit.caption = "changed";
+            const std::filesystem::path p2 = dir / "clip2.uaf";
+            check(WriteAudio(p2, edit, 0x55), "re-save after metadata edit");
+            check(std::filesystem::file_size(p2, ec) < wav.size() + 4096,
+                  "re-save must stay compact (source preserved, not re-stored as PCM)");
+            const std::optional<Audio> back2 = ReadAudio(p2);
+            check(back2 && back2->caption == "changed" && !back2->pcm.empty(),
+                  "edited metadata + decodable audio after re-save");
+        }
+    }
+
+    // Legacy raw-PCM path (no source): still round-trips.
+    {
+        Audio a;
+        a.channels = ch;
+        a.sampleRate = sr;
+        a.bitsPerSample = 16;
+        const u8* s = reinterpret_cast<const u8*>(samples.data());
+        a.pcm.assign(s, s + samples.size() * sizeof(i16));
+        const std::filesystem::path p = dir / "raw.uaf";
+        check(WriteAudio(p, a, 0x66), "WriteAudio (raw PCM) must succeed");
+        const std::optional<Audio> back = ReadAudio(p);
+        check(back && back->pcm == a.pcm && back->encoded.empty(),
+              "legacy raw-PCM asset round-trips unchanged");
+    }
+
+    std::filesystem::remove_all(dir, ec);
+    if (fails == 0)
+        HBE_INFO("audiocodec: passed (stores compressed source, decodes on load, metadata "
+                 "read-modify-write, raw-PCM back-compat).");
+    return fails == 0;
 }
 
 } // namespace hbe::uaf

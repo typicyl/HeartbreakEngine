@@ -8,14 +8,22 @@
 // others - untouched packs stay byte-identical across updates - and the next
 // imported asset fills the lowest free slot.
 //
-// Per-pack layout (version 3):
-//   "UAP1" | u32 version | u32 slotCount | u32 algorithm (0 = stored)
-//   slotCount * [ u32 pathLen | path bytes (UTF-8, '/') | u64 offset
-//                 | u64 storedSize | u64 rawSize ]
-//   blobs (offsets are absolute file positions; empty slots have pathLen 0).
-// An entry with storedSize == rawSize is stored verbatim; otherwise the blob
-// is compressed with the pack's algorithm (Windows Compression API). Version 2
-// packs (no algorithm field, single size) still load.
+// Per-pack layout (version 5):
+//   "UAP1" | u32 version | u32 slotCount | u32 codec | u32 alignment
+//   slotCount * [ u32 pathLen | path bytes (UTF-8, '/', scrambled) | u64 offset
+//                 | u64 storedSize | u64 rawSize | u64 contentHash ]
+//   padding to `alignment`, then blobs (each blob offset is aligned to `alignment`).
+// `codec` is a PORTABLE comp::Codec id (0 stored, 1 zstd, 2 zlib, 3 legacy LZMS), NOT a
+// Windows API constant - so the format carries no OS dependency. An entry with
+// storedSize == rawSize is stored verbatim; otherwise the blob is `codec`-compressed.
+// `contentHash` is comp::Hash64 over the RAW bytes: it drives WITHIN-PACK dedup (two
+// byte-identical slots point at ONE physical blob) and optional load-time integrity.
+//
+// Blobs are aligned so a pack can be memory-mapped and handed to the decoder / GPU
+// upload without a bounce copy. Older packs still load: v4 (scrambled paths, LZMS via
+// the Windows API), v3 (algorithm+rawSize), v2 (single size, always stored). Reading a
+// v2-v4 LZMS pack needs the Windows Compression API and therefore only works on Windows;
+// re-cook to get portable zstd packs that load anywhere.
 #pragma once
 
 #include "Core/Types.h"
@@ -33,8 +41,13 @@ inline constexpr char kMagic[4] = {'U', 'A', 'P', '1'};
 // v4: entry path strings are obfuscated on disk (reversible scramble) so a shipped
 // pack doesn't reveal asset filenames to a casual hex-dump. v2/v3 (plaintext) still
 // load. NOT encryption - just a datamining deterrent.
-inline constexpr u32 kVersion = 4;
+// v5: PORTABLE codec id (was the Windows COMPRESS_ALGORITHM_* enum value) + per-entry
+// content hash + aligned blobs + within-pack content dedup. Reads v2/v3/v4.
+inline constexpr u32 kVersion = 5;
 inline constexpr u32 kSlotsPerPack = 50;
+// Blob alignment (bytes) for v5 packs: 16 is enough for SIMD/DMA-friendly mapped reads
+// while wasting at most 15 bytes per stored blob. Recorded in the header.
+inline constexpr u32 kBlobAlignment = 16;
 
 // Which pack file a slot lands in, and where inside it. The ONLY definition of
 // "50 per pack"; kSlotsPerPack is also written into every pack header and
@@ -48,6 +61,7 @@ struct Entry {
     u64 offset = 0;
     u64 size = 0;     // stored (possibly compressed) byte count
     u64 rawSize = 0;  // decompressed byte count (== size when stored verbatim)
+    u64 contentHash = 0; // comp::Hash64 over raw bytes (v5+; 0 for older packs)
     u32 slot = 0;     // global slot index
 };
 
@@ -55,7 +69,9 @@ struct PackBuildResult {
     u32 assetCount = 0;
     u32 packCount = 0;
     u64 rawBytes = 0;    // total input size
-    u64 packedBytes = 0; // total stored size (after compression)
+    u64 packedBytes = 0; // total stored size (after compression + dedup)
+    u64 dedupedBytes = 0;// raw bytes eliminated by within-pack content dedup
+    u32 dedupedCount = 0;// number of slots that shared an earlier identical blob
 };
 
 // An extra file packed under a chosen virtual path, sourced from anywhere on
@@ -103,8 +119,15 @@ private:
     std::filesystem::path file_;
     std::vector<Entry> entries_;
     std::unordered_map<std::string, usize> index_;
-    u32 algorithm_ = 0; // Windows COMPRESS_ALGORITHM_* id (0 = stored)
+    u32 codec_ = 0; // resolved comp::Codec id for this pack (portable; 0 = stored)
 };
+
+// --test-uapv5: the v5 format gate. Cooks a synthetic asset set (with byte-identical
+// duplicates) into real packs and asserts: every entry round-trips through decode, blob
+// offsets are aligned, the per-entry content hash matches, duplicates are deduped to one
+// physical blob, re-cooking is byte-identical (determinism/patchability), and a v4
+// (stored) pack still opens under the v5 reader. Headless; builds/deletes its own temp.
+bool PackSelfTest();
 
 // Aggregates every `<baseName>_<n>.uap` chunk in a directory.
 class PackSet {

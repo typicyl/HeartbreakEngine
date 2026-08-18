@@ -2,21 +2,13 @@
 #include "Assets/UAP.h"
 
 #include "Assets/AssetFormats.h" // the single source of truth for packable types
+#include "Assets/Compression.h"  // the portable (zstd/zlib/legacy-LZMS) codec seam
 #include "Assets/SlotIds.h"      // the asset's OWN pack slot (authority tier 1)
 
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
 
 #include <atomic>
-
-#ifndef WIN32_LEAN_AND_MEAN
-#  define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#  define NOMINMAX
-#endif
-#include <windows.h>
-#include <compressapi.h> // Windows Compression API (Cabinet.lib)
 
 #include <algorithm>
 #include <cstring>
@@ -30,36 +22,23 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// Pack compression algorithm: LZMS maximizes ratio (decompression is still
-// fast); the id is stored in the pack header so readers stay in sync.
-constexpr u32 kCompressionAlgorithm = COMPRESS_ALGORITHM_LZMS;
+// The portable codec new packs are cooked with. zstd decodes far faster than the old
+// LZMS at a comparable ratio and, unlike LZMS, has no OS dependency - so a v5 pack loads
+// on any platform. (See Assets/Compression.h for the codec seam and why.)
+constexpr comp::Codec kCookCodec = comp::Codec::Zstd;
 
-std::optional<std::vector<u8>> CompressBytes(const std::vector<u8>& input, u32 algorithm) {
-    COMPRESSOR_HANDLE comp = nullptr;
-    if (!::CreateCompressor(algorithm, nullptr, &comp)) return std::nullopt;
-    SIZE_T needed = 0;
-    ::Compress(comp, input.data(), input.size(), nullptr, 0, &needed);
-    std::vector<u8> out(needed);
-    SIZE_T written = 0;
-    const bool ok =
-        ::Compress(comp, input.data(), input.size(), out.data(), out.size(), &written);
-    ::CloseCompressor(comp);
-    if (!ok) return std::nullopt;
-    out.resize(written);
-    return out;
-}
+// Round `n` up to the next multiple of `a` (a must be a power of two).
+constexpr u64 AlignUp(u64 n, u64 a) { return (n + (a - 1)) & ~(a - 1); }
 
-std::optional<std::vector<u8>> DecompressBytes(const std::vector<u8>& input, u64 rawSize,
-                                               u32 algorithm) {
-    DECOMPRESSOR_HANDLE decomp = nullptr;
-    if (!::CreateDecompressor(algorithm, nullptr, &decomp)) return std::nullopt;
-    std::vector<u8> out(static_cast<usize>(rawSize));
-    SIZE_T written = 0;
-    const bool ok = ::Decompress(decomp, input.data(), input.size(), out.data(),
-                                 out.size(), &written);
-    ::CloseDecompressor(decomp);
-    if (!ok || written != rawSize) return std::nullopt;
-    return out;
+// Maps a pack's stored codec field to a portable comp::Codec, honouring the version:
+//   v5+ : the field already IS a comp::Codec id.
+//   v3/4: the field is a Windows COMPRESS_ALGORITHM_* value - 0 means stored, anything
+//         else was LZMS (the only algorithm ever written), read-only on Windows.
+//   v2  : no field; always stored verbatim.
+comp::Codec ResolveCodec(u32 version, u32 field) {
+    if (version >= 5) return static_cast<comp::Codec>(field);
+    if (version >= 3) return field == 0 ? comp::Codec::None : comp::Codec::LzmsWin;
+    return comp::Codec::None;
 }
 
 // Reversible obfuscation of a stored entry path (v4+): XOR each byte with a
@@ -282,7 +261,7 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
     const u32 packCount = maxSlot / kSlotsPerPack + 1;
 
     fs::create_directories(outDir, ec);
-    const u32 algorithm = options.compress ? kCompressionAlgorithm : 0;
+    const comp::Codec codec = options.compress ? kCookCodec : comp::Codec::None;
     PackBuildResult result;
     result.assetCount = static_cast<u32>(files.size());
     result.packCount = packCount;
@@ -309,7 +288,9 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
     }
     struct Blob {
         u64 rawSize = 0;
+        u64 hash = 0;           // comp::Hash64 over the RAW bytes (dedup + integrity)
         std::vector<u8> stored; // file bytes, possibly compressed
+        bool compressed = false;// true when `stored` is codec-compressed (size < raw)
         bool ok = true;
     };
     std::vector<Blob> loaded(items.size());
@@ -330,11 +311,17 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
             b.stored.resize(static_cast<usize>(size));
             in.read(reinterpret_cast<char*>(b.stored.data()), size);
             b.rawSize = static_cast<u64>(size);
-            if (algorithm != 0) {
-                // Keep the original when compression doesn't shrink it.
-                if (auto packed = CompressBytes(b.stored, algorithm);
+            // Hash the RAW bytes: compression-independent, so it is stable across a
+            // re-cook and is what within-pack dedup keys on.
+            b.hash = comp::Hash64(b.stored.data(), b.stored.size());
+            if (codec != comp::Codec::None) {
+                // Keep the original when compression doesn't shrink it (this also skips
+                // storing a larger blob for already-compressed content like BC textures,
+                // meshopt-encoded geometry or compressed audio).
+                if (auto packed = comp::Compress(codec, b.stored.data(), b.stored.size());
                     packed && packed->size() < b.stored.size()) {
                     b.stored = std::move(*packed);
+                    b.compressed = true;
                 }
             }
         }
@@ -346,38 +333,72 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
     for (usize i = 0; i < items.size(); ++i) {
         blobIndexBySlot[items[i].slot] = i;
         result.rawBytes += loaded[i].rawSize;
-        result.packedBytes += loaded[i].stored.size();
     }
+
+    // v5 header: magic(4) + version + slotCount + codec + alignment = 4 + 4*u32.
+    constexpr u64 kHeaderSize = 4 + 4 * sizeof(u32);
+    // v5 TOC record: pathLen(u32) + path + offset(u64) + storedSize(u64) + rawSize(u64)
+    //                + contentHash(u64).
+    const auto tocRecordSize = [](usize pathLen) -> u64 {
+        return sizeof(u32) + pathLen + 4 * sizeof(u64);
+    };
 
     for (u32 p = 0; p < packCount; ++p) {
         const fs::path packFile = outDir / (baseName + "_" + std::to_string(p) + ".uap");
 
-        // Load (and optionally compress) this chunk's blobs, then lay out the
-        // TOC from the stored sizes.
+        // Lay out this chunk's TOC + blobs. Blobs are aligned; a blob whose RAW content
+        // matches an EARLIER slot IN THIS SAME pack is DEDUPED - its TOC entry points at
+        // the earlier blob and its bytes are written once. Dedup is confined to one pack
+        // file so each pack stays self-contained and byte-identical across cooks (the
+        // patchability contract - deleting an asset never perturbs another pack).
         struct SlotEntry {
             std::string path;
             u64 offset = 0;
+            u64 storedSize = 0; // stored (possibly compressed) byte count
             u64 rawSize = 0;
-            std::vector<u8> stored; // file bytes, possibly compressed
+            u64 hash = 0;
+            bool deduped = false;    // shares an earlier slot's blob (bytes not re-written)
+            const std::vector<u8>* bytes = nullptr; // owning blob (null for empty/deduped)
         };
         std::vector<SlotEntry> chunk(kSlotsPerPack);
-        u64 tocSize = 4 + 3 * sizeof(u32);
+        u64 tocSize = kHeaderSize;
         for (u32 s = 0; s < kSlotsPerPack; ++s) {
             SlotEntry& e = chunk[s];
             if (auto it = bySlot.find(p * kSlotsPerPack + s); it != bySlot.end()) {
                 e.path = it->second;
-                // Bytes were read + compressed in the parallel pass above.
                 Blob& b = loaded[blobIndexBySlot.at(p * kSlotsPerPack + s)];
+                e.storedSize = b.stored.size();
                 e.rawSize = b.rawSize;
-                e.stored = std::move(b.stored);
+                e.hash = b.hash;
+                e.bytes = &b.stored;
             }
-            tocSize += sizeof(u32) + e.path.size() + 3 * sizeof(u64);
+            tocSize += tocRecordSize(e.path.size());
         }
-        u64 offset = tocSize;
-        for (SlotEntry& e : chunk) {
+
+        // Assign aligned offsets in slot order, deduping identical content within the
+        // pack. `byHash` maps a content hash to the FIRST slot index that placed it.
+        std::unordered_map<u64, u32> byHash;
+        u64 cursor = AlignUp(tocSize, kBlobAlignment);
+        for (u32 s = 0; s < kSlotsPerPack; ++s) {
+            SlotEntry& e = chunk[s];
             if (e.path.empty()) continue;
-            e.offset = offset;
-            offset += e.stored.size();
+            if (auto it = byHash.find(e.hash); it != byHash.end()) {
+                const SlotEntry& first = chunk[it->second];
+                // Hash match: confirm byte-identity before sharing (collision-safe).
+                if (first.storedSize == e.storedSize && first.rawSize == e.rawSize &&
+                    e.bytes && first.bytes && *e.bytes == *first.bytes) {
+                    e.offset = first.offset;
+                    e.deduped = true;
+                    result.dedupedBytes += e.rawSize;
+                    ++result.dedupedCount;
+                    continue;
+                }
+            }
+            e.offset = cursor;
+            cursor += e.storedSize;
+            cursor = AlignUp(cursor, kBlobAlignment);
+            result.packedBytes += e.storedSize;
+            byHash.emplace(e.hash, s);
         }
 
         std::ofstream out(packFile, std::ios::binary | std::ios::trunc);
@@ -391,22 +412,36 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
         out.write(kMagic, 4);
         pod(kVersion);
         pod(kSlotsPerPack);
-        pod(algorithm);
+        pod(static_cast<u32>(codec));
+        pod(kBlobAlignment);
         for (const SlotEntry& e : chunk) {
             pod(static_cast<u32>(e.path.size()));
             if (!e.path.empty()) {
-                std::string scrambled = e.path; // obfuscate on disk (v4); reader decodes
+                std::string scrambled = e.path; // obfuscate on disk (v4+); reader decodes
                 ScramblePath(scrambled);
                 out.write(scrambled.data(), static_cast<std::streamsize>(scrambled.size()));
             }
             pod(e.offset);
-            pod(static_cast<u64>(e.stored.size()));
+            pod(e.storedSize);
             pod(e.rawSize);
+            pod(e.hash);
         }
+        // Blob region: write each NON-deduped blob at its aligned offset, padding the gap
+        // from the current position. Offsets increase monotonically for non-deduped
+        // blobs (assigned in slot order), so a single forward pass with zero-padding
+        // reproduces the layout exactly - and pack bytes stay deterministic.
+        u64 pos = tocSize;
+        static const u8 kZero[kBlobAlignment] = {};
         for (const SlotEntry& e : chunk) {
-            if (e.path.empty()) continue;
-            out.write(reinterpret_cast<const char*>(e.stored.data()),
-                      static_cast<std::streamsize>(e.stored.size()));
+            if (e.path.empty() || e.deduped) continue;
+            if (e.offset > pos) {
+                out.write(reinterpret_cast<const char*>(kZero),
+                          static_cast<std::streamsize>(e.offset - pos));
+                pos = e.offset;
+            }
+            out.write(reinterpret_cast<const char*>(e.bytes->data()),
+                      static_cast<std::streamsize>(e.storedSize));
+            pos += e.storedSize;
         }
     }
 
@@ -428,12 +463,18 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
         }
     }
 
-    HBE_INFO("UAP: packed {} assets into {} pack(s) of {} slots ('{}_N.uap'){}.",
+    HBE_INFO("UAP: packed {} assets into {} pack(s) of {} slots ('{}_N.uap'){}{}.",
              result.assetCount, result.packCount, kSlotsPerPack, baseName,
              options.compress
-                 ? " at " + std::to_string(result.rawBytes ? result.packedBytes * 100 /
-                                                                 result.rawBytes
-                                                           : 100) + "% of source size"
+                 ? " with " + std::string(comp::ToString(codec)) + " at " +
+                       std::to_string(result.rawBytes ? result.packedBytes * 100 /
+                                                            result.rawBytes
+                                                      : 100) +
+                       "% of source size"
+                 : "",
+             result.dedupedCount
+                 ? " (deduped " + std::to_string(result.dedupedCount) + " slot(s), saving " +
+                       std::to_string(result.dedupedBytes / 1024) + " KB)"
                  : "");
     return result;
 }
@@ -465,8 +506,20 @@ bool PackReader::Open(const fs::path& packFile) {
                   packFile.string(), count, kSlotsPerPack);
         return false;
     }
-    algorithm_ = 0;
-    if (version >= 3) pod(algorithm_);
+    u32 codecField = 0;
+    if (version >= 3) pod(codecField); // v3/4: Windows algorithm; v5: portable comp::Codec
+    u32 alignment = 1;
+    if (version >= 5) pod(alignment); // recorded for validation / mmap consumers
+    (void)alignment;
+    codec_ = static_cast<u32>(ResolveCodec(version, codecField));
+    // A pack we cannot decode (a legacy LZMS pack on a non-Windows build) must fail to
+    // mount loudly rather than hand back garbage on the first Read.
+    if (!comp::CanDecode(static_cast<comp::Codec>(codec_))) {
+        HBE_ERROR("UAP: '{}' uses codec {} which this build cannot decode. Re-cook the "
+                  "packs to get portable zstd.", packFile.string(),
+                  comp::ToString(static_cast<comp::Codec>(codec_)));
+        return false;
+    }
 
     for (u32 i = 0; i < count; ++i) {
         u32 len = 0;
@@ -476,7 +529,7 @@ bool PackReader::Open(const fs::path& packFile) {
         e.slot = i;
         e.path.resize(len);
         if (len) in.read(e.path.data(), len);
-        if (len && version >= 4) ScramblePath(e.path); // de-obfuscate v4 paths
+        if (len && version >= 4) ScramblePath(e.path); // de-obfuscate v4+ paths
         pod(e.offset);
         pod(e.size);
         if (version >= 3) {
@@ -484,6 +537,7 @@ bool PackReader::Open(const fs::path& packFile) {
         } else {
             e.rawSize = e.size; // v2: always stored verbatim
         }
+        if (version >= 5) pod(e.contentHash);
         if (!in) return false;
         if (e.path.empty()) continue; // free slot
         index_[e.path] = entries_.size();
@@ -504,7 +558,8 @@ std::optional<std::vector<u8>> PackReader::Read(const std::string& relPath) cons
     in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(e.size));
     if (!in) return std::nullopt;
     if (e.size == e.rawSize) return bytes; // stored verbatim
-    auto raw = DecompressBytes(bytes, e.rawSize, algorithm_);
+    auto raw = comp::Decompress(static_cast<comp::Codec>(codec_), bytes.data(), bytes.size(),
+                                e.rawSize);
     if (!raw) {
         HBE_ERROR("UAP: failed to decompress '{}' from '{}'.", relPath, file_.string());
     }
@@ -553,6 +608,175 @@ std::optional<std::vector<u8>> PackSet::Read(const std::string& relPath) const {
         if (r.Contains(relPath)) return r.Read(relPath);
     }
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Self-test (--test-uapv5)
+// ---------------------------------------------------------------------------
+namespace {
+
+bool WriteFileBytes(const fs::path& p, const std::vector<u8>& b) {
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    if (!b.empty()) out.write(reinterpret_cast<const char*>(b.data()),
+                              static_cast<std::streamsize>(b.size()));
+    return static_cast<bool>(out);
+}
+
+std::vector<u8> ReadFileBytes(const fs::path& p) {
+    std::ifstream in(p, std::ios::binary | std::ios::ate);
+    if (!in) return {};
+    const std::streamsize n = in.tellg();
+    in.seekg(0);
+    std::vector<u8> b(static_cast<usize>(n));
+    if (n) in.read(reinterpret_cast<char*>(b.data()), n);
+    return b;
+}
+
+// Hand-builds a minimal v4 (pre-portable) pack with ONE stored entry, to prove the v5
+// reader still opens legacy packs. Stored (algorithm 0) so it needs no Windows LZMS.
+bool WriteLegacyV4Pack(const fs::path& packFile, const std::string& path,
+                       const std::vector<u8>& payload) {
+    std::vector<u8> toc;
+    const auto putU32 = [&](u32 v) {
+        const u8* b = reinterpret_cast<const u8*>(&v);
+        toc.insert(toc.end(), b, b + 4);
+    };
+    const auto putU64 = [&](u64 v) {
+        const u8* b = reinterpret_cast<const u8*>(&v);
+        toc.insert(toc.end(), b, b + 8);
+    };
+    // TOC size: header(16) + 50 * (u32 pathLen + path + 3*u64). Only slot 0 occupied.
+    u64 tocSize = 16;
+    for (u32 s = 0; s < kSlotsPerPack; ++s)
+        tocSize += 4 + (s == 0 ? path.size() : 0) + 3 * 8;
+    std::ofstream out(packFile, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(kMagic, 4);
+    putU32(4);              // version
+    putU32(kSlotsPerPack);  // slotCount
+    putU32(0);              // algorithm 0 = stored
+    for (u32 s = 0; s < kSlotsPerPack; ++s) {
+        if (s == 0) {
+            putU32(static_cast<u32>(path.size()));
+            std::string scr = path;
+            ScramblePath(scr); // v4 scrambles paths
+            toc.insert(toc.end(), scr.begin(), scr.end());
+            putU64(tocSize);                         // offset
+            putU64(payload.size());                  // size (stored)
+            putU64(payload.size());                  // rawSize == size
+        } else {
+            putU32(0);
+            putU64(0);
+            putU64(0);
+            putU64(0);
+        }
+    }
+    out.write(reinterpret_cast<const char*>(toc.data()),
+              static_cast<std::streamsize>(toc.size()));
+    if (!payload.empty())
+        out.write(reinterpret_cast<const char*>(payload.data()),
+                  static_cast<std::streamsize>(payload.size()));
+    return static_cast<bool>(out);
+}
+
+} // namespace
+
+bool PackSelfTest() {
+    u32 fails = 0;
+    const auto check = [&](bool ok, const char* what) {
+        if (!ok) { HBE_ERROR("uapv5: FAIL - {}", what); ++fails; }
+    };
+
+    std::error_code ec;
+    const fs::path dir = fs::temp_directory_path() / "hbe_uapv5_test";
+    fs::remove_all(dir, ec);
+    const fs::path assets = dir / "Assets";
+    const fs::path outA = dir / "outA";
+    const fs::path outB = dir / "outB";
+    const fs::path manifest = dir / "test.uapmanifest";
+    fs::create_directories(assets, ec);
+    fs::create_directories(outA, ec);
+    fs::create_directories(outB, ec);
+
+    // A corpus with a byte-identical PAIR (dupe1/dupe2 -> within-pack dedup), a unique
+    // compressible blob, a unique incompressible blob, and an empty file. `.uaf` so the
+    // packable-extension test accepts them; the content is arbitrary (the cook never
+    // parses it, and slots::ReadSlot treats a bad header as "no embedded id").
+    std::vector<u8> dup(20000);
+    for (usize i = 0; i < dup.size(); ++i) dup[i] = static_cast<u8>((i * 131 + 7) & 0xFF);
+    std::vector<u8> compressible(40000, 0xCD);
+    std::vector<u8> noise(30000);
+    { u32 s = 99; for (u8& b : noise) { s = s * 1664525u + 1013904223u; b = static_cast<u8>(s >> 24); } }
+
+    struct Item { const char* name; std::vector<u8> bytes; };
+    std::vector<Item> items = {
+        {"a_dupe1.uaf", dup},
+        {"b_dupe2.uaf", dup}, // identical to a_dupe1 -> must dedup
+        {"c_flat.uaf", compressible},
+        {"d_noise.uaf", noise},
+        {"e_empty.uaf", {}},
+    };
+    for (const Item& it : items)
+        check(WriteFileBytes(assets / it.name, it.bytes), "write source asset");
+
+    // Cook (compressed).
+    WriteOptions opt;
+    opt.compress = true;
+    auto res = WritePacks(outA, "T", assets, manifest, opt);
+    check(res.has_value(), "WritePacks must succeed");
+    if (!res) { fs::remove_all(dir, ec); return false; }
+    check(res->assetCount == items.size(), "asset count matches the corpus");
+    check(res->dedupedCount >= 1, "the identical pair must be deduped");
+    check(res->dedupedBytes >= dup.size(), "dedup savings must count the shared blob");
+
+    // Read every asset back and byte-compare; check content hash + alignment.
+    PackSet set;
+    check(set.Open(outA, "T"), "PackSet must open the cooked packs");
+    for (const Item& it : items) {
+        auto got = set.Read(it.name);
+        check(got.has_value(), "each asset must read back");
+        if (got) check(*got == it.bytes, "round-trip bytes must match the source");
+    }
+    // Offsets aligned, and the stored hash matches the raw content.
+    for (const Entry& e : set.Entries()) {
+        check(e.offset % kBlobAlignment == 0, "every blob offset must be aligned");
+        auto got = set.Read(e.path);
+        if (got)
+            check(e.contentHash == comp::Hash64(got->data(), got->size()),
+                  "stored content hash must match the raw bytes");
+    }
+
+    // Determinism / patchability: a second cook (same manifest) is byte-identical.
+    auto res2 = WritePacks(outB, "T", assets, manifest, opt);
+    check(res2.has_value(), "second cook must succeed");
+    if (res2) {
+        for (u32 p = 0; p < res->packCount; ++p) {
+            const auto a = ReadFileBytes(outA / ("T_" + std::to_string(p) + ".uap"));
+            const auto b = ReadFileBytes(outB / ("T_" + std::to_string(p) + ".uap"));
+            check(!a.empty() && a == b, "re-cook must produce byte-identical packs");
+        }
+    }
+
+    // Legacy v4 (stored) pack must still open + read under the v5 reader.
+    {
+        const fs::path legacyDir = dir / "legacy";
+        fs::create_directories(legacyDir, ec);
+        std::vector<u8> payload(1234);
+        for (usize i = 0; i < payload.size(); ++i) payload[i] = static_cast<u8>(i & 0xFF);
+        check(WriteLegacyV4Pack(legacyDir / "L_0.uap", "old/thing.uaf", payload),
+              "hand-write a v4 pack");
+        PackReader r;
+        check(r.Open(legacyDir / "L_0.uap"), "v5 reader must open a v4 pack");
+        auto got = r.Read("old/thing.uaf");
+        check(got && *got == payload, "v4 stored entry must read back unchanged");
+    }
+
+    fs::remove_all(dir, ec);
+    if (fails == 0)
+        HBE_INFO("uapv5: passed (dedup, content hash, blob alignment, deterministic re-cook, "
+                 "v4 back-compat).");
+    return fails == 0;
 }
 
 } // namespace hbe::uap

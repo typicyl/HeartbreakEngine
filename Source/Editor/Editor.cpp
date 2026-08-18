@@ -19316,7 +19316,6 @@ bool Editor::BuildShipping(std::string& outMessage) {
     }
     namespace fs = std::filesystem;
     std::error_code ec;
-    const std::string& name = Project::Active().Settings().name;
     const fs::path dst = Project::Active().Root() / "Build";
 
     // Compute (and REPORT) the dependency closure FIRST - before Build/ is wiped
@@ -19440,9 +19439,16 @@ bool Editor::BuildShipping(std::string& outMessage) {
 
     // 2) DLLs. Native deps link statically and the MSVC runtime is /MT (static), so a
     //    shipped build normally needs NO DLLs. Copy any that are genuinely present, but
-    //    SKIP the MSVC redistributable DLLs (in case a stale copy lingers in the build
-    //    dir) and the dead HeartbreakEngine.Managed.dll (removed C# scripting) - so the
-    //    shipped folder stays just the exe + packs.
+    //    SKIP DLLs the RUNTIME does not link:
+    //      - the MSVC redistributable family (in case a stale copy lingers in the dir),
+    //      - the dead HeartbreakEngine.Managed.dll (removed C# scripting),
+    //      - the MaterialX DLLs (MaterialXCore/Format/GenShader). MaterialX is EDITOR-ONLY:
+    //        it converts .mtlx <-> .hbmat at IMPORT time and is shared (its own PugiXML must
+    //        stay internal - see cmake/Dependencies.cmake). It is staged next to the editor
+    //        exes, which share this bin/<config> dir with the runtime, so a blanket DLL copy
+    //        scooped them into the ship. The shipped game links ZERO MaterialX and never
+    //        reads a .mtlx, so there is nothing to embed - it simply must not ship.
+    //    Result: the shipped folder stays just the exe + packs.
     for (const auto& it : fs::directory_iterator(runtimeDir, ec)) {
         if (!it.is_regular_file() || it.path().extension() != ".dll") continue;
         std::string lower = it.path().filename().string();
@@ -19452,7 +19458,9 @@ bool Editor::BuildShipping(std::string& outMessage) {
                                  lower.rfind("vcruntime140", 0) == 0 ||
                                  lower.rfind("concrt140", 0) == 0 ||
                                  lower.rfind("vccorlib140", 0) == 0;
-        if (msvcRuntime || lower == "heartbreakengine.managed.dll") continue;
+        const bool editorOnly =
+            lower.rfind("materialx", 0) == 0 || lower == "heartbreakengine.managed.dll";
+        if (msvcRuntime || editorOnly) continue;
         ok &= copy(it.path(), dst / it.path().filename());
     }
 
@@ -19471,20 +19479,26 @@ bool Editor::BuildShipping(std::string& outMessage) {
     extras.push_back({"__project.hbproj", Project::Active().ProjectFile()});
 
     options.extras = &extras;
+    // Shipped packs are named by a FIXED base name, not the game/project name. The
+    // runtime finds and mounts its packs by scanning the exe dir for `*.uap` and
+    // stripping the `_<n>` suffix (Engine::Run bootstrap), so the base name is free to
+    // be anything - it never has to match the game. A constant keeps every shipped title
+    // opaque and uniform on disk (and makes a hex-dump reveal nothing about the game).
+    static constexpr const char* kShipPackBase = "StuffAndThings";
     // NOTE the line that is NOT here: `options.compact = true`. It used to
     // discard the slot assignment and re-derive dense slots 0..N-1 in sorted-path
     // order, which meant the shipped packs were reshuffled by any asset whose
     // path sorted early - shipped pack stability was exactly zero, and every
     // update was a full re-download. Slots now come from the assets themselves
     // (Assets/SlotIds.h), so unchanged packs stay byte-identical.
-    const auto packed = uap::WritePacks(dst, name, Project::Active().AssetsDir(),
+    const auto packed = uap::WritePacks(dst, kShipPackBase, Project::Active().AssetsDir(),
                                         Project::Active().SlotManifestPath(), options);
     ok &= packed.has_value();
     if (packed) {
         // Verify the cooked packs read back (exercises decompression too) and
         // that the folded-in runtime files survived the round trip.
         uap::PackSet set;
-        bool verified = set.Open(dst, name) && set.AssetCount() == packed->assetCount;
+        bool verified = set.Open(dst, kShipPackBase) && set.AssetCount() == packed->assetCount;
         if (verified) {
             const std::vector<uap::Entry> entries = set.Entries();
             const auto bytes = set.Read(entries.front().path);

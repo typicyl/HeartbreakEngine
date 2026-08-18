@@ -32,7 +32,21 @@ inline constexpr char kMagic[4] = {'U', 'A', 'F', '1'};
 //     by mesh::BuildLodChain and shipped ALONGSIDE the full-detail geometry - LOD0 is
 //     the submesh itself. Version-gated: every v1-v8 asset still loads (no LODs);
 //     re-import (or --generate-mesh-lods) to add them.
-inline constexpr u32 kVersion = 9; // v9: Mesh carries distance LODs
+// v10: Mesh geometry is QUANTIZED + meshopt-CODEC-encoded (Assets/MeshCodec) instead of a
+//     raw 72-byte-Vertex dump - ~4-6x smaller AND platform-independent (the raw struct
+//     dump was endianness/ABI coupled). Base geometry AND every LOD use the compact block;
+//     static meshes drop the 24 always-zero skinning bytes. Morph deltas + the rig stay
+//     raw (deltas are not unit vectors; both are small and correctness-sensitive). On load
+//     the block is dequantized back into the EXACT 72-byte Vertex, so no RHI/shader change.
+//     Version-gated: every v1-v9 asset still loads (raw path). Quantization is lossy, so an
+//     upgrade re-round-trips through it - acceptable for shipping geometry.
+// v11: Audio stores the COMPRESSED SOURCE bytes (mp3/flac/wav) instead of decoded raw PCM
+//     - a 3-min stereo track was ~31 MB of PCM; the mp3/flac source is ~3-4 MB. A storage-
+//     mode byte after the caption/speaker selects encoded-source vs raw-PCM, so v1-v10
+//     PCM assets still load. ReadAudio decodes the source back into `pcm` on load (via
+//     miniaudio), so every consumer of Audio::pcm is unchanged; the Audio struct also
+//     keeps the source bytes so an editor metadata edit re-saves without re-encoding.
+inline constexpr u32 kVersion = 11; // v11: audio stores compressed source (decoded on load)
 
 // A `.uaf` header optionally carries the asset's PACK SLOT (see Assets/SlotIds.h)
 // as a u32 right after the guid. Its presence is a FLAG BIT on the version word,
@@ -74,7 +88,13 @@ struct Audio {
     AudioKind kind = AudioKind::Sfx; // SFX / Music / Ambience / Voiceline
     std::string caption;             // accessibility caption (voicelines)
     std::string speaker;             // v7: character name; shown as "Speaker: caption"
-    std::vector<u8> pcm; // interleaved PCM samples
+    std::vector<u8> pcm; // interleaved PCM samples (the runtime plays this)
+    // v11: the compressed SOURCE bytes (mp3/flac/wav). When non-empty, WriteAudio stores
+    // THESE (mp3/flac are ~8-10x smaller than decoded PCM) and ReadAudio decodes them back
+    // into `pcm` at load. Kept in the struct so an editor metadata edit (read-modify-write)
+    // re-saves the compact form without needing an encoder. Empty => legacy raw-PCM asset.
+    std::vector<u8> encoded;
+    u32 encodedFormat = 0; // hint only: 0 unknown/auto, 1 wav, 2 mp3, 3 flac
 };
 
 // A mesh asset stores a hbe::Model (one or more submeshes + materials).
@@ -109,5 +129,10 @@ std::optional<Audio> ReadAudio(const std::filesystem::path& path);
 bool WriteFont(const std::filesystem::path& path, const std::vector<u8>& ttf,
                u64 guid = 0);
 std::optional<std::vector<u8>> ReadFont(const std::filesystem::path& path);
+
+// --test-audiocodec: proves the v11 compressed-source path stores the ENCODED bytes (not
+// the decoded PCM), decodes back to PCM on load, preserves metadata across a read-modify-
+// write, and that a legacy raw-PCM asset still round-trips. Headless (synthesizes a WAV).
+bool AudioSelfTest();
 
 } // namespace hbe::uaf

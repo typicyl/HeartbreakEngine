@@ -44,6 +44,8 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/UAF.cpp"
     "Source/Assets/UAP.cpp"
     "Source/Assets/Compression.cpp"
+    "Source/Assets/MeshCodec.cpp"
+    "Source/Assets/CookStats.cpp"
     "Source/Assets/VFS.cpp"
     "Source/Assets/MaterialAsset.cpp"
     "Source/Assets/AcousticMaterial.cpp"

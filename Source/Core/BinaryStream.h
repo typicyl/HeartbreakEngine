@@ -4,6 +4,7 @@
 #include "Core/Types.h"
 
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -14,6 +15,15 @@
 #include <vector>
 
 namespace hbe {
+
+// The engine's binary asset FORMAT is little-endian by contract (every format header says
+// so). Pod/Vec below are raw memcpy with no byte-swap, so a big-endian build would misread
+// every mesh/texture/pack. Make that an ENFORCED, documented invariant instead of a silent
+// trap: a big-endian port must deliberately add a byte-swap layer here. (All current and
+// planned targets - x64, ARM64, the consoles - are little-endian, so this always holds.)
+static_assert(std::endian::native == std::endian::little,
+              "Heartbreak's binary asset format is little-endian; a big-endian target must "
+              "add byte-swapping to BinaryReader/BinaryWriter before this build is valid.");
 
 // Appends POD values, strings and vectors to an in-memory byte buffer.
 class BinaryWriter {

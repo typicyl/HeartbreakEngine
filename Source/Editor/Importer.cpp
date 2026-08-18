@@ -10,6 +10,7 @@
 #include "Editor/TextureCompress.h" // import-time BC texture compression (opt-in)
 #include "Assets/SlotIds.h" // the pack slot is assigned HERE, at import
 #include "Assets/UAF.h"
+#include "Core/BinaryStream.h" // --test-upgrade writes a genuine legacy v9 .uaf fixture
 #include "Core/Log.h"
 #include "Project/Project.h"
 #include "RHI/RHI.h"
@@ -514,44 +515,47 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
     return uaf::WriteMesh(out, *model, GenGuid(), rig.Valid() ? &rig : nullptr);
 }
 
-// Decodes any miniaudio-supported source (WAV / MP3 / FLAC) to interleaved 16-bit
-// PCM and writes it to a `.uaf`. The engine's asset format is raw PCM, so the
-// compressed source is fully decoded here at import time.
+// Stores the COMPRESSED SOURCE bytes (WAV / MP3 / FLAC) in the `.uaf`, not decoded PCM:
+// an mp3/flac source is ~8-10x smaller on disk than its decoded PCM, and the runtime
+// decodes back to PCM on load (uaf::ReadAudio). The source is validated (and its channel
+// count / sample rate read) by opening a decoder over the bytes - no full decode needed
+// at import. WAV sources are already-uncompressed PCM, so they don't shrink at this layer,
+// but the pack's zstd handles those; the big win is the compressed formats.
 bool ImportAudio(const fs::path& src, const fs::path& out) {
-    // Decode to signed-16 PCM, keeping the source's native channel count + rate.
+    std::ifstream in(src, std::ios::binary | std::ios::ate);
+    if (!in) {
+        HBE_ERROR("Importer: cannot open audio '{}'.", src.string());
+        return false;
+    }
+    const std::streamsize size = in.tellg();
+    in.seekg(0);
+    std::vector<u8> bytes(static_cast<usize>(size));
+    if (size) in.read(reinterpret_cast<char*>(bytes.data()), size);
+    if (bytes.empty()) {
+        HBE_ERROR("Importer: audio '{}' is empty.", src.string());
+        return false;
+    }
+
+    // Validate + read metadata by opening a decoder over the source bytes.
     ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
     ma_decoder dec;
-    if (ma_decoder_init_file_w(src.wstring().c_str(), &cfg, &dec) != MA_SUCCESS) {
+    if (ma_decoder_init_memory(bytes.data(), bytes.size(), &cfg, &dec) != MA_SUCCESS) {
         HBE_ERROR("Importer: cannot decode audio '{}' (unsupported/corrupt).", src.string());
         return false;
     }
-    const u32 channels = dec.outputChannels;
-    // Stream the whole file out in chunks (MP3 can't always report length up front).
-    const ma_uint64 kChunkFrames = 8192;
-    std::vector<i16> chunk(static_cast<usize>(kChunkFrames) * channels);
-    std::vector<u8> pcm;
-    for (;;) {
-        ma_uint64 got = 0;
-        if (ma_decoder_read_pcm_frames(&dec, chunk.data(), kChunkFrames, &got) != MA_SUCCESS ||
-            got == 0) {
-            break;
-        }
-        const u8* b = reinterpret_cast<const u8*>(chunk.data());
-        pcm.insert(pcm.end(), b, b + static_cast<usize>(got) * channels * sizeof(i16));
-        if (got < kChunkFrames) break;
-    }
-
     uaf::Audio audio;
-    audio.channels = channels;
+    audio.channels = dec.outputChannels;
     audio.sampleRate = dec.outputSampleRate;
     audio.bitsPerSample = 16;
-    audio.pcm = std::move(pcm);
     ma_decoder_uninit(&dec);
-
-    if (audio.channels == 0 || audio.sampleRate == 0 || audio.pcm.empty()) {
-        HBE_ERROR("Importer: '{}' decoded to no audio.", src.string());
+    if (audio.channels == 0 || audio.sampleRate == 0) {
+        HBE_ERROR("Importer: '{}' has no decodable audio.", src.string());
         return false;
     }
+
+    const std::string e = LowerExt(src);
+    audio.encodedFormat = (e == ".wav") ? 1u : (e == ".mp3") ? 2u : (e == ".flac") ? 3u : 0u;
+    audio.encoded = std::move(bytes); // WriteAudio stores this (v11), decoded on load
     return uaf::WriteAudio(out, audio, GenGuid());
 }
 
@@ -729,26 +733,51 @@ bool UpgradeSelfTest() {
             md.indices.insert(md.indices.end(), {i0, i2, i1, i1, i2, i3});
         }
     const u64 guid = 0x1234ABCDu;
-    check(uaf::WriteMesh(meshPath, Model{md}, guid), "WriteMesh must succeed");
+    // Write a GENUINE v9 mesh (raw 72-byte-Vertex geometry - the pre-v10 layout). Since
+    // v10 changed the on-disk GEOMETRY encoding (quantized + meshopt), a "stale" fixture
+    // can no longer be faked by patching the version byte of a current file: the reader
+    // would use the v9 raw path on v10-encoded bytes. Emitting real v9 bytes exercises the
+    // actual in-place v9 -> v10 migration users hit on project open. This mirrors the v9
+    // WriteMesh/ReadMaterial layout exactly (single static submesh, no morphs/LODs/rig).
+    const auto writeLegacyV9 = [](const fs::path& path, const MeshData& sm, u64 g) {
+        BinaryWriter w;
+        w.Bytes("UAF1", 4);
+        w.Pod<u32>(9u | 0x80000000u);   // v9 payload, slot-field reserved (uaf::kSlotFlag)
+        w.Pod<u32>(2u);                 // uaf::AssetType::Mesh
+        w.Pod<u64>(g);
+        w.Pod<u32>(0xFFFFFFFFu);        // slots::kUnassigned (StampAsset fills it in)
+        w.Pod<u32>(1u);                 // one submesh
+        w.Vec(sm.vertices);             // v5+ raw vertices
+        w.Vec(sm.indices);
+        w.Pod(sm.material.baseColor);   // v4 material field set
+        w.Pod(sm.material.metallic);
+        w.Pod(sm.material.roughness);
+        w.Str(sm.material.name);
+        w.Str(sm.material.baseColorTex);
+        w.Str(sm.material.normalTex);
+        w.Str(sm.material.mrTex);
+        w.Str(sm.material.aoTex);
+        w.Pod(sm.material.emissive);
+        w.Str(sm.material.emissiveTex);
+        w.Str(sm.material.materialAsset);
+        w.Str(sm.name);
+        w.Pod<u32>(0u);                 // morph targets
+        w.Pod<u32>(0u);                 // distance LODs
+        w.Pod<u32>(0u);                 // hasRig
+        return w.SaveToFile(path);
+    };
+    check(writeLegacyV9(meshPath, md, guid), "write a genuine v9 mesh fixture");
     const u32 slot = slots::StampAsset(dir, manifest, meshPath); // assign + embed a pack slot
     check(slot != slots::kUnassigned, "the fixture mesh must get a pack slot");
     // DELETE the manifest so the test proves the EMBEDDED slot (tier-1) is preserved on its own -
     // the exact fresh-clone / missing-manifest condition the wipe-then-restamp bug renumbered under.
     fs::remove(manifest, ec);
 
-    // Patch the payload version (low byte of the version word at offset 4) down one, so the file
-    // reads as out-of-date without changing anything else.
-    {
-        std::fstream f(meshPath, std::ios::in | std::ios::out | std::ios::binary);
-        f.seekp(4);
-        const u8 older = static_cast<u8>(uaf::kVersion - 1);
-        f.write(reinterpret_cast<const char*>(&older), 1);
-    }
     uaf::AssetType ty = uaf::AssetType::Unknown;
     u32 ver = 0;
     u64 g = 0;
-    check(uaf::PeekHeader(meshPath, ty, ver, g) && ver == uaf::kVersion - 1 && g == guid,
-          "patched mesh must peek as one version old with its guid intact");
+    check(uaf::PeekHeader(meshPath, ty, ver, g) && ver == 9 && g == guid,
+          "the fixture must peek as v9 with its guid intact");
 
     const UpgradeReport rep = UpgradeAssets(dir, manifest);
     check(rep.meshesUpgraded == 1, "exactly one mesh must be upgraded");
