@@ -143,6 +143,29 @@ public:
         g.count = static_cast<u32>(batches.size());
     }
 
+    // GPU-DRIVEN GRASS for this frame: a compute-written blade buffer (`bladeCount` blades
+    // of 6 verts each). Deferred like SetGpuParticles - forwarded inside RenderScene,
+    // cleared after one frame. Call AFTER queueing the grass-generation compute (QueueCompute)
+    // and BEFORE RenderScene.
+    void SetGrass(rhi::GpuBufferHandle blades, u32 bladeCount) {
+        grassBlades_ = blades;
+        grassBladeCount_ = bladeCount;
+        grassArgs_ = {};
+    }
+
+    // GPU-DRIVEN GRASS, INDIRECT/COMPACTED variant (opt-in true GPU-driven path). `blades` is
+    // the compacted buffer + `args` the {6,instanceCount,0,0} draw-arg buffer the compaction
+    // compute filled. Forwarded like SetGrass; the device issues ExecuteIndirect /
+    // vkCmdDrawIndirect. Only takes effect where SupportsIndirectDraw() is true.
+    void SetGrassIndirect(rhi::GpuBufferHandle blades, rhi::GpuBufferHandle args, u32 maxBlades) {
+        grassBlades_ = blades;
+        grassArgs_ = args;
+        grassBladeCount_ = maxBlades;
+    }
+
+    // True when the active backend can draw the indirect/compacted grass path.
+    bool SupportsIndirectDraw() const { return device_ && device_->SupportsIndirectDraw(); }
+
     // Baked NanoVDB volume for this frame (the RUNTIME volume path). `density` is a raw NanoVDB blob
     // (streamed from a .hbvol by VolumeCache, or hand-built for tests); `temperature` is an OPTIONAL
     // second grid (same frame/bounds) driving the emission glow - pass nullptr/0 for grey smoke. Call
@@ -268,6 +291,9 @@ private:
     };
     GpuParticleGroup particleGpuGroups_[rhi::kMaxGpuParticleGroups]{};
     u32 particleGpuGroupCount_ = 0;
+    rhi::GpuBufferHandle grassBlades_{};          // GPU grass blade buffer (one frame)
+    u32 grassBladeCount_ = 0;
+    rhi::GpuBufferHandle grassArgs_{};            // indirect draw args (valid = indirect path)
     rhi::SceneView previewView_;                  // editor asset preview
     std::vector<rhi::DrawItem> previewItems_;     // (consumed each frame)
     bool previewPending_ = false;

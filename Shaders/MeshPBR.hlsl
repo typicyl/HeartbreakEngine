@@ -120,13 +120,35 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 
     VSOutput o;
     float4 posWS = mul(model, float4(posOS, 1.0f));
+    float4 prevPosWS = mul(prevModel, float4(prevPosOS, 1.0f));
+
+    // VEGETATION WIND (gated by HBE_MAT_WIND): sway the vertex in world space, stiffer at
+    // the base (quadratic in height above the instance origin) with a higher-frequency
+    // leaf flutter on top. Applied to the previous position too so the sway itself emits no
+    // motion-vector smear. VS-only; a single branch that is false for every non-vegetation
+    // draw, so nothing else changes.
+    if ((gMaterialFlags & HBE_MAT_WIND) != 0u)
+    {
+        const float3 originWS = mul(model, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+        const float h = max(posWS.y - originWS.y, 0.0f);
+        const float2 wdir = normalize(gWeather1.xy + float2(1e-4f, 0.0f));
+        const float wind = clamp(length(gWeather1.xy) * 30.0f + 0.35f, 0.35f, 1.6f);
+        const float t = gWeather.w;
+        const float phase = posWS.x * 0.25f + posWS.z * 0.25f;
+        const float bend = sin(t * 1.3f + phase) * 0.6f + sin(t * 2.7f + phase * 1.7f) * 0.4f;
+        const float flutter = sin(t * 6.0f + phase * 4.0f) * 0.15f;
+        const float2 disp = wdir * (wind * (h * h * 0.0026f * bend + h * 0.012f * flutter));
+        posWS.xz += disp;
+        prevPosWS.xz += disp;
+    }
+
     o.positionWS = posWS.xyz;
     o.positionCS = mul(gViewProj, posWS);
     o.normalWS   = normalize(mul((float3x3)normalMat, nrmOS));
     o.tangentWS  = float4(normalize(mul((float3x3)model, tanOS)), input.tangentOS.w);
     o.uv         = input.uv;
     o.curClip    = o.positionCS;
-    o.prevClip   = mul(gPrevViewProj, mul(prevModel, float4(prevPosOS, 1.0f)));
+    o.prevClip   = mul(gPrevViewProj, prevPosWS);
     o.positionOS = posOS; // object space (post-skin) for box paint projection
     o.normalOS   = nrmOS;
     return o;
@@ -177,14 +199,8 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     float3 Fdiel = FresnelSchlickF90(VdotH, dielF0, F90);
     float3 Ft    = Fdiel;
     float3 specular;
-    if ((gMaterialFlags & HBE_MAT_CLOTH) != 0u)
-    {
-        // Fabric: Charlie sheen NDF + Neubelt visibility (soft grazing-angle
-        // fuzz) instead of GGX, with an achromatic sheen tint.
-        specular = D_Charlie(roughness, NdotH) * V_Neubelt(NdotV, NdotL)
-                 * (0.3f * radiance * NdotL);
-    }
-    else if ((gMaterialFlags & HBE_MAT_HAIR) != 0u)
+#if HBE_FEAT_HAIR
+    if ((gMaterialFlags & HBE_MAT_HAIR) != 0u)
     {
         // Kajiya-Kay anisotropic HAIR: the highlight is a STREAK across the strand
         // direction, not a round dot. Two shifted specular lobes - a sharp, white
@@ -204,14 +220,43 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
         specular = (primary + secondary) * Ft * radiance * NdotL;
     }
     else
+#endif
     {
         // OpenPBR base: one GGX lobe whose Fresnel blends the dielectric response (Fdiel) with the
         // F82-tint metal response by metalness. metallic 0 + white specular_color == the old look.
         float3 Fmetal = FresnelF82Tint(VdotH, albedo, gMatExt.specular_color);
         Ft = lerp(Fdiel, Fmetal, metallic);
-        float Dt = DistributionGGX(NdotH, roughness);
-        float Gt = GeometrySmith(NdotV, NdotL, roughness);
+#if HBE_FEAT_THINFILM
+        // OpenPBR thin-film iridescence: replace the specular Fresnel with the interference
+        // reflectance of a thin film (soap bubble / oil slick / anodised metal), blended by weight.
+        // thin_film_thickness is authored in micrometres -> nm for the Belcour optical-path math.
+        // Feeds both the GGX specular below AND kdDirect (diffuse energy split) so energy stays coupled.
+        if (gMatExt.thin_film_weight > 0.0f)
+        {
+            float3 F0iri = lerp(dielF0, albedo, metallic);
+            float3 Firi  = EvalIridescence(1.0f, gMatExt.thin_film_ior, VdotH,
+                                           gMatExt.thin_film_thickness * 1000.0f, F0iri);
+            Ft = lerp(Ft, Firi, saturate(gMatExt.thin_film_weight));
+        }
+#endif
+#if HBE_FEAT_ANISO
+        // Anisotropic GGX (brushed metal): stretch the highlight along the tangent frame, rotated by
+        // specular_anisotropy_rotation. Reduces to isotropic GGX at anisotropy 0. Smith G stays the
+        // isotropic approximation (a common real-time simplification).
+        float3 Taw = normalize(tangentWS - N * dot(tangentWS, N));
+        float3 Baw = cross(N, Taw);
+        float  aRot = gMatExt.specular_anisotropy_rotation * 6.2831853f;
+        float3 Ta = Taw * cos(aRot) + Baw * sin(aRot);
+        float3 Ba = cross(N, Ta);
+        float  at, ab;
+        AnisoAlpha(roughness, gMatExt.specular_roughness_anisotropy, at, ab);
+        float  Dt = DistributionGGXAniso(NdotH, dot(Ta, Hv), dot(Ba, Hv), at, ab);
+#else
+        float  Dt = DistributionGGX(NdotH, roughness);
+#endif
+        float  Gt = GeometrySmith(NdotV, NdotL, roughness);
         specular = (Dt * Gt * Ft) / max(4.0f * NdotV * NdotL, EPSILON) * radiance * NdotL;
+#if HBE_FEAT_SUBSURFACE
         if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u)
         {
             // Skin has a DUAL specular lobe: a tight highlight sitting on a broad, soft
@@ -225,32 +270,40 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
             float3 broad = (Db * Gb * Ft) / max(4.0f * NdotV * NdotL, EPSILON) * radiance * NdotL;
             specular = lerp(specular, broad, 0.35f);
         }
+#endif
     }
 
     // OpenPBR diffuse shape: energy-preserving Oren-Nayar (base_diffuse_roughness); sigma 0 == Lambert.
     float3 diffuseResponse = OrenNayarDiffuse(NdotL, NdotV, dot(L, V), gMatExt.base_diffuse_roughness).xxx;
     float3 transmission = 0.0f.xxx;
-    if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u)
+#if HBE_FEAT_SUBSURFACE
+    // OpenPBR subsurface: a pre-integrated (NOT random-walk) diffusion approximation of the wrapped,
+    // reddened terminator bleed. subsurface_weight BLENDS it with the glossy-diffuse base (legacy
+    // HBE_MAT_SUBSURFACE with no authored weight -> full weight); subsurface_radius_scale is a
+    // PER-CHANNEL mean-free-path so red bleeds past the terminator where green/blue stop (the skin
+    // look); subsurface_scatter_anisotropy (Henyey-Greenstein g) biases the back-lit transmission
+    // toward forward (g>0) or back (g<0) scatter. Wrap width is driven by the UNIFORM material radius
+    // (NOT screen-space curvature) so it can't speckle per-facet at the terminator.
+    float sssW = gMatExt.subsurface_weight;
+    if ((gMaterialFlags & HBE_MAT_SUBSURFACE) != 0u && sssW <= 0.0f) sssW = 1.0f;
+    if (sssW > 0.0f)
     {
-        // Pre-integrated subsurface scattering: the LUT gives the soft, reddened
-        // wrap of light around the terminator (curvature drives how far it
-        // bleeds). Falls back to a wrapped diffuse if the LUT is unavailable.
-        // Wrapped, reddened subsurface diffuse. Light bleeds a LITTLE past the terminator
-        // (the soft skin look) and the transition band picks up the blood-scatter tint -
-        // but the FORM is kept (the dark side stays dark). This is a pre-integrated wrap,
-        // NOT a wash: the LUT path over-scattered at every curvature and flattened the
-        // sphere, so this analytic model replaces it. The wrap width is driven by the
-        // UNIFORM material radius (NOT screen-space fwidth curvature) so it can't speckle
-        // per-facet at the terminator the way the derivative-based curvature did.
-        const float sWrap = 0.20f + gSubsurfaceRadius * 0.10f;
-        float wrapped = saturate((rawNdotL + sWrap) / (1.0f + sWrap));
-        float band = saturate((sWrap - abs(rawNdotL)) / sWrap) * saturate(rawNdotL + sWrap);
-        diffuseResponse = wrapped.xxx * lerp(1.0f.xxx, gSubsurfaceColor, saturate(band * 0.8f));
-        // Subtle back-scatter on edge/thin regions (thickness map gates it; 0.5 default).
-        float3 transL = normalize(L + N * 0.3f);
-        float transDot = pow(saturate(dot(V, -transL)), 3.0f);
-        transmission = gSubsurfaceColor * (transDot * (1.0f - thickness) * 0.35f) * radiance;
+        const float  sWrap0 = 0.20f + gSubsurfaceRadius * 0.10f;
+        const float3 rs = max(gMatExt.subsurface_radius_scale, 1e-3f.xxx);
+        const float3 sWrap = sWrap0 * (rs / max(max(rs.r, rs.g), rs.b)); // largest channel keeps sWrap0
+        float3 wrapped = saturate((rawNdotL.xxx + sWrap) / (1.0f.xxx + sWrap));
+        float3 band = saturate((sWrap - abs(rawNdotL)) / sWrap) * saturate(rawNdotL.xxx + sWrap);
+        float3 sssDiffuse = wrapped * lerp(1.0f.xxx, gSubsurfaceColor, saturate(band * 0.8f));
+        diffuseResponse = lerp(diffuseResponse, sssDiffuse, sssW);
+        // Back-scatter on thin/edge regions (thickness map gates it; 0.5 default), sharpened toward a
+        // broader forward lobe as scatter anisotropy increases.
+        const float  g = clamp(gMatExt.subsurface_scatter_anisotropy, -1.0f, 1.0f);
+        const float3 transL = normalize(L + N * 0.3f);
+        const float  transExp = lerp(4.0f, 2.0f, saturate(g * 0.5f + 0.5f));
+        const float  transDot = pow(saturate(dot(V, -transL)), transExp);
+        transmission = gSubsurfaceColor * (transDot * (1.0f - thickness) * 0.35f * sssW) * radiance;
     }
+#endif
     float3 kdDirect = (1.0f - Ft) * (1.0f - metallic);
     float3 diffuse = kdDirect * gMatExt.base_weight * albedo / PI * diffuseResponse * radiance;
     float3 result = diffuse + specular + transmission;
@@ -260,6 +313,7 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
     // and its own (usually low) roughness. It also attenuates the layers beneath it by
     // its Fresnel so the surface can't gain energy - the base just dims where the wet
     // sheen takes over. Gated on gClearcoat, so a dry material pays nothing.
+#if HBE_FEAT_COAT
     if (gClearcoat > 0.0f)
     {
         // OpenPBR coat: dielectric microfacet layer, F0 from coat_ior (default 1.5 -> 0.04), over
@@ -271,8 +325,29 @@ float3 ShadeDirect(float3 N, float3 V, float3 L, float3 radiance, float3 albedo,
         const float ccG = GeometrySmith(NdotV, NdotL, ccRough);
         const float ccSpec = (ccD * ccG * ccF) / max(4.0f * NdotV * NdotL, EPSILON) * NdotL;
         const float3 ccTint = lerp(1.0f.xxx, gMatExt.coat_color, saturate(gClearcoat));
-        result = result * (1.0f - ccF) * ccTint + (ccSpec * radiance);
+        // coat_affect_color darkens the base beneath the coat (internal reflections/absorption).
+        const float3 ccDark = lerp(1.0f.xxx, gMatExt.coat_color, saturate(gMatExt.coat_affect_color * gClearcoat));
+        result = result * (1.0f - ccF) * ccTint * ccDark + (ccSpec * radiance);
     }
+#endif
+#if HBE_FEAT_FUZZ
+    // OpenPBR fuzz: a microfibre sheen layered ON TOP of the whole stack (above coat) - ADDED, not
+    // substituted (this replaces the legacy cloth path that swapped GGX for Charlie). Legacy cloth
+    // materials (HBE_MAT_CLOTH) with no authored weight map to a full-weight achromatic fuzz so they
+    // keep a sheen; the look shifts from pure-Charlie to base + additive fuzz (an intended OpenPBR change).
+    {
+        float fuzzW = gMatExt.fuzz_weight;
+        if ((gMaterialFlags & HBE_MAT_CLOTH) != 0u && fuzzW <= 0.0f) fuzzW = 1.0f;
+        if (fuzzW > 0.0f)
+        {
+            const float fr = clamp(gMatExt.fuzz_roughness, 0.02f, 1.0f);
+            const float3 fuzz = fuzzW * gMatExt.fuzz_color *
+                                (D_Charlie(fr, NdotH) * V_Neubelt(NdotV, NdotL) * radiance * NdotL);
+            // Approximate energy conservation: the sheen reflects some light, so gently dim below.
+            result = result * (1.0f - fuzzW * 0.15f) + fuzz;
+        }
+    }
+#endif
     return result;
 }
 
@@ -367,6 +442,7 @@ PSOutput PSMain(VSOutput input)
     // The iris sits beneath the refractive cornea, so the visible iris point
     // shifts with view angle. Offset the UV along the tangent-space view ray.
     float2 uv = input.uv;
+#if HBE_FEAT_EYE
     if ((gMaterialFlags & HBE_MAT_EYE) != 0u)
     {
         float3 Ng = normalize(input.normalWS);
@@ -376,9 +452,15 @@ PSOutput PSMain(VSOutput input)
         const float irisDepth = 0.045f;
         uv += (Vts.xy / max(Vts.z, 0.25f)) * irisDepth;
     }
+#endif
 
     // --- Material sampling -------------------------------------------------
     float4 albedoTex = SampleBindless(gAlbedoIndex, uv);
+    // Alpha-cutout foliage: kill texels below the leaf-silhouette cutoff so a leaf-cluster texture
+    // reads as leaves, not a solid card. Bindless index 0 is the default white texture (alpha 1),
+    // so a draw without HBE_MAT_ALPHATEST or without an albedo texture never discards.
+    if ((gMaterialFlags & HBE_MAT_ALPHATEST) != 0u && albedoTex.a < 0.4f)
+        discard;
     float3 albedo = gBaseColorFactor.rgb * albedoTex.rgb;
 
     // --- Terrain splat: blend up to 4 FULL MATERIALS (albedo + normal + metal/rough)
@@ -697,6 +779,12 @@ PSOutput PSMain(VSOutput input)
 
     // --- Direct lighting ----------------------------------------------------
     float  NdotV = max(dot(N, V), EPSILON);
+#if HBE_FEAT_COAT
+    // coat_affect_roughness: light scattering through the coat makes the base read rougher. Applied
+    // before lighting so it flows through both the direct/IBL specular and the G-buffer (SSR/AO).
+    if (gClearcoat > 0.0f && gMatExt.coat_affect_roughness > 0.0f)
+        roughness = lerp(roughness, 1.0f, saturate(gClearcoat * gMatExt.coat_affect_roughness));
+#endif
     // OpenPBR dielectric F0 from the specular IOR (default 1.5 -> 0.04), scaled by specular_weight
     // and tinted by specular_color. Skin keeps its slightly lower waxy reflectance (<= 0.028).
     float3 dielF0 = (IorToF0(gMatExt.specular_ior) * gMatExt.specular_weight) * gMatExt.specular_color;
@@ -766,6 +854,17 @@ PSOutput PSMain(VSOutput input)
 
     // --- Ambient: image-based lighting (local probes over a global sky) ----
     float3 F  = FresnelSchlickRoughness(NdotV, F0, roughness);
+#if HBE_FEAT_THINFILM
+    // Thin-film iridescence on the ambient/IBL specular so REFLECTIONS shimmer too, not just the
+    // direct highlight. Evaluated at NdotV and blended by weight, mirroring the direct-light path;
+    // kD below reads this F so the diffuse ambient stays energy-coupled. thickness um -> nm.
+    if (gMatExt.thin_film_weight > 0.0f)
+    {
+        float3 Firi = EvalIridescence(1.0f, gMatExt.thin_film_ior, NdotV,
+                                      gMatExt.thin_film_thickness * 1000.0f, F0);
+        F = lerp(F, Firi, saturate(gMatExt.thin_film_weight));
+    }
+#endif
     float3 kD = (1.0f - F) * (1.0f - metallic);
     float3 Rdir = reflect(-V, N);
     float2 uvN = EquirectUV(N);
@@ -857,6 +956,7 @@ PSOutput PSMain(VSOutput input)
     // sources. A thin Fresnel-weighted lobe over the ambient result, sampling the
     // prefiltered sky at the clear layer's (usually low) roughness. Fresnel here uses
     // NdotV so the sheen rims the silhouette - exactly where wet skin catches light.
+#if HBE_FEAT_COAT
     if (gClearcoat > 0.0f)
     {
         const float ccF0a = IorToF0(gMatExt.coat_ior);
@@ -868,6 +968,7 @@ PSOutput PSMain(VSOutput input)
             : 0.0f;
         ambient = ambient * (1.0f - ccFa) + ccEnv * (ccFa * gAmbientIntensity * ao);
     }
+#endif
 
     // --- Emissive (self-illumination, unaffected by lighting) --------------
     float3 emissive = gEmissiveColor * gEmissiveIntensity;
@@ -875,6 +976,36 @@ PSOutput PSMain(VSOutput input)
         emissive *= SampleBindless(gEmissiveIndex, uv).rgb;
 
     float3 color = ambient + Lo + emissive;
+
+#if HBE_FEAT_TRANSMISSION
+    // OpenPBR transmission: the light coming THROUGH the surface. The transmitted background is the
+    // opaque scene behind it when a resolved scene-colour copy is bound (gSceneColorIndex - true
+    // screen-space refraction, P6b), otherwise the IBL environment in the refracted direction (P6a).
+    // It is tinted by transmission_color (Beer-law absorption approximated by the tint) and blended in
+    // by transmission_weight, with Fresnel keeping more reflection at grazing. thin_walled skips the
+    // IOR bend. Only for materials drawn in the alpha-blended transparent pass. See docs Part F.
+    if ((gMaterialFlags & HBE_MAT_TRANSPARENT) != 0u && gMatExt.transmission_weight > 0.0f)
+    {
+        const float ior = (gMatExt.thin_walled < 0.5f) ? max(gMatExt.specular_ior, 1.0f) : 1.0f;
+        float3 refrDir = refract(-V, N, 1.0f / ior);
+        if (dot(refrDir, refrDir) < 1e-4f) refrDir = reflect(-V, N); // total internal reflection
+        float3 bg;
+        if (gSceneColorIndex != 0u)
+        {
+            const float2 suv = input.positionCS.xy * gScreenTexel;
+            const float2 off = (gMatExt.thin_walled < 0.5f) ? (N.xy * (ior - 1.0f) * 0.06f) : 0.0f.xx;
+            bg = SampleBindlessLod(gSceneColorIndex, saturate(suv + off), roughness * 5.0f).rgb;
+        }
+        else if (gPrefilteredIndex != 0u)
+            bg = SampleBindlessLod(gPrefilteredIndex, EquirectUV(refrDir),
+                                   roughness * gPrefilteredMaxLod).rgb;
+        else
+            bg = 0.0f.xxx;
+        const float3 transmitted = bg * gMatExt.transmission_color;
+        const float  fresnelT = 1.0f - FresnelSchlickRoughness(NdotV, F0, roughness).r; // < 1 at grazing
+        color = lerp(color, transmitted, saturate(gMatExt.transmission_weight * fresnelT));
+    }
+#endif
     if (gOutputLinear == 0)
     {
         // Legacy direct-to-LDR path (no post stack): tonemap inline.
@@ -902,6 +1033,12 @@ PSOutput PSMain(VSOutput input)
     // over the lit scene (this overrides the mask for those rare dynamic decals).
     if ((gMaterialFlags & HBE_MAT_TRANSPARENT) != 0u)
         outAlpha = saturate(gMatExt.geometry_opacity * albedoTex.a); // OpenPBR geometry_opacity (== legacy baseColor.a)
+#if HBE_FEAT_TRANSMISSION
+    // A transmissive surface has already composited its transmitted background into `color`, so write
+    // it fully opaque (srcA = 1) rather than alpha-blending the un-transmitted background a second time.
+    if ((gMaterialFlags & HBE_MAT_TRANSPARENT) != 0u && gMatExt.transmission_weight > 0.0f)
+        outAlpha = 1.0f;
+#endif
 
     PSOutput o;
     o.color    = float4(color, outAlpha);

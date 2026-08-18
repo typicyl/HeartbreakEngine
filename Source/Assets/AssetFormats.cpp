@@ -107,6 +107,12 @@ const std::vector<EngineAsset> kEngineAssets = {
      "pre-fractured destructible chunks + adjacency; header names an interior .hbmat"},
     {".hbvol",      "Volume Cache",     true,  RefScan::Leaf,     nullptr,
      "baked NanoVDB volume frames (VolumeComponent.source); binary grid blobs, names no other asset"},
+    {".hbbiome",    "Biome",            true,  RefScan::JsonScan, nullptr,
+     "vegetation distribution rules over splat/slope/altitude/water; references species by name "
+     "(JsonScan so referenced .hbspecies pack). See Source/Vegetation/BiomeAsset"},
+    {".hbspecies",  "Species",          true,  RefScan::JsonScan, nullptr,
+     "data-driven vegetation species (structure/foliage/env/dynamics); names bark/leaf .hbmat "
+     "+ optional .uaf (JsonScan packs them). See Source/Vegetation/SpeciesAsset"},
     {".hbvolsim",   "Volume Sim",       false, RefScan::Leaf,     nullptr,
      "editor-only volume authoring config (VolumeSimConfig); the offline baker turns it into a "
      ".hbvol which the runtime consumes. Pure numeric JSON, references no other asset, never packed"},

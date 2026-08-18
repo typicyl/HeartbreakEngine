@@ -43,6 +43,7 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/ModelLoader.cpp"
     "Source/Assets/UAF.cpp"
     "Source/Assets/UAP.cpp"
+    "Source/Assets/Compression.cpp"
     "Source/Assets/VFS.cpp"
     "Source/Assets/MaterialAsset.cpp"
     "Source/Assets/AcousticMaterial.cpp"
@@ -94,6 +95,36 @@ set(HBE_SCENE_SOURCES
 
 set(HBE_PHYSICS_SOURCES
     "Source/Physics/PhysicsWorld.cpp")
+
+# Vegetation subsystem: data-oriented plant representation + library-extensible plug-in
+# backends (generation / distribution / noise / wind / simulation / rendering). Runtime-
+# side (both engine libraries); the editor adds only the paint mode + optional importers.
+# See docs/Design-Vegetation.md. Owns NO new infrastructure - it reuses the streamer,
+# ECS, job system, RNG, RHI buffers, meshoptimizer and terrain queries.
+set(HBE_VEGETATION_SOURCES
+    "Source/Vegetation/VegetationStore.cpp"
+    "Source/Vegetation/VegetationWorld.cpp"
+    "Source/Vegetation/VegetationBackends.cpp"
+    "Source/Vegetation/VegetationSurface.cpp"
+    "Source/Vegetation/PoissonDiscDistribution.cpp"
+    "Source/Vegetation/FastNoise2Field.cpp"
+    "Source/Vegetation/BiomeAsset.cpp"
+    "Source/Vegetation/SpeciesAsset.cpp"
+    "Source/Vegetation/TreeMesher.cpp"
+    "Source/Vegetation/TreeGenerators.cpp"
+    "Source/Vegetation/GrassSystem.cpp"
+    "Source/Vegetation/GrassGpu.cpp"
+    "Source/Vegetation/VegetationRender.cpp"
+    "Source/Vegetation/VegetationSystem.cpp"
+    "Source/Vegetation/VegetationSimLod.cpp"
+    "Source/Vegetation/VegetationStreaming.cpp"
+    "Source/Vegetation/VegetationGrowth.cpp"
+    "Source/Vegetation/VegetationDamage.cpp"
+    "Source/Vegetation/VegetationSelfTest.cpp"
+    "Source/Vegetation/VegetationScatterTest.cpp"
+    "Source/Vegetation/VegetationMeshTest.cpp"
+    "Source/Vegetation/VegetationGenTest.cpp"
+    "Source/Vegetation/VegetationGrowthTest.cpp")
 
 # Navigation RUNTIME: Detour-backed tiled navmesh + DetourTileCache dynamic obstacles,
 # consumed from baked `.hbnav` tiles. Compiled into BOTH engine libraries; links Detour
@@ -261,6 +292,8 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/UIEditor.cpp"
     "Source/Editor/Importer.cpp"
+    "Source/Editor/ProctreeImport.cpp" # parametric tree importer (editor-only; bakes to .uaf)
+    "Source/Assets/MaterialXInterop.cpp" # .mtlx <-> .hbmat (editor-only; runtime links no MaterialX)
     "Source/Editor/TextureCompress.cpp"
     "Source/Editor/MeshThumbnail.cpp"
     "Source/Editor/MovieRender.cpp"
@@ -292,6 +325,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_ASSET_SOURCES}
     ${HBE_SCENE_SOURCES}
     ${HBE_PHYSICS_SOURCES}
+    ${HBE_VEGETATION_SOURCES}
     ${HBE_NAV_SOURCES}
     ${HBE_INTERACT_SOURCES}
     ${HBE_GAME_SOURCES}
@@ -319,8 +353,15 @@ function(hbe_configure_engine_lib tgt is_editor)
     target_link_libraries(${tgt} PRIVATE xinput9_1_0)
     # shell32 = DragAcceptFiles / WM_DROPFILES (OS file drops onto the window).
     target_link_libraries(${tgt} PRIVATE shell32)
-    # Windows Compression API (UAP pack compression). Ships with Windows 8+.
-    target_link_libraries(${tgt} PRIVATE cabinet)
+    # Windows Compression API - LEGACY, READ-ONLY. New (v5) packs use portable zstd
+    # (linked below); Cabinet.lib is now needed ONLY to DECODE pre-v5 LZMS packs, and
+    # only that decode path (Source/Assets/Compression.cpp) is #ifdef _WIN32. Guarded so
+    # a future non-Windows build links nothing Windows-specific for the asset format.
+    target_link_libraries(${tgt} PRIVATE $<$<BOOL:${WIN32}>:cabinet>)
+    # Zstandard: the PORTABLE cooked-asset codec that replaces LZMS (Source/Assets/
+    # Compression wraps it; no zstd type crosses an engine header). Linked into BOTH
+    # libraries - the editor encodes at cook, the runtime decodes at load.
+    target_link_libraries(${tgt} PRIVATE libzstd_static)
     # WinSock2 (the collaboration TCP transport). Ships with Windows; no redist, and
     # the same kind of in-box import lib as xinput9_1_0/cabinet above - so the
     # collaboration layer adds no third-party dependency.
@@ -374,6 +415,12 @@ function(hbe_configure_engine_lib tgt is_editor)
     # runs the optimize passes at import, and the runtime keeps the decoders for a future
     # compressed-.uaf path. Tiny, zero-dep static lib.
     target_link_libraries(${tgt} PRIVATE meshoptimizer)
+    # FastNoise2: SIMD noise for vegetation biome/density fields. Wrapped by
+    # Source/Vegetation/FastNoise2Field (pimpl - no FastNoise2 type in any engine header),
+    # gated by HBE_HAVE_FASTNOISE2 so the vegetation noise seam degrades to the built-in
+    # value noise if the library is ever absent. Linked into BOTH libraries.
+    target_link_libraries(${tgt} PRIVATE FastNoise)
+    target_compile_definitions(${tgt} PRIVATE HBE_HAVE_FASTNOISE2=1)
     # HDS Resonance Audio spatial renderer (our engine-agnostic fork; see
     # cmake/Dependencies.cmake + docs/Design-ResonanceAudio.md). Optional: linked only when
     # the fork + its deps are prepared. Source/Audio/SpatializerResonance wraps the vraudio
@@ -446,6 +493,13 @@ function(hbe_configure_engine_lib tgt is_editor)
         # comdlg32 = file dialogs, ole32 = IFileDialog folder picker (COM).
         # mf* = Media Foundation H.264 .mp4 encode/decode (offline movie render).
         target_link_libraries(${tgt} PRIVATE comdlg32 ole32 mfplat mfreadwrite mfuuid mf)
+        # MaterialX interchange (.mtlx <-> .hbmat) - EDITOR ONLY. Link only Core + Format; the
+        # shipped runtime (hbe) links none of it. Guarded on the targets existing so the engine
+        # still builds when HBE_ENABLE_MATERIALX is off / the fetch failed (interop -> stub path).
+        if(TARGET MaterialXCore AND TARGET MaterialXFormat)
+            target_link_libraries(${tgt} PRIVATE MaterialXCore MaterialXFormat)
+            target_compile_definitions(${tgt} PRIVATE HBE_HAS_MATERIALX=1)
+        endif()
     endif()
 endfunction()
 
@@ -524,6 +578,20 @@ add_executable(HeartbreakEditor "Source/main_editor.cpp" "${HBE_SCHEMATIC_STUB}"
 target_link_libraries(HeartbreakEditor PRIVATE hbe_editor)
 set_target_properties(HeartbreakEditor PROPERTIES VS_DPI_AWARE "PerMonitor")
 
+# MaterialX ships as DLLs (see cmake/Dependencies.cmake for why shared). The editor links them, so
+# the .dll files must sit next to the .exe. Copied post-build; defined once, applied to every exe
+# that links hbe_editor. The runtime exe links no MaterialX and gets nothing.
+function(hbe_stage_materialx_dlls tgt)
+    if(HBE_ENABLE_MATERIALX AND TARGET MaterialXCore AND TARGET MaterialXFormat)
+        add_custom_command(TARGET ${tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:MaterialXCore> $<TARGET_FILE:MaterialXFormat>
+                    $<TARGET_FILE_DIR:${tgt}>
+            COMMENT "Staging MaterialX DLLs next to ${tgt}")
+    endif()
+endfunction()
+hbe_stage_materialx_dlls(HeartbreakEditor)
+
 # The Hub: standalone project manager that launches the editor.
 # ---------------------------------------------------------------------------
 # hbe_hubcore - the launcher's logic, with NO ENGINE DEPENDENCY.
@@ -580,6 +648,7 @@ set_target_properties(HeartbreakHub PROPERTIES VS_DPI_AWARE "PerMonitor")
 # The Art Editor: a focused painting tool for 2D artists (same editor lib).
 add_executable(HeartbreakArtEditor "Source/main_arteditor.cpp" "${HBE_SCHEMATIC_STUB}")
 target_link_libraries(HeartbreakArtEditor PRIVATE hbe_editor)
+hbe_stage_materialx_dlls(HeartbreakArtEditor)
 set_target_properties(HeartbreakArtEditor PROPERTIES VS_DPI_AWARE "PerMonitor")
 
 

@@ -14,6 +14,7 @@
 #include "Editor/CollabSession.h" // peer-to-peer sessions + this scene's history
 #include "Editor/SaveDispatch.h" // Ctrl+S: which focused surface owns the chord
 #include "Editor/TimelineSnap.h" // the shared per-frame grid for every timeline
+#include "Editor/ProctreeImport.h" // editor::ProctreeParams (parametric tree importer state)
 #include "Core/Types.h"
 #include "Navigation/NavBaker.h" // nav::NavBuildSettings for the bake panel
 #include "Renderer/CameraController.h"
@@ -1306,6 +1307,22 @@ private:
     glm::vec3 terrainHit_{0.0f};     // last brush world hit (overlay)
     bool terrainHitValid_ = false;
 
+    // -- Vegetation paint/erase brush (P9) ---------------------------------------
+    // Stamps painted trees onto the selected terrain (or erases painted plants) under a
+    // falloff brush, modeled on UpdateTerrainTool. Reuses the same terrain raycast; spawns
+    // through veg::PaintTreeAt (shared spawn path) into the engine's paint mesh library.
+    void UpdateVegetationPaintTool(Engine& engine);
+    bool vegPaint_ = false;          // tool active (paint mode)
+    bool vegErase_ = false;          // LMB erases instead of painting
+    f32  vegBrushRadius_ = 3.5f;     // brush radius (world units)
+    f32  vegPaintSpacing_ = 1.6f;    // min world distance between painted stamps
+    int  vegSpecies_ = 0;            // index into the registered species list
+    u32  vegPaintCounter_ = 0;       // rolls the per-stamp seed for natural variation
+    bool vegStroking_ = false;       // a paint/erase stroke is in progress
+    glm::vec2 vegLastStamp_{1e9f};   // last stamp XZ (for spacing throttle)
+    u32  vegStrokeSpawned_ = 0;      // plants added/removed this stroke (HUD)
+    editor::ProctreeParams vegProctree_; // parametric-tree importer params (panel sliders)
+
     // -- Art Editor (surface painting) -------------------------------------------
     // A unified workflow for 2D artists: paint pigment + relief directly onto any
     // mesh's surface (UV-space texture painting). The panel holds the brush, a
@@ -1592,6 +1609,7 @@ private:
         Panel_People,
         Panel_Review,
         Panel_VolumeBaker,
+        Panel_Vegetation,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];
@@ -1606,6 +1624,7 @@ private:
     // The bake runs on a background fiber-job (CPU solver) so the UI stays responsive; the panel
     // polls the shared job state and writes the file on the main thread when it completes.
     void DrawVolumeBaker(Engine&);
+    void DrawVegetationPanel(Engine&); // P9: vegetation stats + GPU-grass controls + spawn
     volume::VolumeSimConfig volBakeConfig_{};       // edit copy, seeded from the model's defaultConfig
     int                     volBakeModel_ = 0;      // index into VolumeSimRegistry::Get().Types()
     bool                    volBakeSeeded_ = false;

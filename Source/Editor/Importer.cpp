@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -440,6 +441,36 @@ bool ImportModel(const fs::path& src, const fs::path& out) {
             mat.surface.base_metalness = md.material.metallic;
             mat.surface.specular_roughness = md.material.roughness;
             mat.surface.emission_color = md.material.emissive;
+            // KHR glTF extensions -> OpenPBR. Absent extensions carry OpenPBR-default factors
+            // (ior 1.5 / specular 1 / transmission 0 / anisotropy 0), so this is a no-op for plain
+            // metallic-roughness and non-glTF models.
+            mat.surface.specular_ior = md.material.ior;
+            mat.surface.specular_weight = md.material.specularFactor;
+            mat.surface.transmission_weight = md.material.transmission;
+            mat.surface.specular_roughness_anisotropy = md.material.anisotropy;
+            if (md.material.clearcoat > 0.0f) {
+                mat.surface.coat_weight = md.material.clearcoat;
+                mat.surface.coat_roughness = md.material.clearcoatRoughness;
+            }
+            // KHR_materials_sheen -> OpenPBR fuzz (presence gives it full weight).
+            if (md.material.sheenColor != glm::vec3(0.0f) || md.material.sheenRoughness > 0.0f) {
+                mat.surface.fuzz_weight = 1.0f;
+                mat.surface.fuzz_color = md.material.sheenColor;
+                mat.surface.fuzz_roughness = md.material.sheenRoughness;
+            }
+            // KHR_materials_volume -> absorptive (non-thin-walled) glass with attenuation.
+            if (md.material.volumeThickness > 0.0f) {
+                mat.surface.thin_walled = false;
+                mat.surface.transmission_color = md.material.attenuationColor;
+                // Finite guard: a +Infinity attenuation distance (glTF "no absorption") must NOT reach
+                // transmission_depth - a non-finite float serialises to JSON null and throws on reload.
+                if (std::isfinite(md.material.attenuationDistance) && md.material.attenuationDistance > 0.0f)
+                    mat.surface.transmission_depth = md.material.attenuationDistance;
+            }
+            // A transmissive material must render in the alpha-blended pass (where the OpenPBR
+            // transmission/refraction path runs); flag it so it is not drawn as an opaque.
+            if (md.material.transmission > 0.0f)
+                mat.flags |= rhi::MaterialFlag_Transparent;
             mat.albedoTex = md.material.baseColorTex;
             mat.normalTex = md.material.normalTex;
             mat.mrTex = md.material.mrTex;

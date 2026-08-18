@@ -13,9 +13,33 @@
 
 #include <glm/glm.hpp>
 
+#include <functional>
 #include <vector>
 
 namespace hbe::veg {
+
+// The result of sampling the terrain surface at a world XZ - the realized
+// "VegetationSpawnContext" the owner asked for. Produced by the terrain bridge
+// (VegetationSurface.h) and consumed by a distribution to accept/reject and score a
+// candidate. Deliberately NO Scene/terrain type: a distribution filters on this plain
+// struct via a callback, so it never depends on the terrain system.
+struct SpawnSample {
+    bool  onTerrain  = false;         // inside the terrain footprint AND not a hole
+    f32   height     = 0.0f;          // WORLD-space ground height (Y)
+    glm::vec3 normal {0.0f, 1.0f, 0.0f}; // world-space surface normal
+    f32   slopeDeg   = 0.0f;          // angle of the ground from horizontal (deg)
+    i32   splatLayer = -1;            // dominant terrain material layer 0..3 (biome proxy); -1 unknown
+    // waterSurfaceY - height. > 0 = submerged; <= 0 = that many metres ABOVE the water.
+    // Default is a large negative ("no water": ground far above the water line) so a
+    // sample with no water source is never treated as being at the water's edge.
+    f32   waterDepth = -10000.0f;
+    f32   moisture   = 0.0f;          // derived soil moisture 0..1 (water proximity + wetness)
+};
+
+// A pure surface-query callback: world XZ -> SpawnSample. The terrain bridge captures
+// the terrain component + transforms and returns one of these; a distribution calls it
+// without ever seeing a Scene or TerrainComponent (keeps generation job-safe + testable).
+using SurfaceQueryFn = std::function<SpawnSample(const glm::vec2& worldXZ)>;
 
 // --- Interned asset identities (data-driven; see SpeciesRegistry / BiomeRegistry) ---
 // A species/biome is authored in a .hbspecies/.hbbiome asset and interned to a stable

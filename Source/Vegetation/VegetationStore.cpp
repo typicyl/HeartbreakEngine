@@ -10,8 +10,11 @@ TreeId VegetationStore::AddTree(const glm::mat4& xform, SpeciesId species, u64 s
     // Flatten the skeleton's node graph into branch SEGMENTS (parent-node -> node) and
     // leaf-cluster ORIGINS. A node whose parent is a real node contributes one segment;
     // a LeafCluster node contributes one foliage cluster. Roots (parent == -1) anchor
-    // the graph but emit no segment of their own.
+    // the graph but emit no segment of their own. Each segment records its GLOBAL parent
+    // branch index (the segment ending at its start node, or -1 for a ground-connected
+    // base) so structural-support flood-fill can decide what a break orphans.
     const u32 n = skel.NodeCount();
+    std::vector<i32> nodeToBranch(n, -1); // skeleton node -> the branch segment ending there
     for (u32 i = 0; i < n; ++i) {
         const PlantPart kind = static_cast<PlantPart>(skel.kind[i]);
         const i32 par = skel.parent[i];
@@ -30,13 +33,17 @@ TreeId VegetationStore::AddTree(const glm::mat4& xform, SpeciesId species, u64 s
         }
 
         if (par >= 0) {
+            const i32 parentBranch = (par < static_cast<i32>(n)) ? nodeToBranch[par] : -1;
+            const u32 bidx = branches.Count();
             branches.a.push_back(skel.pos[par]);
             branches.b.push_back(skel.pos[i]);
             branches.radiusA.push_back(skel.radius[par]);
             branches.radiusB.push_back(skel.radius[i]);
-            branches.parent.push_back(-1); // branch-local graph rebuilt in the mesher (P3)
+            branches.parent.push_back(parentBranch); // global index, or -1 = base
             branches.order.push_back(skel.order[i]);
             branches.windPhase.push_back(0.0f);
+            branches.broken.push_back(0);
+            nodeToBranch[i] = static_cast<i32>(bidx);
         }
     }
 
@@ -61,6 +68,7 @@ void VegetationStore::Clear() {
     branches.a.clear(); branches.b.clear();
     branches.radiusA.clear(); branches.radiusB.clear();
     branches.parent.clear(); branches.order.clear(); branches.windPhase.clear();
+    branches.broken.clear();
     clusters.origin.clear(); clusters.normal.clear();
     clusters.density.clear(); clusters.atlasSlice.clear();
     instanceBuffer = rhi::GpuBufferHandle{};

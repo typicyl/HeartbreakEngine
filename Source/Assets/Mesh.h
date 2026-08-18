@@ -30,6 +30,20 @@ struct Material {
     f32 metallic  = 0.0f;
     f32 roughness = 0.5f;
     glm::vec3 emissive{0.0f}; // linear emissive factor
+    // KHR glTF PBR-extension factors (read by ConvertMaterial, mapped to SurfaceParams/OpenPBR at
+    // import). Defaults = "extension absent" so OBJ/FBX and plain metallic-roughness glTF are
+    // unchanged. ior stays 1.5 (F0 0.04); transmission/clearcoat/sheen off; anisotropy 0; specular 1.
+    f32 ior = 1.5f;                    // KHR_materials_ior            -> specular_ior
+    f32 transmission = 0.0f;           // KHR_materials_transmission   -> transmission_weight
+    f32 clearcoat = 0.0f;              // KHR_materials_clearcoat      -> coat_weight
+    f32 clearcoatRoughness = 0.0f;     //                              -> coat_roughness
+    f32 anisotropy = 0.0f;             // KHR_materials_anisotropy     -> specular_roughness_anisotropy
+    f32 specularFactor = 1.0f;         // KHR_materials_specular       -> specular_weight
+    glm::vec3 sheenColor{0.0f};        // KHR_materials_sheen          -> fuzz_color (presence -> fuzz)
+    f32 sheenRoughness = 0.0f;         //                              -> fuzz_roughness
+    f32 volumeThickness = 0.0f;        // KHR_materials_volume (>0 -> non-thin-walled absorptive glass)
+    glm::vec3 attenuationColor{1.0f};  //                              -> transmission_color
+    f32 attenuationDistance = 0.0f;    //                              -> transmission_depth (0 = none)
     std::string name;
     // Texture references. During Assimp import these hold the *source* paths;
     // the importer rewrites them to `.uaf` asset references (relative to the

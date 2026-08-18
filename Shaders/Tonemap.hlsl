@@ -142,8 +142,11 @@ float3 FilmGrain(float3 c, float2 uv, float amt, float time)
 {
     const float2 p = uv * float2(1920.0f, 1080.0f) + frac(time) * 137.0f;
     const float n = frac(sin(dot(p, float2(12.9898f, 78.233f))) * 43758.5453f) - 0.5f;
-    // A touch stronger in the mids/shadows than the highlights (where grain reads worst).
-    const float w = 1.0f - Luma(c) * 0.7f;
+    // Peak the grain in the MIDS; fade it to nothing in the deep shadows AND the highlights. Grain
+    // crawling over a crushed black (a face's contact shadow) reads as digital dither, not film -
+    // 4*lum*(1-lum) is 0 at black/white, 1 at mid-grey, so the blacks stay clean.
+    const float lum = Luma(c);
+    const float w = saturate(4.0f * lum * (1.0f - lum));
     return c + n * amt * w;
 }
 

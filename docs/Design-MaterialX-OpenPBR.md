@@ -475,44 +475,159 @@ merged until it builds + reviews clean on **both** backends. Painterly re-verifi
 - Perf: one appended CB block (176 B/draw); default materials pay ~the same shader cost. Permutation
   stripping is P3. Rollback: revert the P2 files (append + additive shader edits; legacy CB untouched).
 
-**P3 — Permutation/hybrid system.**
-- Files: `ShaderCompile.cmake`(DEFINES + variant list); new `MaterialCompiler`; backend PSO tables +
-  selection; loader.
-- Deps: P2. Risks: silent-dormancy (unregistered variant), PSO count, FULL fallback coverage.
-- Validation: strip-on-absence proof (STD binary lacks coat/SSS code); PSO count report; per-variant
-  render tests. Perf: **win** (cheap materials drop branches). Rollback: force PermutationId=FULL.
+**P3 — Shader specialization / permutations. — DONE + BUILDS + verified (2026-08-16).**
+- Hybrid model: STATIC feature presence -> a CURATED set of MeshPBR pixel-shader variants (not 2^N);
+  DYNAMIC values stay in gMatExt. World features (terrain/decals/weather/paint) stay runtime in every
+  variant. Variants: STD/COAT/SSS/FUZZ/HAIR/EYE + FULL (correctness fallback; also transparent/preview).
+- Files: `cmake/ShaderCompile.cmake` (hbe_add_shader gains DEFINES; one shared MeshPBR.vs + 7 PS
+  variants via -D HBE_FEAT_*; MeshPBR.ps == FULL); `Shaders/MeshPBR.hlsl` (#if HBE_FEAT_COAT/SUBSURFACE/
+  FUZZ/HAIR/EYE gates around the lobe blocks; base+world+PSOutput ungated); new
+  `Source/RHI/MaterialCompiler.h` (ComputeShaderVariant: cheapest variant covering the active lobes,
+  else FULL - counts hair/eye as lobes so eye/hair + coat never strips the coat); `Source/RHI/RHI.h`
+  (enum ShaderVariant + DrawItem.shaderVariant, default Full); `Source/Scene/Scene.cpp` (sets
+  shaderVariant per draw); D3D12 + Vulkan (meshPSO_/meshPipeline_ -> per-variant array, create loop
+  with missing-binary->FULL fallback, per-item selection switching only on change, destroy loop).
+- Lockstep invariant: enum order == cmake NAME order == both backends' kVariantPs[] (verified). A
+  missing variant binary falls back to the FULL pixel shader (renders correctly, unspecialized).
+- Validation: Release builds of editor + runtime (both backends, ALL 7 variants -> DXIL + SPIR-V) =
+  0 errors; adversarial review of the #if gates = 0 defects (FULL byte-behaviour == P2, each variant
+  strips only its lobe, every post-gate variable defined ungated). CPU routing verified manually
+  (agent tooling-failed): found + fixed an eye/hair+coat lobe-loss routing bug. Runtime pipeline-count
+  + visual A/B not yet run.
+- Perf: cheap materials (STD) drop the coat/sss/fuzz/hair/eye code entirely (fewer instructions, less
+  register pressure); PSO count ~7 opaque + the existing few; PSO switches are rare (material-sorted).
+  Rollback: default DrawItem.shaderVariant is Full, and each variant falls back to FULL, so forcing
+  Full everywhere restores the P2 single-shader behaviour.
 
-**P4 — Coat + Fuzz + Anisotropy** (evolve clearcoat/cloth; add aniso). Files: `OpenPBRSurface.hlsli`,
-compiler, editor. Deps: P3. Validation: coated/aniso/cloth scenes + parity. Perf: gated. Rollback:
-disable variants (fall to STD/FULL).
+**P4 — Fuzz + Coat improvements + Anisotropy. — DONE + BUILDS + verified (2026-08-16).**
+- Fuzz: now an ADDITIVE microfibre sheen layered on top of the whole stack (Charlie/Neubelt, weighted
+  by fuzz_weight/fuzz_color/fuzz_roughness) - the legacy cloth-replaces-GGX branch was removed, so cloth
+  materials render as base + additive fuzz (an intentional OpenPBR look change; legacy HBE_MAT_CLOTH with
+  no authored weight falls back to fuzz_weight=1). Energy: base gently dimmed by ~0.15*weight.
+- Coat: added coat_affect_color (darkens the base beneath the coat) and coat_affect_roughness (roughens
+  the base before lighting, so it flows through direct/IBL specular AND the G-buffer/SSR).
+- Anisotropy: anisotropic GGX (DistributionGGXAniso + AnisoAlpha in OpenPBRSurface.hlsli) gated
+  `#if HBE_FEAT_ANISO`; anisotropic materials route to FULL (which now defines HBE_FEAT_ANISO) - no new
+  stripped variant, so no enum/backend churn. Rotated tangent frame from specular_anisotropy_rotation.
+- Files: `Shaders/OpenPBRSurface.hlsli` (aniso helpers), `Shaders/MeshPBR.hlsl` (fuzz/coat/aniso in
+  ShadeDirect + coat_affect_roughness in PSMain), `cmake/ShaderCompile.cmake` (HBE_FEAT_ANISO on FULL).
+- Default no-op (verified by construction + adversarial review, 0 defects): anisotropy=0 makes the aniso
+  NDF EXACTLY the isotropic GGX; coat_affect_*=0 and fuzz_weight=0 are identities; a default material
+  routes to STD (all three lobes stripped) -> byte-identical to pre-P4. Only opted-in params change.
+- Validation: editor + runtime Release builds (both backends, all 7 variants) = 0 errors; adversarial
+  math/energy/preprocessor review = 0 defects. Approximations (Part F): isotropic Smith G for aniso;
+  fuzz energy heuristic (0.15*weight base dim); coat_affect_color layered on the coat_color tint. Deps: P3.
+  Rollback: shader-only + one cmake line; revert to restore P3.
 
-**P5 — Subsurface remap** (OpenPBR params, keep RT approximation). Files: `OpenPBRSurface.hlsli`,
-compiler, editor. Deps: P3. Validation: skin scene vs current; parity. Perf: gated. Rollback: keep
-legacy skin flag path.
+**P5 — Subsurface refinement. — DONE + BUILDS + verified (2026-08-16).**
+- Refined the pre-integrated SSS (still NOT random-walk) to OpenPBR params: `subsurface_weight` blends
+  the wrapped SSS diffuse with the Oren-Nayar base (legacy HBE_MAT_SUBSURFACE with no authored weight ->
+  full); `subsurface_radius_scale` is a PER-CHANNEL mean-free-path (wrap is float3; red bleeds past the
+  terminator where green/blue stop - the skin look); `subsurface_scatter_anisotropy` biases the
+  back-lit transmission exponent (broader forward lobe as g rises).
+- Files: `Shaders/MeshPBR.hlsl` (the HBE_FEAT_SUBSURFACE block in ShadeDirect). Shader-only.
+- Behavior: the weight blend and scatter-anisotropy are identity at legacy defaults (weight->1, g=0 ->
+  exponent 3 == old); the per-channel radius_scale (OpenPBR Rayleigh default (1,0.5,0.25)) IS an
+  intended skin look change vs the old scalar wrap (documented; set radius_scale (1,1,1) for uniform).
+- Validation: editor + runtime Release builds (both backends, all variants) = 0 errors; adversarial
+  review = 0 defects (no NaN/div-by-zero; float3 broadcasts valid; sssW=0 -> correct no-SSS path). Deps:
+  P3. Rollback: shader-only; revert restores P4.
 
-**P6 — Transmission** (`ITransmission`: thin-walled + screen-space refraction). Files: new
-scene-color-behind SRV + transparent-pass wiring (both backends), `OpenPBRSurface.hlsli`, compiler,
-editor. Deps: P3, resolved-opaque-color target. Risks: pass ordering, alpha/mask collision, both
-backends. Validation: glass/thin-walled scenes; parity; painterly re-check. Perf: opt-in only.
-Rollback: thin-walled-only (no pass).
+**P6a — Transmission (environment/IBL background). — DONE + BUILDS + verified (2026-08-16).**
+- OpenPBR transmission in MeshPBR PSMain (gated `#if HBE_FEAT_TRANSMISSION`, in the FULL variant that
+  the transparent pass binds): thin-walled + IOR-refracted glass shows the transmitted background,
+  tinted by transmission_color, blended by transmission_weight with a Fresnel term (more reflection at
+  grazing). `refract` with a total-internal-reflection guard; thin_walled skips the IOR bend.
+- The transmitted background is the IBL environment in the refracted direction when no scene-colour is
+  bound; the seam `gSceneColorIndex` (new zero-init frame-constant, lockstep across FrameConstants /
+  FrameCB / FrameUBO) automatically switches to a resolved opaque scene-colour copy when P6b binds one.
+- Files: `Shaders/MeshPBR.hlsl` (transmission block + outAlpha=1 composite), `Shaders/Common.hlsli` +
+  D3D12 FrameCB + Vulkan FrameUBO (gSceneColorIndex seam row), `cmake/ShaderCompile.cmake`
+  (HBE_FEAT_TRANSMISSION on FULL).
+- Default no-op (verified, 0 defects): the block only runs for HBE_MAT_TRANSPARENT materials with
+  transmission_weight>0; everything else is byte-identical to pre-P6. CB seam byte-identical across the
+  three structs; math NaN-safe; painterly mask untouched.
+- Validation: editor + runtime Release builds (both backends, all variants) = 0 errors; adversarial
+  review (CB parity / math / gating / no-op) = 0 defects. Deps: P3. Rollback: revert the P6a files.
 
-**P7 — Thin-film** (Belcour-Barla). Files: `OpenPBRSurface.hlsli`, compiler, editor. Deps: P3.
-Validation: iridescence scene + parity. Perf: gated. Rollback: disable variant.
+**P6b — Transmission (true screen-space refraction). — DONE + BUILDS (both backends) + adversarially
+reviewed (1 critical found+FIXED). Needs live-GPU validation (2026-08-17).** A RESOLVED opaque
+scene-colour copy is bound to the transparent pass so transmission samples the ACTUAL geometry behind
+(not the IBL approximation). `sceneColorCopy_` texture + bindless slot (`slotSceneColor_`), filled by a
+copy of the opaque+sky HDR AFTER sky and BEFORE the transparent pass, then `fcb.sceneColorIndex = slot`.
+The shader already samples it when nonzero (zero shader change from P6a). Guarded by `needSceneColor`
+(a Transparent item with `transmission_weight>0` AND the copy target exists) so non-transmissive scenes
+are byte-identical. **D3D12:** `CopyResource(sceneColorCopy_ <- hdrColor_)` with RENDER_TARGET<->COPY_SOURCE
+/ PIXEL_SHADER_RESOURCE<->COPY_DEST barriers, then `OMSetRenderTargets` rebinds the same 3 RTVs + DSV;
+depth untouched. **Vulkan:** end the main HDR pass, `vkCmdCopyImage` with explicit image-layout barriers
+(hdr_ SHADER_READ_ONLY->TRANSFER_SRC->SHADER_READ_ONLY, sceneColorCopy_ UNDEFINED->TRANSFER_DST->
+SHADER_READ_ONLY), reopen the scene via a new `hdrLoadRenderPass_` (LOAD, **writable** depth) for the
+transparent draws; all 3 scene passes (hdr/water/load) are render-pass-compatible so the transparent/
+water/particle pipelines are valid in any. **Review fix (critical, Vulkan-only):** `CreatePostTarget`
+only set COLOR_ATTACHMENT|SAMPLED usage, so hdr_/sceneColorCopy_ lacked TRANSFER_SRC/DST_BIT that
+vkCmdCopyImage + the TRANSFER layout transitions require (VUID-vkCmdCopyImage-srcImage-01995 etc.) - would
+have been a validation error + UB the instant a transmissive material appeared. Fixed by adding an
+`extraUsage` param to `CreatePostTarget` (default 0) and passing TRANSFER_SRC to hdr_ / TRANSFER_DST to
+sceneColorCopy_ only. Rollback: leave gSceneColorIndex=0 (P6a IBL fallback).
 
-**P8 — Import/interop.** glTF KHR reads (`ConvertMaterial`); focused MaterialX importer (Core+Format,
-editor-only) `.mtlx→SurfaceParams→.hbmat`; MaterialX exporter `HBMaterial→.mtlx`; `AssetFormats` row +
-`Importer` dispatch. Deps: MaterialX Core+Format build integration; P1. Risks: dependency build,
-lossy graphs. Validation: round-trip `.mtlx` import/export of OpenPBR test materials; import-only
-(no runtime link). Perf: import-time only, runtime unaffected. Rollback: gate importer off; hand-auth
-`.hbmat` still works.
+**P7 — Thin-film iridescence (Belcour-Barla). — DONE + BUILDS (both backends, all 7 variants) +
+review pending (2026-08-17).** Soap-bubble / oil-slick / anodised-metal rainbow via the standard
+practical Belcour&Barla-2017 airy-reflectance port (as in glTF KHR_materials_iridescence). New
+`OpenPBRSurface.hlsli` helpers `EvalIridescence` + `EvalSensitivity` (+ `IriIorToF0`/`IriF0ToIor`/
+`IriFSchlick`): computes the interference reflectance of a single thin film over the base and REPLACES
+the specular Fresnel, blended by `thin_film_weight`. Applied at BOTH Fresnel sites in MeshPBR.hlsl
+(direct: modifies `Ft` before GGX + the `kdDirect` diffuse split; ambient/IBL: modifies `F` before `kD`)
+so highlights AND reflections shimmer and energy stays coupled. `thin_film_thickness` is authored in
+**micrometres** -> x1000 to nm for the optical-path math. Gated `#if HBE_FEAT_THINFILM`, added to the
+FULL variant only (routes there via MaterialCompiler's existing `thin_film_weight>0` -> Full rule; no new
+enum/variant). DEFAULT NO-OP: weight 0 -> block skipped; thickness 0 or film IOR == air -> reduces to the
+base Fresnel. Approximations: 2 interference orders (m=1,2), thin-film on the base specular only (not the
+coat lobe), evaluated at NdotV for IBL. Perf: FULL-only, one branch gated on weight. Rollback: remove
+HBE_FEAT_THINFILM from the FULL cmake defines.
 
-**P9 — Editor.** OpenPBR inspector (grouped lobes, presets, preview, tier), transmission/coat/SSS/
-aniso/thin-walled UI; acoustic + painterly panels untouched. Deps: P1-P7. Validation: author→save→
-reload; preset round-trip. Rollback: keep legacy inspector.
+**P8 — Import/interop. — DONE + BUILDS + RUNTIME-VERIFIED (`--test-openpbr` PASS, 2026-08-17).**
+Two parts. **P8a glTF KHR reads (no dependency):** `ConvertMaterial` (ModelLoader.cpp) reads
+`KHR_materials_{ior,transmission,specular,clearcoat,anisotropy,sheen,volume}` via the matching
+`AI_MATKEY_*` (this Assimp exposes them all except iridescence), onto new fields on the import `Material`
+(Mesh.h); `Importer.cpp` maps them to `SurfaceParams` (sheen→fuzz, volume→non-thin-walled absorption)
+and flags transmissive materials Transparent. IOR is only taken when > 1 so an OBJ's `Ni=1` can't zero
+the specular. Absent extensions leave OpenPBR defaults (no regression). **P8b MaterialX
+(MaterialXCore+MaterialXFormat, EDITOR-ONLY):** `Source/Assets/MaterialXInterop.{h,cpp}` — `ImportMaterialX`
+(open_pbr_surface 1:1, standard_surface fallback; value inputs + base/emissive image paths),
+`ExportMaterialX` (writes open_pbr_surface → surfacematerial). Editor "Import/Export .mtlx" buttons on
+the material panel. **Dependency:** fetched via `HBE_ENABLE_MATERIALX` (default ON), every heavy
+subproject OFF. Built **SHARED (DLL)** on purpose — MaterialXFormat vendors PugiXML 1.9 and assimp
+vendors 1.13; as static libs their `pugi::` symbols collide (LNK2005, incompatible layouts), so the DLL
+keeps MaterialX's PugiXML internal. DLLs staged next to the editor exes; the runtime links ZERO
+MaterialX (verified). Subproject-bug workaround: `cmake/modules/MaterialXVersion.rc.in` provided for
+MaterialX's `${CMAKE_SOURCE_DIR}`-relative DLL version-resource step. Rollback: `HBE_ENABLE_MATERIALX=OFF`
+→ interop stubs, `.mtlx` buttons disable.
 
-**P10 — Validation & docs.** Material test suite (dielectric, metal, rough metal, smooth dielectric,
-coated, transmissive, thin-walled, anisotropic, emissive, subsurface, layered) as scenes/`.hbmat`;
-DX12↔Vulkan parity harness; supported-features + approximations doc. Deps: all. Rollback: n/a.
+**P9 — Editor. — DONE + BUILDS (2026-08-17).** The material asset panel (Editor.cpp) was **rebuilt into a
+full parameter editor**: **presets removed** (the `DrawMaterialPresetCombo` call is gone from the asset
+editor; its definition stays for the lighter scene-object inspector), replaced by grouped
+`CollapsingHeader`s — Shading-model / Base / Specular / Transmission / Coat / Fuzz / Subsurface / Thin-film
+/ Emission — that expose **every** `SurfaceParams` field as a slider / colour picker (including scatter
+albedo, dispersion, Abbe number, coat anisotropy, and the rest). Base/Specular/Emission/flags open by
+default; the optional lobes collapse. A one-click "Make Transparent" appears when a transmissive material
+lacks the flag. This is what makes transmission + thin-film authorable (the "Transmission (through)"
+slider is ACOUSTIC, unrelated). Acoustic + painterly panels untouched. Rollback: revert the panel block.
+
+**Post-review hardening (2026-08-17).** The P7/P8 adversarial review found a real crash: a glTF using
+`KHR_materials_volume` with no `attenuationDistance` (spec default = +Infinity, i.e. clear glass) →
+Assimp reports +inf → `transmission_depth = +inf` → `SaveMaterial` serialises non-finite as JSON `null`
+→ `LoadMaterial`'s `j.value(...)` throws `type_error` **outside** the parse try/catch → uncaught crash on
+reload. Fixed at the source (`std::isfinite` guards in `ModelLoader.cpp` + `Importer.cpp`) AND by hardening
+`LoadMaterial` (`MaterialAsset.cpp`): every field now reads through a null/type-tolerant `JGet` + guarded
+`Vec3/Vec4`, so any malformed/hand-edited `.hbmat` falls back to defaults instead of throwing. `--test-openpbr`
+gained a malformed-`.hbmat` crash guard (passes).
+
+**P10 — Validation & docs. — DONE (2026-08-17).** `--test-openpbr` (`main_editor.cpp` →
+`assets::MaterialInteropSelfTest`): round-trips a distinctive all-lobe material through `.hbmat`
+(Save/Load) and `.mtlx` (Export/Import), checks the shader-variant routing, and — since it calls into
+MaterialX — proves the DLLs load + execute. **PASS** at runtime. Supported-features + DX12↔Vulkan parity
++ approximations doc: `docs/MaterialX-OpenPBR-Supported.md`. Remaining (optional): a scene of side-by-side
+`.hbmat` test materials for the live-GPU look pass (P6b/P7 appearance still wants a human eye on-GPU).
 
 ---
 

@@ -173,6 +173,10 @@ struct FrameUBO {
     glm::vec4 ripples[kMaxRipples]{};
     // Depth-based water (see Common.hlsli tail). sceneDepthIndex 0 = skip depth grading.
     u32 sceneDepthIndex = 0; f32 absorptionDepth = 6.0f; f32 shorelineWidth = 1.5f; f32 edgeFade = 0.5f;
+    // Opaque scene-colour SRV for OpenPBR transmission/refraction (P6). 0 = not bound -> the shader
+    // uses the IBL environment as the transmitted background; P6b sets this to a resolved copy for true
+    // screen-space refraction. Appended 16-byte row keeps the pre-P6 FrameUBO byte-compatible.
+    u32 sceneColorIndex = 0; u32 _padSc0 = 0; u32 _padSc1 = 0; u32 _padSc2 = 0;
 };
 
 // Per-pass constants of the post stack (Shaders/PostCommon.hlsli).
@@ -337,6 +341,12 @@ public:
                       const ParticleVertex* additive, u32 addCount) override;
     void SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
                          u32 count) override;
+    void SetGrass(GpuBufferHandle blades, u32 bladeCount) override;
+    void SetGrassIndirect(GpuBufferHandle blades, GpuBufferHandle args, u32 maxBlades) override;
+    // Reflects the ACTUAL indirect grass pipeline (see the D3D12 twin for why).
+    bool SupportsIndirectDraw() const override {
+        return grassIndirectPipeline_ != VK_NULL_HANDLE;
+    }
     void DrawScene(const SceneView& view, const DrawItem* items, u32 count) override;
     void DrawUIOverlay(const UIVertex* vertices, u32 count) override;
     TextureHandle CreateUITarget(u32 width, u32 height) override;
@@ -467,7 +477,13 @@ private:
     VkDescriptorPool      descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet       descriptorSets_[kMaxFramesInFlight]{};
     VkPipelineLayout      pipelineLayout_ = VK_NULL_HANDLE;
-    VkPipeline            meshPipeline_ = VK_NULL_HANDLE;       // main MRT pass
+    // Opaque MRT pass, ONE pipeline per curated OpenPBR shader variant (P3); indexed by
+    // ShaderVariant (shared VS, only the lobe-stripped fragment shader differs). [Full] is the
+    // default bind and the transparent/preview pipelines' fragment shader.
+    VkPipeline            meshPipeline_[static_cast<size_t>(ShaderVariant::Count)] = {};
+    // TWO-SIDED FOLIAGE clones (cull-none) of each opaque variant, for alpha-cutout leaf cards.
+    // Selected in the opaque loop for draws with MaterialFlag_AlphaTest. D3D12 twin: meshPSOFoliage_.
+    VkPipeline            meshPipelineFoliage_[static_cast<size_t>(ShaderVariant::Count)] = {};
     VkPipeline            meshPipelineTransparent_ = VK_NULL_HANDLE; // alpha-blended pass
     VkPipeline            waterPipeline_ = VK_NULL_HANDLE; // Gerstner water surface
     VkPipeline            meshPipelineTransparentDepth_ = VK_NULL_HANDLE; // solid transparent (depth+vel)
@@ -538,6 +554,18 @@ private:
     u32 particleGpuGroupCount_ = 0;
     bool particleGpuAlignWarned_ = false;
     void DrawGpuParticleBatches(VkCommandBuffer cmd, bool additive);
+    // GPU-DRIVEN GRASS: a compute-written blade buffer drawn OPAQUE (depth-write) with its
+    // own lit pipeline inside DrawScene's opaque pass. D3D12 twin: grassPSO_ / DrawGrass.
+    VkPipeline grassPipeline_ = VK_NULL_HANDLE;
+    GpuBufferHandle grassBlades_{};
+    u32 grassBladeCount_ = 0;
+    void DrawGrass(VkCommandBuffer cmd);
+    // INDIRECT/COMPACTED grass (opt-in): a pipeline whose VS keys each blade off
+    // gl_InstanceIndex, drawn via vkCmdDrawIndirect against a {6,instanceCount,0,0} arg
+    // buffer. When grassArgs_ is set for a frame DrawGrass issues the indirect draw. D3D12
+    // twin: grassIndirectPSO_ / grassDrawSig_.
+    VkPipeline grassIndirectPipeline_ = VK_NULL_HANDLE;
+    GpuBufferHandle grassArgs_{};
     // The groups have a ONE-FRAME lifetime: `batches` points into a vector the engine
     // rebuilds every frame, so a group that survives a frame is a dangling pointer
     // with a stale count. DrawScene has early returns, so the clear cannot live only
@@ -628,7 +656,7 @@ private:
     bool CreatePostTargets(u32 width, u32 height);
     void DestroyPostTargets();
     bool CreatePostTarget(u32 w, u32 h, VkFormat fmt, VkRenderPass pass, u32 srvSlot,
-                          PostTargetVk& out);
+                          PostTargetVk& out, VkImageUsageFlags extraUsage = 0);
     void RunPostStack(const SceneView& view);
     // One fullscreen pass into `target` (render pass chosen by the caller).
     void DrawPostPass(VkPipeline pipe, VkRenderPass pass, const PostTargetVk& target,
@@ -662,12 +690,19 @@ private:
     // water PS can SAMPLE scene depth (via slotDepthRO_) while still depth-TESTING against it -
     // the Vulkan twin of D3D12's read-only DSV. LOAD variant; leaves everything SHADER_READ_ONLY.
     VkRenderPass hdrWaterRenderPass_ = VK_NULL_HANDLE;
+    // Transmission/refraction (P6b): reopen the HDR targets LOADED with WRITABLE depth so the
+    // transparent pass can run after the opaque scene-colour copy. Like hdrWaterRenderPass_ but depth
+    // stays writable (transparent-depth strokes still write depth). Leaves everything SHADER_READ_ONLY.
+    VkRenderPass hdrLoadRenderPass_ = VK_NULL_HANDLE;
     VkRenderPass previewRenderPass_ = VK_NULL_HANDLE; // single color + D32 (editor preview)
     VkRenderPass postPass16_ = VK_NULL_HANDLE;        // RGBA16F, discard -> sampled
     VkRenderPass postPass16Load_ = VK_NULL_HANDLE;    // RGBA16F, load (additive) -> sampled
     VkRenderPass postPass8_ = VK_NULL_HANDLE;         // RGBA8, discard -> sampled
 
     PostTargetVk hdr_;          // + own depth below
+    // Resolved opaque scene colour copied from hdr_ between opaque+sky and the transparent pass, so
+    // transmissive materials can sample the geometry BEHIND them (screen-space refraction, P6b).
+    PostTargetVk sceneColorCopy_;
     PostTargetVk gbuffer_;      // RGBA16F: octN.rg, rough.b, metal.a (no framebuffer)
     PostTargetVk velocity_;     // RG16F: screen motion vectors (no framebuffer)
     VkImage hdrDepth_ = VK_NULL_HANDLE;
@@ -693,6 +728,7 @@ private:
     u32 bloomCount_ = 0;
 
     u32 slotHdr_ = 0, slotDepth_ = 0, slotSsaoRaw_ = 0, slotSsaoBlur_ = 0, slotLdr_ = 0;
+    u32 slotSceneColor_ = 0; // bindless SRV of sceneColorCopy_ (transmission/refraction, P6b)
     u32 slotDepthRO_ = 0; // 2nd depth SRV declared DEPTH_STENCIL_READ_ONLY_OPTIMAL (water pass)
     u32 slotGbuffer_ = 0, slotVelocity_ = 0;
     u32 slotTaaHistory_[2] = {};
@@ -2225,7 +2261,33 @@ bool VulkanDevice::CreateMeshPipeline() {
     pci.renderPass = postPipelinesReady_ ? hdrRenderPass_ : renderPass_;
     pci.subpass = 0;
 
-    const VkResult r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &meshPipeline_);
+    // OpenPBR shader specialization (P3): one opaque pipeline per curated variant. Shared VS; only
+    // the lobe-stripped fragment shader differs. A missing/failed variant binary falls back to the
+    // FULL fragment shader (ps). Order MUST match rhi::ShaderVariant / cmake MeshPBR_<VAR>.ps.
+    const wchar_t* kVariantPs[static_cast<size_t>(ShaderVariant::Count)] = {
+        L"MeshPBR_STD.ps.spv", L"MeshPBR_COAT.ps.spv", L"MeshPBR_SSS.ps.spv",
+        L"MeshPBR_FUZZ.ps.spv", L"MeshPBR_HAIR.ps.spv", L"MeshPBR_EYE.ps.spv",
+        L"MeshPBR.ps.spv", // Full (== ps)
+    };
+    VkResult r = VK_SUCCESS;
+    for (u32 v = 0; v < static_cast<u32>(ShaderVariant::Count) && r == VK_SUCCESS; ++v) {
+        VkShaderModule pv = (v == static_cast<u32>(ShaderVariant::Full))
+                                ? ps
+                                : LoadShaderModule(dir + kVariantPs[v]);
+        if (pv == VK_NULL_HANDLE) pv = ps; // variant missing -> FULL (correct, just unspecialized)
+        stages[1].module = pv;
+        r = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr, &meshPipeline_[v]);
+        if (r == VK_SUCCESS) {
+            // Two-sided foliage clone: same pipeline, cull off (rs is the cull-none rasterizer).
+            pci.pRasterizationState = &rs;
+            if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &pci, nullptr,
+                                          &meshPipelineFoliage_[v]) != VK_SUCCESS)
+                meshPipelineFoliage_[v] = meshPipeline_[v]; // fall back to the culled pipeline
+            pci.pRasterizationState = &rsCull; // restore for the next opaque variant
+        }
+        if (pv != ps) vkDestroyShaderModule(device_, pv, nullptr); // module copied into the pipeline
+    }
+    stages[1].module = ps; // restore FULL fragment shader for the transparent/preview clones below
 
     // Transparent variant: straight-alpha blend on the colour attachment, depth
     // test LESS_OR_EQUAL with writes OFF, no writes to the G-buffer/velocity.
@@ -2398,6 +2460,92 @@ bool VulkanDevice::CreateMeshPipeline() {
             }
             if (gvs != VK_NULL_HANDLE) vkDestroyShaderModule(device_, gvs, nullptr);
             if (gps != VK_NULL_HANDLE) vkDestroyShaderModule(device_, gps, nullptr);
+
+            // GPU-DRIVEN GRASS pipeline: empty vertex input (the VS builds each blade from
+            // gl_VertexIndex reading set 2), OPAQUE - depth test + WRITE, no blend, cull NONE
+            // (blades are two-sided). Reuses the main pipeline layout so the PS is lit +
+            // shadowed. Missing shaders just leave grass off.
+            VkShaderModule grvs = LoadShaderModule(dir + L"Grass.vs.spv");
+            VkShaderModule grps = LoadShaderModule(dir + L"Grass.ps.spv");
+            if (particlePipeline_ != VK_NULL_HANDLE && grvs != VK_NULL_HANDLE &&
+                grps != VK_NULL_HANDLE) {
+                VkPipelineShaderStageCreateInfo grst[2] = {stages[0], stages[1]};
+                grst[0].module = grvs;
+                grst[1].module = grps;
+                VkPipelineVertexInputStateCreateInfo grvi{
+                    VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+                grvi.vertexBindingDescriptionCount = 0;
+                grvi.vertexAttributeDescriptionCount = 0;
+                VkPipelineDepthStencilStateCreateInfo grds = ds; // opaque depth: test + write
+                grds.depthTestEnable = VK_TRUE;
+                grds.depthWriteEnable = VK_TRUE;
+                grds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+                VkPipelineColorBlendAttachmentState grcba[3]{};
+                for (auto& a : grcba) { a.colorWriteMask = rgba; a.blendEnable = VK_FALSE; }
+                grcba[1].colorWriteMask = 0; // keep G-buffer
+                grcba[2].colorWriteMask = 0; // keep velocity
+                VkPipelineColorBlendStateCreateInfo grcb = cb;
+                grcb.attachmentCount = 3;
+                grcb.pAttachments = grcba;
+                VkGraphicsPipelineCreateInfo grpp = pci;
+                grpp.pStages = grst;
+                grpp.pVertexInputState = &grvi;
+                grpp.pRasterizationState = &rs; // two-sided
+                grpp.pDepthStencilState = &grds;
+                grpp.pColorBlendState = &grcb;
+                if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &grpp, nullptr,
+                                              &grassPipeline_) != VK_SUCCESS) {
+                    HBE_WARN("[Vulkan] Grass pipeline failed; GPU grass off.");
+                    grassPipeline_ = VK_NULL_HANDLE;
+                }
+            } else if (particlePipeline_ != VK_NULL_HANDLE) {
+                HBE_WARN("[Vulkan] Grass shaders missing; GPU grass off.");
+            }
+            if (grvs != VK_NULL_HANDLE) vkDestroyShaderModule(device_, grvs, nullptr);
+            if (grps != VK_NULL_HANDLE) vkDestroyShaderModule(device_, grps, nullptr);
+
+            // INDIRECT/COMPACTED grass pipeline (opt-in): same opaque state as grassPipeline_,
+            // but the VS reads the blade from gl_InstanceIndex (drawn 6 verts x instanceCount
+            // via vkCmdDrawIndirect). Missing shaders leave the indirect path off and the
+            // caller falls back to the fixed grass draw.
+            VkShaderModule givs = LoadShaderModule(dir + L"GrassIndirect.vs.spv");
+            VkShaderModule gips = LoadShaderModule(dir + L"GrassIndirect.ps.spv");
+            if (grassPipeline_ != VK_NULL_HANDLE && givs != VK_NULL_HANDLE &&
+                gips != VK_NULL_HANDLE) {
+                VkPipelineShaderStageCreateInfo gist[2] = {stages[0], stages[1]};
+                gist[0].module = givs;
+                gist[1].module = gips;
+                VkPipelineVertexInputStateCreateInfo givi{
+                    VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+                givi.vertexBindingDescriptionCount = 0;
+                givi.vertexAttributeDescriptionCount = 0;
+                VkPipelineDepthStencilStateCreateInfo gids = ds;
+                gids.depthTestEnable = VK_TRUE;
+                gids.depthWriteEnable = VK_TRUE;
+                gids.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+                VkPipelineColorBlendAttachmentState gicba[3]{};
+                for (auto& a : gicba) { a.colorWriteMask = rgba; a.blendEnable = VK_FALSE; }
+                gicba[1].colorWriteMask = 0;
+                gicba[2].colorWriteMask = 0;
+                VkPipelineColorBlendStateCreateInfo gicb = cb;
+                gicb.attachmentCount = 3;
+                gicb.pAttachments = gicba;
+                VkGraphicsPipelineCreateInfo gipp = pci;
+                gipp.pStages = gist;
+                gipp.pVertexInputState = &givi;
+                gipp.pRasterizationState = &rs;
+                gipp.pDepthStencilState = &gids;
+                gipp.pColorBlendState = &gicb;
+                if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gipp, nullptr,
+                                              &grassIndirectPipeline_) != VK_SUCCESS) {
+                    HBE_WARN("[Vulkan] Indirect grass pipeline failed; falls back to fixed grass.");
+                    grassIndirectPipeline_ = VK_NULL_HANDLE;
+                }
+            } else if (grassPipeline_ != VK_NULL_HANDLE) {
+                HBE_WARN("[Vulkan] GrassIndirect shaders missing; indirect grass path off.");
+            }
+            if (givs != VK_NULL_HANDLE) vkDestroyShaderModule(device_, givs, nullptr);
+            if (gips != VK_NULL_HANDLE) vkDestroyShaderModule(device_, gips, nullptr);
 
             vkDestroyShaderModule(device_, pvs, nullptr);
             vkDestroyShaderModule(device_, pps, nullptr);
@@ -3091,6 +3239,70 @@ bool VulkanDevice::CreatePostRenderPasses() {
         VK_CHECK(vkCreateRenderPass(device_, &ci, nullptr, &hdrWaterRenderPass_),
                  "vkCreateRenderPass(hdrWater)");
     }
+
+    // Transmission/refraction load pass (P6b): identical to hdrWaterRenderPass_ (LOAD the lit HDR,
+    // hand everything back SHADER_READ_ONLY, compatible with hdr_.framebuffer) EXCEPT the depth
+    // attachment stays WRITABLE - the transparent pass depth-tests AND the depth-write variant writes
+    // depth. Used to reopen the scene after the opaque scene-colour copy so the transparent pass runs.
+    {
+        VkAttachmentDescription atts[4]{};
+        VkAttachmentReference colorRefs[3]{};
+        for (u32 i = 0; i < 3; ++i) {
+            atts[i].format = hdrFormats[i];
+            atts[i].samples = VK_SAMPLE_COUNT_1_BIT;
+            atts[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            atts[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            atts[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            atts[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            atts[i].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; // where hdrRenderPass_ left it
+            atts[i].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;   // hand back to post/water
+            colorRefs[i] = {i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        }
+        VkAttachmentDescription& depth = atts[3];
+        depth = atts[0];
+        depth.format = depthFormat_;
+        VkAttachmentReference depthRef{3, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}; // WRITABLE
+
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 3;
+        sub.pColorAttachments = colorRefs;
+        sub.pDepthStencilAttachment = &depthRef;
+
+        VkSubpassDependency ldeps[2]{};
+        ldeps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        ldeps[0].dstSubpass = 0;
+        ldeps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        ldeps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        ldeps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        ldeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+        ldeps[1].srcSubpass = 0;
+        ldeps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        ldeps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        ldeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        ldeps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        ldeps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ci.attachmentCount = 4;
+        ci.pAttachments = atts;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        ci.dependencyCount = 2;
+        ci.pDependencies = ldeps;
+        VK_CHECK(vkCreateRenderPass(device_, &ci, nullptr, &hdrLoadRenderPass_),
+                 "vkCreateRenderPass(hdrLoad)");
+    }
     return true;
 }
 
@@ -3227,7 +3439,7 @@ bool VulkanDevice::CreatePostPipelines() {
 }
 
 bool VulkanDevice::CreatePostTarget(u32 w, u32 h, VkFormat fmt, VkRenderPass pass,
-                                    u32 srvSlot, PostTargetVk& out) {
+                                    u32 srvSlot, PostTargetVk& out, VkImageUsageFlags extraUsage) {
     VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
     ici.format = fmt;
@@ -3236,7 +3448,9 @@ bool VulkanDevice::CreatePostTarget(u32 w, u32 h, VkFormat fmt, VkRenderPass pas
     ici.arrayLayers = 1;
     ici.samples = VK_SAMPLE_COUNT_1_BIT;
     ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    // extraUsage lets specific targets opt into e.g. TRANSFER_SRC/DST (P6b scene-colour copy) without
+    // widening usage for every post target.
+    ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | extraUsage;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VK_CHECK(vkCreateImage(device_, &ici, nullptr, &out.image), "vkCreateImage(post)");
 
@@ -3293,6 +3507,7 @@ void VulkanDevice::DestroyPostTargets() {
         t.width = t.height = 0;
     };
     destroy(hdr_);
+    destroy(sceneColorCopy_); // opaque scene-colour copy (transmission/refraction, P6b)
     destroy(gbuffer_);
     destroy(velocity_);
     destroy(ssaoRaw_);
@@ -3328,8 +3543,9 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
 
     // Reserve the bindless slots once; resizes rewrite the same descriptors.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 24 + kBloomMaxMips > kMaxBindlessTextures) return false;
+        if (bindlessNextSlot_ + 25 + kBloomMaxMips > kMaxBindlessTextures) return false;
         slotHdr_ = bindlessNextSlot_++;
+        slotSceneColor_ = bindlessNextSlot_++; // opaque scene-colour copy for transmission (P6b)
         slotDepth_ = bindlessNextSlot_++;
         slotDepthRO_ = bindlessNextSlot_++; // depth sampled during the read-only-depth water pass
         slotGbuffer_ = bindlessNextSlot_++;
@@ -3356,9 +3572,18 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
         for (u32 i = 0; i < kBloomMaxMips; ++i) slotBloom_[i] = bindlessNextSlot_++;
     }
 
-    // HDR color (framebuffer made manually: it pairs with the depth below).
+    // HDR color (framebuffer made manually: it pairs with the depth below). TRANSFER_SRC so the P6b
+    // scene-colour copy can use it as a vkCmdCopyImage source (transitioned to TRANSFER_SRC_OPTIMAL).
     if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_NULL_HANDLE,
-                          slotHdr_, hdr_)) {
+                          slotHdr_, hdr_, VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        return false;
+    }
+
+    // Scene-colour copy for screen-space refraction (P6b): a sampled bindless texture (no framebuffer,
+    // no render pass) filled by vkCmdCopyImage(hdr_.image) between opaque+sky and the transparent pass.
+    // TRANSFER_DST so it can be the copy destination (transitioned to TRANSFER_DST_OPTIMAL).
+    if (!CreatePostTarget(width, height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_NULL_HANDLE,
+                          slotSceneColor_, sceneColorCopy_, VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         return false;
     }
 
@@ -4850,6 +5075,8 @@ GpuBufferHandle VulkanDevice::CreateGpuBuffer(const GpuBufferDesc& desc) {
         usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     if (desc.usage & GpuBufferUsage::VertexBuffer)
         usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    if (desc.usage & GpuBufferUsage::IndirectArgs)
+        usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     const VkMemoryPropertyFlags props =
         (desc.usage & GpuBufferUsage::CpuWrite)
             ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
@@ -5278,13 +5505,18 @@ void VulkanDevice::ExecuteQueuedCompute() {
     }
 
     // Compute writes -> this frame's vertex reads (attribute fetch and/or the
-    // set-2 structured-buffer read). D3D12 expresses this as a resource-state
-    // transition inside TransitionGpuBuffer.
+    // set-2 structured-buffer read), PLUS the indirect-draw-argument read for the
+    // compacted grass path (a compute-written {6,inst,0,0} arg buffer consumed by
+    // vkCmdDrawIndirect). D3D12 expresses these as resource-state transitions inside
+    // TransitionGpuBuffer. Adding DRAW_INDIRECT to the dst scope is harmless on frames
+    // that issue no indirect draw (this is a global memory barrier).
     VkMemoryBarrier post{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     post.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    post.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    post.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                         VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
                          0, 1, &post, 0, nullptr, 0, nullptr);
 
     computeQueueCount_ = 0; // one frame only, like SetParticles
@@ -5312,7 +5544,8 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     }
 
     VkCommandBuffer cmd = commandBuffers_[frameIndex_];
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, meshPipeline_);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      meshPipeline_[static_cast<size_t>(ShaderVariant::Full)]);
 
     // Bind the bindless texture set (set 1) once for the whole pass.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
@@ -5457,6 +5690,15 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
     fcb.shorelineWidth = view.waterShorelineWidth;
     fcb.edgeFade = view.waterEdgeFade;
     fcb.sceneDepthIndex = waterDepthGrade ? slotDepthRO_ : 0u; // read-only depth SRV; 0 = skip grading
+    // P6b screen-space refraction: does any transparent item need the opaque scene colour behind it
+    // (OpenPBR transmission)? Only then do we copy it + reopen the scene pass; otherwise the flow is
+    // byte-identical, so non-transmissive scenes are completely unaffected.
+    bool needSceneColor = false;
+    if (items && sceneColorCopy_.image != VK_NULL_HANDLE)
+        for (u32 i = 0; i < count; ++i)
+            if ((items[i].materialFlags & MaterialFlag_Transparent) &&
+                items[i].surface.transmission_weight > 0.0f) { needSceneColor = true; break; }
+    fcb.sceneColorIndex = needSceneColor ? slotSceneColor_ : 0u;
     fcb.rippleCount = std::min(view.rippleCount, kMaxRipples);
     std::memcpy(fcb.ripples, view.ripples, sizeof(fcb.ripples));
     fcb.giOrigin = view.giOrigin;
@@ -5581,12 +5823,29 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         vkCmdDrawIndexed(cmd, gm.indexCount, instances, 0, 0, 0);
     };
 
-    // Opaque pass (transparent items deferred to the blended pass below; items
-    // consumed by an instanced run head are skipped - the head draws them).
-    for (u32 i = 0; i < drawCount; ++i)
-        if (items[i].instanceRun != 0 &&
-            !(items[i].materialFlags & MaterialFlag_Transparent))
-            drawItem(i);
+    // Opaque pass (transparent items deferred to the blended pass below; items consumed by an
+    // instanced run head are skipped - the head draws them). P3: bind the per-item OpenPBR shader
+    // variant pipeline, switching only when it changes (material-sorted items keep switches rare).
+    ShaderVariant curVariant = ShaderVariant::Count; // != any real variant -> forces the first bind
+    bool curFoliage = false;
+    for (u32 i = 0; i < drawCount; ++i) {
+        if (items[i].instanceRun == 0 || (items[i].materialFlags & MaterialFlag_Transparent))
+            continue;
+        const bool foliage = (items[i].materialFlags & MaterialFlag_AlphaTest) != 0;
+        if (items[i].shaderVariant != curVariant || foliage != curFoliage) {
+            curVariant = items[i].shaderVariant;
+            curFoliage = foliage;
+            const size_t vi = static_cast<size_t>(curVariant);
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              (foliage && meshPipelineFoliage_[vi]) ? meshPipelineFoliage_[vi]
+                                                                    : meshPipeline_[vi]);
+        }
+        drawItem(i);
+    }
+
+    // GPU-DRIVEN GRASS: opaque, drawn with the opaque geometry (depth-write on, shadow map
+    // + FrameConstants still bound) so blades are lit, shadowed, and occlude correctly.
+    DrawGrass(cmd);
 
     // Sky background: after opaques so the depth test rejects covered pixels.
     if (drawSky) {
@@ -5596,6 +5855,61 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 0, 1,
                                 &descriptorSets_[frameIndex_], 1, &zeroOffset);
         vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    // P6b screen-space refraction: copy the resolved opaque+sky HDR into sceneColorCopy_ so the
+    // transparent pass can sample the geometry BEHIND transmissive surfaces. End the main render pass
+    // (it leaves colour + depth SHADER_READ_ONLY), copy the colour image, then reopen the scene LOADED
+    // with WRITABLE depth (hdrLoadRenderPass_) for the transparent draws. Guarded so non-transmissive
+    // scenes keep the single-pass flow; the transparent pipelines are render-pass-compatible with both.
+    if (needSceneColor && hdrLoadRenderPass_ != VK_NULL_HANDLE) {
+        vkCmdEndRenderPass(cmd); // hdr_ colour + depth are SHADER_READ_ONLY now
+        auto imgBarrier = [&](VkImage img, VkImageLayout oldL, VkImageLayout newL,
+                              VkAccessFlags srcA, VkAccessFlags dstA, VkPipelineStageFlags srcS,
+                              VkPipelineStageFlags dstS) {
+            VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.oldLayout = oldL; b.newLayout = newL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = img;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            b.srcAccessMask = srcA; b.dstAccessMask = dstA;
+            vkCmdPipelineBarrier(cmd, srcS, dstS, 0, 0, nullptr, 0, nullptr, 1, &b);
+        };
+        imgBarrier(hdr_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                   VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+        imgBarrier(sceneColorCopy_.image, VK_IMAGE_LAYOUT_UNDEFINED, // fully overwritten by the copy
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {sceneW_, sceneH_, 1};
+        vkCmdCopyImage(cmd, hdr_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sceneColorCopy_.image,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        imgBarrier(sceneColorCopy_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        imgBarrier(hdr_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        VkRenderPassBeginInfo lrp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        lrp.renderPass = hdrLoadRenderPass_;
+        lrp.framebuffer = hdr_.framebuffer; // compatible: same 4 attachments as hdrRenderPass_
+        lrp.renderArea.extent = VkExtent2D{sceneW_, sceneH_};
+        lrp.clearValueCount = 0; // LOAD - nothing cleared
+        vkCmdBeginRenderPass(cmd, &lrp, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+                                &bindlessSet_, 0, nullptr);
+        VkViewport lvp{0.0f, static_cast<f32>(sceneH_), static_cast<f32>(sceneW_),
+                       -static_cast<f32>(sceneH_), 0.0f, 1.0f};
+        VkRect2D lsc{{0, 0}, {sceneW_, sceneH_}};
+        vkCmdSetViewport(cmd, 0, 1, &lvp);
+        vkCmdSetScissor(cmd, 0, 1, &lsc);
     }
 
     // Transparent pass: alpha-blended, back-to-front, over opaques + sky.
@@ -5818,6 +6132,57 @@ void VulkanDevice::DrawGpuParticleBatches(VkCommandBuffer cmd, bool additive) {
             vkCmdDraw(cmd, count * 6u, 1, 0, 0);
         }
     }
+}
+
+void VulkanDevice::SetGrass(GpuBufferHandle blades, u32 bladeCount) {
+    grassBlades_ = blades;
+    grassBladeCount_ = bladeCount;
+    grassArgs_ = {}; // fixed-count path this frame
+}
+
+void VulkanDevice::SetGrassIndirect(GpuBufferHandle blades, GpuBufferHandle args, u32 maxBlades) {
+    if (grassIndirectPipeline_ == VK_NULL_HANDLE) return; // no indirect pipeline -> fall back
+    grassBlades_ = blades;
+    grassArgs_ = args;
+    grassBladeCount_ = maxBlades;
+}
+
+// Draws the compute-generated grass. DEFAULT fixed-count path: bind the blade buffer at set 2
+// (dynamic offset 0) and one vkCmdDraw of 6 verts per blade (culled blades collapse to a point
+// in the VS). Opt-in INDIRECT path (grassArgs_ valid): bind the COMPACTED buffer and issue
+// vkCmdDrawIndirect against the {6,instanceCount,0,0} arg buffer the compaction compute filled.
+void VulkanDevice::DrawGrass(VkCommandBuffer cmd) {
+    if (!grassBlades_.IsValid()) return;
+    GpuBufferVk* rb = ResolveGpuBuffer(grassBlades_);
+    if (!rb || rb->stride == 0) return;
+    const u32 slot = frameIndex_ % rb->slots;
+    if (rb->vsSet[slot] == VK_NULL_HANDLE) return;
+
+    // INDIRECT/COMPACTED path.
+    if (grassArgs_.IsValid() && grassIndirectPipeline_ != VK_NULL_HANDLE) {
+        GpuBufferVk* ab = ResolveGpuBuffer(grassArgs_);
+        if (ab && ab->buf[0]) {
+            const u32 aslot = frameIndex_ % ab->slots;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, grassIndirectPipeline_);
+            const u32 dyn = 0u;
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1,
+                                    &rb->vsSet[slot], 1, &dyn);
+            // args = one VkDrawIndirectCommand {vertexCount=6, instanceCount, 0, 0} at offset 0.
+            vkCmdDrawIndirect(cmd, ab->buf[aslot], 0, 1, sizeof(VkDrawIndirectCommand));
+        }
+        return;
+    }
+
+    if (grassPipeline_ == VK_NULL_HANDLE || grassBladeCount_ == 0) return;
+    u32 blades = grassBladeCount_;
+    if (static_cast<VkDeviceSize>(blades) * rb->stride > rb->bytes)
+        blades = static_cast<u32>(rb->bytes / rb->stride);
+    if (blades == 0) return;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, grassPipeline_);
+    const u32 dyn = 0u; // grass binds the whole buffer at offset 0
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 2, 1,
+                            &rb->vsSet[slot], 1, &dyn);
+    vkCmdDraw(cmd, blades * 6u, 1, 0, 0);
 }
 
 void VulkanDevice::DrawUIOverlay(const UIVertex* vertices, u32 count) {
@@ -6927,13 +7292,19 @@ VulkanDevice::~VulkanDevice() {
     if (compositePipe_) vkDestroyPipeline(device_, compositePipe_, nullptr);
     if (hdrRenderPass_) vkDestroyRenderPass(device_, hdrRenderPass_, nullptr);
     if (hdrWaterRenderPass_) vkDestroyRenderPass(device_, hdrWaterRenderPass_, nullptr);
+    if (hdrLoadRenderPass_) vkDestroyRenderPass(device_, hdrLoadRenderPass_, nullptr);
     if (previewRenderPass_) vkDestroyRenderPass(device_, previewRenderPass_, nullptr);
     if (postPass16_) vkDestroyRenderPass(device_, postPass16_, nullptr);
     if (postPass16Load_) vkDestroyRenderPass(device_, postPass16Load_, nullptr);
     if (postPass8_) vkDestroyRenderPass(device_, postPass8_, nullptr);
 
     if (skyPipeline_) vkDestroyPipeline(device_, skyPipeline_, nullptr);
-    if (meshPipeline_) vkDestroyPipeline(device_, meshPipeline_, nullptr);
+    // Foliage clones first: destroy only the ones that are NOT an alias of the culled pipeline
+    // (the fallback path sets meshPipelineFoliage_[v] = meshPipeline_[v]).
+    for (u32 v = 0; v < static_cast<u32>(ShaderVariant::Count); ++v)
+        if (meshPipelineFoliage_[v] && meshPipelineFoliage_[v] != meshPipeline_[v])
+            vkDestroyPipeline(device_, meshPipelineFoliage_[v], nullptr);
+    for (VkPipeline& p : meshPipeline_) if (p) vkDestroyPipeline(device_, p, nullptr);
     if (meshPipelineTransparent_) vkDestroyPipeline(device_, meshPipelineTransparent_, nullptr);
     if (waterPipeline_) vkDestroyPipeline(device_, waterPipeline_, nullptr);
     if (meshPipelineTransparentDepth_)
@@ -6947,6 +7318,8 @@ VulkanDevice::~VulkanDevice() {
     // No RAII on this side: the D3D12 twin's ComPtrs release themselves, these do not.
     if (particleGpuPipeline_) vkDestroyPipeline(device_, particleGpuPipeline_, nullptr);
     if (particleGpuPipelineAdd_) vkDestroyPipeline(device_, particleGpuPipelineAdd_, nullptr);
+    if (grassPipeline_) vkDestroyPipeline(device_, grassPipeline_, nullptr);
+    if (grassIndirectPipeline_) vkDestroyPipeline(device_, grassIndirectPipeline_, nullptr);
     if (strokeSurfacePipe_) vkDestroyPipeline(device_, strokeSurfacePipe_, nullptr);
 
     // World-UI targets (their images/views are owned here, not by textures_).

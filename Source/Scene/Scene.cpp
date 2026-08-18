@@ -8,6 +8,7 @@
 #include "Project/Project.h"
 #include "Renderer/IBL.h"
 #include "Renderer/Renderer.h"
+#include "RHI/MaterialCompiler.h" // material::ComputeShaderVariant (OpenPBR shader specialization)
 #include "Scene/EntityGuid.h"
 #include "Scene/PaintSystem.h"
 #include "Scene/TerrainSystem.h" // hole-mask usability (one rule for every consumer)
@@ -307,6 +308,10 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         item.emissiveTexture = instance.emissiveTexture;
         item.thicknessTexture = instance.thicknessTexture;
         item.materialFlags = instance.materialFlags;
+        // OpenPBR shader specialization (P3): pick the curated MeshPBR variant for this material.
+        // Uses the shading-model flags (hair/eye/subsurface/cloth) from the instance; the world/
+        // painterly flags added below (splat/hole/exempt/censored) don't affect the variant.
+        item.shaderVariant = material::ComputeShaderVariant(instance.surface, instance.materialFlags);
         // Facial blendshapes: fill the top-8 active channels from a resolved MorphState
         // (channel name -> atlas row via targetNames; weights from the driver/schematic).
         // The atlas is uploaded once at spawn (SceneSerializer::Instantiate resolve).

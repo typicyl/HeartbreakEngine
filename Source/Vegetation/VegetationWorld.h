@@ -70,6 +70,10 @@ public:
     IPlantGrowthModel*       Growth(const std::string& name) const;
     IVegetationSimulation*   Simulation(const std::string& name) const;
 
+    // The generator a species should use, chosen from its GenStrategy (falls back to the
+    // default generator when the strategy's backend is not registered).
+    IPlantGenerator* GeneratorForStrategy(GenStrategy strategy) const;
+
     // The default backend of each kind (the first registered, or an explicitly chosen
     // one). Lets callers ask for "the noise field" without knowing which lib backs it.
     IPlantGenerator*         DefaultGenerator() const { return defaultGenerator_; }

@@ -12,6 +12,9 @@
 #include "Scene/ParticleGpuSim.h" // GPU particle simulation context (compute-driven)
 #include "Scene/PrecipSystem.h"   // precip::PrecipField (camera-following rain/snow)
 #include "Scene/OceanFFT.h"       // ocean::GpuOcean (GPU FFT ocean, compute-driven)
+#include "Vegetation/VegetationWorld.h" // veg::VegetationWorld (data-driven vegetation subsystem)
+#include "Vegetation/GrassGpu.h"        // veg::GrassGpuField (GPU-compute grass, --vegdemo)
+#include "Vegetation/VegetationRender.h" // veg::VegetationMeshLibrary (editor-painted plants)
 #include "Scene/TagStreaming.h"   // stream::Streamer (distance streaming of baked shards)
 #include "RHI/RHI.h"
 #include "Core/UserSettings.h" // per-user volume/graphics/brightness/captions
@@ -173,6 +176,8 @@ struct EngineConfig {
     f32 forceRain = -1.0f;    // --rain: rain at this intensity (wets ground, pools)
     bool forceVolClouds = false; // --volclouds: force volumetric clouds on
     bool spawnWater = false;     // --water: spawn a test Gerstner water plane at the origin
+    bool vegDemo = false;        // --vegdemo: spawn a procedural forest on a hilly terrain
+    bool vegGpuIndirect = false; // --veggpuindirect: draw grass via the compaction/indirect path
     bool fftOcean = false;       // --fftocean: drive the spawned test water with the GPU FFT
     bool forceDynIBL = false;    // --dynibl: dynamic IBL re-bake + dynamic sky
     bool forceLightning = false; // --lightning: enable lightning + set a storm
@@ -217,6 +222,31 @@ public:
     // Loaded from the scene's baked .hbnav (SceneEnvironment::navSource); streams tiles
     // around the player on its own radius, decoupled from geometry streaming.
     nav::NavWorld& GetNavWorld() { return navWorld_; }
+    // The data-driven vegetation subsystem (species/biome registries + plug-in backends
+    // + per-shard stores). The editor's vegetation mode and tools drive it (P9).
+    veg::VegetationWorld& GetVegetation() { return veg_; }
+    // The GPU-compute grass field (blade count + tunable config), for the editor panel.
+    veg::GrassGpuField& GetVegGrass() { return vegGrass_; }
+    bool VegGrassActive() const { return vegGrassActive_; }
+    // Enable/disable driving the GPU grass field. Off = the frame loop stops feeding it, so the
+    // grass despawns next frame (the renderer clears its blade handle each frame). Re-enabling
+    // resumes it if a terrain heightfield was set. This is the grass despawn control.
+    void SetVegGrassActive(bool active) { vegGrassActive_ = active; }
+
+    // Resets ENGINE-OWNED vegetation runtime state that is NOT part of the entity registry, so it
+    // does not bleed across a scene change. The GPU grass field is the case that motivates it: it
+    // is camera-centered engine state (not a scene entity), so without this it keeps rendering the
+    // OLD scene's terrain heightfield over a freshly loaded scene. Call on every world replace.
+    void ResetVegetationRuntime() {
+        vegGrassActive_ = false;
+        vegGrass_.SetTerrain({}, 0.0f, 0, 0.0f); // drop the previous scene's heightfield
+    }
+    // Persistent per-species mesh cache shared by every PAINTED plant (editor brush + rehydrate).
+    // Engine-owned so painted entities keep valid mesh handles; cleared before renderer shutdown.
+    veg::VegetationMeshLibrary& GetVegPaintLib() { return vegPaintLib_; }
+    // Spawns the procedural demo forest + GPU grass into the current scene (the --vegdemo
+    // content; also driven by the editor's Vegetation panel button).
+    void SpawnDemoVegetation();
 
     // Mouse-look cursor lock (hide + recenter). Driven by the game flow (locked
     // while Playing) and callable directly.
@@ -432,6 +462,10 @@ private:
     particle::GpuSim gpuSim_;
     precip::PrecipField precip_; // runtime camera-following rain/snow (not serialized)
     ocean::GpuOcean ocean_;      // runtime GPU FFT ocean (compute buffers/pipelines; lazy)
+    veg::VegetationWorld veg_;   // data-driven vegetation subsystem (registries + backends + per-shard stores)
+    veg::GrassGpuField vegGrass_; // GPU-compute grass field (driven while --vegdemo is active)
+    bool vegGrassActive_ = false; // --vegdemo enabled the GPU grass field
+    veg::VegetationMeshLibrary vegPaintLib_; // shared mesh cache for editor-painted plants
 
 public:
     // Exposed for --test-vfxsim (it reads the simulation buffer back).

@@ -30,6 +30,10 @@
 #include "Scene/WeatherSystem.h"
 #include "Scene/DecalSystem.h"
 #include "Scene/WaterSystem.h"
+#include "Vegetation/VegetationSystem.h" // veg::Update (per-frame wind + sim-LOD tick)
+#include "Vegetation/VegetationRender.h"  // veg::SpawnDemoForest (--vegdemo)
+#include "Vegetation/VegetationSurface.h" // veg::FindTerrain (--vegdemo grass)
+#include "Scene/TerrainSystem.h"          // terrain::ExtentXZ / SampleStep (--vegdemo grass)
 #include "Scene/LightningSystem.h"
 #include "Assets/MeshGenerator.h"
 #include "Scene/PaintSystem.h" // --test-terraincollide: terrain brush raycast + dab
@@ -148,6 +152,19 @@ std::vector<rhi::GraphicsAPI> ResolveBackendOrder(const BuildSettings& b) {
 
 void Engine::Quit() {
     if (window_) window_->RequestClose();
+}
+
+void Engine::SpawnDemoVegetation() {
+    if (!scene_ || !renderer_) return;
+    veg::SpawnDemoForest(*scene_, *renderer_, veg_);
+    // GPU-compute grass over the demo terrain: upload its heightfield to the grass field,
+    // then the frame loop drives the generation compute + lit draw each frame.
+    if (const entt::entity te = veg::FindTerrain(*scene_); te != entt::null) {
+        const TerrainComponent& tc = scene_->Registry().get<TerrainComponent>(te);
+        vegGrass_.SetTerrain(tc.heights, terrain::ExtentXZ(tc), tc.GridN(),
+                             terrain::SampleStep(tc));
+        vegGrassActive_ = true;
+    }
 }
 
 int Engine::Run(const EngineConfig& configIn) {
@@ -1122,6 +1139,37 @@ int Engine::Run(const EngineConfig& configIn) {
     }
     HBE_INFO("Graphics backend selected: {} ({} option(s) in the boot order).",
              rhi::ToString(config.api), backendOrder.size());
+
+    // Painted-vegetation load resolver: a "veg:<species>/<part>" MeshRef (from the paint brush /
+    // scatter) rebuilds its runtime mesh through the engine's shared library on scene load. Kept
+    // as a hook so the serializer stays free of vegetation types. Species come from the registry
+    // (demo species registered on demand as a fallback until a .hbspecies is loaded).
+    scene::SetVegMeshResolver([this](const std::string& src, Renderer& r, AABB& bounds,
+                                     rhi::TextureHandle& outAlbedo) -> rhi::MeshHandle {
+        const std::string body = src.substr(4); // strip "veg:"
+        const usize slash = body.rfind('/');
+        if (slash == std::string::npos) return {};
+        const std::string species = body.substr(0, slash);
+        const std::string part = body.substr(slash + 1);
+        veg::SpeciesId id = veg_.Species().Find(species);
+        if (!veg_.Species().Valid(id)) {
+            veg::RegisterDemoSpecies(veg_); // fallback for the built-in demo species
+            id = veg_.Species().Find(species);
+        }
+        if (!veg_.Species().Valid(id)) return {};
+        const veg::Species& sp = veg_.Species().Get(id);
+        const veg::VegetationMeshLibrary::SpeciesMeshes& m =
+            vegPaintLib_.GetOrCreate(r, veg_, id, sp);
+        const f32 cw = sp.crownWidth > 0.0f ? sp.crownWidth : 2.0f;
+        const f32 h = sp.maxHeight > 0.0f ? sp.maxHeight : 6.0f;
+        bounds.min = glm::vec3(-cw, 0.0f, -cw); // generous local bounds (culling only)
+        bounds.max = glm::vec3(cw, h + cw, cw);
+        if (part == "foliage") {
+            outAlbedo = vegPaintLib_.LeafTexture(r); // re-supply the runtime-only leaf texture
+            return m.foliage;
+        }
+        return m.woody;
+    });
     if (config.gpuProfile) {
         renderer.SetGpuProfileEnabled(true); // --gpuprofile: per-pass GPU breakdown
         HBE_INFO("GPU profiler requested (--gpuprofile): device active={}. Per-pass timings "
@@ -1437,6 +1485,9 @@ int Engine::Run(const EngineConfig& configIn) {
             scene.Registry().emplace<RigidBody>(b, rb);
         }
     }
+
+    if (config.vegGpuIndirect) vegGrass_.Cfg().useIndirect = true; // opt-in compaction path
+    if (config.vegDemo) SpawnDemoVegetation(); // --vegdemo (also the editor panel's button)
 
     if (config.forceDof) scene.Environment().post.dofEnabled = 1;
     if (config.forceMotionBlur) scene.Environment().post.motionBlurEnabled = 1;
@@ -2644,8 +2695,18 @@ int Engine::Run(const EngineConfig& configIn) {
         // Ground weather: ease wetness/puddles/snow from the precip state (no-op
         // unless dynamicWeather). Runs before RenderScene so MakeView sees the update.
         weather::Update(scene, dt);
+        // Vegetation: hierarchical wind + simulation-LOD tick. Runs after weather so it
+        // sees this frame's wind/precip state, and before RenderScene. GROWTH/structure
+        // only advances while the sim is running (physics_->IsRunning()); wind/sim-LOD is
+        // presentational and would advance every frame once P7 fills the stub in.
+        veg::Update(veg_, scene, renderer.GetCamera().Position(), dt,
+                    physics_ && physics_->IsRunning());
         // Weather-driven lightning flashes (storm-gated); may fire a thunder cue.
         lightning::Update(scene, dt, &audio, assetsDir);
+        // GPU-compute grass: queue this frame's blade-generation compute + hand the buffer
+        // to the renderer, BEFORE RenderScene (the compute drains in BeginFrame).
+        if (vegGrassActive_)
+            vegGrass_.Update(renderer, renderer.GetCamera().Position(), scene.Time());
         {
             const auto _pt = clock::now();
             renderer.RenderScene(scene, dt);
@@ -2661,6 +2722,8 @@ int Engine::Run(const EngineConfig& configIn) {
     // Unload the navmesh before the job system shuts down: Unload drains any in-flight
     // tile-read job so no worker is left writing into freed nav memory.
     navWorld_.Unload();
+    vegGrass_.Shutdown(renderer); // release the GPU grass buffers (waits for GPU idle)
+    vegPaintLib_.Clear(renderer); // free painted-plant species meshes before the device dies
     renderer.Shutdown();
     jobs::Shutdown();
     window_ = nullptr;
@@ -3159,6 +3222,7 @@ void Engine::LoadGameplayScene(const std::filesystem::path& scenePath) {
     // entities, so tear down the narrative runtime first. Found the hard way -
     // mirrors LoadGameplayWorld / LoadGame / FlowMainMenu.
     ResetDialogueRuntime();
+    ResetVegetationRuntime(); // GPU grass is engine state, not entities - don't carry it over
     ClearCutscene();
     game::ClearTransientQueues(); // don't let a queued death/noise/spot fire into the new scene
     // BindLevel is the level transition: it captures the outgoing level (resident set
@@ -3314,6 +3378,7 @@ bool Engine::LoadGame(const std::string& slot) {
     // a save mid-conversation must not resume a stale graph over the restored world
     // or hang on a Choice whose buttons the Replace destroyed.
     ResetDialogueRuntime();
+    ResetVegetationRuntime(); // don't render the prior world's grass over the restored save
     // Resume gameplay through the normal reveal so physics is un-paused, the cursor
     // locks, and any loading overlay is dropped - loading a save (e.g. dev F9) DURING
     // the loading screen would otherwise land in Playing with the sim still frozen.
@@ -3561,6 +3626,7 @@ void Engine::FlowMainMenu() {
     // Leaving gameplay: stop any in-progress dialogue and clear its captions so
     // they don't linger/resume over the menu.
     ResetDialogueRuntime();
+    ResetVegetationRuntime(); // no gameplay grass lingering over the menu
     // Stop any in-progress cutscene and restore the camera before the menu.
     if (cutsceneCamOwned_) SetGameCameraEnabled(cutsceneRestoreCam_);
     cutsceneCamOwned_ = false;
@@ -3642,6 +3708,7 @@ void Engine::LoadGameplayWorld() {
     // Stop any dialogue/captions left over from a prior run (the runner state
     // is an Engine member, so it survives the scene Replace below).
     ResetDialogueRuntime();
+    ResetVegetationRuntime(); // fresh run: drop the previous run's grass field
     // Stop any in-progress cutscene and hand the camera back (else it stays
     // disabled into the new run).
     ClearCutscene();
@@ -5150,6 +5217,11 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             config.forceVolClouds = true; // raymarched volumetric clouds
         } else if (arg == "--water") {
             config.spawnWater = true; // spawn a test Gerstner water plane
+        } else if (arg == "--vegdemo") {
+            config.vegDemo = true; // spawn a procedural forest on a hilly terrain
+        } else if (arg == "--veggpuindirect") {
+            config.vegDemo = true;         // implies the demo...
+            config.vegGpuIndirect = true;  // ...drawn via the GPU compaction/indirect grass path
         } else if (arg == "--fftocean") {
             config.spawnWater = true; // spawn the test water...
             config.fftOcean = true;   // ...driven by the GPU Tessendorf FFT

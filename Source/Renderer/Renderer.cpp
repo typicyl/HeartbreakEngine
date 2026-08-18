@@ -539,6 +539,16 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
             particleGpuGroups_[g] = {};
         }
         particleGpuGroupCount_ = 0;
+        // GPU-driven grass: the compute-written blade buffer, drawn inside DrawScene's HDR
+        // pass with its own lit PSO. One frame only. If the compaction path set an indirect
+        // arg buffer, forward that; otherwise the fixed-count path.
+        if (grassArgs_.IsValid())
+            device_->SetGrassIndirect(grassBlades_, grassArgs_, grassBladeCount_);
+        else
+            device_->SetGrass(grassBlades_, grassBladeCount_);
+        grassBlades_ = {};
+        grassBladeCount_ = 0;
+        grassArgs_ = {};
         // Shadow map first: it must record before the main pass begins. FULL list
         // (see the culling invariant above); the main pass draws the prefix only.
         device_->DrawShadowPass(view, drawItems_.data(), itemCount);

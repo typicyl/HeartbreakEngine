@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <unordered_map>
@@ -61,6 +62,29 @@ Material ConvertMaterial(const aiMaterial* src) {
         emissiveStrength > 0.0f) {
         mat.emissive *= emissiveStrength;
     }
+
+    // KHR glTF PBR extensions -> OpenPBR factors. Each key is optional: on a non-glTF file (or a
+    // plain metallic-roughness glTF) Get() fails and the OpenPBR-default field is left untouched.
+    // IOR is only taken when > 1 so an OBJ's Ni=1.0 (which would zero the specular F0) is ignored.
+    ai_real khr;
+    if (src->Get(AI_MATKEY_REFRACTI, khr) == AI_SUCCESS && khr > 1.0f) mat.ior = khr;             // ior
+    if (src->Get(AI_MATKEY_TRANSMISSION_FACTOR, khr) == AI_SUCCESS) mat.transmission = khr;       // transmission
+    if (src->Get(AI_MATKEY_CLEARCOAT_FACTOR, khr) == AI_SUCCESS) mat.clearcoat = khr;             // clearcoat
+    if (src->Get(AI_MATKEY_CLEARCOAT_ROUGHNESS_FACTOR, khr) == AI_SUCCESS) mat.clearcoatRoughness = khr;
+    if (src->Get(AI_MATKEY_ANISOTROPY_FACTOR, khr) == AI_SUCCESS) mat.anisotropy = khr;           // anisotropy
+    if (src->Get(AI_MATKEY_SPECULAR_FACTOR, khr) == AI_SUCCESS) mat.specularFactor = khr;         // specular
+    if (src->Get(AI_MATKEY_SHEEN_ROUGHNESS_FACTOR, khr) == AI_SUCCESS) mat.sheenRoughness = khr;  // sheen rough
+    if (src->Get(AI_MATKEY_VOLUME_THICKNESS_FACTOR, khr) == AI_SUCCESS) mat.volumeThickness = khr;// volume
+    // glTF attenuationDistance defaults to +Infinity ("no absorption"); Assimp reports that verbatim.
+    // Keep only finite distances - an infinite one must map to "no volume" (transmission_depth 0), and
+    // letting +inf through serialises to a JSON null that throws on reload.
+    if (src->Get(AI_MATKEY_VOLUME_ATTENUATION_DISTANCE, khr) == AI_SUCCESS && std::isfinite(khr))
+        mat.attenuationDistance = khr;
+    aiColor3D khrCol;
+    if (src->Get(AI_MATKEY_SHEEN_COLOR_FACTOR, khrCol) == AI_SUCCESS)
+        mat.sheenColor = {khrCol.r, khrCol.g, khrCol.b};
+    if (src->Get(AI_MATKEY_VOLUME_ATTENUATION_COLOR, khrCol) == AI_SUCCESS)
+        mat.attenuationColor = {khrCol.r, khrCol.g, khrCol.b};
 
     // Texture source paths (as referenced by the model file).
     auto getTex = [&](aiTextureType type, std::string& out) {

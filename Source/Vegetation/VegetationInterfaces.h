@@ -28,7 +28,8 @@ struct SceneEnvironment; // Scene/Scene.h - the wind model reads it (weather/tim
 namespace veg {
 
 class SpeciesRegistry; // VegetationWorld.h
-class VegetationStore;  // VegetationStore.h
+struct VegetationStore;  // VegetationStore.h
+class INoiseField;      // defined below (used by VegShardContext for density clumping)
 
 // The environment ONE streamed region presents to a scatter/generation job. Pure data
 // so it is safe to hand to a worker fiber. Terrain sampling (height/slope/splat/water)
@@ -40,6 +41,13 @@ struct VegShardContext {
     glm::vec2 aabbMin{0.0f};   // world XZ min of the region
     glm::vec2 aabbMax{0.0f};   // world XZ max of the region
     f32 lodDensityScale = 1.0f; // distance-driven density reduction (1 = full)
+
+    // Terrain surface query (world XZ -> SpawnSample). Empty = no terrain (skip all
+    // ground filtering; used by headless tests that scatter on a flat plane).
+    SurfaceQueryFn surface;
+    // Optional density/clumping field (FastNoise2 or the built-in value noise). A
+    // distribution modulates acceptance probability by it. nullptr = uniform density.
+    const INoiseField* noise = nullptr;
 };
 
 // Candidate placements a distribution backend produces for a shard (SoA).

@@ -263,6 +263,10 @@ struct FrameCB {
     glm::vec4 ripples[kMaxRipples]{};
     // Depth-based water (see Common.hlsli tail). sceneDepthIndex 0 = skip depth grading.
     u32 sceneDepthIndex = 0; f32 absorptionDepth = 6.0f; f32 shorelineWidth = 1.5f; f32 edgeFade = 0.5f;
+    // Opaque scene-colour SRV for OpenPBR transmission/refraction (P6). 0 = not bound -> the shader
+    // uses the IBL environment as the transmitted background; P6b sets this to a resolved copy for true
+    // screen-space refraction. Appended 16-byte row keeps the pre-P6 FrameCB byte-compatible.
+    u32 sceneColorIndex = 0; u32 _padSc0 = 0; u32 _padSc1 = 0; u32 _padSc2 = 0;
 };
 
 // Per-pass constants of the post stack (Shaders/PostCommon.hlsli).
@@ -465,6 +469,14 @@ public:
                       const ParticleVertex* additive, u32 addCount) override;
     void SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
                          u32 count) override;
+    void SetGrass(GpuBufferHandle blades, u32 bladeCount) override;
+    void SetGrassIndirect(GpuBufferHandle blades, GpuBufferHandle args, u32 maxBlades) override;
+    // Reflects the ACTUAL indirect grass pipeline, not a blanket capability: if the
+    // GrassIndirect draw PSO / command signature failed to build, the caller must stay on
+    // the fixed path (its compaction compute would produce a buffer nothing can draw).
+    bool SupportsIndirectDraw() const override {
+        return grassIndirectPSO_ != nullptr && grassDrawSig_ != nullptr;
+    }
     void DrawScene(const SceneView& view, const DrawItem* items, u32 count) override;
     void DrawUIOverlay(const UIVertex* vertices, u32 count) override;
     TextureHandle CreateUITarget(u32 width, u32 height) override;
@@ -585,7 +597,14 @@ private:
     DXGI_FORMAT depthFormat_ = DXGI_FORMAT_D32_FLOAT;
 
     ComPtr<ID3D12RootSignature> meshRootSig_;
-    ComPtr<ID3D12PipelineState> meshPSO_;       // main HDR pass (MRT: color+gbuffer+velocity)
+    // Opaque HDR pass (MRT: color+gbuffer+velocity), ONE PSO per curated OpenPBR shader variant
+    // (P3). Indexed by ShaderVariant; the vertex shader is shared, only the (lobe-stripped) pixel
+    // shader differs. meshPSO_[Full] is also the effective default before the opaque loop selects.
+    ComPtr<ID3D12PipelineState> meshPSO_[static_cast<size_t>(ShaderVariant::Count)];
+    // TWO-SIDED FOLIAGE clones of each opaque variant (CULL_MODE_NONE): alpha-cutout leaf cards
+    // must show both faces or the canopy goes patchy from behind. Selected in the opaque loop for
+    // draws with MaterialFlag_AlphaTest. Same shaders/state otherwise.
+    ComPtr<ID3D12PipelineState> meshPSOFoliage_[static_cast<size_t>(ShaderVariant::Count)];
     ComPtr<ID3D12PipelineState> meshPSOTransparent_; // alpha-blended pass (depth-write off)
     ComPtr<ID3D12PipelineState> meshPSOTransparentDepth_; // solid transparent: depth+velocity write
     ComPtr<ID3D12PipelineState> skyPSO_;        // background pass (shares meshRootSig_)
@@ -709,6 +728,21 @@ private:
     GpuParticleGroup particleGpuGroups_[kMaxGpuParticleGroups]{};
     u32 particleGpuGroupCount_ = 0;
     void DrawGpuParticleBatches(bool additive);
+    // GPU-DRIVEN GRASS: a compute-written blade buffer drawn OPAQUE (depth-write) with its
+    // own lit PSO inside DrawScene's opaque pass. Reuses the main root signature so blades
+    // are lit + shadowed. Vulkan twin: grassPipeline_ / grassBlades_ / DrawGrass.
+    ComPtr<ID3D12PipelineState> grassPSO_;
+    GpuBufferHandle grassBlades_{};
+    u32 grassBladeCount_ = 0;
+    void DrawGrass();
+    // GPU-DRIVEN GRASS, INDIRECT/COMPACTED variant (opt-in): a separate PSO whose VS keys
+    // each blade off SV_InstanceID, plus a DRAW command signature for ExecuteIndirect. When
+    // grassArgs_ is set for a frame, DrawGrass issues the indirect draw instead of the fixed
+    // one. Missing shaders leave grassIndirectPSO_ null and the caller falls back.
+    ComPtr<ID3D12PipelineState> grassIndirectPSO_;
+    ComPtr<ID3D12CommandSignature> grassDrawSig_;
+    GpuBufferHandle grassArgs_{};      // 16-byte {vtx,inst,0,0}; valid = indirect this frame
+    u32 grassIndirectMax_ = 0;         // compacted-region capacity (SRV bound size)
     // The groups have a ONE-FRAME lifetime: `batches` points into a vector the engine
     // rebuilds every frame, so a group that survives a frame is a dangling pointer
     // with a stale count. DrawScene has early returns, so the clear cannot live only
@@ -748,6 +782,10 @@ private:
     DXGI_FORMAT sceneFormat_ = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
     ComPtr<ID3D12Resource> hdrColor_, hdrDepth_;
+    // Resolved opaque scene colour, copied from hdrColor_ after opaque+sky and before the transparent
+    // pass, so transmissive materials can sample the geometry BEHIND them (screen-space refraction,
+    // P6b). Copy-dest + SRV only (no RTV). Only produced when a transmissive transparent item exists.
+    ComPtr<ID3D12Resource> sceneColorCopy_;
     ComPtr<ID3D12Resource> gbuffer_;            // RGBA16F: octN.rg, rough.b, metal.a
     ComPtr<ID3D12Resource> velocity_;           // RG16F: screen motion vectors
     ComPtr<ID3D12Resource> ssaoRaw_, ssaoBlur_; // half-res
@@ -770,6 +808,7 @@ private:
     ComPtr<ID3D12DescriptorHeap> postDsvHeap_;  // hdr depth
     u32 postRtvSize_ = 0;
     u32 slotHdr_ = 0, slotDepth_ = 0, slotSsaoRaw_ = 0, slotSsaoBlur_ = 0, slotLdr_ = 0;
+    u32 slotSceneColor_ = 0; // bindless SRV of sceneColorCopy_ (transmission/refraction, P6b)
     u32 slotGbuffer_ = 0, slotVelocity_ = 0;
     bool gbufInSrv_ = false; // G-buffer/velocity resource-state tracking
     u32 slotTaaHistory_[2] = {};
@@ -2084,27 +2123,51 @@ bool D3D12Device::CreateMeshPipeline() {
     pso.DepthStencilState.FrontFace = stencilOp;
     pso.DepthStencilState.BackFace = stencilOp;
 
-    HRESULT psoHr = device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&meshPSO_));
-    if (FAILED(psoHr)) {
-        HBE_ERROR("[D3D12] CreateGraphicsPipelineState failed (hr=0x{:08X})",
-                  static_cast<u32>(psoHr));
-        // Surface the debug-layer explanation if available.
-        ComPtr<ID3D12InfoQueue> iq;
-        if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&iq)))) {
-            const u64 n = iq->GetNumStoredMessages();
-            for (u64 i = 0; i < n; ++i) {
-                SIZE_T len = 0;
-                iq->GetMessage(i, nullptr, &len);
-                std::vector<u8> buf(len);
-                auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
-                if (SUCCEEDED(iq->GetMessage(i, msg, &len)) && msg->pDescription) {
-                    HBE_ERROR("[D3D12][dbg] {}", msg->pDescription);
+    // OpenPBR shader specialization (P3): one opaque PSO per curated variant. Only the pixel shader
+    // differs (stripped lobes); the shared VS above is reused. A missing/failed variant binary falls
+    // back to the FULL pixel shader (`ps`) so the material still renders correctly. Order MUST match
+    // rhi::ShaderVariant / cmake MeshPBR_<VAR>.ps.
+    const wchar_t* kVariantPs[static_cast<size_t>(ShaderVariant::Count)] = {
+        L"MeshPBR_STD.ps.dxil", L"MeshPBR_COAT.ps.dxil", L"MeshPBR_SSS.ps.dxil",
+        L"MeshPBR_FUZZ.ps.dxil", L"MeshPBR_HAIR.ps.dxil", L"MeshPBR_EYE.ps.dxil",
+        L"MeshPBR.ps.dxil", // Full (== ps, already loaded)
+    };
+    for (u32 v = 0; v < static_cast<u32>(ShaderVariant::Count); ++v) {
+        std::vector<u8> pv =
+            (v == static_cast<u32>(ShaderVariant::Full)) ? ps : ReadBinaryFile(dir + kVariantPs[v]);
+        if (pv.empty()) pv = ps; // variant binary missing -> FULL (correct, just unspecialized)
+        pso.PS = {pv.data(), pv.size()};
+        HRESULT psoHr = device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&meshPSO_[v]));
+        if (SUCCEEDED(psoHr)) {
+            // Two-sided foliage clone: same PSO, cull off (leaf cards need both faces).
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC fp = pso;
+            fp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            if (FAILED(device_->CreateGraphicsPipelineState(&fp, IID_PPV_ARGS(&meshPSOFoliage_[v]))))
+                meshPSOFoliage_[v] = meshPSO_[v]; // fall back to the culled PSO if the clone fails
+        }
+        if (FAILED(psoHr)) {
+            HBE_ERROR("[D3D12] CreateGraphicsPipelineState (mesh variant {}) failed (hr=0x{:08X})",
+                      v, static_cast<u32>(psoHr));
+            // Surface the debug-layer explanation if available.
+            ComPtr<ID3D12InfoQueue> iq;
+            if (SUCCEEDED(device_->QueryInterface(IID_PPV_ARGS(&iq)))) {
+                const u64 n = iq->GetNumStoredMessages();
+                for (u64 i = 0; i < n; ++i) {
+                    SIZE_T len = 0;
+                    iq->GetMessage(i, nullptr, &len);
+                    std::vector<u8> buf(len);
+                    auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf.data());
+                    if (SUCCEEDED(iq->GetMessage(i, msg, &len)) && msg->pDescription) {
+                        HBE_ERROR("[D3D12][dbg] {}", msg->pDescription);
+                    }
                 }
             }
+            return false;
         }
-        return false;
     }
-    HBE_INFO("[D3D12] Mesh PBR pipeline created.");
+    pso.PS = {ps.data(), ps.size()}; // restore FULL PS for the transparent/preview clones below
+    HBE_INFO("[D3D12] Mesh PBR pipelines created ({} OpenPBR variants).",
+             static_cast<u32>(ShaderVariant::Count));
 
     // Transparent variant: straight-alpha blend on the colour target, depth test
     // LESS_EQUAL with writes OFF, and no writes to the G-buffer/velocity (so glass
@@ -2474,6 +2537,81 @@ bool D3D12Device::CreateMeshPipeline() {
             } else if (ok) {
                 HBE_WARN("[D3D12] ParticleGpu shaders missing; GPU particle expansion off.");
             }
+
+            // GPU-DRIVEN GRASS PSO: like the GPU particle PSO (no input layout, SV_VertexID),
+            // but OPAQUE - depth WRITE on, no blend, cull NONE (blades are two-sided). Reuses
+            // the main root signature, so the grass PS is fully lit + shadowed. Missing shaders
+            // just leave grass off (opt-in per scene), so it warns rather than failing.
+            const std::vector<u8> grvs = ReadBinaryFile(dir + L"Grass.vs.dxil");
+            const std::vector<u8> grps = ReadBinaryFile(dir + L"Grass.ps.dxil");
+            if (ok && !grvs.empty() && !grps.empty()) {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC pp = pso;
+                pp.VS = {grvs.data(), grvs.size()};
+                pp.PS = {grps.data(), grps.size()};
+                pp.InputLayout = {nullptr, 0};
+                pp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pp.DepthStencilState.DepthEnable = TRUE;
+                pp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+                pp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+                pp.BlendState.RenderTarget[0].BlendEnable = FALSE;
+                if (postPipelinesReady_) {
+                    // Opaque grass writes colour only; leave the G-buffer velocity/normal
+                    // targets untouched (grass gets no SSAO/velocity in this first cut).
+                    pp.BlendState.IndependentBlendEnable = TRUE;
+                    pp.BlendState.RenderTarget[1].RenderTargetWriteMask = 0;
+                    pp.BlendState.RenderTarget[2].RenderTargetWriteMask = 0;
+                }
+                if (!SUCCEEDED(device_->CreateGraphicsPipelineState(&pp, IID_PPV_ARGS(&grassPSO_)))) {
+                    HBE_WARN("[D3D12] Grass pipeline unavailable; GPU grass off.");
+                    grassPSO_.Reset();
+                }
+            } else if (ok) {
+                HBE_WARN("[D3D12] Grass shaders missing; GPU grass off.");
+            }
+
+            // INDIRECT/COMPACTED grass PSO (opt-in): identical opaque state, but the VS keys
+            // each blade off SV_InstanceID (drawn as 6 verts x instanceCount via ExecuteIndirect).
+            // Also build the DRAW command signature once. Missing shaders just leave the indirect
+            // path unavailable (SetGrassIndirect no-ops and the caller falls back to SetGrass).
+            const std::vector<u8> givs = ReadBinaryFile(dir + L"GrassIndirect.vs.dxil");
+            const std::vector<u8> gips = ReadBinaryFile(dir + L"GrassIndirect.ps.dxil");
+            if (ok && grassPSO_ && !givs.empty() && !gips.empty()) {
+                D3D12_GRAPHICS_PIPELINE_STATE_DESC pp = pso;
+                pp.VS = {givs.data(), givs.size()};
+                pp.PS = {gips.data(), gips.size()};
+                pp.InputLayout = {nullptr, 0};
+                pp.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pp.DepthStencilState.DepthEnable = TRUE;
+                pp.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+                pp.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+                pp.BlendState.RenderTarget[0].BlendEnable = FALSE;
+                if (postPipelinesReady_) {
+                    pp.BlendState.IndependentBlendEnable = TRUE;
+                    pp.BlendState.RenderTarget[1].RenderTargetWriteMask = 0;
+                    pp.BlendState.RenderTarget[2].RenderTargetWriteMask = 0;
+                }
+                bool giOk = SUCCEEDED(
+                    device_->CreateGraphicsPipelineState(&pp, IID_PPV_ARGS(&grassIndirectPSO_)));
+                if (giOk) {
+                    // A DRAW-only command signature needs no root-signature (it changes no
+                    // root arguments); stride = sizeof(D3D12_DRAW_ARGUMENTS) = 16 bytes.
+                    D3D12_INDIRECT_ARGUMENT_DESC arg{};
+                    arg.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+                    D3D12_COMMAND_SIGNATURE_DESC csd{};
+                    csd.ByteStride = sizeof(D3D12_DRAW_ARGUMENTS);
+                    csd.NumArgumentDescs = 1;
+                    csd.pArgumentDescs = &arg;
+                    giOk = SUCCEEDED(device_->CreateCommandSignature(
+                        &csd, nullptr, IID_PPV_ARGS(&grassDrawSig_)));
+                }
+                if (!giOk) {
+                    HBE_WARN("[D3D12] Indirect grass pipeline unavailable; falls back to fixed grass.");
+                    grassIndirectPSO_.Reset();
+                    grassDrawSig_.Reset();
+                }
+            } else if (ok && grassPSO_) {
+                HBE_WARN("[D3D12] GrassIndirect shaders missing; indirect grass path off.");
+            }
         }
         for (u32 i = 0; ok && i < backBufferCount_; ++i) {
             particleVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kParticleVertexBufferSize);
@@ -2761,12 +2899,13 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     // Reserve the bindless slots once; resizes rewrite the same descriptors so
     // shader-visible indices stay stable.
     if (slotHdr_ == 0) {
-        if (bindlessNextSlot_ + 22 + 2 * kMaxBackBuffers + kBloomMaxMips > kMaxBindlessTextures)
+        if (bindlessNextSlot_ + 23 + 2 * kMaxBackBuffers + kBloomMaxMips > kMaxBindlessTextures)
             return false; // 2*kMaxBackBuffers = density + temperature grid SRVs, one pair per frame
         slotHdr_ = bindlessNextSlot_++;
         slotDepth_ = bindlessNextSlot_++;
         slotGbuffer_ = bindlessNextSlot_++;
         slotVelocity_ = bindlessNextSlot_++;
+        slotSceneColor_ = bindlessNextSlot_++; // opaque scene-colour copy for transmission (P6b)
         slotVol_ = bindlessNextSlot_++;
         slotVolHalf_ = bindlessNextSlot_++;
         slotVolPart_ = bindlessNextSlot_++;
@@ -2829,6 +2968,31 @@ bool D3D12Device::CreatePostTargets(u32 width, u32 height) {
     const f32 hdrClear[4] = {0.018f, 0.018f, 0.022f, 1.0f};
     if (!makeColor(width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, slotHdr_, hdrClear, hdrColor_))
         return false;
+
+    // Scene-colour copy target for screen-space refraction (P6b): a plain R16F texture with only a
+    // bindless SRV (no RTV). Filled by CopyResource(hdrColor_) between opaque+sky and the transparent
+    // pass; its slot (slotSceneColor_) stays stable across resizes like the others.
+    {
+        sceneColorCopy_.Reset();
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = width; rd.Height = height; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE; // copy dest + SRV only (never a render target)
+        if (FAILED(device_->CreateCommittedResource(
+                &def, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                nullptr, IID_PPV_ARGS(&sceneColorCopy_))))
+            return false;
+        D3D12_CPU_DESCRIPTOR_HANDLE srv = bindlessHeap_->GetCPUDescriptorHandleForHeapStart();
+        srv.ptr += static_cast<SIZE_T>(slotSceneColor_) * bindlessDescSize_;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(sceneColorCopy_.Get(), &sv, srv);
+    }
 
     // Sampleable scene depth (R32_TYPELESS resource, D32 DSV, R32F SRV).
     {
@@ -4338,6 +4502,17 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         return;
     }
     const bool drawSky = (view.skyIndex != 0) && skyPSO_;
+    // P6b screen-space refraction: does any transparent item need the opaque scene colour behind it
+    // (OpenPBR transmission)? Only then do we pay for the scene-colour copy + bind it; otherwise the
+    // pass flow is byte-identical to before, so non-transmissive scenes are completely unaffected.
+    bool needSceneColor = false;
+    if (items && sceneColorCopy_)
+        for (u32 i = 0; i < count; ++i)
+            if ((items[i].materialFlags & MaterialFlag_Transparent) &&
+                items[i].surface.transmission_weight > 0.0f) {
+                needSceneColor = true;
+                break;
+            }
     // Without the post stack there is nothing to resolve, so an empty scene
     // can skip the pass entirely (legacy behavior).
     if ((count == 0 || !items) && !drawSky && !postReady_) {
@@ -4346,7 +4521,7 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
     }
 
     cmdList_->SetGraphicsRootSignature(meshRootSig_.Get());
-    cmdList_->SetPipelineState(meshPSO_.Get());
+    cmdList_->SetPipelineState(meshPSO_[static_cast<size_t>(ShaderVariant::Full)].Get());
     cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     // Bind the bindless texture heap + table (root param 2) and this frame's
@@ -4429,6 +4604,7 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         // Depth-graded water reads scene depth via slotDepth_; only valid when the read-only DSV
         // exists (the water loop below re-exposes hdrDepth_ read-only). 0 = skip depth grading.
         fcb.sceneDepthIndex = roDsvValid_ ? slotDepth_ : 0u;
+        fcb.sceneColorIndex = (postReady_ && needSceneColor) ? slotSceneColor_ : 0u; // transmission (P6b)
         for (u32 c = 0; c < kMaxShadowCascades; ++c) {
             fcb.cascadeViewProj[c] = view.cascadeViewProj[c];
         }
@@ -4613,17 +4789,64 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         cmdList_->DrawIndexedInstanced(gm.indexCount, instances, 0, 0, 0);
     };
 
-    // Opaque pass (transparent items deferred to the blended pass below; items
-    // consumed by an instanced run head are skipped - the head draws them).
-    for (u32 i = 0; i < count; ++i)
-        if (items[i].instanceRun != 0 &&
-            !(items[i].materialFlags & MaterialFlag_Transparent))
-            drawItem(i);
+    // Opaque pass (transparent items deferred to the blended pass below; items consumed by an
+    // instanced run head are skipped - the head draws them). P3: bind the per-item OpenPBR shader
+    // variant PSO, switching only when it changes (material-sorted items keep switches rare).
+    ShaderVariant curVariant = ShaderVariant::Count; // != any real variant -> forces the first bind
+    bool curFoliage = false;
+    for (u32 i = 0; i < count; ++i) {
+        if (items[i].instanceRun == 0 || (items[i].materialFlags & MaterialFlag_Transparent))
+            continue;
+        const bool foliage = (items[i].materialFlags & MaterialFlag_AlphaTest) != 0;
+        if (items[i].shaderVariant != curVariant || foliage != curFoliage) {
+            curVariant = items[i].shaderVariant;
+            curFoliage = foliage;
+            const size_t vi = static_cast<size_t>(curVariant);
+            cmdList_->SetPipelineState((foliage && meshPSOFoliage_[vi]) ? meshPSOFoliage_[vi].Get()
+                                                                       : meshPSO_[vi].Get());
+        }
+        drawItem(i);
+    }
+
+    // GPU-DRIVEN GRASS: opaque, drawn with the opaque geometry (depth-write on, shadow map
+    // + FrameConstants still bound) so blades are lit, shadowed, and occlude correctly.
+    DrawGrass();
 
     // Sky background: after opaques so the depth test rejects covered pixels.
     if (drawSky) {
         cmdList_->SetPipelineState(skyPSO_.Get());
         cmdList_->DrawInstanced(3, 1, 0, 0);
+    }
+
+    // P6b screen-space refraction: copy the resolved opaque+sky HDR into sceneColorCopy_ so the
+    // transparent pass can sample the geometry BEHIND transmissive surfaces. Guarded on needSceneColor
+    // so non-transmissive scenes never pay for it or change behaviour. hdrColor_ is a bound RTV, so
+    // transition it to COPY_SOURCE for the copy then back, and re-bind the MRTs before the draws.
+    if (needSceneColor && postReady_ && sceneColorCopy_) {
+        D3D12_RESOURCE_BARRIER pre[2] = {
+            TransitionBarrier(hdrColor_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE),
+            TransitionBarrier(sceneColorCopy_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                              D3D12_RESOURCE_STATE_COPY_DEST),
+        };
+        cmdList_->ResourceBarrier(2, pre);
+        cmdList_->CopyResource(sceneColorCopy_.Get(), hdrColor_.Get());
+        D3D12_RESOURCE_BARRIER post[2] = {
+            TransitionBarrier(hdrColor_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET),
+            TransitionBarrier(sceneColorCopy_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+        };
+        cmdList_->ResourceBarrier(2, post);
+        const auto pRtvCopy = [&](u32 index) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = postRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+            h.ptr += static_cast<SIZE_T>(index) * postRtvSize_;
+            return h;
+        };
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtvsCopy[3] = {
+            pRtvCopy(0), pRtvCopy(11 + kBloomMaxMips), pRtvCopy(12 + kBloomMaxMips)};
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsvCopy = postDsvHeap_->GetCPUDescriptorHandleForHeapStart();
+        cmdList_->OMSetRenderTargets(3, rtvsCopy, FALSE, &dsvCopy);
     }
 
     // Transparent pass: alpha-blended, back-to-front, over opaques + sky.
@@ -4836,6 +5059,59 @@ void D3D12Device::DrawGpuParticleBatches(bool additive) {
             cmdList_->DrawInstanced(count * 6u, 1, 0, 0);
         }
     }
+}
+
+void D3D12Device::SetGrass(GpuBufferHandle blades, u32 bladeCount) {
+    grassBlades_ = blades;
+    grassBladeCount_ = bladeCount;
+    grassArgs_ = {}; // fixed-count path for this frame
+}
+
+void D3D12Device::SetGrassIndirect(GpuBufferHandle blades, GpuBufferHandle args, u32 maxBlades) {
+    if (!grassIndirectPSO_ || !grassDrawSig_) return; // no indirect PSO -> caller falls back
+    grassBlades_ = blades;
+    grassArgs_ = args;
+    grassIndirectMax_ = maxBlades;
+    grassBladeCount_ = maxBlades; // unused by the indirect draw, but keeps DrawGrass' guard happy
+}
+
+// Draws the compute-generated grass field. Two paths share this: the DEFAULT fixed-count path
+// binds the blade buffer at root param 6 and issues DrawInstanced(6*N,1,0,0) (culled blades
+// collapse to a point in the VS); the opt-in INDIRECT path (grassArgs_ valid) binds the
+// COMPACTED buffer and issues ExecuteIndirect against a {6,instanceCount,0,0} arg buffer the
+// compaction compute filled - only visible blades reach the VS.
+void D3D12Device::DrawGrass() {
+    if (!grassBlades_.IsValid()) return;
+    GpuBufferD3D12* rb = ResolveGpuBuffer(grassBlades_);
+    if (!rb || rb->stride == 0) return;
+    const u32 slot = frameIndex_ % rb->slots;
+    // The compute pass left the blade buffer in UNORDERED_ACCESS; make the VS read legal.
+    TransitionGpuBuffer(*rb, slot, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    const D3D12_GPU_VIRTUAL_ADDRESS base = rb->res[slot]->GetGPUVirtualAddress();
+
+    // INDIRECT/COMPACTED path.
+    if (grassArgs_.IsValid() && grassIndirectPSO_ && grassDrawSig_) {
+        GpuBufferD3D12* ab = ResolveGpuBuffer(grassArgs_);
+        if (ab && ab->res[0]) {
+            const u32 aslot = frameIndex_ % ab->slots;
+            TransitionGpuBuffer(*ab, aslot, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+            cmdList_->SetPipelineState(grassIndirectPSO_.Get());
+            cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            cmdList_->SetGraphicsRootShaderResourceView(6, base);
+            cmdList_->ExecuteIndirect(grassDrawSig_.Get(), 1, ab->res[aslot].Get(), 0, nullptr, 0);
+        }
+        return;
+    }
+
+    if (!grassPSO_ || grassBladeCount_ == 0) return;
+    u32 blades = grassBladeCount_;
+    if (static_cast<u64>(blades) * rb->stride > rb->bytes)
+        blades = static_cast<u32>(rb->bytes / rb->stride);
+    if (blades == 0) return;
+    cmdList_->SetPipelineState(grassPSO_.Get());
+    cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cmdList_->SetGraphicsRootShaderResourceView(6, base);
+    cmdList_->DrawInstanced(blades * 6u, 1, 0, 0);
 }
 
 void D3D12Device::DrawUIOverlay(const UIVertex* vertices, u32 count) {

@@ -8,6 +8,7 @@
 
 #include "Assets/AssetFormats.h"
 #include "Assets/AssetLoader.h"
+#include "Assets/MaterialXInterop.h" // .mtlx <-> .hbmat interchange (MaterialX; editor-only)
 #include "Assets/MeshGenerator.h"
 #include "Assets/SlotIds.h" // pack slots are stamped into newly created assets
 #include "Assets/UAF.h"
@@ -42,6 +43,13 @@
 #include "Scene/StrokeZone.h" // 3D paint strokes group + stream with their zone
 #include "Scene/TagTable.h" // streaming tags: the Inspector combo + the Tags panel
 #include "Scene/TerrainSystem.h"
+#include "Vegetation/VegetationRender.h"  // veg::PaintTreeAt / EraseVegetationAt (paint brush)
+#include "Vegetation/VegetationSurface.h" // veg::MakeTerrainSurfaceQuery / FindTerrain
+#include "Vegetation/VegetationWorld.h"   // veg::SpeciesRegistry (species picker)
+#include "Vegetation/TreeMesher.h"        // veg::BuildTreeMesh (proctree import bake)
+#include "Editor/ProctreeImport.h"        // editor::ImportProctreeSkeleton (parametric trees)
+#include "Assets/UAF.h"                   // uaf::WriteMesh (bake proctree tree to .uaf)
+#include "Core/Rng.h"                     // Rng (per-stamp jitter)
 #include "Schematic/Schematic.h"
 #include "Schematic/SchematicSystem.h"
 #include "UI/FontAtlas.h"
@@ -796,6 +804,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
     DrawMovieRender(engine);      // trailer render (ticks the job; pins the viewport last)
     DrawVolumeBaker(engine);      // author + bake a .hbvol volume (ticks the bake job)
+    DrawVegetationPanel(engine);  // P9: vegetation stats + GPU-grass controls + spawn
     DrawUIDocumentPanel(engine);  // .hbui open/new/save/close + the active edit target
     // The dedicated `.hbui` authoring canvas. AFTER DrawGameView on purpose: both
     // claim the in-game UI pointer via Engine::SetUIPointer, and when the UI editor
@@ -811,6 +820,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawSelectionOutline(scene, renderer);
     DrawNavOverlay(scene, renderer);
     UpdateTerrainTool(engine); // terrain sculpt brush (consumes the click below)
+    UpdateVegetationPaintTool(engine); // vegetation paint/erase brush (also consumes the click)
     UpdateArtTool(engine);     // surface paint brush (also consumes the click)
     // Billboard icons for non-mesh entities (+ click-select). After the tools so
     // it can yield to an in-progress sculpt/paint stroke.
@@ -883,7 +893,8 @@ void Editor::DrawWindowMenu() {
         "Audio Mixer",  "Assets",     "Art Editor",
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
-        "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker"};
+        "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker",
+        "Vegetation"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -1771,6 +1782,116 @@ void Editor::UpdateTerrainTool(Engine& engine) {
         terrainConsumedClick_ = true; // don't also pick an entity
     } else {
         terrainStroking_ = false;
+    }
+}
+
+// Vegetation paint/erase brush (P9). Stamps painted trees onto the selected terrain, or erases
+// painted plants, under a falloff ring - modeled on UpdateTerrainTool (same ray -> terrain-local
+// -> world-hit path, same orbit-freeze + undo-per-stroke + click-suppression). Painting spawns
+// through veg::PaintTreeAt (the shared scatter spawn path) into the engine's persistent paint
+// mesh library; erasing removes tagged VegetationInstance entities within the ring.
+void Editor::UpdateVegetationPaintTool(Engine& engine) {
+    if (!vegPaint_ || !vpVisible_) return;
+    Scene& scene = engine.GetScene();
+    Renderer& renderer = engine.GetRenderer();
+    auto& reg = scene.Registry();
+    if (selected_ == entt::null || !reg.valid(selected_)) return;
+    TerrainComponent* t = reg.try_get<TerrainComponent>(selected_);
+    if (!t) return; // paint onto the selected terrain (same requirement as the sculpt tool)
+
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const f32 mx = (mp.x - vpX_) / glm::max(vpW_, 1.0f);
+    const f32 my = (mp.y - vpY_) / glm::max(vpH_, 1.0f);
+    const bool over = vpHovered_ && mx >= 0.0f && mx <= 1.0f && my >= 0.0f && my <= 1.0f;
+
+    const Camera& cam = renderer.GetCamera();
+    const glm::mat4 invVP = glm::inverse(cam.ViewProjection());
+    const glm::vec2 ndc(mx * 2.0f - 1.0f, 1.0f - my * 2.0f);
+    glm::vec4 pn = invVP * glm::vec4(ndc, 0.0f, 1.0f);
+    glm::vec4 pf = invVP * glm::vec4(ndc, 1.0f, 1.0f);
+    pn /= pn.w;
+    pf /= pf.w;
+    const glm::vec3 ro(pn), rd = glm::normalize(glm::vec3(pf) - glm::vec3(pn));
+    const glm::mat4 world = scene.WorldMatrix(selected_);
+    const glm::mat4 invWorld = glm::inverse(world);
+    const glm::vec3 lo = glm::vec3(invWorld * glm::vec4(ro, 1.0f));
+    const glm::vec3 ld = glm::vec3(invWorld * glm::vec4(rd, 0.0f));
+
+    glm::vec3 localHit;
+    if (!terrain::RaycastLocal(*t, lo, ld, localHit)) {
+        vegStroking_ = vegStroking_ && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        return;
+    }
+    const glm::vec3 worldHit = glm::vec3(world * glm::vec4(localHit, 1.0f));
+    const glm::vec2 hitXZ(worldHit.x, worldHit.z);
+
+    // Brush ring overlay (green = paint, red = erase), projected onto the terrain surface.
+    {
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        dl->PushClipRect(ImVec2(vpX_, vpY_), ImVec2(vpX_ + vpW_, vpY_ + vpH_), true);
+        const glm::mat4 vp = cam.ViewProjection();
+        ImVec2 pts[33];
+        bool ok = true;
+        for (int i = 0; i <= 32 && ok; ++i) {
+            const f32 a = static_cast<f32>(i) / 32.0f * 6.2831853f;
+            const f32 lx = localHit.x + std::cos(a) * vegBrushRadius_;
+            const f32 lz = localHit.z + std::sin(a) * vegBrushRadius_;
+            const glm::vec3 lp(lx, terrain::SampleHeight(*t, lx, lz), lz);
+            glm::vec4 clip = vp * world * glm::vec4(lp, 1.0f);
+            if (clip.w <= 0.001f) { ok = false; break; }
+            const glm::vec2 nd = glm::vec2(clip) / clip.w;
+            pts[i] = ImVec2(vpX_ + (nd.x * 0.5f + 0.5f) * vpW_,
+                            vpY_ + (0.5f - nd.y * 0.5f) * vpH_);
+        }
+        const ImU32 col = vegErase_ ? IM_COL32(255, 90, 90, 235) : IM_COL32(120, 235, 120, 235);
+        if (ok) dl->AddPolyline(pts, 33, col, 0, 2.0f);
+        dl->PopClipRect();
+    }
+
+    const bool lmb = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (over && lmb) {
+        if (renderer.IsOrbitEnabled()) {
+            SyncFreecam(renderer);
+            renderer.SetOrbitEnabled(false);
+        }
+        if (!vegStroking_) {
+            PushUndo(scene); // one undo step per stroke
+            vegStroking_ = true;
+            vegLastStamp_ = glm::vec2(1e9f);
+            vegStrokeSpawned_ = 0;
+        }
+
+        if (vegErase_) {
+            // Erase continuously while dragging - clears the ring's footprint.
+            vegStrokeSpawned_ += veg::EraseVegetationAt(scene, hitXZ, vegBrushRadius_);
+        } else {
+            veg::VegetationWorld& vworld = engine.GetVegetation();
+            const u32 speciesCount = vworld.Species().Count();
+            // Throttle by spacing so a drag lays a natural trail, not a solid wall.
+            const bool spaced =
+                glm::distance(hitXZ, vegLastStamp_) >= glm::max(vegPaintSpacing_, 0.05f);
+            if (speciesCount > 0 && spaced) {
+                const u32 idx = static_cast<u32>(glm::clamp(vegSpecies_, 0,
+                                                            static_cast<int>(speciesCount) - 1));
+                const veg::SpeciesId sid{idx};
+                // Jitter within the ring for a natural spread; deterministic per stamp.
+                const u64 seed = 0x5A17ED9EEDull * (vegPaintCounter_ + 1u) ^ 0x9E3779B97F4A7C15ull;
+                Rng rr(seed);
+                const f32 ang = rr.NextFloat() * 6.2831853f;
+                const f32 rad = std::sqrt(rr.NextFloat()) * vegBrushRadius_;
+                const glm::vec2 jitter(std::cos(ang) * rad, std::sin(ang) * rad);
+                const veg::SurfaceQueryFn surface = veg::MakeTerrainSurfaceQuery(scene);
+                if (veg::PaintTreeAt(scene, renderer, vworld, engine.GetVegPaintLib(), sid,
+                                     hitXZ + jitter, seed, surface)) {
+                    ++vegPaintCounter_;
+                    ++vegStrokeSpawned_;
+                    vegLastStamp_ = hitXZ;
+                }
+            }
+        }
+        terrainConsumedClick_ = true; // suppress entity picking under the brush
+    } else {
+        vegStroking_ = false;
     }
 }
 
@@ -5781,6 +5902,7 @@ void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path
     navPath_.clear();
     if (scene::LoadScene(engine.GetScene(), engine.GetRenderer(), path)) {
         currentScenePath_ = path;
+        engine.ResetVegetationRuntime(); // the old scene's GPU grass is engine state, not entities
         AdoptWorld(engine.GetScene()); // this registry IS that file, from now on
         // A DIFFERENT document is open, so the history baseline moves. This is on the
         // load path and NOT in AdoptWorld on purpose: AdoptWorld also fires for undo/redo
@@ -17032,6 +17154,168 @@ void Editor::OpenVolumeSim(const std::filesystem::path& path) {
 }
 
 // Volume Baker panel: author a VolumeSimConfig, bake it to a .hbvol on a background job, assign it.
+void Editor::DrawVegetationPanel(Engine& engine) {
+    if (!panelOpen_[Panel_Vegetation]) return;
+    if (!ImGui::Begin("Vegetation", &panelOpen_[Panel_Vegetation])) {
+        ImGui::End();
+        return;
+    }
+    veg::VegetationWorld& world = engine.GetVegetation();
+    ImGui::TextUnformatted("Vegetation subsystem (library-extensible backends)");
+    ImGui::Separator();
+    ImGui::Text("Species: %u   Biomes: %u   Resident shards: %u", world.Species().Count(),
+                world.Biomes().Count(), world.ResidentShardCount());
+    if (const veg::IPlantGenerator* g = world.DefaultGenerator())
+        ImGui::Text("Default generator: %s", g->Name());
+    if (const veg::INoiseField* nz = world.DefaultNoise())
+        ImGui::Text("Default noise: %s", nz->Name());
+    if (const veg::IWindModel* w = world.DefaultWind())
+        ImGui::Text("Wind model: %s", w->Name());
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("GPU-compute grass");
+    // Despawn control: toggling this off stops driving the field, so the grass disappears next
+    // frame (and stops following the camera). Toggling back on resumes it over the set terrain.
+    bool grassOn = engine.VegGrassActive();
+    if (ImGui::Checkbox("Grass enabled (despawn when off)", &grassOn))
+        engine.SetVegGrassActive(grassOn);
+    if (engine.VegGrassActive()) {
+        veg::GrassGpuField& grass = engine.GetVegGrass();
+        ImGui::Text("Blades generated/frame: %u", grass.BladeCount());
+        veg::GrassGpuField::Config& cfg = grass.Cfg();
+        // These take effect live (fed to the generation compute each frame).
+        ImGui::SliderFloat("Blade height (m)", &cfg.bladeHeight, 0.1f, 1.2f);
+        ImGui::SliderFloat("Blade width (m)", &cfg.bladeWidth, 0.01f, 0.15f);
+        ImGui::SliderFloat("Draw distance (m)", &cfg.maxDist, 10.0f, 80.0f);
+        // Opt-in true GPU-driven path: a compaction compute appends only the visible blades
+        // and the draw is ExecuteIndirect / vkCmdDrawIndirect. Toggles live; the label shows
+        // whether the device actually activated it (a clear-only backend stays on the fixed path).
+        ImGui::Checkbox("GPU indirect + compaction", &cfg.useIndirect);
+        ImGui::SameLine();
+        if (grass.IndirectActive())
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "(active)");
+        else if (cfg.useIndirect)
+            ImGui::TextDisabled("(requested)");
+        else
+            ImGui::TextDisabled("(fixed-count path)");
+    } else {
+        ImGui::TextDisabled("No GPU grass field active in this scene.");
+    }
+
+    ImGui::Separator();
+    // -- Paint / erase brush (P9) ----------------------------------------------
+    ImGui::TextUnformatted("Paint / erase brush");
+    ImGui::Checkbox("Paint mode", &vegPaint_);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(select a terrain, then LMB-drag in the viewport)");
+    if (vegPaint_) {
+        ImGui::Checkbox("Erase (remove painted plants)", &vegErase_);
+        ImGui::SliderFloat("Brush radius (m)##veg", &vegBrushRadius_, 0.5f, 20.0f);
+        if (!vegErase_)
+            ImGui::SliderFloat("Stamp spacing (m)", &vegPaintSpacing_, 0.2f, 8.0f);
+
+        const u32 speciesCount = world.Species().Count();
+        if (speciesCount == 0) {
+            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.4f, 1.0f),
+                               "No species registered - add sample species or load a .hbspecies.");
+        } else {
+            vegSpecies_ = glm::clamp(vegSpecies_, 0, static_cast<int>(speciesCount) - 1);
+            const veg::Species& cur = world.Species().Get(veg::SpeciesId{static_cast<u32>(vegSpecies_)});
+            if (ImGui::BeginCombo("Species##veg", cur.name.c_str())) {
+                for (u32 i = 0; i < speciesCount; ++i) {
+                    const veg::Species& s = world.Species().Get(veg::SpeciesId{i});
+                    const bool sel = (static_cast<int>(i) == vegSpecies_);
+                    if (ImGui::Selectable(s.name.c_str(), sel)) vegSpecies_ = static_cast<int>(i);
+                    if (sel) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        if (ImGui::Button("Add sample species"))
+            veg::RegisterDemoSpecies(world); // demo_oak + demo_pine (idempotent)
+        ImGui::SameLine();
+        // Freeze the picked procedural species into a fixed .uaf under Assets/Trees/ - the
+        // External-authoring path (a proctree/Blender export fills the same slot). The written
+        // asset can then back an `External` species via its `authoredMesh` field.
+        if (speciesCount > 0 && ImGui::Button("Bake to .uaf")) {
+            const veg::Species& s =
+                world.Species().Get(veg::SpeciesId{static_cast<u32>(vegSpecies_)});
+            const std::filesystem::path dir = Project::Active().AssetsDir() / "Trees";
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            const std::filesystem::path out = dir / (s.name + ".uaf");
+            if (veg::BakeSpeciesToUaf(world, veg::SpeciesId{static_cast<u32>(vegSpecies_)}, out))
+                HBE_INFO("[veg] baked species '{}' -> {}", s.name, out.string());
+            else
+                HBE_WARN("[veg] bake of species '{}' failed", s.name);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Rehydrate meshes")) {
+            const u32 n = veg::RehydrateVegetation(engine.GetScene(), engine.GetRenderer(), world,
+                                                   engine.GetVegPaintLib());
+            HBE_INFO("[veg] rehydrated {} plant meshes", n);
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(rebuild painted-plant meshes after a scene load)");
+        if (vegStroking_)
+            ImGui::Text("Stroke: %u plants %s", vegStrokeSpawned_, vegErase_ ? "erased" : "painted");
+    }
+
+    ImGui::Separator();
+    // -- Parametric tree importer (P11, "proctree-style", editor-only) ----------
+    if (ImGui::CollapsingHeader("Import parametric tree")) {
+        editor::ProctreeParams& pp = vegProctree_;
+        int seed = static_cast<int>(pp.seed);
+        if (ImGui::InputInt("Seed##pt", &seed)) pp.seed = static_cast<u32>(glm::max(0, seed));
+        int levels = static_cast<int>(pp.levels), segs = static_cast<int>(pp.segments),
+            kids = static_cast<int>(pp.childCount);
+        if (ImGui::SliderInt("Levels##pt", &levels, 2, 6)) pp.levels = static_cast<u32>(levels);
+        if (ImGui::SliderInt("Segments##pt", &segs, 2, 12)) pp.segments = static_cast<u32>(segs);
+        if (ImGui::SliderInt("Children##pt", &kids, 1, 6)) pp.childCount = static_cast<u32>(kids);
+        ImGui::SliderFloat("Trunk height##pt", &pp.trunkHeight, 1.0f, 20.0f);
+        ImGui::SliderFloat("Trunk radius##pt", &pp.trunkRadius, 0.05f, 1.0f);
+        ImGui::SliderFloat("Branch angle##pt", &pp.branchAngle, 10.0f, 80.0f);
+        ImGui::SliderFloat("Taper##pt", &pp.taper, 0.4f, 0.9f);
+        ImGui::SliderFloat("Length falloff##pt", &pp.lengthFalloff, 0.4f, 0.95f);
+        ImGui::SliderFloat("Droop##pt", &pp.droop, 0.0f, 0.5f);
+        if (ImGui::Button("Import & bake to species")) {
+            veg::PlantSkeleton skel;
+            if (editor::ImportProctreeSkeleton(pp, skel)) {
+                // Mesh it with a neutral broadleaf look, write a .uaf, and register an External
+                // species that points at it - so it appears in the paint picker immediately.
+                veg::Species sp;
+                sp.name = "proctree_" + std::to_string(pp.seed);
+                sp.strategy = veg::GenStrategy::External;
+                sp.maxHeight = pp.trunkHeight;
+                sp.trunkRadius = pp.trunkRadius;
+                sp.barkColor = {0.30f, 0.21f, 0.13f, 1.0f};
+                sp.leafColor = {0.22f, 0.42f, 0.16f, 1.0f};
+                const Model model = veg::BuildTreeMesh(skel, sp);
+                const std::filesystem::path dir = Project::Active().AssetsDir() / "Trees";
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                const std::filesystem::path out = dir / (sp.name + ".uaf");
+                if (!model.empty() && uaf::WriteMesh(out, model, 0)) {
+                    sp.authoredMesh = "Trees/" + sp.name + ".uaf";
+                    world.Species().Add(sp);
+                    HBE_INFO("[veg] imported parametric tree '{}' ({} nodes) -> {}", sp.name,
+                             skel.NodeCount(), out.string());
+                } else {
+                    HBE_WARN("[veg] parametric tree bake failed");
+                }
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("(recursive parametric model; baked to an External species)");
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Spawn Demo Vegetation")) engine.SpawnDemoVegetation();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(procedural forest + GPU grass into the current scene)");
+    ImGui::End();
+}
+
 void Editor::DrawVolumeBaker(Engine& engine) {
     // Tick the bake job every frame (even when hidden) so a finished bake writes its file + stamps.
     if (volBakeJob_ && volBakeJob_->state.load(std::memory_order_acquire) >= 2) {
@@ -17838,50 +18122,114 @@ void Editor::DrawAssetViewer(Engine& engine) {
             editedMat_.name = nameBuf;
             edited = true;
         }
-        if (DrawMaterialPresetCombo(editedMat_.flags, editedMat_.surface.base_metalness, editedMat_.surface.specular_roughness,
-                                    editedMat_.surface.subsurface_color, editedMat_.surface.subsurface_radius))
-            edited = true;
-        edited |= ImGui::ColorEdit4("Base Color", glm::value_ptr(editedMat_.surface.base_color));
-        edited |= ImGui::SliderFloat("Metallic", &editedMat_.surface.base_metalness, 0.0f, 1.0f);
-        edited |= ImGui::SliderFloat("Roughness", &editedMat_.surface.specular_roughness, 0.04f, 1.0f);
-        edited |= ImGui::ColorEdit3("Emissive", glm::value_ptr(editedMat_.surface.emission_color));
-        edited |= ImGui::DragFloat("Emissive Intensity", &editedMat_.surface.emission_luminance,
-                                   0.05f, 0.0f, 100.0f);
-        bool sss = (editedMat_.flags & rhi::MaterialFlag_Subsurface) != 0u;
-        if (ImGui::Checkbox("Subsurface (skin)", &sss)) {
-            if (sss) editedMat_.flags |= rhi::MaterialFlag_Subsurface;
-            else     editedMat_.flags &= ~static_cast<u32>(rhi::MaterialFlag_Subsurface);
-            edited = true;
-        }
-        if (sss) {
-            edited |= ImGui::ColorEdit3("Subsurface Color",
-                                        glm::value_ptr(editedMat_.surface.subsurface_color));
-            edited |= ImGui::SliderFloat("Scatter radius", &editedMat_.surface.subsurface_radius,
-                                         0.1f, 4.0f, "%.2f");
-        }
-        // Clearcoat (wet/oily clear layer: sweat, wet skin, wet eyes, varnish).
-        edited |= ImGui::SliderFloat("Clearcoat", &editedMat_.surface.coat_weight, 0.0f, 1.0f, "%.2f");
-        if (editedMat_.surface.coat_weight > 0.0f)
-            edited |= ImGui::SliderFloat("Clearcoat roughness", &editedMat_.surface.coat_roughness,
-                                         0.02f, 0.5f, "%.2f");
+        // Full OpenPBR Surface parameter editor: NO presets - every parameter is directly adjustable,
+        // grouped by lobe. Widgets write editedMat_.surface / .flags in place. Base/Specular/Emission
+        // and the shading flags open by default; the optional lobes collapse to keep the panel short
+        // but expose every field when opened.
+        auto& sp = editedMat_.surface;
         const auto matFlag = [&](const char* label, u32 bit) {
             bool on = (editedMat_.flags & bit) != 0u;
             if (ImGui::Checkbox(label, &on)) {
                 if (on) editedMat_.flags |= bit;
-                else    editedMat_.flags &= ~bit;
+                else    editedMat_.flags &= ~static_cast<u32>(bit);
                 edited = true;
             }
         };
-        matFlag("Cloth (fabric sheen)", rhi::MaterialFlag_Cloth);
-        matFlag("Eye (parallax iris)", rhi::MaterialFlag_Eye);
-        matFlag("Transparent (alpha blend)", rhi::MaterialFlag_Transparent);
-        // Cast shadow is the inverse of the NoShadow flag (free-standing strokes
-        // turn this off so they don't shadow the surface they float over).
-        bool castShadow = (editedMat_.flags & rhi::MaterialFlag_NoShadow) == 0u;
-        if (ImGui::Checkbox("Cast shadow", &castShadow)) {
-            if (castShadow) editedMat_.flags &= ~static_cast<u32>(rhi::MaterialFlag_NoShadow);
-            else            editedMat_.flags |= rhi::MaterialFlag_NoShadow;
-            edited = true;
+
+        if (ImGui::CollapsingHeader("Shading model", ImGuiTreeNodeFlags_DefaultOpen)) {
+            matFlag("Subsurface (skin)", rhi::MaterialFlag_Subsurface);
+            matFlag("Cloth (fabric sheen)", rhi::MaterialFlag_Cloth);
+            matFlag("Eye (parallax iris)", rhi::MaterialFlag_Eye);
+            matFlag("Transparent (alpha blend)", rhi::MaterialFlag_Transparent);
+            // Cast shadow is the inverse of the NoShadow flag.
+            bool castShadow = (editedMat_.flags & rhi::MaterialFlag_NoShadow) == 0u;
+            if (ImGui::Checkbox("Cast shadow", &castShadow)) {
+                if (castShadow) editedMat_.flags &= ~static_cast<u32>(rhi::MaterialFlag_NoShadow);
+                else            editedMat_.flags |= rhi::MaterialFlag_NoShadow;
+                edited = true;
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Base", ImGuiTreeNodeFlags_DefaultOpen)) {
+            edited |= ImGui::ColorEdit4("Base color (+opacity)", glm::value_ptr(sp.base_color),
+                                        ImGuiColorEditFlags_AlphaBar);
+            edited |= ImGui::SliderFloat("Base weight", &sp.base_weight, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Metalness", &sp.base_metalness, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Diffuse roughness", &sp.base_diffuse_roughness, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Oren-Nayar retroreflection. 0 = Lambert.");
+        }
+
+        if (ImGui::CollapsingHeader("Specular", ImGuiTreeNodeFlags_DefaultOpen)) {
+            edited |= ImGui::SliderFloat("Specular weight", &sp.specular_weight, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::ColorEdit3("Specular tint", glm::value_ptr(sp.specular_color));
+            edited |= ImGui::SliderFloat("Roughness", &sp.specular_roughness, 0.04f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("IOR", &sp.specular_ior, 1.0f, 3.0f, "%.3f");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Index of refraction. 1.5 -> 0.04 dielectric F0.");
+            edited |= ImGui::SliderFloat("Anisotropy", &sp.specular_roughness_anisotropy, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Anisotropy rotation", &sp.specular_anisotropy_rotation, 0.0f, 1.0f, "%.2f");
+        }
+
+        if (ImGui::CollapsingHeader("Transmission (glass)")) {
+            edited |= ImGui::SliderFloat("Transmission", &sp.transmission_weight, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Optical transparency. Renders in the refraction pass; also needs "
+                                  "the Transparent flag.");
+            edited |= ImGui::ColorEdit3("Transmission tint", glm::value_ptr(sp.transmission_color));
+            bool tw = sp.thin_walled;
+            if (ImGui::Checkbox("Thin-walled", &tw)) { sp.thin_walled = tw; edited = true; }
+            edited |= ImGui::SliderFloat("Attenuation depth", &sp.transmission_depth, 0.0f, 10.0f, "%.2f");
+            edited |= ImGui::ColorEdit3("Scatter albedo", glm::value_ptr(sp.transmission_scatter));
+            edited |= ImGui::SliderFloat("Scatter anisotropy", &sp.transmission_scatter_anisotropy, -1.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Dispersion", &sp.transmission_dispersion_scale, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Abbe number", &sp.transmission_dispersion_abbe_number, 10.0f, 80.0f, "%.1f");
+            if (sp.transmission_weight > 0.0f && (editedMat_.flags & rhi::MaterialFlag_Transparent) == 0u) {
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Not Transparent - won't refract.");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Make Transparent")) {
+                    editedMat_.flags |= rhi::MaterialFlag_Transparent;
+                    edited = true;
+                }
+            }
+        }
+
+        if (ImGui::CollapsingHeader("Coat")) {
+            edited |= ImGui::SliderFloat("Coat weight", &sp.coat_weight, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::ColorEdit3("Coat color", glm::value_ptr(sp.coat_color));
+            edited |= ImGui::SliderFloat("Coat roughness", &sp.coat_roughness, 0.02f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Coat anisotropy", &sp.coat_roughness_anisotropy, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Coat IOR", &sp.coat_ior, 1.0f, 3.0f, "%.3f");
+            edited |= ImGui::SliderFloat("Coat affects color", &sp.coat_affect_color, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Coat affects rough", &sp.coat_affect_roughness, 0.0f, 1.0f, "%.2f");
+        }
+
+        if (ImGui::CollapsingHeader("Fuzz / sheen")) {
+            edited |= ImGui::SliderFloat("Fuzz weight", &sp.fuzz_weight, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::ColorEdit3("Fuzz color", glm::value_ptr(sp.fuzz_color));
+            edited |= ImGui::SliderFloat("Fuzz roughness", &sp.fuzz_roughness, 0.0f, 1.0f, "%.2f");
+        }
+
+        if (ImGui::CollapsingHeader("Subsurface")) {
+            edited |= ImGui::SliderFloat("SSS weight", &sp.subsurface_weight, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::ColorEdit3("SSS color", glm::value_ptr(sp.subsurface_color));
+            edited |= ImGui::SliderFloat("SSS radius", &sp.subsurface_radius, 0.1f, 4.0f, "%.2f");
+            edited |= ImGui::SliderFloat3("SSS radius scale", glm::value_ptr(sp.subsurface_radius_scale),
+                                          0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Per-channel mean free path. (1, 0.5, 0.25) reddens skin terminators.");
+            edited |= ImGui::SliderFloat("SSS anisotropy", &sp.subsurface_scatter_anisotropy, -1.0f, 1.0f, "%.2f");
+        }
+
+        if (ImGui::CollapsingHeader("Thin film (iridescence)")) {
+            edited |= ImGui::SliderFloat("Film weight", &sp.thin_film_weight, 0.0f, 1.0f, "%.2f");
+            edited |= ImGui::SliderFloat("Film thickness", &sp.thin_film_thickness, 0.0f, 2.0f, "%.3f um");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Micrometres. Soap bubble ~0.3-0.8; oil slick thicker.");
+            edited |= ImGui::SliderFloat("Film IOR", &sp.thin_film_ior, 1.0f, 3.0f, "%.3f");
+        }
+
+        if (ImGui::CollapsingHeader("Emission", ImGuiTreeNodeFlags_DefaultOpen)) {
+            edited |= ImGui::ColorEdit3("Emission color", glm::value_ptr(sp.emission_color));
+            edited |= ImGui::DragFloat("Emission luminance", &sp.emission_luminance, 0.05f, 0.0f, 100.0f);
         }
 
         ImGui::SeparatorText("Texture maps");
@@ -18001,6 +18349,47 @@ void Editor::DrawAssetViewer(Engine& engine) {
                 selected_, MaterialRef{Project::Active().RelativeAssetPath(viewedAsset_)});
         }
         ImGui::EndDisabled();
+
+        // MaterialX interchange (.mtlx <-> .hbmat). Export writes an open_pbr_surface next to the
+        // .hbmat; import overlays an OpenPBR/standard_surface node onto the working copy. Disabled
+        // (with a reason tooltip) when this editor was built without MaterialX.
+        const bool mtlxOk = assets::MaterialXAvailable();
+        ImGui::BeginDisabled(!mtlxOk);
+        if (ImGui::Button("Export .mtlx")) {
+            std::filesystem::path out = viewedAsset_;
+            out.replace_extension(".mtlx");
+            std::string err;
+            if (assets::ExportMaterialX(editedMat_, out, err))
+                SetSaveStatus("Exported MaterialX '" + out.filename().string() + "'.", false);
+            else
+                SetSaveStatus("MaterialX export failed: " + err, true);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Import .mtlx")) {
+            const std::vector<platform::FileFilter> filters{{"MaterialX", {"mtlx"}}};
+            if (auto picked = platform::OpenFileDialog(filters)) {
+                std::string err;
+                if (auto imported = assets::ImportMaterialX(*picked, err)) {
+                    // Overlay the imported OpenPBR values/flags onto the working copy, keeping this
+                    // asset's identity (name/path) so Save writes back to the same .hbmat.
+                    editedMat_.surface = imported->surface;
+                    editedMat_.flags = imported->flags;
+                    if (!imported->albedoTex.empty()) editedMat_.albedoTex = imported->albedoTex;
+                    if (!imported->emissiveTex.empty()) editedMat_.emissiveTex = imported->emissiveTex;
+                    editedMatDirty_ = true;
+                    matPreviewStale = true;
+                    SetSaveStatus("Imported MaterialX '" + picked->filename().string() +
+                                      "' (Save to keep).",
+                                  false);
+                } else {
+                    SetSaveStatus("MaterialX import failed: " + err, true);
+                }
+            }
+        }
+        ImGui::EndDisabled();
+        if (!mtlxOk && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Built without MaterialX (HBE_ENABLE_MATERIALX was OFF at configure).");
+
         if (editedMatDirty_) {
             ImGui::SameLine();
             ImGui::TextDisabled("(unsaved changes)");

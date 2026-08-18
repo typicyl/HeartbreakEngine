@@ -527,6 +527,21 @@ void ClearInstantiateCaches();
 // the same data (Instantiate hands them straight to the AABB component on a hit).
 void CacheUploadedMesh(const std::string& key, rhi::MeshHandle mesh, const AABB& bounds);
 
+// PAINTED-VEGETATION mesh resolver (P9). A painted plant persists as a MeshInstance whose
+// MeshRef source is "veg:<species>/<part>" (part = "woody"|"foliage"). On load, Instantiate
+// resolves that source through this hook - installed by the Engine, which owns the
+// VegetationWorld + the shared species mesh library - to a runtime mesh handle (and fills the
+// mesh bounds). Returns an invalid handle when the species is unknown or headless (the entity
+// then loads as a bare transform, exactly like a broken .uaf reference). Deliberately kept as
+// a hook so the serializer stays free of vegetation types, and so veg meshes are NOT put in the
+// Instantiate mesh cache (they are owned solely by the library, invisible to TrimUnreferencedGpu).
+// `outAlbedo` receives the foliage leaf texture (invalid for woody parts) - the runtime texture
+// handle is not serialized, so the resolver re-supplies it on load; the material flags / colours
+// ride on the MeshInstance itself and round-trip normally.
+using VegMeshResolveFn = std::function<rhi::MeshHandle(
+    const std::string& source, Renderer&, AABB& outBounds, rhi::TextureHandle& outAlbedo)>;
+void SetVegMeshResolver(VegMeshResolveFn fn);
+
 // VRAM RECLAIM. Destroy every CACHED mesh/texture that no live entity in `scene` still
 // references (a mark-sweep over the shared Instantiate caches), reclaiming their GPU memory
 // and recycling their bindless slots. Call this AFTER a streaming despawn (the only place

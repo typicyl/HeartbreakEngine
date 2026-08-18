@@ -2605,6 +2605,12 @@ void CacheUploadedMesh(const std::string& key, rhi::MeshHandle mesh, const AABB&
     CachePutMesh(key, mesh, bounds, std::string());
 }
 
+// The Engine-installed resolver for "veg:<species>/<part>" mesh sources (painted vegetation).
+// File-static like the mesh caches; unset until the Engine installs it, in which case a "veg:"
+// source loads as a bare transform (harmless - the same as a missing asset).
+static VegMeshResolveFn g_vegMeshResolver;
+void SetVegMeshResolver(VegMeshResolveFn fn) { g_vegMeshResolver = std::move(fn); }
+
 // MARK-SWEEP VRAM reclaim: destroy every CACHED mesh/texture that NO live entity still
 // references, and drop it from the shared caches so a later stream-in re-creates it. Called
 // after a streaming despawn. SAFE because it only frees CACHE VALUES (generated resources -
@@ -3126,6 +3132,17 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
                     mi.mesh = renderer.UploadMesh(md);
                     ComputeBounds(md, bounds.min, bounds.max);
                 }
+            } else if (d.meshSource.rfind("veg:", 0) == 0) {
+                // Painted vegetation: rebuild the runtime species mesh through the Engine's
+                // resolver. The handle is library-owned (see the CachePutMesh guard below), so
+                // it is deliberately NOT cached here. Unset resolver / unknown species -> bare
+                // transform, exactly like a broken reference. The resolver also re-supplies the
+                // foliage leaf texture (a runtime handle, never serialized).
+                if (g_vegMeshResolver) {
+                    rhi::TextureHandle vegAlbedo;
+                    mi.mesh = g_vegMeshResolver(d.meshSource, renderer, bounds, vegAlbedo);
+                    if (vegAlbedo.IsValid()) mi.albedoTexture = vegAlbedo;
+                }
             } else {
                 std::string rel;
                 u32 submesh = 0;
@@ -3200,7 +3217,10 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
             // asset comes back - which is the correct failure for a broken reference,
             // and is also what makes every serializer self-test able to run headless
             // where UploadMesh returns nothing by design.
-            if (mi.mesh.IsValid())
+            // "veg:" meshes are owned solely by the vegetation library (invisible to
+            // TrimUnreferencedGpu); caching one here would let a stream/erase sweep free a
+            // still-shared species mesh out from under the library. Every other source caches.
+            if (mi.mesh.IsValid() && d.meshSource.rfind("veg:", 0) != 0)
                 CachePutMesh(d.meshSource, mi.mesh, bounds, submeshMaterial);
             reg.emplace<MeshInstance>(e, mi);
             reg.emplace<MeshRef>(e, MeshRef{d.meshSource});

@@ -7,7 +7,9 @@
 // Usage: HeartbreakEditor [--d3d12 | --vulkan] [--width N] [--height N]
 //                         [--validation] [--model <path>]
 #include "Assets/AssetFormats.h" // --test-assetformats (the registry's own invariants)
+#include "Assets/Compression.h"  // --test-compress (the portable zstd/zlib codec seam)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
+#include "Assets/MaterialXInterop.h" // --test-openpbr (.hbmat/.mtlx round-trip + variant routing)
 #include "Assets/SeamWeld.h"
 #include "Navigation/NavBaker.h" // --test-nav (Recast bake -> Detour stream/query/obstacles)
 #include "Scene/BodyShape.h"
@@ -63,6 +65,11 @@
 #include "Scene/ParticleGpuSim.h"
 #include "Scene/ParticleSystem.h"
 #include "Scene/Scene.h"
+#include "Vegetation/VegetationSystem.h" // hbe::veg::DataSelfTest (--test-vegdata)
+#include "Vegetation/VegetationStreaming.h" // hbe::veg::StreamSelfTest (--test-vegstream)
+#include "Vegetation/VegetationDamage.h" // hbe::veg::LifeSelfTest (--test-veglife)
+#include "Vegetation/VegetationRender.h" // hbe::veg::PaintSelfTest (--test-vegpaint)
+#include "Editor/ProctreeImport.h" // hbe::editor::ProctreeSelfTest (--test-proctree)
 #include "Scene/Hierarchy.h" // --test-pasteorder (the sibling-order contract)
 #include "Scene/SceneSerializer.h"
 #include "Scene/StrokeZone.h" // --test-strokezones (3D paint strokes stream with their zone)
@@ -426,6 +433,23 @@ int main(int argc, char** argv) {
             std::printf("assetformats %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
+        // --test-compress: the PORTABLE-CODEC gate. Round-trips zstd/zlib/None across
+        // empty/tiny/compressible/incompressible buffers and checks the content hash is
+        // deterministic + discriminating. This is the foundation the v5 pack format and
+        // the mesh/audio cooks all sit on. Headless. Same contract as --test-seamweld.
+        if (std::strcmp(argv[i], "--test-compress") == 0) {
+            const bool ok = hbe::comp::SelfTest();
+            std::printf("compress %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-openpbr: the MATERIAL INTERCHANGE gate. Round-trips a distinctive OpenPBR material
+        // through .hbmat and (when MaterialX is linked) .mtlx, and checks the shader-variant routing.
+        // Also proves the MaterialX DLLs load + execute. Headless; no GPU/window/project.
+        if (std::strcmp(argv[i], "--test-openpbr") == 0) {
+            const bool ok = hbe::assets::MaterialInteropSelfTest();
+            std::printf("openpbr %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
         // --test-packclosure: THE GATE for "Pack only referenced assets". Builds
         // a synthetic project exercising every format in the reference matrix,
         // each referencing the next, and proves the closure reaches all of them
@@ -619,6 +643,85 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-worldlocal") == 0) {
             const bool ok = hbe::scene::WorldLocalSelfTest();
             std::printf("worldlocal %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vegdata: pin the vegetation P1 data model - SoA lockstep + handle
+        // round-trip, DETERMINISTIC generation (same seed -> identical skeleton bytes),
+        // registry interning, store slicing, and noise-field determinism. Headless.
+        if (std::strcmp(argv[i], "--test-vegdata") == 0) {
+            const bool ok = hbe::veg::DataSelfTest();
+            std::printf("vegdata %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vegscatter: pin vegetation P2 - DETERMINISTIC placements (same worldSeed
+        // -> identical points), tileable min-spacing, terrain/water filtering via the
+        // surface query, biome/species scoring, and the .hbbiome round-trip. Headless.
+        if (std::strcmp(argv[i], "--test-vegscatter") == 0) {
+            const bool ok = hbe::veg::ScatterSelfTest();
+            std::printf("vegscatter %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vegmesh: pin vegetation P3 - the .hbspecies round-trip, the tubular
+        // mesher, the meshoptimizer LOD chain, deterministic geometry, and sane bounds.
+        if (std::strcmp(argv[i], "--test-vegmesh") == 0) {
+            const bool ok = hbe::veg::MeshSelfTest();
+            std::printf("vegmesh %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-veggen: pin vegetation P4 - space colonization + L-system generators
+        // (deterministic, bounded, structurally distinct, meshable). Headless.
+        if (std::strcmp(argv[i], "--test-veggen") == 0) {
+            const bool ok = hbe::veg::GenSelfTest();
+            std::printf("veggen %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-veggrow: pin STRUCTURAL growth - more age -> more structure (not a
+        // scaled copy), deterministic, taller. Headless.
+        if (std::strcmp(argv[i], "--test-veggrow") == 0) {
+            const bool ok = hbe::veg::GrowthSelfTest();
+            std::printf("veggrow %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-veglod: pin vegetation P7 simulation-LOD - distance bands, budgeted
+        // promotion, immediate demotion. Headless.
+        if (std::strcmp(argv[i], "--test-veglod") == 0) {
+            const bool ok = hbe::veg::LodSelfTest();
+            std::printf("veglod %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vegstream: pin vegetation P8 - deterministic shard generation +
+        // job-safe parallel generation matching the serial reference. Headless.
+        if (std::strcmp(argv[i], "--test-vegstream") == 0) {
+            const bool ok = hbe::veg::StreamSelfTest();
+            std::printf("vegstream %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-veglife: pin vegetation P10 life-cycle - incremental growth (adds
+        // structure, preserves form, deterministic) + damage/support. Headless.
+        if (std::strcmp(argv[i], "--test-veglife") == 0) {
+            const bool ok = hbe::veg::LifeSelfTest();
+            std::printf("veglife %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vegpaint: pin the paint brush's renderer-free logic - erase-within-radius
+        // geometry + "veg:" MeshRef tag isolation (never erases other meshes). Headless.
+        if (std::strcmp(argv[i], "--test-vegpaint") == 0) {
+            const bool ok = hbe::veg::PaintSelfTest();
+            std::printf("vegpaint %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-vegbake: pin the External-authoring asset path - a species bakes to a .uaf
+        // and round-trips (generate -> mesh -> write -> read) with intact geometry. Headless.
+        if (std::strcmp(argv[i], "--test-vegbake") == 0) {
+            const bool ok = hbe::veg::BakeSelfTest();
+            std::printf("vegbake %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-proctree: pin the parametric tree importer - deterministic, valid parent
+        // invariant, bounded, meshable (woody + leaves), seed-sensitive. Headless.
+        if (std::strcmp(argv[i], "--test-proctree") == 0) {
+            const bool ok = hbe::editor::ProctreeSelfTest();
+            std::printf("proctree %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-graphfanin: prove RECONVERGENCE works in both node graphs. A choice

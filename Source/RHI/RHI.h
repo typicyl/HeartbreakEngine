@@ -590,6 +590,30 @@ enum MaterialFlags : u32 {
     // The entity is a water surface: drawn in a dedicated water pass (Gerstner-wave VS +
     // reflective PS), not the normal opaque/transparent mesh path.
     MaterialFlag_Water = 1u << 11,
+    // Vegetation: the MeshPBR VS sways this draw's vertices in the wind (stiffer at the
+    // base, leaf flutter at the tips). VS-only; no shader-variant / PSO change.
+    MaterialFlag_Wind = 1u << 12,
+    // Alpha-cutout foliage: the PS discards texels whose albedo alpha is below the cutoff, so a
+    // leaf-cluster texture on a quad renders as leaf shapes (not a solid card). PS-only discard in
+    // the opaque pass; pairs with the two-sided foliage PSO where available.
+    MaterialFlag_AlphaTest = 1u << 13,
+};
+
+// Curated OpenPBR shader-specialization variants (P3). The opaque forward pass binds one
+// pixel-shader variant per draw so a material only pays for the lobes it uses. This is a small
+// hand-picked set keyed by the material's shading model, NOT a 2^N feature matrix; anything not
+// covered routes to Full (the correctness fallback). ORDER + NAMES must stay in lockstep with the
+// MeshPBR_<VAR>.ps registration in cmake/ShaderCompile.cmake, the backend PS-load tables, and
+// material::ComputeShaderVariant (Source/RHI/MaterialCompiler.h).
+enum class ShaderVariant : u32 {
+    Std = 0,   // base OpenPBR dielectric+metal (+ world features); the ~90% case
+    Coat,      // + coat lobe
+    Sss,       // + subsurface
+    Fuzz,      // + fuzz / cloth sheen
+    Hair,      // Kajiya-Kay hair
+    Eye,       // parallax-iris eye
+    Full,      // every lobe compiled in (fallback; also transparent/preview pass)
+    Count,
 };
 
 // One mesh instance to draw with an OpenPBR Surface material.
@@ -609,6 +633,10 @@ struct DrawItem {
     TextureHandle emissiveTexture;
     TextureHandle thicknessTexture;        // back-light transmission thickness (0 = none)
     u32        materialFlags = MaterialFlag_None;
+    // OpenPBR shader specialization (P3): which curated MeshPBR pixel-shader variant the opaque
+    // pass binds for this draw. Computed by material::ComputeShaderVariant from surface + flags.
+    // Defaults to Full so an un-set DrawItem always renders correctly (just unspecialized).
+    ShaderVariant shaderVariant = ShaderVariant::Full;
 
     // Art Editor surface paint: a per-object paint canvas composited over the
     // material in the forward pass. `paintColorTexture` is RGB pigment + A
@@ -842,6 +870,12 @@ enum : u32 {
     // slot without racing the GPU - MapGpuBuffer hands back the CURRENT frame's
     // slot, and every bind uses that same slot.
     CpuWrite = 1u << 3,
+    // Usable as the source of an indirect draw/dispatch (D3D12 ExecuteIndirect
+    // argument buffer / Vulkan VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT). Implies
+    // device-local + ShaderWrite (a compute kernel fills the arg words), and the
+    // backend transitions it to the indirect-argument state for the draw. Used by
+    // the GPU-compacted grass path; see SetGrassIndirect.
+    IndirectArgs = 1u << 4,
 };
 }
 
@@ -1104,6 +1138,30 @@ public:
     // cannot share one call. Each call adds one (buffer, batches) group; the whole
     // set is consumed and cleared by DrawScene.
     virtual void SetGpuParticles(GpuBufferHandle, const GpuParticleBatch*, u32 /*count*/) {}
+
+    // GPU-DRIVEN GRASS: a compute-written blade buffer (`blades`, a ByteAddressBuffer of
+    // 32-byte records) drawn as `bladeCount` blades of 6 vertices each. Bound on the same
+    // VS structured-buffer seam as SetVertexShaderBuffer (t2/space1) and drawn inside
+    // DrawScene's opaque HDR pass with a dedicated lit PSO, so blades are shadowed exactly
+    // like meshes. One frame only; an invalid handle / count 0 disables it at zero cost.
+    // No-op on clear-only backends (grass simply does not appear there).
+    virtual void SetGrass(GpuBufferHandle /*blades*/, u32 /*bladeCount*/) {}
+
+    // GPU-DRIVEN GRASS, INDIRECT variant: the compaction path. `blades` is a COMPACTED
+    // buffer the generate compute filled with only the visible blades, and `args` is a
+    // 16-byte draw-argument buffer {vtxPerInstance=6, instanceCount, 0, 0} the SAME compute
+    // wrote (instanceCount = how many blades survived the cull). The draw is issued via
+    // ExecuteIndirect / vkCmdDrawIndirect as 6 verts x instanceCount instances (the VS keys
+    // each blade off SV_InstanceID / gl_InstanceIndex; firstInstance is always 0 so the two
+    // backends agree). `maxBlades` bounds the compacted region for the SRV view. This is the
+    // opt-in true GPU-driven path; SetGrass (fixed count + degenerate-cull) stays the default.
+    // Calling this instead of SetGrass for a frame selects the indirect draw. Both no-op on
+    // devices without SupportsIndirectDraw().
+    virtual void SetGrassIndirect(GpuBufferHandle /*blades*/, GpuBufferHandle /*args*/,
+                                  u32 /*maxBlades*/) {}
+    // True when the backend implements the indirect grass path (D3D12 + Vulkan). Clear-only
+    // backends return false and the caller falls back to SetGrass.
+    virtual bool SupportsIndirectDraw() const { return false; }
 
     // Records draws for `count` items using the analytic PBR pipeline. Must be
     // called between BeginFrame (after the clear) and EndFrame.

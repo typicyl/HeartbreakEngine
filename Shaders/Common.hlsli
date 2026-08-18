@@ -121,6 +121,10 @@ cbuffer FrameConstants : register(b0)
     float  gAbsorptionDepth; // metres of water column to full deep-colour absorption
     float  gShorelineWidth;  // metres of the shoreline foam band
     float  gEdgeFade;        // metres of soft depth-fade where water meets geometry
+    // OpenPBR transmission (P6): bindless opaque scene-colour SRV (0 = use the IBL environment as the
+    // transmitted background; nonzero = a resolved copy for true screen-space refraction, P6b).
+    uint   gSceneColorIndex;
+    uint3  _padSceneColor;
 };
 
 // OpenPBR Surface parameters appended to the per-object constants (P2). Mirror of
@@ -258,6 +262,8 @@ cbuffer ObjectConstants : register(b1)
 #define HBE_MAT_TERRAIN_HOLE 256u     // clip terrain pixels where the hole mask (thickness slot) is set
 #define HBE_MAT_TERRAIN_SPLAT 512u    // blend 4 tiling layer albedos (albedo/normal/mr/ao slots) by the emissive-slot weight mask
 #define HBE_MAT_CENSORED 1024u // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
+#define HBE_MAT_WIND 4096u     // vegetation vertex wind: the MeshPBR VS sways the vertex (stiffer at the base)
+#define HBE_MAT_ALPHATEST 8192u // alpha-cutout foliage: discard albedo texels below the cutoff (leaf shapes)
 
 // ---------------------------------------------------------------------------
 // Bindless texture table.
@@ -458,9 +464,12 @@ float ShadowFactor(float3 positionWS, float NdotL)
             ndc.z <= 0.0f || ndc.z >= 1.0f)
             continue; // outside this cascade; try the next (coarser) one
 
-        // Slope-scaled receiver bias on top of the rasterizer's depth bias;
-        // coarser cascades cover more world per texel and need more bias.
-        const float bias = max(0.0015f * (1.0f - NdotL), 0.0003f) * (1.0f + c * 0.5f);
+        // Receiver bias big enough to kill self-shadow ACNE. The full-surface salt-and-pepper on
+        // LIT, sun-facing skin was the receiver coin-flipping against its OWN depth per PCF tap
+        // (worse once the kernel widened): a curved surface at a moderate sun angle is exactly the
+        // acne case. A little peter-panning from the larger bias is invisible on organic surfaces,
+        // and as a bonus it shrinks the over-dark contact shadow slightly.
+        const float bias = max(0.0035f * (1.0f - NdotL), 0.0011f) * (1.0f + c * 0.6f);
         const float receiver = ndc.z - bias;
 
         // This cascade's tile within the 2x2 atlas.
@@ -468,37 +477,37 @@ float ShadowFactor(float3 positionWS, float NdotL)
         const float2 tileMin = tile + HBE_SHADOW_ATLAS_TEXEL;
         const float2 tileMax = tile + 0.5f - HBE_SHADOW_ATLAS_TEXEL;
 
-        // Rotated 4-tap PCF (was a 3x3 = 9-tap): ~half the shadow-map samples per
-        // lit pixel for near-identical softness. The directional shadow lookup is the
-        // dominant DAYTIME GPU cost (the sun casts by day, dims to ~0 at night), so
-        // halving it gives the daytime frame the headroom to reach the vsync cap that
-        // night already hits. A per-world-position rotation dithers the sparser kernel
-        // so it doesn't reveal a fixed grid (same trick as ShadowFactorCheap below).
+        // VOGEL-DISK PCF. The old 4-tap rotated kernel was sub-texel and PER-PIXEL rotated: only
+        // 5 lit fractions, randomized per pixel, so a soft penumbra read as a stationary
+        // salt-and-pepper SPECKLE unless TAA was averaging it. A Vogel spiral spreads 16 taps
+        // EVENLY over the disk, so the penumbra is a smooth function of the receiver position.
         //
-        // With ONLY the spatial hash the dither is WORLD-LOCKED, so a soft penumbra reads
-        // as a stationary salt-and-pepper speckle. When TAA is resolving this frame
-        // (gTaaActive), sweep the rotation over time so each surface point samples a
-        // DIFFERENT kernel orientation every frame and TAA averages them into a smooth soft
-        // shadow - at ZERO extra taps. Gated so the Low preset (no TAA) keeps the stable
-        // static dither instead of shimmering. gWeather.w = time.
-        float rot =
-            frac(sin(dot(positionWS.xz, float2(12.9898f, 78.233f))) * 43758.5453f) * 6.2831853f;
-        rot += gWeather.w * 30.0f * float(gTaaActive);
+        // CRITICAL for TAA-off (FXAA) presets: NO per-pixel spatial hash on the rotation. That
+        // hash gave neighbouring pixels different disk orientations -> different lit fractions ->
+        // the static grain the user hit. A FIXED disk is a smooth, stable gradient (16 taps hide
+        // any pattern). Rotate over time ONLY when TAA is resolving it, for an extra-clean result.
+        //
+        // 16 taps is the daytime-shadow cost; the sun dims to ~0 at night (already vsync-capped),
+        // so night is unaffected. If a daytime target drops below vsync, kTaps is the single dial.
+        const float rot = gWeather.w * 8.0f * float(gTaaActive);
         const float sr = sin(rot), cr = cos(rot);
-        const float2 kBase[4] = {float2(0.9f, 0.9f), float2(-0.9f, 0.9f), float2(0.9f, -0.9f),
-                                 float2(-0.9f, -0.9f)};
+        const int   kTaps = 16;
+        const float radius = 2.2f; // shadow texels; wider = softer penumbra
         float lit = 0.0f;
         [unroll]
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < kTaps; ++i)
         {
-            const float2 d = float2(kBase[i].x * cr - kBase[i].y * sr,
-                                    kBase[i].x * sr + kBase[i].y * cr) *
-                             HBE_SHADOW_ATLAS_TEXEL;
+            // Even Vogel spiral: radius ~ sqrt(i) keeps disk coverage uniform.
+            const float rr = sqrt((float(i) + 0.5f) / float(kTaps));
+            const float th = float(i) * 2.39996323f; // golden angle
+            float2 o = float2(rr * cos(th), rr * sin(th));
+            o = float2(o.x * cr - o.y * sr, o.x * sr + o.y * cr); // rotate the whole disk
+            const float2 d = o * radius * HBE_SHADOW_ATLAS_TEXEL;
             const float2 suv = clamp(tile + uv * 0.5f + d, tileMin, tileMax);
             const float occluder = SampleBindlessLod(gShadowMapIndex, suv, 0.0f).r;
             lit += (receiver <= occluder) ? 1.0f : 0.0f;
         }
-        return lit * 0.25f;
+        return lit / float(kTaps);
     }
     return 1.0f;
 }

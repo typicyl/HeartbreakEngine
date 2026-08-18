@@ -1425,6 +1425,57 @@ struct TerrainChunk {
     u32 cz = 0;
 };
 
+// Scene-level VEGETATION authoring config (one per world, typically on the terrain or a
+// world root). It is the species PALETTE + biome the distribution draws from, a global
+// density, and the deterministic world seed. Asset references are literal strings (so
+// the pack closure can walk them); the runtime resolves the names into the
+// SpeciesRegistry / BiomeRegistry (Source/Vegetation). Serialized in P3/P9.
+struct VegetationLayer {
+    std::vector<std::string> speciesAssets; // .hbspecies paths (serialized)
+    std::string biomeAsset;                 // .hbbiome path (serialized)
+    f32 globalDensity = 1.0f;               // multiplies the biome's base density
+    u64 worldSeed = 1337;                   // master seed for deterministic generation
+    bool enabled = true;
+
+    // Optional painted density / exclusion mask (same lifecycle as the terrain splat
+    // mask; 0 = no plants .. 255 = full density). Empty = uniform. P2/P9.
+    std::vector<u8> densityMask;            // GridN^2 (matches the terrain grid)
+    rhi::TextureHandle densityMaskTex;      // runtime upload (not serialized)
+    bool maskDirty = false;                 // runtime: densityMask changed -> re-upload
+};
+
+// ONE lightweight entt entity per streamed REGION whose residency triggers async
+// vegetation generation for that region (P8). The bulk plant data (trees/branches/
+// foliage clusters) lives in the side VegetationStore keyed by `shardKey`, NEVER as
+// entt entities - which is what keeps 10k trees / 1M branches / 10M+ foliage feasible.
+struct VegetationField {
+    u64 seed = 0;                 // folded with VegetationLayer::worldSeed for this region
+    glm::vec3 boundsMin{0.0f};    // world-space region bounds (XZ used for scatter)
+    glm::vec3 boundsMax{0.0f};
+    std::string biomeOverride;    // "" = inherit the layer's biome
+    f32 density = 1.0f;           // per-region density multiplier
+
+    // Runtime-only (never serialized): generation state + the store key.
+    u64 shardKey = 0;             // key into VegetationWorld's per-shard stores
+    bool generated = false;       // this region's vegetation has been built
+    bool generating = false;      // an async generation job is in flight
+};
+
+// Tags a single PAINTED / scattered plant entity (the woody body or its foliage), spawned by
+// veg::PopulateForest / the editor vegetation paint brush. Two jobs: (1) it lets the erase
+// brush find plant entities to remove within a radius (a plain MeshInstance query can't tell a
+// tree from a rock), and (2) it carries the data needed to REHYDRATE the runtime mesh handle on
+// scene load - `species` is the stable species NAME (not the runtime-interned SpeciesId, which is
+// not stable across sessions), `seed` reproduces the per-instance transform, `foliage` picks the
+// woody vs. leaf submesh. The MeshInstance.mesh handle itself is runtime-only and is rebuilt from
+// these fields by the vegetation rehydrate pass.
+struct VegetationInstance {
+    std::string species;    // stable species name (looked up in the VegetationWorld registry)
+    u64 seed = 0;           // per-instance deterministic seed (yaw + scale)
+    bool foliage = false;   // false = woody body, true = the leaf submesh
+    f32 age01 = 1.0f;       // maturity the mesh was generated at
+};
+
 // Data-driven locomotion via motion matching: a feature database is built from
 // the source asset's animation clips (root speed / turn rate sampled over time)
 // and, each search interval, the entity's Animator is switched to the clip+time

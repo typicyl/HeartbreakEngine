@@ -41,9 +41,10 @@ struct VegetationStore {
     struct Branches {
         std::vector<glm::vec3> a, b;          // segment endpoints, plant-local
         std::vector<f32> radiusA, radiusB;    // radii at each end
-        std::vector<i32> parent;              // branch-local parent index (support/break)
+        std::vector<i32> parent;              // GLOBAL parent branch index (-1 = ground-connected base)
         std::vector<u8>  order;               // branch order
         std::vector<f32> windPhase;           // per-branch wind phase offset
+        std::vector<u8>  broken;              // 1 = severed (damage); descendants lose support
         u32 Count() const { return static_cast<u32>(a.size()); }
     } branches;
 
