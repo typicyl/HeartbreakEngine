@@ -7,6 +7,7 @@
 
 #include "Core/Types.h"
 #include "Assets/CutsceneAsset.h" // active cutscene the player evaluates
+#include "Cinematics/Evaluator.h"  // active .hbseq Sequence + SequenceInstance the player evaluates
 #include "Dialogue/DialogueGraph.h" // active dialogue graph the conversation player walks
 #include "Navigation/NavWorld.h" // persistent streamed Detour navmesh (agents path on this)
 #include "Scene/ParticleGpuSim.h" // GPU particle simulation context (compute-driven)
@@ -329,6 +330,14 @@ public:
     // Play (which would hijack the viewport camera with no schematic trigger).
     void ClearCutscene();
 
+    // --- Cinematic Sequence (.hbseq) ---------------------------------------
+    // The Sequencer's runtime, sibling to the cutscene path above. Active while a
+    // .hbseq plays (started via game::PlaySequence). Camera takeover + cinematic
+    // mode (gameplay suppression) mirror the cutscene lifecycle exactly.
+    bool SequenceActive() const { return sequenceTime_ >= 0.0f; }
+    void ClearSequence(); // abort + restore camera & gameplay (Play/Stop, flow changes)
+    void SkipSequence();  // player-requested skip
+
     // Drop any in-progress conversation + choice buttons + interaction prompt +
     // captions. The editor calls this on Play/Stop (dialogue runner state is an
     // Engine member that survives a scene Replace, so a conversation left running
@@ -494,6 +503,15 @@ private:
     f32 cutsceneTime_ = -1.0f;      // -1 = no cutscene; else seconds along the timeline
     bool cutsceneRestoreCam_ = true; // gameCameraEnabled_ to restore when it ends
     bool cutsceneCamOwned_ = false;  // true while a cutscene has taken over the camera
+    // Active cinematic Sequence (.hbseq): the Sequencer runtime, sibling to the
+    // cutscene above. sequenceTime_ < 0 = none. Camera ownership + cinematic mode
+    // (gameplay suppression) mirror the cutscene fields and their lifecycle rules.
+    cine::Sequence sequence_;
+    cine::SequenceInstance seqInstance_;
+    f32 sequenceTime_ = -1.0f;
+    bool sequenceRestoreCam_ = true;
+    bool sequenceCamOwned_ = false;
+    bool cinematicActive_ = false;   // freeze player + AI while a suppressing sequence runs
     bool paused_ = false;            // player pause (see Paused/SetPaused above)
     void SeedSettingsWidgets();  // fill "setting:*" widgets from userSettings_ (on Settings shown)
     void ApplyChangedSettings(); // read changed "setting:*" widgets -> apply live + mark dirty
@@ -551,6 +569,7 @@ public:
     void SaveUserSettings(); // persist userSettings_ (rebinds, options) to disk
 private:
     void UpdateCutscene(f32 dt); // evaluate the active .hbcutscene camera/anim/dialogue tracks
+    void UpdateSequence(f32 dt); // evaluate the active .hbseq Sequencer tracks each frame
     void PlayUISounds();         // play UIElement hover/click sounds (edge-detected)
     // Owned by value: the navmesh manager for the current level. Loads/streams the
     // scene's .hbnav (SceneEnvironment::navSource); see Engine::Run's sim band.

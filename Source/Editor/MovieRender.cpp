@@ -2,9 +2,12 @@
 #include "Editor/MovieRender.h"
 
 #include "Assets/UAF.h"
+#include "Cinematics/SequenceAsset.h"
+#include "Cinematics/TrackRegistry.h"
 #include "Core/Log.h"
 #include "Engine/CutscenePlayer.h"
 #include "Engine/Engine.h"
+#include "Renderer/Camera.h"
 #include "Renderer/Renderer.h"
 #include "Scene/Scene.h"
 #include "Scene/SceneSerializer.h"
@@ -21,6 +24,28 @@ namespace hbe::movie {
 namespace fs = std::filesystem;
 
 namespace {
+
+// Deterministically pose a .hbseq frame for offline capture. Uses the SAME runtime
+// evaluator as playback and editor preview (cine::Evaluate/FireEvents), with
+// fireDeferred=false so game:: side effects never queue (the game is not running);
+// animation clip triggers still fire (they write the Animator directly).
+void PoseSequenceFrame(Engine& engine, cine::Sequence& seq, cine::SequenceInstance& inst,
+                       const fs::path& assetsDir, f32 prevT, f32 t, bool fire) {
+    cine::EvalContext ctx;
+    ctx.scene = &engine.GetScene();
+    ctx.camera = &engine.GetRenderer().GetCamera();
+    ctx.post = &engine.GetScene().Environment().post;
+    ctx.assetsDir = assetsDir;
+    ctx.mode = cine::EvalMode::Offline;
+    ctx.applyCamera = true;
+    ctx.fireDeferred = false;
+    ctx.applyGameplay = false;
+    ctx.t = t;
+    ctx.prevT = prevT;
+    ctx.dt = t - prevT;
+    if (fire) cine::FireEvents(seq, inst, ctx);
+    cine::Evaluate(seq, inst, ctx);
+}
 
 // Decodes any audio asset to interleaved-stereo int16 at `rate` Hz. A `.uaf` holds
 // raw PCM (resampled via miniaudio); anything else (.mp3/.wav/.flac) goes through
@@ -122,6 +147,7 @@ void MovieJob::Start(Engine& engine, const fs::path& assetsDir, const MovieConfi
     t_ = 0.0f;
     prevT_ = 0.0f;
     haveCutscene_ = false;
+    haveSequence_ = false;
 
     f32 dur = cfg.duration;
     if (!cfg.cutsceneRel.empty()) {
@@ -131,6 +157,21 @@ void MovieJob::Start(Engine& engine, const fs::path& assetsDir, const MovieConfi
             if (cutscene_.duration > 0.0f) dur = cutscene_.duration;
         } else {
             status_ = "Failed to load cutscene '" + cfg.cutsceneRel + "'.";
+            phase_ = Phase::Done;
+            return;
+        }
+    }
+    // A .hbseq takes precedence over a cutscene (the Sequencer supersedes it).
+    if (!cfg.sequenceRel.empty()) {
+        cine::RegisterBuiltinTrackKinds();
+        if (auto s = cine::LoadSequence(assetsDir / cfg.sequenceRel)) {
+            sequence_ = std::move(*s);
+            seqInstance_ = cine::SequenceInstance{};
+            haveSequence_ = true;
+            haveCutscene_ = false;
+            if (sequence_.Length() > 0.0f) dur = sequence_.Length();
+        } else {
+            status_ = "Failed to load sequence '" + cfg.sequenceRel + "'.";
             phase_ = Phase::Done;
             return;
         }
@@ -188,8 +229,9 @@ void MovieJob::Tick(Engine& engine) {
             status_ = "Cancelled.";
             return;
         }
-        // Hold the cutscene at t=0 while TAA history + auto-exposure + particles settle.
+        // Hold the timeline at t=0 while TAA history + auto-exposure + particles settle.
         if (haveCutscene_) cutscene::Evaluate(cutscene_, 0.0f, scene, r.GetCamera(), true);
+        if (haveSequence_) PoseSequenceFrame(engine, sequence_, seqInstance_, assetsDir_, 0.0f, 0.0f, false);
         if (--warmLeft_ <= 0) {
             phase_ = Phase::Capture;
             posed_ = false;
@@ -244,6 +286,7 @@ void MovieJob::Tick(Engine& engine) {
             cutscene::FireMarkers(cutscene_, prevT_, t_, scene, false);
             cutscene::Evaluate(cutscene_, t_, scene, r.GetCamera(), true);
         }
+        if (haveSequence_) PoseSequenceFrame(engine, sequence_, seqInstance_, assetsDir_, prevT_, t_, true);
         posed_ = true;
     }
 }

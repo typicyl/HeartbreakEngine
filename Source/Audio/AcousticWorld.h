@@ -39,7 +39,8 @@ public:
     // simulating (coupling then can't be measured, so only the listener's room contributes).
     void Update(Scene& scene, const glm::vec3& listenerPos, const glm::vec3& listenerForward,
                 const std::filesystem::path& assetsDir, AudioSystem& audio,
-                const PhysicsWorld* physics, bool environmentReverbEnabled);
+                const PhysicsWorld* physics, bool environmentReverbEnabled,
+                bool autoAcousticsEnabled);
 
     // Fraction of sound energy transmitted from `a` to `b` through intervening geometry: the
     // product of each hit wall's material transmission, with any AcousticPortal opening overriding
@@ -70,12 +71,37 @@ private:
                            const std::filesystem::path& assetsDir, AudioSystem& audio,
                            const PhysicsWorld* physics, entt::entity listenerRoom);
 
-    AcousticMaterialCache matCache_; // per-surface material cache (used by P3 occlusion)
+    // AUTO-ACOUSTICS: estimate the shoebox room around the listener directly from the geometry -
+    // cast axis rays, read how far each surrounding surface is AND what it is made of (the ray's hit
+    // material), and build an AcousticRoom from that. Drives the reverb/reflections from the real
+    // walls + materials with NO authored or baked rooms. Returns false when the space is too open
+    // (outdoors) to be a room. Cheap (6 physics rays + cached material lookups).
+    bool ProbeListenerRoom(const PhysicsWorld& physics, const Scene& scene,
+                           const glm::vec3& listenerPos, const std::filesystem::path& assetsDir,
+                           AcousticRoom& out);
+
+    AcousticMaterialCache matCache_; // per-surface material cache (used by P3 occlusion + the probe)
     AcousticRoom lastRoom_{};
     bool lastEnabled_ = false;
     bool hasPushed_ = false;
     entt::entity lastSpace_ = entt::null;
+    // Auto-acoustics smoothing/throttle state.
+    AcousticRoom probeRoom_{};        // the smoothed estimate actually applied
+    AcousticRoom probeEstimate_{};    // the latest raw probe result
+    bool probeHasEstimate_ = false;
+    bool probeRoomInit_ = false;      // probeRoom_ has been seeded (avoid lerping from zero)
+    glm::vec3 lastProbePos_{1e9f};
+    int probeThrottle_ = 0;
 };
+
+// Estimates a shoebox AcousticRoom from 6 axis-ray probes around `listenerPos`: `faceDist`/`faceMat`
+// are the hit distance + surface material per face in order +x,-x,+y,-y,+z,-z, and `escaped[i]` is
+// true where the ray hit nothing (an open face). Room dimensions come from opposing-face distances,
+// per-face materials from the hits, and reverb scales with how enclosed the space is. Returns false
+// when too few faces are enclosed (outdoors -> dry). Pure math; exposed for the self-test.
+bool EstimateRoomFromProbes(const glm::vec3& listenerPos, const f32 faceDist[6],
+                            const AcousticMaterial faceMat[6], const bool escaped[6],
+                            AcousticRoom& out);
 
 // Computes shoebox room acoustics from box geometry + per-face acoustic materials:
 // per-wall reflection coefficients (sqrt(1 - mid-band absorption)) + Eyring RT60 per octave band.

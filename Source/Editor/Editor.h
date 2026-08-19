@@ -4,6 +4,8 @@
 #include "Assets/AssetRefs.h" // pack dependency closure (BuildSettings::onlyReferenced)
 #include "Assets/AudioEvent.h"
 #include "Assets/CutsceneAsset.h"
+#include "Cinematics/Evaluator.h"     // cine::Sequence + SequenceInstance (Sequencer panel)
+#include "Cinematics/SequenceAsset.h" // cine::LoadSequence / SaveSequence
 #include "Assets/DialogueAsset.h"
 #include "Dialogue/DialogueGraph.h" // branching-dialogue graph editor
 #include "Assets/CharacterAsset.h"
@@ -735,6 +737,39 @@ private:
     void CutscenePreviewAbandon() {
         csPreview_ = false; csPlaying_ = false; csPreviewSnapshot_.clear();
     }
+
+    // -- Sequencer panel (.hbseq) ---------------------------------------------
+    // The Sequencer NLE: a hierarchical superset of the cutscene timeline. Its
+    // working copy, live-preview bracket and per-document undo mirror the cutscene
+    // panel's exactly (Source/Editor/SequencerEditor.cpp).
+    cine::Sequence editedSequence_;
+    std::filesystem::path editedSequencePath_;
+    bool sequenceOpen_ = false;
+    bool editedSequenceDirty_ = false;
+    f32 seqPlayhead_ = 0.0f;            // timeline playhead (seconds)
+    f32 seqZoom_ = 90.0f;              // pixels per second
+    f32 seqScroll_ = 0.0f;             // seconds at the lane's left edge
+    int seqSelTrack_ = -1;             // selected track (flattened index), -1 = none
+    int seqSelSection_ = -1;           // selected section within seqSelTrack_
+    int seqSelBinding_ = -1;           // selected binding, -1 = none
+    bool seqPreview_ = false;          // preview owns the viewport camera
+    bool seqPlaying_ = false;          // playing advances the playhead
+    f32 seqPrevTime_ = 0.0f;           // last eval time (event firing interval)
+    std::string seqPreviewSnapshot_;   // scene JSON to restore on stop
+    cine::SequenceInstance seqPreviewInstance_;
+    void OpenSequence(Engine& engine, const std::filesystem::path& path);
+    std::filesystem::path CreateSequenceAsset(const std::filesystem::path& dir,
+                                              const std::string& name = {});
+    void DrawSequencer(Engine& engine);
+    void DrawSequencerInspector(Engine& engine); // the selected binding/track/section editor
+    f32 seqAddSectionTime_ = 0.0f;               // right-click "Add Section here" time
+    void SequencerPreviewBegin(Engine& engine);
+    void SequencerPreviewEnd(Engine& engine);
+    void SequencerPreviewAbandon() {
+        seqPreview_ = false; seqPlaying_ = false; seqPreviewSnapshot_.clear();
+    }
+    bool SaveSequenceAsset();
+
     u32  lastPostedVoice_ = 0;          // editor Play test voice (stoppable)
 
     // -- Scene manager --------------------------------------------------------------
@@ -1207,6 +1242,7 @@ private:
     // so a full copy per edit is far cheaper than tracking per-field deltas, and it cannot
     // desynchronise the way an incremental log can.
     AssetHistory<CutsceneAsset> csHistory_;
+    AssetHistory<cine::Sequence> seqHistory_; // Sequencer per-document undo (whole-asset copy)
     // Set while a drag is in flight so the snapshot is taken ONCE, at the grab, rather
     // than every frame the mouse moves - otherwise one drag fills the whole 64-entry
     // history with intermediate positions and Ctrl+Z walks back a pixel at a time.
@@ -1610,6 +1646,7 @@ private:
         Panel_Review,
         Panel_VolumeBaker,
         Panel_Vegetation,
+        Panel_Sequencer,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

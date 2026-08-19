@@ -374,6 +374,7 @@ void Editor::BuildUI(Engine& engine) {
         for (bool& b : panelOpen_) b = true;
         panelOpen_[Panel_ProjectSettings] = false; // opened from Project/Window menu
         panelOpen_[Panel_CutsceneTimeline] = false; // opened when editing a cutscene
+        panelOpen_[Panel_Sequencer] = false;         // opened when editing a .hbseq
         panelOpen_[Panel_DialogueEditor] = false;   // opened when editing a dialogue
         panelOpen_[Panel_InputIcons] = false;        // opened from the Window menu on demand
         panelOpen_[Panel_Objectives] = false;        // task-goal browser, opened on demand
@@ -802,6 +803,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
     DrawCutsceneTimeline(engine); // after freecam so preview can override the camera
+    DrawSequencer(engine);        // Sequencer NLE; after freecam so preview can drive the camera
     DrawMovieRender(engine);      // trailer render (ticks the job; pins the viewport last)
     DrawVolumeBaker(engine);      // author + bake a .hbvol volume (ticks the bake job)
     DrawVegetationPanel(engine);  // P9: vegetation stats + GPU-grass controls + spawn
@@ -894,7 +896,7 @@ void Editor::DrawWindowMenu() {
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
         "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker",
-        "Vegetation"};
+        "Vegetation", "Sequencer"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -1131,6 +1133,10 @@ void Editor::ProcessEditRequest(Engine& engine) {
                     // points at, so drop the selection rather than leave it dangling.
                     csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
                     editedCutsceneDirty_ = true;
+                } else if (ctx.focused == editor::SaveSurface::Sequence &&
+                           seqHistory_.Undo(editedSequence_)) {
+                    seqSelTrack_ = seqSelSection_ = seqSelBinding_ = -1;
+                    editedSequenceDirty_ = true;
                 }
                 break;
             case editor::EditAction::AssetRedo:
@@ -1142,6 +1148,10 @@ void Editor::ProcessEditRequest(Engine& engine) {
                            csHistory_.Redo(editedCutscene_)) {
                     csSelKind_ = csSelTrack_ = csSelIndex_ = -1;
                     editedCutsceneDirty_ = true;
+                } else if (ctx.focused == editor::SaveSurface::Sequence &&
+                           seqHistory_.Redo(editedSequence_)) {
+                    seqSelTrack_ = seqSelSection_ = seqSelBinding_ = -1;
+                    editedSequenceDirty_ = true;
                 }
                 break;
             case editor::EditAction::AssetCut:
@@ -1195,6 +1205,8 @@ bool Editor::SurfaceHistoryEmpty(editor::SaveSurface s, editor::EditVerb v) cons
             return redo ? dlgHistory_.redo.empty() : dlgHistory_.undo.empty();
         case editor::SaveSurface::Cutscene:
             return redo ? csHistory_.redo.empty() : csHistory_.undo.empty();
+        case editor::SaveSurface::Sequence:
+            return redo ? seqHistory_.redo.empty() : seqHistory_.undo.empty();
         default:
             // The remaining asset editors have no history yet, so their Undo/Redo
             // resolves to Ignored - a silent no-op. That is deliberate and is the SAFE
@@ -1216,6 +1228,8 @@ bool Editor::SurfaceHasContent(Engine& engine, editor::SaveSurface s) const {
         case editor::SaveSurface::Dialogue:   return !editedDialoguePath_.empty();
         case editor::SaveSurface::Cutscene:
             return editedCutsceneValid_ && !editedCutscenePath_.empty();
+        case editor::SaveSurface::Sequence:
+            return sequenceOpen_ && !editedSequencePath_.empty();
         // The Music panel syncs its working graph from the project once per session,
         // and `musicLoaded_` goes true on its FIRST DRAW whether or not a graph
         // exists - so it alone is not "there is something to save". The path matters
@@ -1431,6 +1445,18 @@ void Editor::ProcessSaveRequest(Engine& engine) {
             else
                 SetSaveStatus("CUTSCENE SAVE FAILED - '" +
                                   editedCutscenePath_.filename().string() +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::Sequence:
+            if (SaveSequenceAsset())
+                SetSaveStatus("Saved sequence '" + editedSequencePath_.filename().string() +
+                                  "'.",
+                              false);
+            else
+                SetSaveStatus("SEQUENCE SAVE FAILED - '" +
+                                  editedSequencePath_.filename().string() +
                                   "' was NOT written.",
                               true);
             return;
@@ -5894,6 +5920,7 @@ void Editor::DrawAssetBrowser(Engine& engine) {
 
 void Editor::LoadSceneInEditor(Engine& engine, const std::filesystem::path& path) {
     CutscenePreviewAbandon(); // the previewed scene is about to be replaced
+    SequencerPreviewAbandon();
     PushUndo(engine.GetScene()); // Ctrl+Z returns to the previous world
     selected_ = entt::null;
     engine.GetPhysics().SetEditedEntity(entt::null);
@@ -6240,6 +6267,8 @@ void Editor::EnterPlayMode(Engine& engine) {
     // Restore the authored scene if a cutscene preview mutated it, so play mode
     // snapshots the real scene (not a previewed pose).
     CutscenePreviewEnd(engine);
+    SequencerPreviewEnd(engine);
+    engine.ClearSequence(); // drop any in-flight .hbseq so Play starts clean
     // Same reason, for the UI editor's Interact preview: it mutates the authored
     // widget state in place (value / toggled / selected / scroll) and restores it
     // when switched off. Play must snapshot the AUTHORED values - otherwise the
@@ -6286,6 +6315,7 @@ void Editor::EnterPlayMode(Engine& engine) {
 void Editor::StopPlayMode(Engine& engine) {
     if (!playMode_) return;
     engine.ClearCutscene();             // abort any in-flight cutscene so it can't resume next Play
+    engine.ClearSequence();             // and any in-flight .hbseq (restore camera + gameplay)
     engine.ResetDialogueRuntime();      // drop any conversation/choice/prompt left running
     engine.GetPhysics().SetRunning(false);
     engine.SetGameCameraEnabled(false); // back to the editor camera
@@ -12800,6 +12830,7 @@ void Editor::PushUndo(Scene& scene) {
 void Editor::Undo(Engine& engine) {
     if (undoStack_.empty()) return;
     CutscenePreviewEnd(engine); // revert previewed poses so the stacks capture authored state
+    SequencerPreviewEnd(engine);
     redoStack_.push_back(CaptureSnapshot(engine));
     const Snapshot snapshot = std::move(undoStack_.back());
     undoStack_.pop_back();
@@ -12809,6 +12840,7 @@ void Editor::Undo(Engine& engine) {
 void Editor::Redo(Engine& engine) {
     if (redoStack_.empty()) return;
     CutscenePreviewEnd(engine); // revert previewed poses so the stacks capture authored state
+    SequencerPreviewEnd(engine);
     undoStack_.push_back(CaptureSnapshot(engine));
     const Snapshot snapshot = std::move(redoStack_.back());
     redoStack_.pop_back();
@@ -15012,6 +15044,12 @@ void Editor::DrawAudioMixer(Engine& engine) {
             ImGui::SetTooltip("Each acoustic room contributes its OWN reverb tail, coupled through\n"
                               "portals - a sound in the next room rings in that room's reverb,\n"
                               "heard through the doorway. Needs AcousticSpace rooms. Extra CPU.");
+        changed |= ImGui::Checkbox("Auto-acoustics (geometry-driven)", &sa.autoAcoustics);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Outside authored AcousticSpaces, estimate the room from the geometry\n"
+                              "around the listener (ray distances + hit materials) and drive the\n"
+                              "reverb/reflections from that - no rooms to author. A few physics rays;\n"
+                              "authored AcousticSpaces still override where present.");
         ImGui::EndDisabled();
         if (changed) Project::Active().Save();
     }
@@ -20096,6 +20134,8 @@ void Editor::OnProjectChanged() {
     // scene is torn down here, so abandon the preview (don't restore a stale
     // cross-project snapshot) and close the timeline.
     CutscenePreviewAbandon();
+    SequencerPreviewAbandon();
+    sequenceOpen_ = false;
     editedCutsceneValid_ = false;
     editedCutscenePath_.clear();
     csSelKind_ = csSelTrack_ = csSelIndex_ = -1;

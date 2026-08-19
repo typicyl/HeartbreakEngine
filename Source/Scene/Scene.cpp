@@ -255,6 +255,11 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
     // the per-entity walk entirely when nothing is hidden (the common case).
     const auto* hiddenStore = registry_.storage<EditorHidden>();
     const bool cullHidden = editorView_ && hiddenStore && hiddenStore->size() > 0;
+    // RUNTIME visibility suppression (Hidden tag), honoured in play mode + the shipped
+    // runtime too (unlike EditorHidden). Driven by the cinematic Visibility track;
+    // skipped entirely when nothing is hidden (the common case).
+    const auto* runtimeHiddenStore = registry_.storage<Hidden>();
+    const bool cullRuntimeHidden = runtimeHiddenStore && runtimeHiddenStore->size() > 0;
     // Skip the per-draw blendshape lookup entirely when no entity has a MorphState
     // (the common case) - same idiom as cullHidden above.
     const auto* morphStore = registry_.storage<MorphState>();
@@ -266,6 +271,7 @@ void Scene::CollectDrawItems(std::vector<rhi::DrawItem>& out) const {
         const auto& instance  = view.get<const MeshInstance>(e);
         if (!instance.mesh.IsValid()) continue;
         if (cullHidden && IsEditorHidden(e)) continue;
+        if (cullRuntimeHidden && registry_.all_of<Hidden>(e)) continue;
 
         rhi::DrawItem item;
         item.mesh = instance.mesh;

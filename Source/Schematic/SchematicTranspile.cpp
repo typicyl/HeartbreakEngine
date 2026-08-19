@@ -356,6 +356,10 @@ struct Gen {
                 out += "        game::PlayCutscene((" + IN(1) + ").s);\n";
                 EmitExec(out, node, 0, stack, depth);
                 break;
+            case NodeType::PlaySequence:
+                out += "        game::PlaySequence((" + IN(1) + ").s);\n";
+                EmitExec(out, node, 0, stack, depth);
+                break;
             case NodeType::UIShowPanel:
                 out += "        game::QueueUICommand({game::UICommand::Op::Show, (" + IN(1) +
                        ").s});\n";

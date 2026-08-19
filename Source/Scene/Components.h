@@ -78,6 +78,13 @@ struct HierarchyOrder {
 // hidden setup survives reloads; the runtime ignores it (see Scene::SetEditorView).
 struct EditorHidden {};
 
+// RUNTIME visibility suppression (unlike EditorHidden, honoured in play mode and
+// the shipped runtime). A bare tag: when present, Scene::CollectDrawItems skips the
+// entity's mesh. Driven by the cinematic Visibility track (Source/Cinematics) and
+// restored when the sequence ends. NOT serialized - it is transient run state, like
+// StreamShard; authored visibility belongs to the sequence asset, not the scene.
+struct Hidden {};
+
 // Editor-only, SESSION-ONLY: force an INACTIVE UIPanel to lay out anyway, so the
 // author can look at a screen the game has not shown.
 //

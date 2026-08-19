@@ -2,6 +2,8 @@
 #include "Engine/Engine.h"
 
 #include "Core/Platform.h"
+#include "Cinematics/SequenceAsset.h" // cine::LoadSequence for game::PlaySequence
+#include "Cinematics/TrackRegistry.h" // cine::RegisterBuiltinTrackKinds
 #include "Engine/CutscenePlayer.h"
 #include "Assets/CutsceneAsset.h"
 #include "Assets/DialogueAsset.h"
@@ -2102,7 +2104,11 @@ int Engine::Run(const EngineConfig& configIn) {
         // anim, settling props), and without this gate WASD would walk the player
         // around behind the menu. The editor keeps its old behaviour (flowActive_
         // is false there) - play-in-editor characters still move.
-        if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing))
+        // cinematicActive_: while a .hbseq with suppressGameplay plays, freeze player
+        // movement (the sequence's own transform/animation tracks drive the actors);
+        // AND it into BOTH gameplay gates (here + gameplay::Update) so movement and
+        // AI/fire suppress together. Restored when the sequence ends (spec §17).
+        if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing) && !cinematicActive_)
             character::Update(scene, input, dt, renderer.GetCamera().Forward());
         // Buoyancy: float dynamic bodies on the water surface. BEFORE the step so the forces
         // it queues are integrated this frame (matching destruction's after-step ordering).
@@ -2139,7 +2145,7 @@ int Engine::Run(const EngineConfig& configIn) {
             // behind the menu - AI patrolled and shot, encounters cleared, and
             // checkpoints wrote `.hbsave` while the player was still on the title
             // screen. The editor keeps its old behaviour (flowActive_ is false).
-            if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing))
+            if (physics.IsRunning() && (!flowActive_ || gameState_ == GameState::Playing) && !cinematicActive_)
                 gameplay::Update(scene, physics, renderer, input, renderer.GetCamera(), dt,
                                  ui::PointerOverInteractive(scene, uiCtx_));
             accGpMs += std::chrono::duration<f64, std::milli>(clock::now() - _pt).count();
@@ -2348,6 +2354,29 @@ int Engine::Run(const EngineConfig& configIn) {
                     }
                 }
                 UpdateCutscene(dt); // evaluate camera/anim/dialogue tracks
+
+                // Start a requested cinematic Sequence (.hbseq): register the track
+                // kinds once (idempotent), load it, optionally take over the camera and
+                // enter cinematic mode (freeze gameplay), then step it. Mirrors the
+                // cutscene camera-ownership capture rules exactly.
+                std::string seqPath;
+                if (game::ConsumeSequence(seqPath)) {
+                    cine::RegisterBuiltinTrackKinds();
+                    if (auto s = cine::LoadSequence(mAssets / seqPath)) {
+                        const bool takesCamera = cine::HasCameraTrack(*s);
+                        if (scene_) seqInstance_.Release(*scene_); // free a prior run's spawnables/hidden
+                        seqInstance_ = cine::SequenceInstance{};
+                        sequence_ = std::move(*s);
+                        sequenceTime_ = 0.0f;
+                        if (takesCamera && !sequenceCamOwned_) {
+                            sequenceRestoreCam_ = gameCameraEnabled_;
+                            SetGameCameraEnabled(false); // engine owns the camera now
+                            sequenceCamOwned_ = true;
+                        }
+                        cinematicActive_ = sequence_.suppressGameplay;
+                    }
+                }
+                UpdateSequence(dt); // evaluate the .hbseq tracks each frame
             }
             // Duck the score while speech is on screen. A running conversation or
             // any live subtitle counts - so a barked voiceline ducks too, not just
@@ -2420,11 +2449,15 @@ int Engine::Run(const EngineConfig& configIn) {
         audio.SetListenerPose(renderer.GetCamera().Position(), renderer.GetCamera().Forward());
 
         // Room acoustics: drive the listener's reverb + early reflections from the AcousticSpace
-        // it occupies (uses this frame's post-camera listener). No-op without binaural audio.
+        // it occupies, or estimate the room from the surrounding geometry when auto-acoustics is on
+        // and no AcousticSpace applies (uses this frame's post-camera listener). No-op without
+        // binaural audio.
         acoustics.Update(scene, renderer.GetCamera().Position(), renderer.GetCamera().Forward(),
                          audioAssetsDir, audio, physics.IsRunning() ? &physics : nullptr,
                          Project::HasActive() &&
-                             Project::Active().Settings().spatialAudio.environmentReverb);
+                             Project::Active().Settings().spatialAudio.environmentReverb,
+                         Project::HasActive() &&
+                             Project::Active().Settings().spatialAudio.autoAcoustics);
 
         // Particles: simulate (spawn + integrate) and build this frame's billboards
         // against the camera basis. Emit even in the editor so emitters preview live.
@@ -3234,6 +3267,7 @@ void Engine::LoadGameplayScene(const std::filesystem::path& scenePath) {
     ResetDialogueRuntime();
     ResetVegetationRuntime(); // GPU grass is engine state, not entities - don't carry it over
     ClearCutscene();
+    ClearSequence(); // and any in-flight .hbseq (restore camera + gameplay)
     game::ClearTransientQueues(); // don't let a queued death/noise/spot fire into the new scene
     // BindLevel is the level transition: it captures the outgoing level (resident set
     // AND every resident shard) before scene::BindWorld destroys it, then binds and
@@ -3722,6 +3756,7 @@ void Engine::LoadGameplayWorld() {
     // Stop any in-progress cutscene and hand the camera back (else it stays
     // disabled into the new run).
     ClearCutscene();
+    ClearSequence();
     // Drop anything the previous run queued but never drained: a death/noise/spot
     // event or a UI/music command surviving the swap fires into the FRESH world,
     // against entity ids that now mean something else. This is the level-TRANSITION
@@ -4920,6 +4955,52 @@ void Engine::ClearCutscene() {
         cutsceneCamOwned_ = false;
     }
     cutsceneTime_ = -1.0f;
+}
+
+void Engine::UpdateSequence(f32 dt) {
+    if (sequenceTime_ < 0.0f || !scene_ || !renderer_) return;
+    const f32 prev = sequenceTime_;
+    sequenceTime_ += dt;
+    const f32 t = sequenceTime_;
+
+    cine::EvalContext ctx;
+    ctx.scene = scene_;
+    ctx.camera = &renderer_->GetCamera();
+    ctx.post = &scene_->Environment().post; // post/DoF tracks write the scene look
+    ctx.assetsDir =
+        Project::HasActive() ? Project::Active().AssetsDir() : std::filesystem::path();
+    ctx.mode = cine::EvalMode::Runtime;
+    ctx.applyCamera = sequenceCamOwned_; // only drive the camera when we own it
+    ctx.fireDeferred = true;             // runtime: events queue into the game:: bus
+    ctx.applyGameplay = true;
+    ctx.t = t;
+    ctx.prevT = prev;
+    ctx.dt = dt;
+
+    // Fire events crossed in [prev, t), then pose the scene at t. The SAME evaluator
+    // drives editor preview and offline capture, so they cannot diverge.
+    cine::FireEvents(sequence_, seqInstance_, ctx);
+    cine::Evaluate(sequence_, seqInstance_, ctx);
+
+    if (t >= sequence_.Length()) ClearSequence(); // end: restore camera + gameplay
+}
+
+void Engine::SkipSequence() {
+    if (sequenceTime_ < 0.0f) return;
+    HBE_INFO("Sequence: skipped by the player at {:.2f}s / {:.2f}s.", sequenceTime_,
+             sequence_.Length());
+    ClearSequence();
+    ResetDialogueRuntime(); // drop any conversation/subtitles the sequence put up
+}
+
+void Engine::ClearSequence() {
+    if (sequenceCamOwned_) {
+        SetGameCameraEnabled(sequenceRestoreCam_);
+        sequenceCamOwned_ = false;
+    }
+    cinematicActive_ = false;                       // un-freeze gameplay
+    if (scene_) seqInstance_.Release(*scene_);       // destroy spawnables, un-hide entities
+    sequenceTime_ = -1.0f;
 }
 
 void Engine::UpdateGameFlow(f32 dt) {

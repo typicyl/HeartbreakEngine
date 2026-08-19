@@ -190,6 +190,7 @@ void ParseSettings(const json& j, ProjectSettings& s) {
         sa.binaural = it->value("binaural", true);
         sa.speakerMode = it->value("speakerMode", false);
         sa.environmentReverb = it->value("environmentReverb", false);
+        sa.autoAcoustics = it->value("autoAcoustics", true);
     }
     s.build = BuildSettings{}; // defaults for projects without a block
     if (const auto it = j.find("build"); it != j.end() && it->is_object()) {
@@ -538,7 +539,8 @@ bool Project::Save() const {
         const SpatialAudioSettings& sa = settings_.spatialAudio;
         j["spatialAudio"] = {{"binaural", sa.binaural},
                              {"speakerMode", sa.speakerMode},
-                             {"environmentReverb", sa.environmentReverb}};
+                             {"environmentReverb", sa.environmentReverb},
+                             {"autoAcoustics", sa.autoAcoustics}};
     }
 
     std::ofstream out(projectFile_);

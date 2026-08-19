@@ -13,6 +13,7 @@
 #include "Assets/CookStats.h"    // --cook-stats / --test-cookstats (why is this build big?)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
 #include "Assets/MaterialXInterop.h" // --test-openpbr (.hbmat/.mtlx round-trip + variant routing)
+#include "Material/MaterialAuthoringTest.h" // --test-material (graph/compile/layers/box/paint)
 #include "Assets/SeamWeld.h"
 #include "Navigation/NavBaker.h" // --test-nav (Recast bake -> Detour stream/query/obstacles)
 #include "Scene/BodyShape.h"
@@ -45,6 +46,7 @@
 #include "Collab/TcpTransport.h"     // --test-tcp
 #include "Core/JobSystem.h"
 #include "Core/Window.h"
+#include "Cinematics/CinematicsTest.h" // --test-cinematics / --test-curve (Sequencer + curve engine)
 #include "Dialogue/DialogueGraph.h" // --test-graphfanin (node-graph reconvergence)
 #include "Scene/OceanFFT.h"         // --test-oceanfft (Tessendorf FFT reference/oracle)
 #include "Volume/VolumeNano.h"      // --test-nanovdb (header-only NanoVDB build gate)
@@ -155,6 +157,24 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-seamweld") == 0) {
             const bool ok = hbe::weld::SelfTest();
             std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-curve: the reusable scalar animation-curve engine (Core/Curve):
+        // linear/constant/cubic interpolation, auto-tangent overshoot clamping,
+        // weighted-tangent Bezier, extrapolation modes, greedy reduction. Pure CPU.
+        if (std::strcmp(argv[i], "--test-curve") == 0) {
+            const bool ok = hbe::cine::CurveSelfTest();
+            std::printf("curve %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-cinematics: the Sequencer runtime core - track registry, .hbseq JSON
+        // round-trip, GUID/Name binding resolution, and deterministic + idempotent
+        // evaluation of a transform track against a real Scene. Pure CPU, no window.
+        if (std::strcmp(argv[i], "--test-cinematics") == 0) {
+            const bool curveOk = hbe::cine::CurveSelfTest();
+            const bool seqOk = hbe::cine::SelfTest(); // run both so all failures surface
+            const bool ok = curveOk && seqOk;
+            std::printf("cinematics %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-nav (alias --navtest): headless navigation end-to-end. Recast-bakes
@@ -451,6 +471,15 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-openpbr") == 0) {
             const bool ok = hbe::assets::MaterialInteropSelfTest();
             std::printf("openpbr %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-material: the unified MATERIAL AUTHORING gate (docs/Design-MaterialAuthoring.md).
+        // Node-graph serialization + deterministic compilation + constant folding + parameter
+        // overrides + layer/height/normal blending + box-brush weight/rotation/falloff + world/
+        // local tiling + mask/layer-stack serialization. Headless; no GPU/window/project.
+        if (std::strcmp(argv[i], "--test-material") == 0) {
+            const bool ok = hbe::mat::SelfTest();
+            std::printf("material %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         // --test-packclosure: THE GATE for "Pack only referenced assets". Builds
@@ -4014,7 +4043,12 @@ int main(int argc, char** argv) {
             std::printf("--render-movie requires --project\n");
             return 1;
         }
-        s_cfg.cutsceneRel = (renderMovie == "current") ? std::string() : renderMovie;
+        // A `.hbseq` target renders the Sequencer timeline; a `.hbcutscene` (or any
+        // other value) renders the legacy cutscene; "current" renders the live scene.
+        if (renderMovie != "current") {
+            if (renderMovie.ends_with(".hbseq")) s_cfg.sequenceRel = renderMovie;
+            else s_cfg.cutsceneRel = renderMovie;
+        }
         static hbe::Editor mvEditor;
         static hbe::movie::MovieJob mvJob;
         static bool mvStarted = false;

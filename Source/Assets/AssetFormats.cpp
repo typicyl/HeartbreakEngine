@@ -82,6 +82,8 @@ const std::vector<EngineAsset> kEngineAssets = {
     {".hbdialogue", "Dialogue",         true,  RefScan::JsonScan, nullptr,
      "branching conversation graph"},
     {".hbcutscene", "Cutscene",         true,  RefScan::JsonScan, nullptr, ""},
+    {".hbseq",      "Sequence",         true,  RefScan::JsonScan, nullptr,
+     "cinematic Sequencer; refs bindings/assets/sub-sequences as JSON strings"},
     {".hbmusic",    "Music Graph",      true,  RefScan::JsonScan, nullptr, "adaptive music"},
     {".hbchar",     "Character",        true,  RefScan::JsonScan, nullptr,
      "modular rig; CharacterSystem loads it via the VFS"},

@@ -36,6 +36,7 @@ enum class SaveSurface : u8 {
     Schematic,   // Schematic Editor -> the open `.hbschem`
     Dialogue,    // Dialogue Editor -> the open `.hbdialogue`
     Cutscene,    // Cutscene Timeline -> the open `.hbcutscene`
+    Sequence,    // Sequencer -> the open `.hbseq`
     Music,       // Music panel -> the open `.hbmusic` (+ the .hbproj keys it owns)
     Character,   // Character Editor -> the open `.hbchar`
     Material,    // Asset Viewer -> `.hbmat` sub-editor
@@ -69,6 +70,7 @@ enum class SaveAction : u8 {
     Schematic,
     Dialogue,
     Cutscene,
+    Sequence,
     Music,
     Character,
     Material,

@@ -68,6 +68,8 @@ SaveAction DecideSave(const SaveContext& ctx) {
             return ctx.surfaceHasContent ? SaveAction::Dialogue : SaveAction::NothingOpen;
         case SaveSurface::Cutscene:
             return ctx.surfaceHasContent ? SaveAction::Cutscene : SaveAction::NothingOpen;
+        case SaveSurface::Sequence:
+            return ctx.surfaceHasContent ? SaveAction::Sequence : SaveAction::NothingOpen;
         case SaveSurface::Music:
             return ctx.surfaceHasContent ? SaveAction::Music : SaveAction::NothingOpen;
         case SaveSurface::Character:
@@ -94,6 +96,7 @@ const char* SaveSurfaceName(SaveSurface s) {
         case SaveSurface::Schematic:   return "Schematic Editor";
         case SaveSurface::Dialogue:    return "Dialogue Editor";
         case SaveSurface::Cutscene:    return "Cutscene Timeline";
+        case SaveSurface::Sequence:    return "Sequencer";
         case SaveSurface::Music:       return "Music";
         case SaveSurface::Character:   return "Character Editor";
         case SaveSurface::Material:    return "Asset Viewer (material)";
@@ -117,6 +120,7 @@ const char* SaveActionName(SaveAction a) {
         case SaveAction::Schematic:       return "Schematic";
         case SaveAction::Dialogue:        return "Dialogue";
         case SaveAction::Cutscene:        return "Cutscene";
+        case SaveAction::Sequence:        return "Sequence";
         case SaveAction::Music:           return "Music";
         case SaveAction::Character:       return "Character";
         case SaveAction::Material:        return "Material";
@@ -134,6 +138,7 @@ const char* SaveActionNoun(SaveAction a) {
         case SaveAction::Schematic:  return "schematic";
         case SaveAction::Dialogue:   return "dialogue graph";
         case SaveAction::Cutscene:   return "cutscene";
+        case SaveAction::Sequence:   return "sequence";
         case SaveAction::Music:      return "music graph";
         case SaveAction::Character:  return "character";
         case SaveAction::Material:   return "material";
@@ -170,6 +175,7 @@ constexpr Row kRows[] = {
     {SaveSurface::Schematic,   SaveAction::Schematic},
     {SaveSurface::Dialogue,    SaveAction::Dialogue},
     {SaveSurface::Cutscene,    SaveAction::Cutscene},
+    {SaveSurface::Sequence,    SaveAction::Sequence},
     {SaveSurface::Music,       SaveAction::Music},
     {SaveSurface::Character,   SaveAction::Character},
     {SaveSurface::Material,    SaveAction::Material},
@@ -368,6 +374,7 @@ constexpr u8 kCaps[static_cast<usize>(SaveSurface::Count)] = {
     /* Schematic   */ kU | kR,
     /* Dialogue    */ kU | kR,
     /* Cutscene    */ kU | kR,
+    /* Sequence    */ kU | kR,
     /* Music       */ kU | kR,
     /* Character   */ kU | kR,
     /* Material    */ kU | kR,

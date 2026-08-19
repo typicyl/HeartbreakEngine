@@ -111,6 +111,8 @@ std::array<NodeDesc, static_cast<usize>(NodeType::Count)> BuildCatalog() {
                                  {EXEC, {"Asset", P::String}}, {EXEC}});
     set(NodeType::PlayCutscene, {"Play Cutscene", "Cinematic",
                                  {EXEC, {"Asset", P::String}}, {EXEC}});
+    set(NodeType::PlaySequence, {"Play Sequence", "Cinematic",
+                                 {EXEC, {"Asset", P::String}}, {EXEC}});
     // Combat: faction-based health/damage. Entity inputs default to Self when unwired.
     set(NodeType::ApplyDamage, {"Apply Damage", "Combat",
                                 {EXEC, {"Target", P::Entity}, {"Amount", P::Float}}, {EXEC}});
@@ -214,6 +216,7 @@ Value DefaultLiteral(NodeType t, u32 inPin, PinType pt) {
     if (t == NodeType::PlayVoiceline && inPin == 1) return Value::Str("Voice/line.uaf");
     if (t == NodeType::PlayDialogue && inPin == 1) return Value::Str("Dialogue/scene.hbdialogue");
     if (t == NodeType::PlayCutscene && inPin == 1) return Value::Str("Cutscenes/intro.hbcutscene");
+    if (t == NodeType::PlaySequence && inPin == 1) return Value::Str("Sequences/intro.hbseq");
     if (t == NodeType::ApplyDamage && inPin == 2) return Value::Float(25.0f);
     if (t == NodeType::Heal && inPin == 2) return Value::Float(25.0f);
     if (t == NodeType::SetHealth && inPin == 2) return Value::Float(100.0f);

@@ -171,6 +171,11 @@ struct SpatialAudioSettings {
     // coupled to the listener through portals - so a sound in the next room rings in THAT room's
     // reverb, heard through the doorway. Opt-in (extra CPU + tuning). Needs binaural + rooms.
     bool environmentReverb = false;
+    // Auto-acoustics: when the listener is NOT inside an authored AcousticSpace, estimate the room
+    // from the surrounding geometry (ray distances + hit materials) and drive the reverb/reflections
+    // from that - so echo/reverb come from the real walls + materials with no rooms to author.
+    // Cheap (a few physics rays); authored AcousticSpaces still override where present.
+    bool autoAcoustics = true;
 };
 
 // One device's button/key icon set: id -> texture `.uaf` path (relative to Assets).

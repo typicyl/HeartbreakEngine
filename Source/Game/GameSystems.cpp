@@ -39,6 +39,8 @@ std::string g_dialogue;                // latest requested `.hbdialogue` (rel. A
 bool g_dialoguePending = false;
 std::string g_cutscene;                // latest requested `.hbcutscene` (rel. Assets)
 bool g_cutscenePending = false;
+std::string g_sequence;                // latest requested `.hbseq` (rel. Assets)
+bool g_sequencePending = false;
 // Deferred UI panel commands (drained by the engine, in order).
 std::vector<UICommand> g_uiCommands;
 std::vector<DeathRec> g_deaths; // combat deaths, drained into the OnDeath event
@@ -122,6 +124,17 @@ bool ConsumeCutscene(std::string& outAsset) {
     if (!g_cutscenePending) return false;
     g_cutscenePending = false;
     outAsset = g_cutscene;
+    return true;
+}
+bool SequencePending() { return g_sequencePending; }
+void PlaySequence(const std::string& asset) {
+    g_sequence = asset;
+    g_sequencePending = true;
+}
+bool ConsumeSequence(std::string& outAsset) {
+    if (!g_sequencePending) return false;
+    g_sequencePending = false;
+    outAsset = g_sequence;
     return true;
 }
 
@@ -346,6 +359,8 @@ void Reset() {
     g_dialoguePending = false;
     g_cutscene.clear();
     g_cutscenePending = false;
+    g_sequence.clear();
+    g_sequencePending = false;
     g_uiCommands.clear();
     g_deaths.clear();
     g_noises.clear();

@@ -490,6 +490,10 @@ private:
                 game::PlayCutscene(EvalInput(n.id, 1, 0).s);
                 Follow(n.id, 0, depth);
                 break;
+            case NodeType::PlaySequence:
+                game::PlaySequence(EvalInput(n.id, 1, 0).s);
+                Follow(n.id, 0, depth);
+                break;
             // Panel ops are deferred (the engine owns the UIManager); element setters
             // write the registry directly (SetPosition precedent) - schematics run
             // before BuildVertices, so the change shows the same frame.

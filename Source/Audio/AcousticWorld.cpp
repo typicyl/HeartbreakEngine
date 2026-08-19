@@ -129,6 +129,63 @@ AcousticRoom RoomForSpace(const Scene& scene, entt::entity e, const AcousticSpac
                                sp.reflectionGain, sp.reverbGain, sp.reverbTime);
 }
 
+// -- Auto-acoustics helpers --------------------------------------------------------------------
+const f32 kProbeMaxDist = 40.0f; // ray length; beyond this a face counts as "open"
+const f32 kProbeTeleport = 8.0f; // a listener jump beyond this = scene switch/teleport -> re-seed
+
+// A fully-open face: absorbs everything (no reflection), fully transparent - what a ray sees when
+// it escapes to the sky / an opening.
+AcousticMaterial OpenAirMaterial() {
+    AcousticMaterial m;
+    m.absorption.fill(1.0f);
+    m.scattering = 0.0f;
+    m.transmission = 1.0f;
+    return m;
+}
+
+// Per-band average of several surface materials (for the shoebox's combined "wall").
+AcousticMaterial AverageMaterial(const AcousticMaterial* mats, int n) {
+    AcousticMaterial avg;
+    avg.absorption.fill(0.0f);
+    f32 s = 0.0f, t = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        for (int b = 0; b < kAcousticBands; ++b) avg.absorption[b] += mats[i].absorption[b];
+        s += mats[i].scattering;
+        t += mats[i].transmission;
+    }
+    if (n > 0) {
+        const f32 inv = 1.0f / static_cast<f32>(n);
+        for (int b = 0; b < kAcousticBands; ++b) avg.absorption[b] *= inv;
+        avg.scattering = s * inv;
+        avg.transmission = t * inv;
+    }
+    return avg;
+}
+
+// Move `cur` toward `target` by factor `k` (per-field lerp of the audible parameters).
+void LerpRoom(AcousticRoom& cur, const AcousticRoom& target, f32 k) {
+    cur.position += (target.position - cur.position) * k;
+    cur.dimensions += (target.dimensions - cur.dimensions) * k;
+    cur.rotation = target.rotation; // auto-probe is always axis-aligned; no slerp needed
+    for (int i = 0; i < 6; ++i)
+        cur.reflectionCoeff[i] += (target.reflectionCoeff[i] - cur.reflectionCoeff[i]) * k;
+    for (int b = 0; b < 9; ++b) cur.rt60[b] += (target.rt60[b] - cur.rt60[b]) * k;
+    cur.reflectionGain += (target.reflectionGain - cur.reflectionGain) * k;
+    cur.reverbGain += (target.reverbGain - cur.reverbGain) * k;
+    cur.reflectionCutoffHz = target.reflectionCutoffHz;
+}
+
+// Coarse "changed enough to re-push" test so the reverb network is not reconfigured every frame
+// while the smoothed estimate drifts by a hair.
+bool RoomChangedEnough(const AcousticRoom& a, const AcousticRoom& b) {
+    if (glm::distance(a.position, b.position) > 0.3f) return true;
+    if (glm::length(a.dimensions - b.dimensions) > 0.4f) return true;
+    if (std::fabs(a.reverbGain - b.reverbGain) > 0.004f) return true;
+    for (int b0 = 0; b0 < 9; ++b0)
+        if (std::fabs(a.rt60[b0] - b.rt60[b0]) > 0.05f) return true;
+    return false;
+}
+
 } // namespace
 
 AcousticRoom ComputeAcousticRoom(const glm::vec3& center, const glm::quat& rotation,
@@ -168,6 +225,61 @@ AcousticRoom ComputeAcousticRoom(const glm::vec3& center, const glm::quat& rotat
     (void)reverbTime;
 #endif
     return r;
+}
+
+bool EstimateRoomFromProbes(const glm::vec3& listenerPos, const f32 faceDist[6],
+                            const AcousticMaterial faceMat[6], const bool escaped[6],
+                            AcousticRoom& out) {
+    int enclosedFaces = 0;
+    for (int i = 0; i < 6; ++i)
+        if (!escaped[i]) ++enclosedFaces;
+    // Need enough surrounding surfaces to be a "room". 3+ open faces -> outdoors -> let it be dry.
+    if (enclosedFaces < 4) return false;
+    const f32 enclosure = static_cast<f32>(enclosedFaces) / 6.0f; // 0.67 .. 1.0 here
+
+    // Order: +x,-x,+y,-y,+z,-z. Dimensions from opposing faces; centre offset from the asymmetry.
+    const auto dim = [&](int a, int b) {
+        return glm::clamp(faceDist[a] + faceDist[b], 1.0f, 2.0f * kProbeMaxDist);
+    };
+    const glm::vec3 dims(dim(0, 1), dim(2, 3), dim(4, 5));
+    const glm::vec3 center =
+        listenerPos + 0.5f * glm::vec3(faceDist[0] - faceDist[1], faceDist[2] - faceDist[3],
+                                       faceDist[4] - faceDist[5]);
+
+    const AcousticMaterial wallMats[4] = {faceMat[0], faceMat[1], faceMat[4], faceMat[5]}; // ±x, ±z
+    const AcousticMaterial wall = AverageMaterial(wallMats, 4);
+    const AcousticMaterial& floor = faceMat[3];   // -y
+    const AcousticMaterial& ceiling = faceMat[2]; // +y
+
+    // reverbGain scales with enclosure so a room missing a wall reverberates less than a sealed one.
+    out = ComputeAcousticRoom(center, glm::quat(1.0f, 0.0f, 0.0f, 0.0f), dims, wall, floor, ceiling,
+                              1.0f, enclosure, 1.0f);
+    return true;
+}
+
+bool AcousticWorld::ProbeListenerRoom(const PhysicsWorld& physics, const Scene& scene,
+                                      const glm::vec3& listenerPos,
+                                      const std::filesystem::path& assetsDir, AcousticRoom& out) {
+    static const glm::vec3 dirs[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                      {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+    f32 faceDist[6];
+    AcousticMaterial faceMat[6];
+    bool escaped[6];
+    const AcousticMaterial openAir = OpenAirMaterial();
+    for (int i = 0; i < 6; ++i) {
+        AcousticRayHit h;
+        if (AcousticRaycast(physics, scene, listenerPos, dirs[i], kProbeMaxDist, assetsDir, matCache_,
+                            h)) {
+            faceDist[i] = h.distance;
+            faceMat[i] = h.material;
+            escaped[i] = false;
+        } else {
+            faceDist[i] = kProbeMaxDist;
+            faceMat[i] = openAir;
+            escaped[i] = true;
+        }
+    }
+    return EstimateRoomFromProbes(listenerPos, faceDist, faceMat, escaped, out);
 }
 
 f32 PortalTransmission(const AcousticMaterial& closedMaterial, f32 openness) {
@@ -251,7 +363,16 @@ void AcousticWorld::SegmentTransmissionBands(const PhysicsWorld& physics, const 
 void AcousticWorld::ClearCaches() {
     matCache_.Clear();
     hasPushed_ = false;
+    lastEnabled_ = false;
     lastSpace_ = entt::null;
+    lastRoom_ = AcousticRoom{};
+    // Auto-acoustics smoother state (so a scene/level switch never carries a stale estimated room).
+    probeRoom_ = AcousticRoom{};
+    probeEstimate_ = AcousticRoom{};
+    probeHasEstimate_ = false;
+    probeRoomInit_ = false;
+    lastProbePos_ = glm::vec3(1e9f);
+    probeThrottle_ = 0;
 }
 
 #if HBE_HAVE_RESONANCE
@@ -412,7 +533,8 @@ void AcousticWorld::BuildEnvironments(Scene& scene, const glm::vec3& listenerPos
 void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
                            const glm::vec3& listenerForward,
                            const std::filesystem::path& assetsDir, AudioSystem& audio,
-                           const PhysicsWorld* physics, bool environmentReverbEnabled) {
+                           const PhysicsWorld* physics, bool environmentReverbEnabled,
+                           bool autoAcousticsEnabled) {
     entt::registry& reg = scene.Registry();
 
     // Highest-priority enabled AcousticSpace whose OBB contains the listener (>= tie-break =
@@ -449,18 +571,75 @@ void AcousticWorld::Update(Scene& scene, const glm::vec3& listenerPos,
 #endif
 
     if (best == entt::null) {
-        // Outdoors / no room: disable room effects (push once on the transition out).
-        if (!hasPushed_ || lastEnabled_) {
-            audio.SetRoom(AcousticRoom{}, false);
-            lastEnabled_ = false;
-            lastSpace_ = entt::null;
-            hasPushed_ = true;
+        // Not inside an authored AcousticSpace. AUTO-ACOUSTICS: estimate the room from the geometry
+        // around the listener (ray distances + hit materials) and drive the reverb from THAT, so
+        // echo/reverb come from the real walls + materials with no authored rooms. Falls back to dry
+        // when disabled, physics is unavailable, or the space is open (outdoors).
+        bool drove = false;
+#if HBE_HAVE_RESONANCE
+        if (autoAcousticsEnabled && physics != nullptr) {
+            // A large listener jump (scene switch, checkpoint reload, teleport) invalidates the
+            // smoothed estimate - discard it so the new location seeds fresh instead of crossfading
+            // from the previous scene's room.
+            if (glm::distance(listenerPos, lastProbePos_) > kProbeTeleport) {
+                probeRoomInit_ = false;
+                probeHasEstimate_ = false;
+            }
+            // Throttle the raycasts (re-probe on movement or periodically); smooth toward the result.
+            const bool moved = glm::distance(listenerPos, lastProbePos_) > 0.3f;
+            if (moved || (probeThrottle_++ % 8 == 0) || !probeRoomInit_) {
+                probeHasEstimate_ =
+                    ProbeListenerRoom(*physics, scene, listenerPos, assetsDir, probeEstimate_);
+                lastProbePos_ = listenerPos;
+            }
+            if (probeHasEstimate_) {
+                // Enclosed: smooth toward the estimate (seed on first sight, else lerp).
+                if (!probeRoomInit_) {
+                    probeRoom_ = probeEstimate_;
+                    probeRoomInit_ = true;
+                } else {
+                    LerpRoom(probeRoom_, probeEstimate_, 0.15f);
+                }
+            } else if (probeRoomInit_) {
+                // Open now (fewer than the enclosure threshold): FADE the reverb out rather than
+                // hard-cutting, so crossing a doorway / a flickering ray does not pop. The room is
+                // retained (still seeded) so stepping back in crossfades from where it faded to.
+                probeRoom_.reverbGain += (0.0f - probeRoom_.reverbGain) * 0.15f;
+                probeRoom_.reflectionGain += (0.0f - probeRoom_.reflectionGain) * 0.15f;
+            }
+            // Apply while the reverb is still audible; once it has faded out, release + go dry.
+            if (probeRoomInit_ && probeRoom_.reverbGain > 1e-4f) {
+                if (!hasPushed_ || !lastEnabled_ || lastSpace_ != entt::null ||
+                    RoomChangedEnough(probeRoom_, lastRoom_)) {
+                    audio.SetRoom(probeRoom_, true);
+                    lastRoom_ = probeRoom_;
+                    lastEnabled_ = true;
+                    lastSpace_ = entt::null;
+                    hasPushed_ = true;
+                }
+                drove = true;
+            } else {
+                probeRoomInit_ = false; // faded out / never enclosed -> release the estimate
+            }
+        }
+#else
+        (void)autoAcousticsEnabled;
+#endif
+        if (!drove) {
+            // Outdoors / disabled / faded out: disable room effects (push once on the transition).
+            if (!hasPushed_ || lastEnabled_) {
+                audio.SetRoom(AcousticRoom{}, false);
+                lastEnabled_ = false;
+                lastSpace_ = entt::null;
+                hasPushed_ = true;
+            }
         }
         return;
     }
 
     AcousticSpace& sp = reg.get<AcousticSpace>(best);
     sp.active = true;
+    probeRoomInit_ = false; // leaving auto-acoustics for an authored room; reset the smoother
     AcousticRoom room = RoomForSpace(scene, best, sp);
     // With the environment reverb on, IT owns the late reverb tail (the listener's room is one
     // environment at coupling 1); the single-room path then supplies only the early reflections.
@@ -613,6 +792,37 @@ bool AcousticRoomSelfTest() {
             check(a.max.x > 3.0f && a.min.x < 0.0f, "room A AABB should cover its cells + padding");
             check(b.min.x > 30.0f, "room B should be the far cluster");
         }
+    }
+
+    // Auto-acoustics probe estimation: a sealed hard room -> a reverberant AcousticRoom sized from
+    // the opposing rays; an open space -> no room (dry); a room missing a wall -> less reverb.
+    {
+        const glm::vec3 lp(10.0f, 5.0f, 20.0f);
+        const f32 dist[6] = {2.0f, 3.0f, 3.0f, 2.0f, 4.0f, 4.0f}; // +x,-x,+y,-y,+z,-z
+        AcousticMaterial hardMat[6];
+        for (int i = 0; i < 6; ++i) hardMat[i] = *marble;
+        const bool sealed[6] = {false, false, false, false, false, false};
+        AcousticRoom pr;
+        check(EstimateRoomFromProbes(lp, dist, hardMat, sealed, pr),
+              "a sealed room should estimate a room");
+        check(NearlyEq(pr.dimensions.x, 5.0f) && NearlyEq(pr.dimensions.y, 5.0f) &&
+                  NearlyEq(pr.dimensions.z, 8.0f),
+              "probe room dimensions come from opposing rays");
+        check(NearlyEq(pr.position.x, 9.5f) && NearlyEq(pr.position.y, 5.5f),
+              "probe room centre offsets from ray asymmetry");
+        check(pr.rt60[4] > 0.3f, "a sealed hard room should be reverberant");
+
+        const bool mostlyOpen[6] = {true, true, true, true, true, false}; // only the floor hit
+        AcousticRoom openRoom;
+        check(!EstimateRoomFromProbes(lp, dist, hardMat, mostlyOpen, openRoom),
+              "an open space (< 4 enclosed faces) should not be a room");
+
+        const bool oneWallOpen[6] = {true, false, false, false, false, false}; // +x missing
+        AcousticRoom partial;
+        check(EstimateRoomFromProbes(lp, dist, hardMat, oneWallOpen, partial),
+              "a 5-face room is still a room");
+        check(partial.reverbGain < pr.reverbGain,
+              "a room missing a wall should reverberate less than a sealed one");
     }
 
     return ok;

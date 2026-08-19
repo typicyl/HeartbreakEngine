@@ -124,6 +124,14 @@ bool CutscenePending();
 void PlayCutscene(const std::string& asset);
 bool ConsumeCutscene(std::string& outAsset);
 
+// --- Cinematic Sequence (deferred; a `.hbseq` Sequencer timeline) ------------
+// The hierarchical superset of a cutscene: multi-track camera/transform/animation/
+// event/audio/etc. The engine loads it, optionally takes over the camera + enters
+// cinematic mode (freezing gameplay), and evaluates it each frame. Latest wins.
+void PlaySequence(const std::string& asset);
+bool ConsumeSequence(std::string& outAsset);
+bool SequencePending();
+
 // --- UI panel commands (deferred) --------------------------------------------
 // Schematic UI nodes drive the panel stack through these; the engine (which owns
 // the UIManager) drains the queue each frame, in order (Push then Pop matters).

@@ -114,6 +114,8 @@ enum class NodeType : u16 {
     AreaVisitCount,  // Area(string; ""=current) -> Count(float) + FirstVisit(bool) (pure)
     GetAreaVar,      // Area(string) + Name(string) -> Value(float)  (pure)
     SetAreaVar,      // exec + Area(string) + Name(string) + Value(float) -> exec
+    // --- Cinematics (append-only) ---------------------------------------------
+    PlaySequence,    // exec in + Asset(string .hbseq) -> exec (runs a Sequencer cinematic)
     Count
 };
 

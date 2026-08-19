@@ -8,6 +8,7 @@
 #pragma once
 
 #include "Assets/CutsceneAsset.h"
+#include "Cinematics/Evaluator.h" // cine::Sequence + SequenceInstance (offline .hbseq render)
 #include "Core/Types.h"
 #include "Editor/MovieEncoder.h"
 
@@ -26,6 +27,7 @@ bool WritePng(const std::filesystem::path& path, u32 w, u32 h, const std::vector
 
 struct MovieConfig {
     std::string cutsceneRel;         // .hbcutscene relative to Assets/ ("" = current scene)
+    std::string sequenceRel;         // .hbseq Sequencer timeline relative to Assets/ (overrides cutscene)
     std::string musicRel;            // optional background-music file (rel Assets/; .uaf/.mp3/.wav)
     std::filesystem::path outputFile; // .mp4 target (if set, encode H.264; else PNG dir)
     std::filesystem::path outputDir; // PNG frame sequence dir (used when outputFile empty)
@@ -60,6 +62,9 @@ private:
     std::filesystem::path assetsDir_;
     CutsceneAsset cutscene_;
     bool haveCutscene_ = false;
+    cine::Sequence sequence_;          // offline .hbseq render (sibling to cutscene_)
+    cine::SequenceInstance seqInstance_;
+    bool haveSequence_ = false;
     std::string sceneSnapshot_;
     int warmLeft_ = 0;
     int totalFrames_ = 0;

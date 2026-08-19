@@ -14,6 +14,10 @@ set(HBE_CORE_SOURCES
     "Source/Core/JobSystem.cpp"
     "Source/Core/UserSettings.cpp"
     "Source/Core/InputActions.cpp"
+    # Reusable scalar animation-curve engine (Bezier/Hermite/weighted tangents,
+    # extrapolation, reduction). Foundation of the cinematic keyframe system; usable
+    # by any system that animates a scalar. Depends only on Core/Types + glm.
+    "Source/Core/Curve.cpp"
     # PLATFORM LAYER. Selected by OS exactly the way the RHI backends are selected by
     # graphics API - a second platform adds Platform_Linux.cpp beside this and changes
     # nothing else. The conditional is worth writing now, with one backend, because it is
@@ -57,6 +61,17 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/DialogueAsset.cpp"
     "Source/Assets/CutsceneAsset.cpp"
     "Source/Assets/AssetLoader.cpp")
+
+# Unified material authoring / layering / masking (backend-agnostic core). Links into BOTH the
+# runtime (hbe) and editor (hbe_editor) libs; headless-testable via --test-material. See
+# docs/Design-MaterialAuthoring.md.
+set(HBE_MATERIAL_SOURCES
+    "Source/Material/MaterialCore.cpp"
+    "Source/Material/MaterialGraph.cpp"
+    "Source/Material/MaterialGraphCompiler.cpp"
+    "Source/Material/BoxBrush.cpp"
+    "Source/Material/MaterialLayer.cpp"
+    "Source/Material/MaterialAuthoringTest.cpp")
 
 set(HBE_SCENE_SOURCES
     "Source/Scene/Scene.cpp"
@@ -208,6 +223,21 @@ set(HBE_ENGINE_SOURCES
     "Source/Engine/CutscenePlayer.cpp"
     "Source/Engine/Engine.cpp")
 
+# Cinematic system (Sequencer): the hierarchical .hbseq sequence model + reusable
+# deterministic evaluator + extensible track registry + binding resolver + JSON
+# serialization + headless self-tests. An ORCHESTRATION layer over the existing
+# animation/camera/audio/dialogue/event systems - runtime-side (both libraries);
+# the editor adds only the Sequencer panel (HBE_EDITOR_SOURCES). See
+# docs/Design-HeartbreakCinematics.md.
+set(HBE_CINEMATICS_SOURCES
+    "Source/Cinematics/Sequence.cpp"
+    "Source/Cinematics/TrackRegistry.cpp"
+    "Source/Cinematics/Binding.cpp"
+    "Source/Cinematics/Evaluator.cpp"
+    "Source/Cinematics/Tracks.cpp"
+    "Source/Cinematics/SequenceAsset.cpp"
+    "Source/Cinematics/CinematicsTest.cpp")
+
 set(HBE_D3D12_SOURCES  "Source/RHI/D3D12/D3D12Device.cpp")
 set(HBE_VULKAN_SOURCES "Source/RHI/Vulkan/VulkanDevice.cpp"
     # The Win32 VkSurfaceKHR backend - the ONLY Vulkan TU that includes <windows.h> and defines
@@ -293,6 +323,7 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/PasteParentTest.cpp"
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/UIEditor.cpp"
+    "Source/Editor/SequencerEditor.cpp" # Sequencer NLE panel (own TU; keeps Editor.cpp under /bigobj)
     "Source/Editor/Importer.cpp"
     "Source/Editor/ProctreeImport.cpp" # parametric tree importer (editor-only; bakes to .uaf)
     "Source/Assets/MaterialXInterop.cpp" # .mtlx <-> .hbmat (editor-only; runtime links no MaterialX)
@@ -340,6 +371,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_COLLAB_SOURCES}
     ${HBE_RHI_SOURCES}
     ${HBE_RENDERER_SOURCES}
+    ${HBE_CINEMATICS_SOURCES}
     ${HBE_ENGINE_SOURCES})
 
 # ---------------------------------------------------------------------------
