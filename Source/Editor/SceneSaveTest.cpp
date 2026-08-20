@@ -37,6 +37,7 @@
 #include "Project/Project.h"
 #include "Renderer/Renderer.h"
 #include "Scene/AnimationSystem.h"
+#include "Scene/BrushSystem.h" // --test-brush: brush::BuildEntityMesh
 #include "Scene/Scene.h"
 #include "Scene/SceneSerializer.h"
 #include "Scene/TagShard.h"
@@ -48,6 +49,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -1138,6 +1140,123 @@ bool Editor::MaterialVolumeSaveSelfTest() {
     if (ok)
         HBE_INFO("matvolume: MaterialVolumeComponent round-trips through the scene serializer "
                  "with every field intact.");
+    return ok;
+}
+
+bool Editor::BrushSaveSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("brush: FAILED - {}", what);
+        }
+    };
+    const auto signedVolume = [](const MeshData& m) {
+        f64 v = 0.0;
+        for (usize i = 0; i + 2 < m.indices.size(); i += 3) {
+            const glm::dvec3 a(m.vertices[m.indices[i + 0]].position);
+            const glm::dvec3 b(m.vertices[m.indices[i + 1]].position);
+            const glm::dvec3 c(m.vertices[m.indices[i + 2]].position);
+            v += glm::dot(a, glm::cross(b, c));
+        }
+        return v / 6.0;
+    };
+    const auto close = [](f64 a, f64 b) { return std::abs(a - b) < 3e-3; };
+
+    // A scene: an additive brush at the origin, and a subtractive brush that punches a post clean
+    // through it. The additive's generated mesh must lose exactly the overlap volume; the
+    // subtractive brush must generate nothing.
+    {
+        Scene s;
+        auto& reg = s.Registry();
+        const entt::entity add = s.CreateEntity("Wall");
+        reg.emplace<Transform>(add);
+        BrushComponent ab;
+        ab.halfExtents = {1.0f, 1.0f, 1.0f};
+        ab.op = 0; // additive
+        reg.emplace<BrushComponent>(add, ab);
+
+        const entt::entity sub = s.CreateEntity("Doorway");
+        reg.emplace<Transform>(sub);
+        BrushComponent sb;
+        sb.halfExtents = {0.3f, 0.5f, 2.0f}; // spans the wall in Z, carves a 0.6 x 1.0 hole
+        sb.op = 1;                            // subtractive
+        reg.emplace<BrushComponent>(sub, sb);
+
+        const MeshData am = brush::BuildEntityMesh(s, add);
+        const MeshData sm = brush::BuildEntityMesh(s, sub);
+        expect(!am.vertices.empty(), "additive brush generated no geometry");
+        expect(sm.vertices.empty(), "subtractive brush must generate NO geometry (carve tool only)");
+        const f64 v = signedVolume(am);
+        expect(v > 0.0, "brush geometry winding is inside-out (negative volume)");
+        // overlap = 0.6(x) * 1.0(y) * 2.0(z, clamped to body's +/-1) = 1.2 removed from 8.0.
+        expect(close(v, 8.0 - 1.2), "additive-minus-subtractive volume should be 6.8");
+    }
+
+    // World-frame composition: a subtractive brush translated so only half of it overlaps must carve
+    // only that half (proves the invA * worldB transform into the additive's local frame).
+    {
+        Scene s;
+        auto& reg = s.Registry();
+        const entt::entity add = s.CreateEntity("Block");
+        reg.emplace<Transform>(add);
+        BrushComponent ab;
+        ab.halfExtents = {1.0f, 1.0f, 1.0f};
+        reg.emplace<BrushComponent>(add, ab);
+
+        const entt::entity sub = s.CreateEntity("Notch");
+        Transform st;
+        st.position = {1.0f, 0.0f, 0.0f}; // centred on the +X face: half in, half out
+        reg.emplace<Transform>(sub, st);
+        BrushComponent sb;
+        sb.halfExtents = {0.5f, 0.5f, 0.5f};
+        sb.op = 1;
+        reg.emplace<BrushComponent>(sub, sb);
+
+        const f64 v = signedVolume(brush::BuildEntityMesh(s, add));
+        // overlap = x[0.5,1](0.5) * y[-0.5,0.5](1.0) * z[-0.5,0.5](1.0) = 0.5 removed from 8.0.
+        expect(close(v, 8.0 - 0.5), "world-offset carve volume should be 7.5");
+    }
+
+    // BrushComponent survives the scene save round-trip (the Ctrl+S / collab JSON path).
+    {
+        Scene s;
+        auto& reg = s.Registry();
+        const entt::entity e = reg.create();
+        reg.emplace<Guid>(e, Guid{0x1234});
+        reg.emplace<Transform>(e);
+        BrushComponent b;
+        b.halfExtents = {2.5f, 0.5f, 3.0f};
+        b.op = 1;
+        b.uvScale = 4.0f;
+        reg.emplace<BrushComponent>(e, b);
+        const entt::entity bare = reg.create();
+        reg.emplace<Guid>(bare, Guid{0x5678});
+        reg.emplace<Transform>(bare);
+
+        const std::string text = scene::SaveSceneToString(s);
+        scene::SceneData d;
+        expect(scene::ParseSceneString(text, d), "brush snapshot parses");
+        const scene::EntityData* bd = nullptr;
+        const scene::EntityData* od = nullptr;
+        for (const auto& ed : d.entities) {
+            if (ed.hasBrush) bd = &ed;
+            else if (ed.guid == 0x5678) od = &ed;
+        }
+        expect(bd != nullptr, "brush entity survived the round trip");
+        expect(od && !od->hasBrush, "the bare entity did not gain a brush");
+        if (bd) {
+            const auto nearf = [](f32 a, f32 c) { return std::abs(a - c) < 1e-4f; };
+            expect(nearf(bd->brush.halfExtents.x, 2.5f) && nearf(bd->brush.halfExtents.y, 0.5f) &&
+                       nearf(bd->brush.halfExtents.z, 3.0f),
+                   "brush halfExtents round-trips");
+            expect(bd->brush.op == 1, "brush op round-trips");
+            expect(nearf(bd->brush.uvScale, 4.0f), "brush uvScale round-trips");
+            expect(bd->brush.dirty, "loaded brush is marked dirty so geometry rebuilds");
+        }
+    }
+
+    if (ok) HBE_INFO("brush: CSG box brush carves correctly and BrushComponent round-trips.");
     return ok;
 }
 

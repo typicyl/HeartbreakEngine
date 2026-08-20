@@ -9,6 +9,7 @@
 #include "Assets/MeshGenerator.h"
 #include "Assets/UAF.h"
 #include "Core/Log.h"
+#include "Scene/BrushSystem.h" // brush::BuildEntityMesh (CSG blockout brushes as nav geometry)
 #include "Scene/Components.h"
 #include "Scene/Scene.h"
 #include "Scene/StrokeZone.h" // strokezone::IsStroke - decals are never nav geometry
@@ -228,6 +229,37 @@ void GatherGeometry(const Scene& scene, const std::filesystem::path& assetsDir,
         const int n = static_cast<int>(geom->first.size());
         for (usize i = 0; i + 2 < idx.size(); i += 3) {
             const i32 a = idx[i], b = idx[i + 1], c = idx[i + 2];
+            if (a < 0 || b < 0 || c < 0 || a >= n || b >= n || c >= n) continue;
+            tris.push_back(base + a);
+            tris.push_back(base + b);
+            tris.push_back(base + c);
+        }
+    }
+
+    // CSG blockout brushes carry no MeshRef (their geometry is derived), so they need their own
+    // pass. An ADDITIVE brush contributes its carved solid as static floor/wall; a subtractive brush
+    // yields an empty mesh from BuildEntityMesh and drops out. Same opt-out rules as above.
+    for (const entt::entity e : reg.view<const BrushComponent>()) {
+        if (const NavmeshInput* ni = reg.try_get<const NavmeshInput>(e); ni && !ni->enabled)
+            continue;
+        if (reg.all_of<NavigationObstacle>(e)) continue;
+        if (const SceneLayer* sl = reg.try_get<const SceneLayer>(e);
+            sl && sl->kind == SceneKind::Dynamic)
+            continue;
+        const MeshData md = brush::BuildEntityMesh(scene, e);
+        if (md.vertices.empty() || md.indices.size() < 3) continue;
+        const glm::mat4 world = scene.WorldMatrix(e);
+        const int base = static_cast<int>(verts.size() / 3);
+        for (const Vertex& v : md.vertices) {
+            const glm::vec3 w = glm::vec3(world * glm::vec4(v.position, 1.0f));
+            verts.push_back(w.x);
+            verts.push_back(w.y);
+            verts.push_back(w.z);
+        }
+        const int n = static_cast<int>(md.vertices.size());
+        for (usize i = 0; i + 2 < md.indices.size(); i += 3) {
+            const i32 a = static_cast<i32>(md.indices[i]), b = static_cast<i32>(md.indices[i + 1]),
+                      c = static_cast<i32>(md.indices[i + 2]);
             if (a < 0 || b < 0 || c < 0 || a >= n || b >= n || c >= n) continue;
             tris.push_back(base + a);
             tris.push_back(base + b);

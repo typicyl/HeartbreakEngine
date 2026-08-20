@@ -132,6 +132,19 @@ void PlaySequence(const std::string& asset);
 bool ConsumeSequence(std::string& outAsset);
 bool SequencePending();
 
+// --- Particle effects (deferred) ---------------------------------------------
+// `SpawnEffect("explosions/grenade", transform)` spawns a `.hbvfx` effect asset at a world
+// transform. Gameplay/schematics enqueue; the spawn system (which owns the Scene + Renderer)
+// drains the queue each frame, instantiates a ParticleEmitter entity from the asset, and
+// auto-despawns one-shot (non-looping) effects when they finish. Many per frame -> a queue.
+struct EffectReq {
+    std::string name;             // `.hbvfx` path relative to Assets/ (extension optional)
+    glm::mat4 transform{1.0f};    // world placement of the effect
+};
+void SpawnEffect(const std::string& name, const glm::mat4& transform);
+void SpawnEffect(const std::string& name, const glm::vec3& position);
+bool ConsumeEffect(EffectReq& out);
+
 // --- UI panel commands (deferred) --------------------------------------------
 // Schematic UI nodes drive the panel stack through these; the engine (which owns
 // the UIManager) drains the queue each frame, in order (Push then Pop matters).

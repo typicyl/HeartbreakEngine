@@ -10,6 +10,8 @@
 #include "Project/Project.h"
 #include "Scene/AnimationSystem.h"
 #include "Scene/CharacterSystem.h"
+#include "Scene/DecalAssetJson.h" // decalasset::DecalToJson/FromJson (shared with .hbdecal)
+#include "Scene/EffectAssetJson.h" // particle::EmitterToJson/FromJson (shared with .hbvfx)
 #include "Scene/EntityGuid.h"
 #include "Scene/Hierarchy.h" // BuildChildrenMap (the one parent->children walk)
 #include "Scene/PaintSystem.h"
@@ -463,6 +465,7 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const CameraZone>()) add(e);
     for (const entt::entity e : reg.view<const MusicZone>()) add(e);
     for (const entt::entity e : reg.view<const MaterialVolumeComponent>()) add(e);
+    for (const entt::entity e : reg.view<const BrushComponent>()) add(e);
     for (const entt::entity e : reg.view<const AcousticSpace>()) add(e);
     for (const entt::entity e : reg.view<const AcousticPortal>()) add(e);
     for (const entt::entity e : reg.view<const CameraSpline>()) add(e);
@@ -987,6 +990,11 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                     {"enabled", mv->enabled},
                                     {"bakeResolution", mv->bakeResolution}};
         }
+        if (const BrushComponent* br = reg.try_get<BrushComponent>(e)) {
+            je["brush"] = {{"halfExtents", ToJson(br->halfExtents)},
+                           {"op", br->op},
+                           {"uvScale", br->uvScale}};
+        }
         if (const AcousticSpace* as = reg.try_get<AcousticSpace>(e)) {
             je["acousticSpace"] = {{"halfExtents", ToJson(as->halfExtents)},
                                    {"wallMaterial", as->wallMaterial},
@@ -1112,34 +1120,10 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
         if (const WorldText* wt = reg.try_get<WorldText>(e))
             je["worldText"] = ui::WriteWorldText(*wt);
         if (const ParticleEmitter* pe = reg.try_get<ParticleEmitter>(e)) {
-            je["particles"] = {
-                {"rate", pe->rate}, {"maxParticles", pe->maxParticles},
-                {"emitting", pe->emitting}, {"lifetime", pe->lifetime},
-                {"lifetimeVariance", pe->lifetimeVariance}, {"emitRadius", pe->emitRadius},
-                {"direction", ToJson(pe->direction)}, {"startSpeed", pe->startSpeed},
-                {"speedVariance", pe->speedVariance}, {"spread", pe->spread},
-                {"gravity", ToJson(pe->gravity)}, {"drag", pe->drag},
-                {"buoyancy", pe->buoyancy}, {"vortex", pe->vortex},
-                {"startColor", ToJson(pe->startColor)}, {"endColor", ToJson(pe->endColor)},
-                {"startSize", pe->startSize}, {"endSize", pe->endSize},
-                {"spin", pe->spin}, {"texture", pe->texture}, {"additive", pe->additive},
-                // Volumetric overhaul (all optional; omit == legacy defaults).
-                {"shape", static_cast<u32>(pe->shape)},
-                {"boxHalfExtents", ToJson(pe->boxHalfExtents)}, {"coneAngle", pe->coneAngle},
-                {"burst", pe->burst}, {"loop", pe->loop}, {"duration", pe->duration},
-                {"turbulence", pe->turbulence}, {"turbulenceScale", pe->turbulenceScale},
-                {"fadeIn", pe->fadeIn}, {"fadeOut", pe->fadeOut},
-                {"render", static_cast<u32>(pe->render)}, {"stretch", pe->stretch},
-                {"subUVCols", pe->subUVCols}, {"subUVRows", pe->subUVRows},
-                {"subUVFps", pe->subUVFps}, {"softFade", pe->softFade},
-                // Module-stack opt-ins. Every one is written, but every one also
-                // parses back to the pre-stack behaviour when ABSENT, which is what
-                // lets a scene saved before the module stack load unchanged.
-                {"useCurlNoise", pe->useCurlNoise}, {"curlStrength", pe->curlStrength},
-                {"curlFrequency", pe->curlFrequency}, {"expDrag", pe->expDrag},
-                {"simulateColor", pe->simulateColor}, {"colorVariance", pe->colorVariance},
-                {"simulateSize", pe->simulateSize}, {"sizeVariance", pe->sizeVariance},
-                {"gpuExpand", pe->gpuExpand}, {"gpuSim", pe->gpuSim}};
+            // Delegate to the ONE emitter field (de)serializer (Scene/EffectAsset), so the scene
+            // format and the standalone `.hbvfx` effect asset can never drift. Key set + every
+            // backward-compat default is defined there.
+            je["particles"] = particle::EmitterToJson(*pe);
         }
         if (const AudioSource* src = reg.try_get<AudioSource>(e)) {
             je["audio"] = {{"asset", src->asset},
@@ -1189,15 +1173,8 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                      {"source", rp->source}};
         }
         if (const DecalComponent* dc = reg.try_get<DecalComponent>(e)) {
-            je["decal"] = {{"halfExtents", ToJson(dc->halfExtents)},
-                           {"opacity", dc->opacity},
-                           {"angleFade", dc->angleFade},
-                           {"normalStrength", dc->normalStrength},
-                           {"roughness", dc->roughness},
-                           {"metallic", dc->metallic},
-                           {"albedo", dc->albedoTex},
-                           {"normal", dc->normalTex},
-                           {"mr", dc->mrTex}};
+            // Delegate to the ONE decal field serializer (Scene/DecalAsset), shared with `.hbdecal`.
+            je["decal"] = decalasset::DecalToJson(*dc);
         }
         if (const WaterComponent* wc = reg.try_get<WaterComponent>(e)) {
             je["water"] = {
@@ -1854,6 +1831,14 @@ void ParseSceneJson(const json& root, SceneData& out) {
             mv.enabled = it->value("enabled", true);
             mv.bakeResolution = it->value("bakeResolution", mv.bakeResolution);
         }
+        if (auto it = je.find("brush"); it != je.end()) {
+            d.hasBrush = true;
+            BrushComponent& br = d.brush;
+            br.halfExtents = Vec3(it->value("halfExtents", json()), br.halfExtents);
+            br.op = it->value("op", br.op);
+            br.uvScale = it->value("uvScale", br.uvScale);
+            br.dirty = true; // derived geometry always rebuilds on load
+        }
         if (auto it = je.find("acousticSpace"); it != je.end()) {
             d.hasAcousticSpace = true;
             AcousticSpace& as = d.acousticSpace;
@@ -2054,63 +2039,9 @@ void ParseSceneJson(const json& root, SceneData& out) {
         }
         if (auto it = je.find("particles"); it != je.end()) {
             d.hasParticles = true;
-            ParticleEmitter& p = d.particles;
-            p.rate = it->value("rate", p.rate);
-            p.maxParticles = it->value("maxParticles", p.maxParticles);
-            p.emitting = it->value("emitting", p.emitting);
-            p.lifetime = it->value("lifetime", p.lifetime);
-            p.lifetimeVariance = it->value("lifetimeVariance", p.lifetimeVariance);
-            p.emitRadius = it->value("emitRadius", p.emitRadius);
-            p.direction = Vec3(it->value("direction", json()), p.direction);
-            p.startSpeed = it->value("startSpeed", p.startSpeed);
-            p.speedVariance = it->value("speedVariance", p.speedVariance);
-            p.spread = it->value("spread", p.spread);
-            p.gravity = Vec3(it->value("gravity", json()), p.gravity);
-            p.drag = it->value("drag", p.drag);
-            p.buoyancy = it->value("buoyancy", p.buoyancy);
-            p.vortex = it->value("vortex", p.vortex);
-            p.startColor = Vec4(it->value("startColor", json()), p.startColor);
-            p.endColor = Vec4(it->value("endColor", json()), p.endColor);
-            p.startSize = it->value("startSize", p.startSize);
-            p.endSize = it->value("endSize", p.endSize);
-            p.spin = it->value("spin", p.spin);
-            p.texture = it->value("texture", "");
-            p.additive = it->value("additive", p.additive);
-            // Volumetric overhaul (older scenes omit these -> struct defaults).
-            p.shape = static_cast<ParticleEmitter::Shape>(
-                it->value("shape", static_cast<u32>(p.shape)));
-            p.boxHalfExtents = Vec3(it->value("boxHalfExtents", json()), p.boxHalfExtents);
-            p.coneAngle = it->value("coneAngle", p.coneAngle);
-            p.burst = it->value("burst", p.burst);
-            p.loop = it->value("loop", p.loop);
-            p.duration = it->value("duration", p.duration);
-            p.turbulence = it->value("turbulence", p.turbulence);
-            p.turbulenceScale = it->value("turbulenceScale", p.turbulenceScale);
-            p.fadeIn = it->value("fadeIn", p.fadeIn);
-            p.fadeOut = it->value("fadeOut", p.fadeOut);
-            p.render = static_cast<ParticleEmitter::Render>(
-                it->value("render", static_cast<u32>(p.render)));
-            p.stretch = it->value("stretch", p.stretch);
-            p.subUVCols = it->value("subUVCols", p.subUVCols);
-            p.subUVRows = it->value("subUVRows", p.subUVRows);
-            p.subUVFps = it->value("subUVFps", p.subUVFps);
-            p.softFade = it->value("softFade", p.softFade);
-            // Module-stack opt-ins. The struct defaults are all "off", so a scene
-            // authored before the module stack omits every key here and compiles to
-            // the pure legacy stack - which is the compatibility guarantee, expressed
-            // in the one place it can actually be broken.
-            p.useCurlNoise = it->value("useCurlNoise", p.useCurlNoise);
-            p.curlStrength = it->value("curlStrength", p.curlStrength);
-            p.curlFrequency = it->value("curlFrequency", p.curlFrequency);
-            p.expDrag = it->value("expDrag", p.expDrag);
-            p.simulateColor = it->value("simulateColor", p.simulateColor);
-            p.colorVariance = glm::clamp(it->value("colorVariance", p.colorVariance), 0.0f, 1.0f);
-            p.simulateSize = it->value("simulateSize", p.simulateSize);
-            p.sizeVariance = glm::clamp(it->value("sizeVariance", p.sizeVariance), 0.0f, 1.0f);
-            p.gpuExpand = it->value("gpuExpand", p.gpuExpand);
-            // Absent in every scene saved before GPU simulation existed -> false ->
-            // the legacy CPU stack, unchanged. Same contract as every flag above it.
-            p.gpuSim = it->value("gpuSim", p.gpuSim);
+            // ONE emitter field reader (Scene/EffectAsset); every absent key still falls back to the
+            // struct default = legacy behaviour, so pre-module-stack scenes load unchanged.
+            particle::EmitterFromJson(*it, d.particles);
         }
         if (auto it = je.find("navAgent"); it != je.end()) {
             d.hasNavAgent = true;
@@ -2154,16 +2085,8 @@ void ParseSceneJson(const json& root, SceneData& out) {
         }
         if (auto it = je.find("decal"); it != je.end()) {
             d.hasDecal = true;
-            d.decal.halfExtents =
-                Vec3(it->value("halfExtents", json()), glm::vec3(0.5f, 0.5f, 0.15f));
-            d.decal.opacity = it->value("opacity", 1.0f);
-            d.decal.angleFade = it->value("angleFade", 2.0f);
-            d.decal.normalStrength = it->value("normalStrength", 1.0f);
-            d.decal.roughness = it->value("roughness", 0.8f);
-            d.decal.metallic = it->value("metallic", 0.0f);
-            d.decal.albedoTex = it->value("albedo", std::string());
-            d.decal.normalTex = it->value("normal", std::string());
-            d.decal.mrTex = it->value("mr", std::string());
+            // ONE decal field reader (Scene/DecalAsset); absent keys fall back to legacy defaults.
+            decalasset::DecalFromJson(*it, d.decal);
         }
         if (auto it = je.find("water"); it != je.end()) {
             d.hasWater = true;
@@ -3353,6 +3276,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasCameraZone) reg.emplace<CameraZone>(e, d.cameraZone);
         if (d.hasMusicZone) reg.emplace<MusicZone>(e, d.musicZone);
         if (d.hasMaterialVolume) reg.emplace<MaterialVolumeComponent>(e, d.materialVolume);
+        if (d.hasBrush) reg.emplace<BrushComponent>(e, d.brush);
         if (d.hasAcousticSpace) reg.emplace<AcousticSpace>(e, d.acousticSpace);
         if (d.hasAcousticPortal) reg.emplace<AcousticPortal>(e, d.acousticPortal);
         if (d.hasCameraSpline) reg.emplace<CameraSpline>(e, d.cameraSpline);
@@ -5148,6 +5072,7 @@ HBE_PLAIN_DELTA(CamZone, "cameraZone", hasCameraZone, cameraZone, CameraZone)
 HBE_PLAIN_DELTA(CamSpline, "cameraSpline", hasCameraSpline, cameraSpline, CameraSpline)
 HBE_PLAIN_DELTA(MusZone, "musicZone", hasMusicZone, musicZone, MusicZone)
 HBE_PLAIN_DELTA(MatVolume, "materialVolume", hasMaterialVolume, materialVolume, MaterialVolumeComponent)
+HBE_PLAIN_DELTA(Brush, "brush", hasBrush, brush, BrushComponent)
 HBE_PLAIN_DELTA(AcSpace, "acousticSpace", hasAcousticSpace, acousticSpace, AcousticSpace)
 HBE_PLAIN_DELTA(AcPortal, "acousticPortal", hasAcousticPortal, acousticPortal, AcousticPortal)
 HBE_PLAIN_DELTA(PostVol, "postVolume", hasPostVolume, postVolume, PostVolume)
@@ -5188,6 +5113,7 @@ const DeltaApplier kAppliers[] = {
     {"cameraSpline", &CamSplineApply, &CamSplineRemove},
     {"musicZone", &MusZoneApply, &MusZoneRemove},
     {"materialVolume", &MatVolumeApply, &MatVolumeRemove},
+    {"brush", &BrushApply, &BrushRemove},
     {"acousticSpace", &AcSpaceApply, &AcSpaceRemove},
     {"acousticPortal", &AcPortalApply, &AcPortalRemove},
     {"postVolume", &PostVolApply, &PostVolRemove},

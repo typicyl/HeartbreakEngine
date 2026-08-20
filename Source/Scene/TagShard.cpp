@@ -811,6 +811,7 @@ std::vector<BakeRow> Rows(const scene::SceneData& data) {
         if (d.hasCameraZone) AddHalf(b, d.cameraZone.halfExtents);
         if (d.hasMusicZone) AddHalf(b, d.musicZone.halfExtents);
         if (d.hasMaterialVolume) AddHalf(b, d.materialVolume.halfExtents);
+        if (d.hasBrush) AddHalf(b, d.brush.halfExtents);
         if (d.hasPostVolume) AddHalf(b, d.postVolume.halfExtents);
         if (d.hasProbe) AddHalf(b, d.probe.halfExtents);
         if (d.hasCensor) AddSphere(b, d.censor.offset, d.censor.radius);
@@ -893,6 +894,7 @@ std::vector<BakeRow> Rows(const Scene& scene, const std::function<bool(entt::ent
         if (const MusicZone* c = reg.try_get<MusicZone>(e)) AddHalf(b, c->halfExtents);
         if (const MaterialVolumeComponent* c = reg.try_get<MaterialVolumeComponent>(e))
             AddHalf(b, c->halfExtents);
+        if (const BrushComponent* c = reg.try_get<BrushComponent>(e)) AddHalf(b, c->halfExtents);
         if (const PostVolume* c = reg.try_get<PostVolume>(e)) AddHalf(b, c->halfExtents);
         if (const ReflectionProbe* c = reg.try_get<ReflectionProbe>(e)) AddHalf(b, c->halfExtents);
         if (const CensorComponent* c = reg.try_get<CensorComponent>(e))

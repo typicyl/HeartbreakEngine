@@ -93,6 +93,9 @@ set(HBE_SCENE_SOURCES
     "Source/Scene/FacialSystem.cpp"
     "Source/Scene/Hierarchy.cpp"
     "Source/Scene/TerrainSystem.cpp"
+    "Source/Scene/BrushSystem.cpp"
+    "Source/Scene/EffectAsset.cpp"
+    "Source/Scene/DecalAsset.cpp"
     "Source/Scene/PaintSystem.cpp"
     "Source/Scene/ParticleSystem.cpp"
     "Source/Scene/WeatherSystem.cpp"
@@ -327,6 +330,7 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/PasteParentTest.cpp"
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/MaterialGraphEditor.cpp" # Material Maker node-graph panel (own TU; keeps Editor.cpp under /bigobj)
+    "Source/Editor/MaterialLayerEditor.cpp" # material LAYER STACK panel (own TU)
     "Source/Editor/RuntimeShaderCompiler.cpp" # editor-only runtime HLSL->DXIL/SPIR-V compiler (invokes the toolchain DXC)
     "Source/Editor/UIEditor.cpp"
     "Source/Editor/SequencerEditor.cpp" # Sequencer NLE panel (own TU; keeps Editor.cpp under /bigobj)

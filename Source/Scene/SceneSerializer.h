@@ -127,6 +127,8 @@ struct EntityData {
     MusicZone musicZone;
     bool hasMaterialVolume = false;
     MaterialVolumeComponent materialVolume;
+    bool hasBrush = false;
+    BrushComponent brush;
     bool hasAcousticSpace = false;
     AcousticSpace acousticSpace;
     bool hasAcousticPortal = false;

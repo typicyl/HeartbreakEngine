@@ -95,6 +95,47 @@ void TestRotatedCutter() {
     CCHECK(Close(v, 8.0 - 0.5, 5e-3), "rotated post carve volume should be 7.5");
 }
 
+void TestFlushFace() {
+    // A cutter whose face is exactly COPLANAR with a body face but shares NO volume must remove
+    // nothing (the classic BSP coplanar-classification hazard).
+    const Box body = UnitBox({0, 0, 0}, {1.0f, 1.0f, 1.0f});
+    const std::vector<Box> cut = {UnitBox({2.0f, 0, 0}, {1.0f, 1.0f, 1.0f})}; // touches at x=1
+    const MeshData m = CarveBox(body, cut, 1.0f);
+    CCHECK(Close(SignedVolume(m), 8.0), "flush (coplanar, non-overlapping) cutter must remove nothing");
+}
+
+void TestNoOverlap() {
+    // A cutter nowhere near the body removes nothing and leaves the plain box.
+    const Box body = UnitBox({0, 0, 0}, {1.0f, 1.0f, 1.0f});
+    const std::vector<Box> cut = {UnitBox({10.0f, 0, 0}, {1.0f, 1.0f, 1.0f})};
+    CCHECK(Close(SignedVolume(CarveBox(body, cut, 1.0f)), 8.0), "far cutter must remove nothing");
+}
+
+void TestFullCarve() {
+    // A cutter that fully encloses the body annihilates it (empty mesh, zero volume).
+    const Box body = UnitBox({0, 0, 0}, {1.0f, 1.0f, 1.0f});
+    const std::vector<Box> cut = {UnitBox({0, 0, 0}, {2.0f, 2.0f, 2.0f})};
+    const MeshData m = CarveBox(body, cut, 1.0f);
+    CCHECK(m.Empty() || Close(SignedVolume(m), 0.0), "fully-enclosed body must carve to nothing");
+}
+
+void TestCornerCarve() {
+    // A cutter overlapping one corner removes exactly that octant-column.
+    const Box body = UnitBox({0, 0, 0}, {1.0f, 1.0f, 1.0f});
+    const std::vector<Box> cut = {UnitBox({1.0f, 1.0f, 0}, {1.0f, 1.0f, 1.0f})};
+    // overlap = x[0,1](1) * y[0,1](1) * z[-1,1](2) = 2 removed from 8 -> 6.
+    CCHECK(Close(SignedVolume(CarveBox(body, cut, 1.0f)), 6.0), "corner carve volume should be 6");
+}
+
+void TestTwoCutters() {
+    // Two disjoint doorways in one wall remove both volumes.
+    const Box wall = UnitBox({0, 0, 0}, {2.0f, 1.0f, 0.1f}); // 4 x 2 x 0.2 = 1.6
+    const std::vector<Box> cut = {UnitBox({-1.0f, -0.5f, 0}, {0.3f, 0.5f, 0.5f}),
+                                  UnitBox({1.0f, -0.5f, 0}, {0.3f, 0.5f, 0.5f})};
+    // each removes 0.6 * 1.0 * 0.2 = 0.12 -> 1.6 - 0.24 = 1.36.
+    CCHECK(Close(SignedVolume(CarveBox(wall, cut, 1.0f)), 1.6 - 0.24), "two-doorway volume should be 1.36");
+}
+
 void TestDeterminism() {
     const Box body = UnitBox({0, 0, 0}, {1.0f, 1.0f, 0.1f});
     const std::vector<Box> door = {UnitBox({0, 0, 0}, {0.3f, 0.5f, 0.5f})};
@@ -115,6 +156,11 @@ bool SelfTest() {
     TestInteriorVoid();
     TestDoorway();
     TestRotatedCutter();
+    TestFlushFace();
+    TestNoOverlap();
+    TestFullCarve();
+    TestCornerCarve();
+    TestTwoCutters();
     TestDeterminism();
     if (g_fail == 0)
         HBE_INFO("[csg test] all CSG box-brush blocks passed");

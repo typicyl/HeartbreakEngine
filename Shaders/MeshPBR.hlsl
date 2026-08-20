@@ -641,6 +641,7 @@ PSOutput PSMain(VSOutput input)
     // into the material BEFORE lighting (correctly lit, conforms to any geometry) and
     // BEFORE the weather block (so snow/wet sit on top of a decal). Uniform branch on the
     // decal count keeps it free when there are none.
+    float3 decalEmissive = float3(0.0f, 0.0f, 0.0f); // decals with the emissive bit add glow here
     [branch] if (gDecalCount > 0u)
     {
         float3 geoN = normalize(input.normalWS);
@@ -652,8 +653,15 @@ PSOutput PSMain(VSOutput input)
         for (uint di = 0; di < gDecalCount; ++di)
         {
             Decal dc = gDecals[di];
-            float facing = dot(geoN, -dc.forwardWS); // surface must face the projector
-            if (facing <= 0.0f) continue;
+            // Channel-enable + two-sided bits packed into `flags` (see Scene::BuildView).
+            bool wantBase  = (dc.flags & 1u) != 0u;
+            bool wantNorm  = (dc.flags & 2u) != 0u;
+            bool wantMR    = (dc.flags & 4u) != 0u;
+            bool twoSided  = (dc.flags & 8u) != 0u;
+            float facing = dot(geoN, -dc.forwardWS);      // >0 = faces the projector
+            float f = twoSided ? abs(facing) : facing;    // two-sided projects on back faces too
+            if (f <= 0.0f) continue;
+            if (f < dc.params.w) continue;                // hard projection cone (params.w=cos(maxAngle))
             float3 lp = mul(dc.invWorld, float4(input.positionWS, 1.0f)).xyz;
             float3 al = abs(lp);
             if (al.x > 0.5f || al.y > 0.5f || al.z > 0.5f) continue; // outside the box
@@ -664,11 +672,12 @@ PSOutput PSMain(VSOutput input)
             float4 dalb = (dc.albedoIndex != 0u)
                               ? SampleBindlessGrad(dc.albedoIndex, duv, duvDx, duvDy)
                               : float4(1.0f, 1.0f, 1.0f, 1.0f);
-            float edge = saturate((0.5f - max(al.x, al.y)) * 8.0f);  // soft UV border
-            float cov = dalb.a * dc.opacity * pow(saturate(facing), dc.angleFade) * edge;
+            float edge = saturate((0.5f - max(al.x, al.y)) * 8.0f);  // soft UV border (XY)
+            edge *= saturate((0.5f - al.z) * 4.0f);                  // soft fade along the depth axis
+            float cov = dalb.a * dc.opacity * pow(saturate(f), dc.angleFade) * edge;
             if (cov <= 0.001f) continue;
-            if (dc.albedoIndex != 0u) albedo = lerp(albedo, dalb.rgb, cov);
-            if (dc.normalIndex != 0u)
+            if (wantBase && dc.albedoIndex != 0u) albedo = lerp(albedo, dalb.rgb, cov);
+            if (wantNorm && dc.normalIndex != 0u)
             {
                 float3 nts = SampleBindlessGrad(dc.normalIndex, duv, duvDx, duvDy).xyz * 2.0f - 1.0f;
                 // Right-handed frame matching the mesh convention (ApplyNormalMap uses
@@ -679,17 +688,23 @@ PSOutput PSMain(VSOutput input)
                 float3 dN = normalize(nts.x * dc.tangentWS + nts.y * B + nts.z * (-dc.forwardWS));
                 N = normalize(lerp(N, dN, cov * dc.params.x));
             }
-            if (dc.mrIndex != 0u)
+            if (wantMR)
             {
-                float3 mr = SampleBindlessGrad(dc.mrIndex, duv, duvDx, duvDy).rgb; // b=metal g=rough
-                metallic  = lerp(metallic, mr.b, cov);
-                roughness = lerp(roughness, mr.g, cov);
+                if (dc.mrIndex != 0u)
+                {
+                    float3 mr = SampleBindlessGrad(dc.mrIndex, duv, duvDx, duvDy).rgb; // b=metal g=rough
+                    metallic  = lerp(metallic, mr.b, cov);
+                    roughness = lerp(roughness, mr.g, cov);
+                }
+                else
+                {
+                    roughness = lerp(roughness, dc.params.y, cov);
+                    metallic  = lerp(metallic, dc.params.z, cov);
+                }
             }
-            else
-            {
-                roughness = lerp(roughness, dc.params.y, cov);
-                metallic  = lerp(metallic, dc.params.z, cov);
-            }
+            // Emissive glow (flags bit 4), shaped by coverage so it follows the decal's alpha.
+            if ((dc.flags & 16u) != 0u)
+                decalEmissive += dc.emissive.rgb * (dc.emissive.a * cov);
         }
         roughness = clamp(roughness, 0.02f, 1.0f);
         metallic  = saturate(metallic);
@@ -987,6 +1002,7 @@ PSOutput PSMain(VSOutput input)
     float3 emissive = gEmissiveColor * gEmissiveIntensity;
     if (gEmissiveIndex != 0 && !splat) // for splat the emissive slot is the weight mask
         emissive *= SampleBindless(gEmissiveIndex, uv).rgb;
+    emissive += decalEmissive; // emissive decals (glowing signs / runes / embers)
 
     float3 color = ambient + Lo + emissive;
 

@@ -35,6 +35,7 @@
 #include "Vegetation/VegetationSystem.h" // veg::Update (per-frame wind + sim-LOD tick)
 #include "Vegetation/VegetationRender.h"  // veg::SpawnDemoForest (--vegdemo)
 #include "Vegetation/VegetationSurface.h" // veg::FindTerrain (--vegdemo grass)
+#include "Scene/BrushSystem.h"            // brush::Update (CSG blockout box brush geometry)
 #include "Scene/TerrainSystem.h"          // terrain::ExtentXZ / SampleStep (--vegdemo grass)
 #include "Scene/LightningSystem.h"
 #include "Assets/MeshGenerator.h"
@@ -1899,6 +1900,8 @@ int Engine::Run(const EngineConfig& configIn) {
         anim::Update(scene, dt, simulating); // keyframe tracks pose entities first
         // Build/refresh any dirty chunked terrain (cheap when nothing changed).
         terrain::Update(scene, renderer);
+        // Rebuild any dirty CSG blockout brush geometry (cheap when nothing changed).
+        brush::Update(scene, renderer);
         // Water surfaces: build/refresh their grids, age ripples, spawn rain splashes.
         water::Update(scene, renderer, dt);
         // Motion matching picks each animator's clip from movement intent BEFORE

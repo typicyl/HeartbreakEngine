@@ -713,8 +713,19 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
         out.albedoIndex = dcp.albedo.index;
         out.normalIndex = dcp.normal.index;
         out.mrIndex = dcp.mr.index;
-        out.flags = 0;
-        out.params = glm::vec4(dcp.normalStrength, dcp.roughness, dcp.metallic, 0.0f);
+        // flags: channel-enable bits (0 base, 1 normal, 2 MR) + two-sided (3). The shader gates each
+        // channel write on these, so a normal-only or colour-only decal is authorable.
+        u32 flags = 0;
+        if (dcp.affectBaseColor) flags |= 1u;
+        if (dcp.affectNormal) flags |= 2u;
+        if (dcp.affectMR) flags |= 4u;
+        if (dcp.twoSided) flags |= 8u;
+        if (dcp.affectEmissive) flags |= 16u;
+        out.flags = flags;
+        // params.w = cos(maxAngle): a hard projection-cone threshold (0 at 90deg = legacy behaviour).
+        const f32 cone = std::cos(glm::radians(glm::clamp(dcp.maxAngle, 0.0f, 90.0f)));
+        out.params = glm::vec4(dcp.normalStrength, dcp.roughness, dcp.metallic, cone);
+        out.emissive = glm::vec4(dcp.emissiveColor, glm::max(dcp.emissiveIntensity, 0.0f));
     }
 
     // Baked SH-L1 irradiance volume (smooth directional diffuse GI; overrides the

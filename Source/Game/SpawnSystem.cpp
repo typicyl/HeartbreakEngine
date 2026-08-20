@@ -6,11 +6,16 @@
 #include "Game/GameSystems.h"
 #include "Project/Project.h"
 #include "Scene/Components.h"
+#include "Scene/EffectAsset.h" // particle::LoadEffect (.hbvfx)
 #include "Scene/Hierarchy.h" // scene::BuildChildrenMap (one parent->children pass)
 #include "Scene/Scene.h"
 #include "Scene/SceneSerializer.h"
 
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp> // glm::quat_cast (world-matrix -> Transform rotation)
+
 #include <cmath>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -63,6 +68,24 @@ Prefab* GetPrefab(const std::string& rel) {
     }
     auto [ins, _] = g_prefabs.emplace(rel, std::move(pf));
     return ins->second.ok ? &ins->second : nullptr;
+}
+
+// Parsed `.hbvfx` effects, cached process-wide (disk parse is the expensive half; the emitter is
+// tiny and copied per spawn). std::nullopt caches a failed/absent asset so it isn't retried on a hot
+// spawn path. Cleared on project switch / re-save via ClearPrefabCache.
+std::unordered_map<std::string, std::optional<ParticleEmitter>> g_effectCache;
+
+const ParticleEmitter* GetEffect(const std::string& name) {
+    if (name.empty() || !Project::HasActive()) return nullptr;
+    std::string rel = name;
+    if (rel.size() < 6 || rel.compare(rel.size() - 6, 6, ".hbvfx") != 0) rel += ".hbvfx";
+    if (auto it = g_effectCache.find(rel); it != g_effectCache.end())
+        return it->second ? &*it->second : nullptr;
+    std::optional<ParticleEmitter> e =
+        particle::LoadEffect(Project::Active().AssetsDir() / rel);
+    if (!e) HBE_WARN("SpawnEffect: failed to load effect '{}'.", rel);
+    auto [ins, _] = g_effectCache.emplace(rel, std::move(e));
+    return ins->second ? &*ins->second : nullptr;
 }
 
 bool IsAliveMember(const entt::registry& reg, entt::entity e) {
@@ -184,8 +207,51 @@ void FireClearedAction(const Encounter& en) {
 
 } // namespace
 
+entt::entity SpawnEffect(Scene& scene, const std::string& name, const glm::mat4& transform) {
+    const ParticleEmitter* asset = GetEffect(name);
+    if (!asset) return entt::null;
+    entt::registry& reg = scene.Registry();
+    const entt::entity e = scene.CreateEntity("FX:" + name);
+
+    // Decompose the world matrix into the Transform's T/R/S (honours rotation + scale).
+    Transform tf;
+    const glm::vec3 c0(transform[0]), c1(transform[1]), c2(transform[2]);
+    tf.scale = {glm::length(c0), glm::length(c1), glm::length(c2)};
+    const glm::mat3 rot(c0 / glm::max(tf.scale.x, 1e-6f), c1 / glm::max(tf.scale.y, 1e-6f),
+                        c2 / glm::max(tf.scale.z, 1e-6f));
+    tf.rotation = glm::quat_cast(rot);
+    tf.position = glm::vec3(transform[3]);
+    reg.emplace<Transform>(e, tf);
+    reg.emplace<ParticleEmitter>(e, *asset);
+
+    // A one-shot (non-looping) effect self-destructs once it has finished emitting AND its last
+    // particles have died. Continuous emission runs for `duration`; then particles live out their
+    // (variance-extended) lifetime. Looping effects persist until explicitly removed.
+    if (!asset->loop) {
+        const f32 maxLife = asset->lifetime * (1.0f + glm::clamp(asset->lifetimeVariance, 0.0f, 1.0f));
+        reg.emplace<EffectLifetime>(e, EffectLifetime{asset->duration + maxLife + 0.5f});
+    }
+    return e;
+}
+
 void Update(Scene& scene, Renderer& renderer, f32 dt) {
     entt::registry& reg = scene.Registry();
+
+    // Drain deferred game::SpawnEffect requests (gameplay/schematics enqueue; we own the Scene).
+    for (game::EffectReq req; game::ConsumeEffect(req);) SpawnEffect(scene, req.name, req.transform);
+
+    // Age one-shot effects; destroy those whose particles have all died.
+    {
+        std::vector<entt::entity> expired;
+        for (auto e : reg.view<EffectLifetime>()) {
+            EffectLifetime& fx = reg.get<EffectLifetime>(e);
+            fx.remaining -= dt;
+            if (fx.remaining <= 0.0f) expired.push_back(e);
+        }
+        for (entt::entity e : expired)
+            if (reg.valid(e)) reg.destroy(e);
+    }
+
     auto sv = reg.view<Spawner>();
     if (sv.begin() == sv.end()) return; // no spawners -> zero per-frame cost
 
@@ -299,6 +365,9 @@ void UpdateEncounters(Scene& scene, f32 dt) {
     }
 }
 
-void ClearPrefabCache() { g_prefabs.clear(); }
+void ClearPrefabCache() {
+    g_prefabs.clear();
+    g_effectCache.clear();
+}
 
 } // namespace hbe::spawn

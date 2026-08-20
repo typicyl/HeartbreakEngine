@@ -113,6 +113,8 @@ std::array<NodeDesc, static_cast<usize>(NodeType::Count)> BuildCatalog() {
                                  {EXEC, {"Asset", P::String}}, {EXEC}});
     set(NodeType::PlaySequence, {"Play Sequence", "Cinematic",
                                  {EXEC, {"Asset", P::String}}, {EXEC}});
+    set(NodeType::SpawnEffect, {"Spawn Effect", "VFX",
+                                {EXEC, {"Effect", P::String}, {"Position", P::Vec3}}, {EXEC}});
     // Combat: faction-based health/damage. Entity inputs default to Self when unwired.
     set(NodeType::ApplyDamage, {"Apply Damage", "Combat",
                                 {EXEC, {"Target", P::Entity}, {"Amount", P::Float}}, {EXEC}});

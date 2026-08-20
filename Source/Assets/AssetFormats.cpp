@@ -125,6 +125,12 @@ const std::vector<EngineAsset> kEngineAssets = {
     {".hbmatlayer", "Material Layers",  true,  RefScan::JsonScan, nullptr,
      "LIVE-mode material LAYER STACK (Source/Material/MaterialLayer); names child .hbmat layers + "
      "paint/box masks as JSON strings, so JsonScan packs them. The runtime resolver blends them"},
+    {".hbvfx",      "VFX Effect",       true,  RefScan::JsonScan, nullptr,
+     "standalone particle effect = the authored ParticleEmitter fields (Scene/EffectAsset); "
+     "game::SpawnEffect(name) instantiates it. JsonScan so the sprite .uaf seeds the pack closure"},
+    {".hbdecal",    "Decal",            true,  RefScan::JsonScan, nullptr,
+     "reusable decal preset = the authored DecalComponent fields (Scene/DecalAsset); a decal library "
+     "entry. JsonScan so its albedo/normal/mr .uaf textures seed the pack closure"},
     // NOT packed by extension - each for a specific reason. Do not "fix" these to
     // true: .hbproj IS read at runtime through the VFS, but it ships via the
     // separate uap::ExtraFile path (BuildShipping packs it under the virtual name

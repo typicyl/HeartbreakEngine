@@ -243,7 +243,11 @@ struct DecalData {
     glm::vec3 forwardWS{0.0f, 0.0f, 1.0f}; f32 opacity = 1.0f;
     glm::vec3 tangentWS{1.0f, 0.0f, 0.0f}; f32 angleFade = 2.0f;
     u32 albedoIndex = 0, normalIndex = 0, mrIndex = 0, flags = 0;
-    glm::vec4 params{1.0f, 0.8f, 0.0f, 0.0f}; // x=normalStrength, y=roughness, z=metallic
+    glm::vec4 params{1.0f, 0.8f, 0.0f, 0.0f}; // x=normalStrength, y=roughness, z=metallic, w=coneCos
+    // APPEND-ONLY (keeps the 128->144B struct 16-byte aligned; the HLSL Decal mirror in Common.hlsli
+    // grows identically). xyz = emissive colour, w = intensity; the shader adds it to the surface
+    // emission (shaped by the decal coverage) when the affect-emissive flag bit is set.
+    glm::vec4 emissive{0.0f, 0.0f, 0.0f, 0.0f};
 };
 inline constexpr u32 kMaxDecals = 16;
 

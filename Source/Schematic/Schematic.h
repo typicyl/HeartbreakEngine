@@ -116,6 +116,8 @@ enum class NodeType : u16 {
     SetAreaVar,      // exec + Area(string) + Name(string) + Value(float) -> exec
     // --- Cinematics (append-only) ---------------------------------------------
     PlaySequence,    // exec in + Asset(string .hbseq) -> exec (runs a Sequencer cinematic)
+    // --- VFX (append-only) ----------------------------------------------------
+    SpawnEffect,     // exec + Effect(string .hbvfx) + Position(vec3) -> exec (spawns a particle effect)
     Count
 };
 

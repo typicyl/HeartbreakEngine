@@ -139,13 +139,25 @@ float4 PSMain(FSOutput input) : SV_Target {
 
     float transmittance = 1.0f;
     float3 inscatter = float3(0.0f, 0.0f, 0.0f);
+    // EMPTY-SPACE SKIP: smoke fills a tiny fraction of its AABB, so most uniform steps sample
+    // background and only pay the density read. When a sample is empty we grow the step (up to 3x)
+    // and advance without shading; the instant density appears we snap back to the base step. This
+    // is ENERGY-CORRECT in empty regions (d==0 -> exp(-0*step)==1, no matter the step) and only
+    // risks under-sampling the leading edge of a feature thinner than ~3 steps, which the 3x cap
+    // bounds. The iteration budget stays `steps`, so a dense volume behaves exactly as before.
+    float t = box.x + dither * stepLen;
+    float skip = stepLen;
     [loop]
-    for (int i = 0; i < steps; ++i) {
-        const float t = box.x + (i + dither) * stepLen;
+    for (int i = 0; i < steps && t < box.y; ++i) {
         const float3 pos = ro + rd * t;
         float d = VR_SampleDensity(buf, grid, acc, pos - worldOffset) * densityMul; // -offset: back to grid local
         d *= saturate((sceneDist - t) * 2.857f); // soft contact with geometry
-        if (d < 1e-4f) continue;
+        if (d < 1e-4f) {
+            skip = min(skip * 1.5f, stepLen * 3.0f); // accelerate through empty space
+            t += skip;
+            continue;
+        }
+        skip = stepLen; // density found: march at full resolution again
 
         // Self-shadow: short optical-depth march toward the light through the grid.
         float shadow = 1.0f;
@@ -190,6 +202,7 @@ float4 PSMain(FSOutput input) : SV_Target {
         inscatter += transmittance * scat * stepLen;
         transmittance *= stepTrans;
         if (transmittance < 0.003f) break;
+        t += stepLen; // shaded step: advance at the base resolution
     }
     return float4(inscatter, transmittance);
 }

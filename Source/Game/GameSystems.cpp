@@ -8,6 +8,7 @@
 
 #include <entt/entt.hpp>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp> // glm::translate (SpawnEffect position overload)
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -44,6 +45,7 @@ bool g_sequencePending = false;
 // Deferred UI panel commands (drained by the engine, in order).
 std::vector<UICommand> g_uiCommands;
 std::vector<DeathRec> g_deaths; // combat deaths, drained into the OnDeath event
+std::vector<EffectReq> g_effects; // .hbvfx spawn requests, drained by the spawn system
 std::vector<Noise> g_noises;    // live AI-audible sounds (TTL-aged)
 std::vector<SpottedRec> g_spotted; // AI "spotted" edges, drained into OnSpotPlayer
 } // namespace
@@ -135,6 +137,20 @@ bool ConsumeSequence(std::string& outAsset) {
     if (!g_sequencePending) return false;
     g_sequencePending = false;
     outAsset = g_sequence;
+    return true;
+}
+
+void SpawnEffect(const std::string& name, const glm::mat4& transform) {
+    if (name.empty()) return;
+    g_effects.push_back(EffectReq{name, transform});
+}
+void SpawnEffect(const std::string& name, const glm::vec3& position) {
+    SpawnEffect(name, glm::translate(glm::mat4(1.0f), position));
+}
+bool ConsumeEffect(EffectReq& out) {
+    if (g_effects.empty()) return false;
+    out = std::move(g_effects.front());
+    g_effects.erase(g_effects.begin());
     return true;
 }
 
@@ -362,6 +378,7 @@ void Reset() {
     g_sequence.clear();
     g_sequencePending = false;
     g_uiCommands.clear();
+    g_effects.clear();
     g_deaths.clear();
     g_noises.clear();
     g_spotted.clear();

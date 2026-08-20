@@ -29,6 +29,9 @@
 #include "Engine/Engine.h"
 #include "Material/MaterialCook.h" // box-brush world tool: BakeMeshVolumesOverlay (+ LayerStack/BoxBrush)
 #include "Physics/PhysicsWorld.h"
+#include "Scene/BrushSystem.h" // CSG blockout box brush: MarkAllDirty on edit
+#include "Scene/DecalAsset.h" // .hbdecal reusable decal asset save/load from the decal inspector
+#include "Scene/EffectAsset.h" // .hbvfx effect asset save/load from the emitter inspector
 #include "Scene/AnimationSystem.h"
 #include "Scene/Hierarchy.h" // sibling order + the one parent->children walk
 #include "Scene/PaintSystem.h"
@@ -388,6 +391,7 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_People] = false;             // who may join this project
         panelOpen_[Panel_Review] = false;             // opens itself when there is a merge
         panelOpen_[Panel_MaterialGraph] = false;      // Material Maker, opened on demand
+        panelOpen_[Panel_MaterialLayers] = false;     // layer-stack editor, opened on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -802,6 +806,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawSchematicEditor(engine);
     DrawDialogueEditor(engine);
     DrawMaterialGraph(engine);    // Material Maker node-graph editor (Window > Material Graph)
+    DrawMaterialLayers(engine);   // layer-stack editor (Window > Material Layers)
     DrawInputIconsPanel(engine);
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
@@ -827,6 +832,8 @@ void Editor::BuildUI(Engine& engine) {
     UpdateTerrainTool(engine); // terrain sculpt brush (consumes the click below)
     UpdateVegetationPaintTool(engine); // vegetation paint/erase brush (also consumes the click)
     UpdateArtTool(engine);     // surface paint brush (also consumes the click)
+    UpdateBrushTool(engine);   // CSG box-brush drag-out (also consumes the click)
+    UpdateDecalTool(engine);   // decal drop-on-surface (also consumes the click)
     // Billboard icons for non-mesh entities (+ click-select). After the tools so
     // it can yield to an in-progress sculpt/paint stroke.
     DrawEntityIcons(scene, renderer);
@@ -842,7 +849,8 @@ void Editor::BuildUI(Engine& engine) {
         ImGuizmo::IsUsing() ||
         (selected_ != entt::null && scene.Registry().valid(selected_) && ImGuizmo::IsOver());
     if (vpClicked_ && !gizmoBlocks && !freecamActive_ && !terrainConsumedClick_ &&
-        !paintConsumedClick_ && !splineConsumedClick_ && !iconConsumedClick_) {
+        !paintConsumedClick_ && !splineConsumedClick_ && !iconConsumedClick_ &&
+        !brushConsumedClick_ && !decalConsumedClick_) {
         if (renderer.IsOrbitEnabled()) {
             SyncFreecam(renderer);
             renderer.SetOrbitEnabled(false);
@@ -899,7 +907,7 @@ void Editor::DrawWindowMenu() {
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
         "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker",
-        "Vegetation", "Sequencer", "Material Graph"};
+        "Vegetation", "Sequencer", "Material Graph", "Material Layers"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -1835,6 +1843,161 @@ void Editor::UpdateTerrainTool(Engine& engine) {
         terrainConsumedClick_ = true; // don't also pick an entity
     } else {
         terrainStroking_ = false;
+    }
+}
+
+// CSG box-brush DRAG-OUT tool: with the tool active, click-drag on the ground plane (Y=0) to
+// rubber-band a footprint; release drops a box brush of that size at a default height. This is the
+// Unreal-style "drag a box directly in the level" gesture. Mirrors UpdateTerrainTool's ray path +
+// click-suppression; the gizmo shapes the brush further after creation.
+void Editor::UpdateBrushTool(Engine& engine) {
+    brushConsumedClick_ = false;
+    if (!brushTool_ || !vpVisible_) {
+        brushDragging_ = false;
+        return;
+    }
+    Scene& scene = engine.GetScene();
+    Renderer& renderer = engine.GetRenderer();
+    auto& reg = scene.Registry();
+
+    // World ray through the cursor.
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const f32 mx = (mp.x - vpX_) / glm::max(vpW_, 1.0f);
+    const f32 my = (mp.y - vpY_) / glm::max(vpH_, 1.0f);
+    const bool over = vpHovered_ && mx >= 0.0f && mx <= 1.0f && my >= 0.0f && my <= 1.0f;
+    const Camera& cam = renderer.GetCamera();
+    const glm::mat4 invVP = glm::inverse(cam.ViewProjection());
+    const glm::vec2 ndc(mx * 2.0f - 1.0f, 1.0f - my * 2.0f);
+    glm::vec4 pn = invVP * glm::vec4(ndc, 0.0f, 1.0f);
+    glm::vec4 pf = invVP * glm::vec4(ndc, 1.0f, 1.0f);
+    pn /= pn.w;
+    pf /= pf.w;
+    const glm::vec3 ro(pn), rd = glm::normalize(glm::vec3(pf) - glm::vec3(pn));
+
+    // Intersect the ground plane Y=0. (A future refinement could hit the surface under the cursor.)
+    if (std::abs(rd.y) < 1e-5f) return; // ray parallel to the ground
+    const f32 t = -ro.y / rd.y;
+    if (t <= 0.0f) return; // ground is behind the camera
+    const glm::vec3 hit = ro + rd * t;
+
+    const bool lmb = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (over && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !brushDragging_) {
+        brushDragStart_ = hit;
+        brushDragCur_ = hit;
+        brushDragging_ = true;
+        brushConsumedClick_ = true;
+    } else if (brushDragging_ && lmb) {
+        brushDragCur_ = hit;
+        brushConsumedClick_ = true;
+    } else if (brushDragging_ && !lmb) {
+        brushDragging_ = false;
+        // Footprint -> a box brush. Guard against a stray click (near-zero footprint).
+        const glm::vec3 lo = glm::min(brushDragStart_, brushDragCur_);
+        const glm::vec3 hi = glm::max(brushDragStart_, brushDragCur_);
+        const f32 hx = (hi.x - lo.x) * 0.5f, hz = (hi.z - lo.z) * 0.5f;
+        if (hx >= 0.05f && hz >= 0.05f) {
+            const f32 hy = glm::max(brushToolHeight_, 0.1f) * 0.5f;
+            PushUndo(scene);
+            const entt::entity e =
+                scene.CreateEntity(brushToolSubtract_ ? "Subtract Brush" : "Box Brush");
+            Transform tf;
+            tf.position = {(lo.x + hi.x) * 0.5f, hy, (lo.z + hi.z) * 0.5f}; // sits on the ground
+            reg.emplace<Transform>(e, tf);
+            BrushComponent bc;
+            bc.halfExtents = {hx, hy, hz};
+            bc.op = brushToolSubtract_ ? 1 : 0;
+            reg.emplace<BrushComponent>(e, bc);
+            brush::MarkAllDirty(scene);
+            selected_ = e;
+        }
+        brushConsumedClick_ = true;
+    }
+
+    // Preview the footprint while dragging: a ground rectangle lifted to the default height.
+    if (brushDragging_) {
+        const glm::vec3 lo = glm::min(brushDragStart_, brushDragCur_);
+        const glm::vec3 hi = glm::max(brushDragStart_, brushDragCur_);
+        const f32 topY = glm::max(brushToolHeight_, 0.1f);
+        const glm::mat4 vp = cam.ViewProjection();
+        const auto proj = [&](const glm::vec3& w, ImVec2& out) -> bool {
+            const glm::vec4 c = vp * glm::vec4(w, 1.0f);
+            if (c.w <= 0.001f) return false;
+            const glm::vec2 n = glm::vec2(c) / c.w;
+            out = ImVec2(vpX_ + (n.x * 0.5f + 0.5f) * vpW_, vpY_ + (0.5f - n.y * 0.5f) * vpH_);
+            return true;
+        };
+        const glm::vec3 c[8] = {
+            {lo.x, 0, lo.z},    {hi.x, 0, lo.z},    {hi.x, 0, hi.z},    {lo.x, 0, hi.z},
+            {lo.x, topY, lo.z}, {hi.x, topY, lo.z}, {hi.x, topY, hi.z}, {lo.x, topY, hi.z},
+        };
+        ImVec2 s[8];
+        bool okAll = true;
+        for (int i = 0; i < 8; ++i) okAll = proj(c[i], s[i]) && okAll;
+        if (okAll) {
+            ImDrawList* dl = ImGui::GetForegroundDrawList();
+            const ImU32 col = brushToolSubtract_ ? IM_COL32(255, 140, 40, 235)
+                                                 : IM_COL32(90, 235, 120, 235);
+            static const int edges[12][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6},
+                                             {6, 7}, {7, 4}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+            for (auto& e : edges) dl->AddLine(s[e[0]], s[e[1]], col, 2.0f);
+        }
+    }
+}
+
+// Decal DROP-ON-SURFACE tool: with it active, click a surface under the cursor to drop a decal
+// there, auto-oriented so its projection +Z points INTO the surface. Reuses the mesh raycast the
+// paint tools use; the gizmo/inspector then refine size + channels.
+void Editor::UpdateDecalTool(Engine& engine) {
+    decalConsumedClick_ = false;
+    if (!decalDropTool_ || !vpVisible_) return;
+    Scene& scene = engine.GetScene();
+    Renderer& renderer = engine.GetRenderer();
+    auto& reg = scene.Registry();
+
+    const ImVec2 mp = ImGui::GetIO().MousePos;
+    const f32 mx = (mp.x - vpX_) / glm::max(vpW_, 1.0f);
+    const f32 my = (mp.y - vpY_) / glm::max(vpH_, 1.0f);
+    if (!vpHovered_ || mx < 0.0f || mx > 1.0f || my < 0.0f || my > 1.0f) return;
+
+    const Camera& cam = renderer.GetCamera();
+    const glm::mat4 invVP = glm::inverse(cam.ViewProjection());
+    const glm::vec2 ndc(mx * 2.0f - 1.0f, 1.0f - my * 2.0f);
+    glm::vec4 pn = invVP * glm::vec4(ndc, 0.0f, 1.0f);
+    glm::vec4 pf = invVP * glm::vec4(ndc, 1.0f, 1.0f);
+    pn /= pn.w;
+    pf /= pf.w;
+    const glm::vec3 ro(pn), rd = glm::normalize(glm::vec3(pf) - glm::vec3(pn));
+
+    const entt::entity tgt = EntityUnderPixel(scene, renderer, mx, my);
+    if (tgt == entt::null || !reg.valid(tgt)) return;
+    const MeshData* md = GetCpuMesh(scene, tgt);
+    if (!md) return;
+    const glm::mat4 w = scene.WorldMatrix(tgt);
+    const glm::mat4 iw = glm::inverse(w);
+    paint::PaintHit hit;
+    if (!paint::RaycastMesh(*md, glm::vec3(iw * glm::vec4(ro, 1.0f)),
+                            glm::vec3(iw * glm::vec4(rd, 0.0f)), hit))
+        return;
+    const glm::vec3 hitWorld = glm::vec3(w * glm::vec4(hit.localPos, 1.0f));
+    const glm::mat3 nm = glm::transpose(glm::inverse(glm::mat3(w)));
+    glm::vec3 N = glm::normalize(nm * hit.localNormal);
+    if (glm::dot(N, rd) > 0.0f) N = -N; // the outward-facing surface normal
+
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        decalConsumedClick_ = true;
+        PushUndo(scene);
+        // Build an orthonormal basis whose +Z (the decal's projection axis) points INTO the surface.
+        const glm::vec3 f = -N;
+        const glm::vec3 up = glm::abs(f.y) < 0.99f ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
+        const glm::vec3 r = glm::normalize(glm::cross(up, f));
+        const glm::vec3 u = glm::cross(f, r);
+        Transform tf;
+        tf.position = hitWorld;
+        tf.rotation = glm::quat_cast(glm::mat3(r, u, f));
+        const entt::entity e = scene.CreateEntity("Decal");
+        reg.emplace<Transform>(e, tf);
+        reg.emplace<DecalComponent>(e);
+        selected_ = e;
     }
 }
 
@@ -7083,10 +7246,16 @@ void Editor::DestroyRecursive(Scene& scene, entt::entity e) {
     // still points at it" property the recursion had. The list is built up front
     // because reg.destroy mutates every pool it touches.
     const std::vector<entt::entity> all = scene::SubtreeInOrder(reg, e);
+    // Deleting a brush changes what the remaining additive brushes carve against, so re-derive their
+    // geometry afterwards (a subtractive brush's holes must fill back in when it is removed).
+    bool hadBrush = false;
+    for (const entt::entity x : all)
+        if (reg.valid(x) && reg.all_of<BrushComponent>(x)) hadBrush = true;
     for (auto it = all.rbegin(); it != all.rend(); ++it) {
         if (selected_ == *it) selected_ = entt::null;
         if (reg.valid(*it)) reg.destroy(*it);
     }
+    if (hadBrush) brush::MarkAllDirty(scene);
 }
 
 void Editor::DrawEntityNode(Scene& scene, Renderer& renderer, entt::entity e) {
@@ -7365,6 +7534,30 @@ void Editor::DrawHierarchy(Engine& engine) {
             reg.emplace<MaterialVolumeComponent>(e);
             selected_ = e;
         }
+        if (ImGui::MenuItem("Box Brush (Additive)")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Box Brush");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<BrushComponent>(e); // op 0 = additive; brush::Update builds its mesh next frame
+            brush::MarkAllDirty(scene);
+            selected_ = e;
+        }
+        if (ImGui::MenuItem("Box Brush (Subtractive)")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Subtract Brush");
+            reg.emplace<Transform>(e, Transform{});
+            BrushComponent bc;
+            bc.op = 1; // subtractive: carves the additive brushes it overlaps
+            reg.emplace<BrushComponent>(e, bc);
+            brush::MarkAllDirty(scene);
+            selected_ = e;
+        }
+        ImGui::MenuItem("Box Brush Drag Tool", nullptr, &brushTool_);
+        if (brushTool_) {
+            ImGui::MenuItem("   \xE2\x86\xB3 Subtractive drag", nullptr, &brushToolSubtract_);
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::DragFloat("   Drag height (m)", &brushToolHeight_, 0.05f, 0.1f, 200.0f);
+        }
         if (ImGui::MenuItem("Acoustic Space")) {
             PushUndo(scene);
             const entt::entity e = scene.CreateEntity("Acoustic Space");
@@ -7400,6 +7593,7 @@ void Editor::DrawHierarchy(Engine& engine) {
             reg.emplace<DecalComponent>(e);
             selected_ = e;
         }
+        ImGui::MenuItem("Decal Drop Tool (click a surface)", nullptr, &decalDropTool_);
         if (ImGui::MenuItem("Water (Gerstner)")) {
             PushUndo(scene);
             const entt::entity e = scene.CreateEntity("Water");
@@ -8856,6 +9050,30 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.open) {
             ImGui::TextDisabled("Projects textures onto the surfaces it overlaps.");
             ImGui::TextDisabled("Orient the box so its +Z points INTO the surface.");
+            // Reusable DECAL LIBRARY (.hbdecal): save this decal preset, or load one over it.
+            {
+                static char dcName[96] = "decal";
+                ImGui::SetNextItemWidth(140.0f);
+                ImGui::InputText("Preset name##dc", dcName, sizeof(dcName));
+                ImGui::SameLine();
+                if (ImGui::Button("Save .hbdecal##dc") && Project::HasActive() && dcName[0]) {
+                    const std::filesystem::path dir = Project::Active().AssetsDir() / "decals";
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    if (decalasset::SaveDecal(
+                            dir / (std::string(dcName) + decalasset::kDecalExtension), *dc))
+                        HBE_INFO("Saved decal -> decals/{}{}", dcName, decalasset::kDecalExtension);
+                }
+                std::string dlPick;
+                if (AssetPicker("Load (.hbdecal)##dc", std::string(), decalasset::kDecalExtension,
+                                uaf::AssetType::Unknown, dlPick) &&
+                    !dlPick.empty() && Project::HasActive()) {
+                    if (auto loaded = decalasset::LoadDecal(Project::Active().AssetsDir() / dlPick)) {
+                        PushUndo(scene);
+                        *dc = *loaded; // resolved=false inside -> texture handles re-resolve
+                    }
+                }
+            }
             ImGui::DragFloat3("Box Half Extents##dc", glm::value_ptr(dc->halfExtents), 0.02f,
                               0.01f, 100.0f);
             undoOnActivate();
@@ -8869,6 +9087,34 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             undoOnActivate();
             ImGui::SliderFloat("Metallic (no MR map)##dc", &dc->metallic, 0.0f, 1.0f, "%.2f");
             undoOnActivate();
+            ImGui::SeparatorText("Channels + projection");
+            // Which surface channels this decal writes (author normal-only detail, colour-only
+            // stains, roughness-only wet patches, ...).
+            bool cb = dc->affectBaseColor, cn = dc->affectNormal, cm = dc->affectMR,
+                 ts = dc->twoSided;
+            if (ImGui::Checkbox("Base Color##dc", &cb)) { PushUndo(scene); dc->affectBaseColor = cb; }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Normal##dc", &cn)) { PushUndo(scene); dc->affectNormal = cn; }
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Rough/Metal##dc", &cm)) { PushUndo(scene); dc->affectMR = cm; }
+            if (ImGui::Checkbox("Two-sided##dc", &ts)) { PushUndo(scene); dc->twoSided = ts; }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::SliderFloat("Max Angle##dc", &dc->maxAngle, 5.0f, 90.0f, "%.0f deg");
+            undoOnActivate();
+            ImGui::TextDisabled("Max Angle hard-rejects wrap onto steep faces (90 = off).");
+            // Emissive glow (self-illumination shaped by the decal alpha) - signs, runes, embers.
+            bool ce = dc->affectEmissive;
+            if (ImGui::Checkbox("Emissive##dc", &ce)) { PushUndo(scene); dc->affectEmissive = ce; }
+            if (dc->affectEmissive) {
+                ImGui::SameLine();
+                ImGui::ColorEdit3("##dcemcol", glm::value_ptr(dc->emissiveColor),
+                                  ImGuiColorEditFlags_NoInputs);
+                if (ImGui::IsItemActivated()) PushUndo(scene);
+                ImGui::SliderFloat("Emissive Intensity##dc", &dc->emissiveIntensity, 0.0f, 20.0f,
+                                   "%.1f");
+                undoOnActivate();
+            }
             std::string dpick;
             if (AssetPicker("Albedo (.uaf)##dc", dc->albedoTex, ".uaf", uaf::AssetType::Texture,
                             dpick, "(none)")) {
@@ -9339,6 +9585,43 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                     pe->textureResolved = false;
                 }
             }
+            // Reusable EFFECT ASSET (.hbvfx): save this emitter as a standalone effect, or load one
+            // over it. This is the "author once -> game::SpawnEffect(name) / reuse" workflow.
+            {
+                static char fxName[96] = "effect";
+                ImGui::SetNextItemWidth(160.0f);
+                ImGui::InputText("Effect name", fxName, sizeof(fxName));
+                ImGui::SameLine();
+                if (ImGui::Button("Save .hbvfx") && Project::HasActive() && fxName[0]) {
+                    const std::filesystem::path dir = Project::Active().AssetsDir() / "effects";
+                    std::error_code ec;
+                    std::filesystem::create_directories(dir, ec);
+                    const std::filesystem::path out =
+                        dir / (std::string(fxName) + particle::kEffectExtension);
+                    if (particle::SaveEffect(out, *pe))
+                        HBE_INFO("Saved effect -> effects/{}{}", fxName, particle::kEffectExtension);
+                }
+                std::string fxPick;
+                if (AssetPicker("Load (.hbvfx)", std::string(), particle::kEffectExtension,
+                                uaf::AssetType::Unknown, fxPick) &&
+                    !fxPick.empty() && Project::HasActive()) {
+                    if (auto loaded = particle::LoadEffect(Project::Active().AssetsDir() / fxPick)) {
+                        PushUndo(scene);
+                        // Overlay authored fields; carry the live pool/stack/RNG so applying an
+                        // effect doesn't thrash allocations, and re-arm the emission window.
+                        ParticleEmitter t = *loaded;
+                        t.pool = std::move(pe->pool);
+                        t.stack = std::move(pe->stack);
+                        t.state = pe->state;
+                        t.state.emitterAge = 0.0f;
+                        t.state.burstFired = false;
+                        t.state.wasEmitting = false;
+                        t.stackSignature = pe->stackSignature;
+                        *pe = std::move(t);
+                        pe->textureResolved = false;
+                    }
+                }
+            }
             bool emit = pe->emitting;
             if (ImGui::Checkbox("Emitting", &emit)) { PushUndo(scene); pe->emitting = emit; }
             ImGui::SameLine();
@@ -9734,6 +10017,57 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<MaterialVolumeComponent>(sel);
+        }
+    }
+
+    // --- Box Brush (CSG blockout geometry) ------------------------------------
+    if (BrushComponent* br = reg.try_get<BrushComponent>(sel)) {
+        const SectionState s = ComponentSection("Box Brush");
+        if (s.open) {
+            // Any geometric edit re-carves every brush (a subtractive edit reaches overlapping
+            // additives), so mark all brushes dirty whenever a field here changes.
+            const auto dirtyOnEdit = [&]() {
+                if (ImGui::IsItemActivated()) PushUndo(scene);
+                if (ImGui::IsItemEdited()) brush::MarkAllDirty(scene);
+            };
+            int op = br->op;
+            const char* kOps[] = {"Additive (adds solid)", "Subtractive (carves)"};
+            if (ImGui::Combo("Type", &op, kOps, IM_ARRAYSIZE(kOps))) {
+                PushUndo(scene);
+                br->op = op;
+                brush::MarkAllDirty(scene);
+            }
+            ImGui::DragFloat3("Half Extents", glm::value_ptr(br->halfExtents), 0.05f, 0.01f, 5000.0f);
+            dirtyOnEdit();
+            ImGui::DragFloat("Texture Tile (m)", &br->uvScale, 0.02f, 0.05f, 100.0f);
+            dirtyOnEdit();
+            if (br->op == 0) {
+                if (MeshInstance* mi = reg.try_get<MeshInstance>(sel)) {
+                    ImGui::ColorEdit3("Color", glm::value_ptr(mi->surface.base_color));
+                    if (ImGui::IsItemActivated()) PushUndo(scene);
+                    ImGui::DragFloat("Roughness", &mi->surface.specular_roughness, 0.005f, 0.0f, 1.0f);
+                    if (ImGui::IsItemActivated()) PushUndo(scene);
+                }
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled(br->op == 0
+                                    ? "Additive: this box becomes solid level geometry.\n"
+                                      "Subtractive brushes carve doorways/rooms out of it."
+                                    : "Subtractive: this box CARVES the additive brushes it\n"
+                                      "overlaps. It is a tool - it has no solid geometry itself.");
+            ImGui::TextDisabled("Move / rotate / scale with the gizmo (geometry rebuilds live).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<BrushComponent>(sel);
+            // Removing a brush changes what remaining additives carve against; also drop its
+            // derived geometry + collider so nothing stale renders.
+            if (MeshInstance* mi = reg.try_get<MeshInstance>(sel)) {
+                if (mi->mesh.IsValid()) renderer.DestroyMesh(mi->mesh);
+                reg.remove<MeshInstance>(sel);
+            }
+            reg.remove<RigidBody>(sel);
+            brush::MarkAllDirty(scene);
         }
     }
 
@@ -20884,11 +21218,26 @@ void Editor::DrawSelectionOutline(Scene& scene, Renderer& renderer) {
                                      : IM_COL32(170, 90, 220, 200);
         drawBox(m, -mz->halfExtents, mz->halfExtents, col, 1.5f);
     }
-    // Material volume / box brush (cyan = enabled, dim = disabled).
+    // Material volume (cyan = enabled, dim = disabled).
     if (const MaterialVolumeComponent* mv = reg.try_get<MaterialVolumeComponent>(selected_)) {
         const ImU32 col = mv->enabled ? IM_COL32(90, 210, 255, 235)
                                       : IM_COL32(110, 160, 190, 170);
         drawBox(m, -mv->halfExtents, mv->halfExtents, col, 1.5f);
+    }
+    // CSG blockout brush (green = additive solid, orange = subtractive carve).
+    if (const BrushComponent* br = reg.try_get<BrushComponent>(selected_)) {
+        const ImU32 col = br->op == 0 ? IM_COL32(90, 235, 120, 235)   // additive
+                                      : IM_COL32(255, 140, 40, 235);  // subtractive
+        drawBox(m, -br->halfExtents, br->halfExtents, col, 1.8f);
+    }
+    // Decal projector box (purple) + a line showing the +Z projection direction.
+    if (const DecalComponent* dcp = reg.try_get<DecalComponent>(selected_)) {
+        const ImU32 col = IM_COL32(200, 120, 255, 230);
+        drawBox(m, -dcp->halfExtents, dcp->halfExtents, col, 1.5f);
+        ImVec2 a, b;
+        if (project(glm::vec3(m[3]), a) &&
+            project(glm::vec3(m * glm::vec4(0, 0, dcp->halfExtents.z, 1.0f)), b))
+            draw->AddLine(a, b, IM_COL32(255, 230, 120, 235), 2.0f);
     }
     // Acoustic space volume (orange = active/listener inside, amber = idle).
     if (const AcousticSpace* as = reg.try_get<AcousticSpace>(selected_)) {
@@ -21580,6 +21929,9 @@ void Editor::DrawGizmo(Engine& engine) {
             parentWorld = scene.WorldMatrix(p->entity);
         }
         DecomposeTRS(glm::inverse(parentWorld) * model, *t);
+        // Moving/rotating/scaling a brush changes its carved geometry (an additive brush re-carves
+        // against the subtractive brushes' new relative positions), so rebuild live while dragging.
+        if (reg.all_of<BrushComponent>(selected_)) brush::MarkAllDirty(scene);
     }
     if (!ImGuizmo::IsUsing()) gizmoEditing_ = false; // drag ended
     if (ImGuizmo::IsUsing()) physics.SetEditedEntity(selected_);

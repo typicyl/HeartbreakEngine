@@ -224,6 +224,11 @@ public:
     // does not gain one. Headless: no GPU, no window, no project, no ImGui context.
     static bool MaterialVolumeSaveSelfTest();
 
+    // `--test-brush`: CSG BLOCKOUT BOX BRUSH scene integration. Proves brush::BuildEntityMesh routes
+    // additive vs subtractive correctly and carves in the right WORLD frame (signed-volume check),
+    // and that BrushComponent survives the scene save round-trip. Headless: no GPU, no project.
+    static bool BrushSaveSelfTest();
+
     // `--test-editorzones`: LIVE EDITOR ZONES, end to end through the real Editor.
     //
     // Proves the non-destructive bind (a stream::Streamer bound to the editor's world
@@ -896,6 +901,11 @@ private:
 
     // -- Palette / tree / tools (phase I3) ---------------------------------------
 public:
+    // Public thin wrapper over the (private) asset picker for editor panels that live in their own
+    // translation units (MaterialLayerEditor). Extension-filtered, AssetType::Unknown.
+    bool AssetPickerPublic(const char* label, const std::string& current, const char* extension,
+                           std::string& out);
+
     // ONE authorable thing the palette can make. Deliberately a RECIPE, not a
     // component name: "Vertical Layout Group" is a Panel element plus a
     // UILayoutGroup plus the defaults that make it visible, and an author thinks
@@ -1164,6 +1174,7 @@ private:
     // 8 surface-channel input pins). A live preview compiles + bakes the graph to a swatch.
     void DrawMaterialGraph(Engine& engine);       // toolbar + preview + canvas + node inspector
     void DrawMaterialGraphCanvas(Engine& engine, float width); // node canvas
+    void DrawMaterialLayers(Engine& engine);      // Photoshop-style .hbmatlayer stack editor
     void OpenMaterialGraph(const std::filesystem::path& path);
     bool SaveMaterialGraph();                       // writes mgGraph_ back to mgPath_
     std::filesystem::path CreateMaterialGraphAsset(const std::filesystem::path& dir = {},
@@ -1376,6 +1387,24 @@ private:
     bool terrainConsumedClick_ = false; // suppress entity picking this frame
     glm::vec3 terrainHit_{0.0f};     // last brush world hit (overlay)
     bool terrainHitValid_ = false;
+
+    // CSG BOX BRUSH drag-out tool: with the tool active, click-drag on the ground plane rubber-bands
+    // a footprint; release creates a box brush of that footprint (default height), Additive or
+    // Subtractive. The gizmo then shapes it further. Mirrors the terrain/paint tool structure.
+    void UpdateBrushTool(Engine& engine);
+    bool brushTool_ = false;            // drag-out tool active
+    bool brushToolSubtract_ = false;    // create Subtractive brushes instead of Additive
+    f32  brushToolHeight_ = 3.0f;       // default box height (metres) for a dragged footprint
+    bool brushDragging_ = false;        // a footprint drag is in progress
+    glm::vec3 brushDragStart_{0.0f};    // ground-plane drag anchor (world)
+    glm::vec3 brushDragCur_{0.0f};      // ground-plane drag cursor (world)
+    bool brushConsumedClick_ = false;   // suppress entity picking this frame
+
+    // DECAL DROP tool: with it active, click a surface to drop a decal there, auto-oriented so its
+    // +Z projects INTO the surface (the audit's "biggest decal UX gap"). Reuses the mesh raycast.
+    void UpdateDecalTool(Engine& engine);
+    bool decalDropTool_ = false;        // drop-on-surface tool active
+    bool decalConsumedClick_ = false;   // suppress entity picking this frame
 
     // -- Vegetation paint/erase brush (P9) ---------------------------------------
     // Stamps painted trees onto the selected terrain (or erases painted plants) under a
@@ -1686,6 +1715,7 @@ private:
         Panel_Vegetation,
         Panel_Sequencer,
         Panel_MaterialGraph,
+        Panel_MaterialLayers,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

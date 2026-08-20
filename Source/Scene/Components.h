@@ -931,6 +931,28 @@ struct MaterialVolumeComponent {
     int bakeResolution = 1024;   // paint-canvas resolution the bake writes
 };
 
+// A CSG BLOCKOUT BRUSH (the Unreal-style box brush): an editable box PRIMITIVE that becomes real
+// level geometry - NOT a decal or a projection. An Additive brush generates a solid box mesh; a
+// Subtractive brush boolean-CARVES doorways / windows / room interiors out of the additive brushes
+// it overlaps (brush::BuildEntityMesh -> csg::CarveBox). The generated mesh, its AABB, and its
+// static triangle collision are DERIVED state, rebuilt by brush::Update whenever `dirty` is set and
+// never serialized (exactly like terrain chunks regenerate from the heightfield). The box's world
+// placement / rotation / scale IS this entity's Transform; `halfExtents` is its local half-size.
+struct BrushComponent {
+    glm::vec3 halfExtents{1.0f}; // local box half-size (placed + scaled by this entity's Transform)
+    int op = 0;                  // csg::Op: 0 = Additive (adds solid), 1 = Subtractive (carves)
+    f32 uvScale = 2.0f;          // metres per texture tile on the generated faces
+    bool dirty = true;           // NOT serialized; re-derived true on load -> geometry rebuilds
+};
+
+// Runtime-only auto-despawn timer for a ONE-SHOT `.hbvfx` effect spawned via game::SpawnEffect.
+// NOT serialized (the scene serializer never writes it): when a non-looping effect has finished
+// emitting and its last particles have died, `remaining` reaches 0 and the spawn system destroys
+// the entity. Looping effects get no EffectLifetime and persist until explicitly removed.
+struct EffectLifetime {
+    f32 remaining = 0.0f; // seconds until the spawned effect entity is destroyed
+};
+
 // A ROOM / enclosed acoustic space: a box region whose dimensions + wall/floor/ceiling acoustic
 // materials define the reverberation + early reflections heard while the LISTENER is inside it.
 // The highest-priority enabled space containing the listener drives the spatial backend's room
@@ -1811,6 +1833,22 @@ struct DecalComponent {
     f32 normalStrength = 1.0f; // decal normal-map blend (when a normal map is set)
     f32 roughness = 0.8f;      // used only when no metal-rough map is set
     f32 metallic = 0.0f;       // used only when no metal-rough map is set
+    // Channel influence: which surface channels this decal writes. Lets an artist author a
+    // normal-only detail decal, a colour-only stain, or a roughness-only wet patch instead of always
+    // overriding everything. All true = a full material decal (today's behaviour).
+    bool affectBaseColor = true;
+    bool affectNormal = true;
+    bool affectMR = true;      // roughness + metallic together
+    // Emissive: a self-illumination tint the decal adds (shaped by its coverage/alpha), for glowing
+    // signs, runes, embers, markings. Off by default so existing decals are unchanged.
+    bool affectEmissive = false;
+    glm::vec3 emissiveColor{1.0f, 0.6f, 0.2f};
+    f32 emissiveIntensity = 0.0f; // 0 = no glow even if affectEmissive is on
+    bool twoSided = false;     // also project onto surfaces facing AWAY from the projector
+    // Hard projection cone: reject surfaces turned more than this from the projector axis (degrees).
+    // 90 = disabled (the legacy behaviour: any front-facing surface). Lower values kill the smear a
+    // box decal leaves as it wraps around a corner / onto near-perpendicular faces.
+    f32 maxAngle = 90.0f;
     std::string albedoTex;     // .uaf (rel to Assets); "" = tint only (no colour change)
     std::string normalTex;     // .uaf; "" = keep the surface normal
     std::string mrTex;         // .uaf (glTF b=metal g=rough); "" = use roughness/metallic above

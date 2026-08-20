@@ -43,7 +43,8 @@ struct Decal
     float3   forwardWS; float opacity;    // projection axis (box local +Z)
     float3   tangentWS; float angleFade;  // decal U axis; pow() on surface-faces-projector
     uint albedoIndex; uint normalIndex; uint mrIndex; uint flags;
-    float4   params;                      // x=normalStrength, y=roughness, z=metallic
+    float4   params;                      // x=normalStrength, y=roughness, z=metallic, w=coneCos
+    float4   emissive;                    // rgb = emissive colour, w = intensity (append-only mirror)
 };
 
 // Per-frame constants (camera + primary directional light + ambient/IBL).

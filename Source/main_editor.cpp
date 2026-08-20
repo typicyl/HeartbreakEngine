@@ -10,6 +10,8 @@
 #include "Assets/Compression.h"  // --test-compress (the portable zstd/zlib codec seam)
 #include "Assets/MeshCodec.h"    // --test-meshcodec (quantized + meshopt geometry codec)
 #include "Assets/MeshCsg.h"      // --test-csg (BSP CSG for the blockout box brush)
+#include "Scene/EffectAsset.h"   // --test-hbvfx (.hbvfx particle effect asset)
+#include "Scene/DecalAsset.h"    // --test-hbdecal (.hbdecal reusable decal asset)
 #include "Assets/UAF.h"          // --test-audiocodec (v11 compressed-source audio)
 #include "Assets/CookStats.h"    // --cook-stats / --test-cookstats (why is this build big?)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
@@ -1226,6 +1228,24 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-csg") == 0) {
             const bool ok = hbe::csg::SelfTest();
             std::printf("csg %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-brush: CSG blockout box brush scene integration + save round-trip. Headless.
+        if (std::strcmp(argv[i], "--test-brush") == 0) {
+            const bool ok = hbe::Editor::BrushSaveSelfTest();
+            std::printf("brush %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-hbvfx: .hbvfx particle effect asset round-trip. Headless.
+        if (std::strcmp(argv[i], "--test-hbvfx") == 0) {
+            const bool ok = hbe::particle::SelfTest();
+            std::printf("hbvfx %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-hbdecal: .hbdecal reusable decal asset round-trip. Headless.
+        if (std::strcmp(argv[i], "--test-hbdecal") == 0) {
+            const bool ok = hbe::decalasset::SelfTest();
+            std::printf("hbdecal %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         if (std::strcmp(argv[i], "--test-paintcanvas") == 0) {
