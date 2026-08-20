@@ -56,8 +56,10 @@ f32 MaskSource::Evaluate(const SampleContext& ctx) const {
     switch (kind) {
         case MaskKind::Constant: w = constant; break;
         case MaskKind::Box: w = box.EvaluateBrush(ctx.worldPos); break;
+        // An unbaked procedural mask / an unbound paint canvas is ABSENT (contributes nothing), not
+        // fully applied. Falling back to `constant` (default 1.0) would paint the whole surface.
         case MaskKind::Procedural:
-        case MaskKind::Paint: w = texture.Valid() ? texture.Sample(SpaceUV(ctx, textureSpace)) : constant; break;
+        case MaskKind::Paint: w = texture.Valid() ? texture.Sample(SpaceUV(ctx, textureSpace)) : 0.0f; break;
         default: w = constant; break;
     }
     if (invert) w = 1.0f - w;
@@ -94,27 +96,56 @@ glm::vec3 BlendNormalRNM(const glm::vec3& base, const glm::vec3& detail, f32 str
 
 SurfaceParams LerpSurface(const SurfaceParams& a, const SurfaceParams& b, f32 t) {
     t = std::clamp(t, 0.0f, 1.0f);
-    SurfaceParams r = a; // fields not blended keep `a`'s value (typically identical presets)
+    SurfaceParams r;
+    // Blend EVERY OpenPBR value field so mask=1 reproduces the layer's surface EXACTLY (a partial
+    // list silently ignored a layer's changes to any un-listed but rendered field, e.g.
+    // subsurface_radius). Bools pick by t>=0.5.
+    // Base
     r.base_color = glm::mix(a.base_color, b.base_color, t);
     r.base_weight = glm::mix(a.base_weight, b.base_weight, t);
     r.base_metalness = glm::mix(a.base_metalness, b.base_metalness, t);
     r.base_diffuse_roughness = glm::mix(a.base_diffuse_roughness, b.base_diffuse_roughness, t);
+    // Specular
     r.specular_weight = glm::mix(a.specular_weight, b.specular_weight, t);
     r.specular_color = glm::mix(a.specular_color, b.specular_color, t);
     r.specular_roughness = glm::mix(a.specular_roughness, b.specular_roughness, t);
+    r.specular_roughness_anisotropy = glm::mix(a.specular_roughness_anisotropy, b.specular_roughness_anisotropy, t);
+    r.specular_anisotropy_rotation = glm::mix(a.specular_anisotropy_rotation, b.specular_anisotropy_rotation, t);
     r.specular_ior = glm::mix(a.specular_ior, b.specular_ior, t);
-    r.emission_color = glm::mix(a.emission_color, b.emission_color, t);
-    r.emission_luminance = glm::mix(a.emission_luminance, b.emission_luminance, t);
+    // Transmission
+    r.transmission_weight = glm::mix(a.transmission_weight, b.transmission_weight, t);
+    r.transmission_color = glm::mix(a.transmission_color, b.transmission_color, t);
+    r.transmission_depth = glm::mix(a.transmission_depth, b.transmission_depth, t);
+    r.transmission_scatter = glm::mix(a.transmission_scatter, b.transmission_scatter, t);
+    r.transmission_scatter_anisotropy = glm::mix(a.transmission_scatter_anisotropy, b.transmission_scatter_anisotropy, t);
+    r.transmission_dispersion_scale = glm::mix(a.transmission_dispersion_scale, b.transmission_dispersion_scale, t);
+    r.transmission_dispersion_abbe_number = glm::mix(a.transmission_dispersion_abbe_number, b.transmission_dispersion_abbe_number, t);
+    r.thin_walled = (t >= 0.5f) ? b.thin_walled : a.thin_walled;
+    // Subsurface
+    r.subsurface_weight = glm::mix(a.subsurface_weight, b.subsurface_weight, t);
+    r.subsurface_color = glm::mix(a.subsurface_color, b.subsurface_color, t);
+    r.subsurface_radius = glm::mix(a.subsurface_radius, b.subsurface_radius, t);
+    r.subsurface_radius_scale = glm::mix(a.subsurface_radius_scale, b.subsurface_radius_scale, t);
+    r.subsurface_scatter_anisotropy = glm::mix(a.subsurface_scatter_anisotropy, b.subsurface_scatter_anisotropy, t);
+    // Coat
     r.coat_weight = glm::mix(a.coat_weight, b.coat_weight, t);
     r.coat_color = glm::mix(a.coat_color, b.coat_color, t);
     r.coat_roughness = glm::mix(a.coat_roughness, b.coat_roughness, t);
-    r.subsurface_weight = glm::mix(a.subsurface_weight, b.subsurface_weight, t);
-    r.subsurface_color = glm::mix(a.subsurface_color, b.subsurface_color, t);
-    r.transmission_weight = glm::mix(a.transmission_weight, b.transmission_weight, t);
-    r.transmission_color = glm::mix(a.transmission_color, b.transmission_color, t);
+    r.coat_roughness_anisotropy = glm::mix(a.coat_roughness_anisotropy, b.coat_roughness_anisotropy, t);
+    r.coat_ior = glm::mix(a.coat_ior, b.coat_ior, t);
+    r.coat_affect_color = glm::mix(a.coat_affect_color, b.coat_affect_color, t);
+    r.coat_affect_roughness = glm::mix(a.coat_affect_roughness, b.coat_affect_roughness, t);
+    // Fuzz
     r.fuzz_weight = glm::mix(a.fuzz_weight, b.fuzz_weight, t);
     r.fuzz_color = glm::mix(a.fuzz_color, b.fuzz_color, t);
     r.fuzz_roughness = glm::mix(a.fuzz_roughness, b.fuzz_roughness, t);
+    // Thin film
+    r.thin_film_weight = glm::mix(a.thin_film_weight, b.thin_film_weight, t);
+    r.thin_film_thickness = glm::mix(a.thin_film_thickness, b.thin_film_thickness, t);
+    r.thin_film_ior = glm::mix(a.thin_film_ior, b.thin_film_ior, t);
+    // Emission
+    r.emission_color = glm::mix(a.emission_color, b.emission_color, t);
+    r.emission_luminance = glm::mix(a.emission_luminance, b.emission_luminance, t);
     return r;
 }
 
@@ -208,27 +239,92 @@ template <class T> T JG(const json& j, const char* k, const T& d) {
     try { return it->get<T>(); } catch (...) { return d; }
 }
 
-// Serialize the OpenPBR VALUE subset the resolver blends (child .hbmat files hold the full set;
-// this is the runtime layer-stack cache). Deterministic field order.
+// Serialize the FULL OpenPBR value set the resolver blends (child .hbmat files hold the same set;
+// this is the runtime layer-stack cache). Serializing the full set is what makes a LayerStack
+// round-trip lossless - a subset silently reverted un-listed rendered fields (coat_roughness,
+// subsurface_*, ...) to their defaults on reload. Deterministic field order.
 json SurfaceToJson(const SurfaceParams& s) {
     json j;
     j["baseColor"] = V4(s.base_color);
+    j["baseWeight"] = s.base_weight;
     j["metalness"] = s.base_metalness;
+    j["diffuseRoughness"] = s.base_diffuse_roughness;
+    j["specWeight"] = s.specular_weight;
+    j["specColor"] = V3(s.specular_color);
     j["roughness"] = s.specular_roughness;
+    j["specAniso"] = s.specular_roughness_anisotropy;
+    j["specAnisoRot"] = s.specular_anisotropy_rotation;
     j["ior"] = s.specular_ior;
+    j["transWeight"] = s.transmission_weight;
+    j["transColor"] = V3(s.transmission_color);
+    j["transDepth"] = s.transmission_depth;
+    j["transScatter"] = V3(s.transmission_scatter);
+    j["transScatterAniso"] = s.transmission_scatter_anisotropy;
+    j["transDispScale"] = s.transmission_dispersion_scale;
+    j["transAbbe"] = s.transmission_dispersion_abbe_number;
+    j["thinWalled"] = s.thin_walled;
+    j["sssWeight"] = s.subsurface_weight;
+    j["sssColor"] = V3(s.subsurface_color);
+    j["sssRadius"] = s.subsurface_radius;
+    j["sssRadiusScale"] = V3(s.subsurface_radius_scale);
+    j["sssScatterAniso"] = s.subsurface_scatter_anisotropy;
+    j["coat"] = s.coat_weight;
+    j["coatColor"] = V3(s.coat_color);
+    j["coatRoughness"] = s.coat_roughness;
+    j["coatAniso"] = s.coat_roughness_anisotropy;
+    j["coatIor"] = s.coat_ior;
+    j["coatAffectColor"] = s.coat_affect_color;
+    j["coatAffectRough"] = s.coat_affect_roughness;
+    j["fuzzWeight"] = s.fuzz_weight;
+    j["fuzzColor"] = V3(s.fuzz_color);
+    j["fuzzRoughness"] = s.fuzz_roughness;
+    j["thinFilmWeight"] = s.thin_film_weight;
+    j["thinFilmThickness"] = s.thin_film_thickness;
+    j["thinFilmIor"] = s.thin_film_ior;
     j["emission"] = V3(s.emission_color);
     j["emissionLum"] = s.emission_luminance;
-    j["coat"] = s.coat_weight;
     return j;
 }
 void SurfaceFromJson(const json& j, SurfaceParams& s) {
+    if (!j.is_object()) return;
     s.base_color = G4(j.value("baseColor", json()), s.base_color);
+    s.base_weight = JG(j, "baseWeight", s.base_weight);
     s.base_metalness = JG(j, "metalness", s.base_metalness);
+    s.base_diffuse_roughness = JG(j, "diffuseRoughness", s.base_diffuse_roughness);
+    s.specular_weight = JG(j, "specWeight", s.specular_weight);
+    s.specular_color = G3(j.value("specColor", json()), s.specular_color);
     s.specular_roughness = JG(j, "roughness", s.specular_roughness);
+    s.specular_roughness_anisotropy = JG(j, "specAniso", s.specular_roughness_anisotropy);
+    s.specular_anisotropy_rotation = JG(j, "specAnisoRot", s.specular_anisotropy_rotation);
     s.specular_ior = JG(j, "ior", s.specular_ior);
+    s.transmission_weight = JG(j, "transWeight", s.transmission_weight);
+    s.transmission_color = G3(j.value("transColor", json()), s.transmission_color);
+    s.transmission_depth = JG(j, "transDepth", s.transmission_depth);
+    s.transmission_scatter = G3(j.value("transScatter", json()), s.transmission_scatter);
+    s.transmission_scatter_anisotropy = JG(j, "transScatterAniso", s.transmission_scatter_anisotropy);
+    s.transmission_dispersion_scale = JG(j, "transDispScale", s.transmission_dispersion_scale);
+    s.transmission_dispersion_abbe_number = JG(j, "transAbbe", s.transmission_dispersion_abbe_number);
+    s.thin_walled = JG(j, "thinWalled", s.thin_walled);
+    s.subsurface_weight = JG(j, "sssWeight", s.subsurface_weight);
+    s.subsurface_color = G3(j.value("sssColor", json()), s.subsurface_color);
+    s.subsurface_radius = JG(j, "sssRadius", s.subsurface_radius);
+    s.subsurface_radius_scale = G3(j.value("sssRadiusScale", json()), s.subsurface_radius_scale);
+    s.subsurface_scatter_anisotropy = JG(j, "sssScatterAniso", s.subsurface_scatter_anisotropy);
+    s.coat_weight = JG(j, "coat", s.coat_weight);
+    s.coat_color = G3(j.value("coatColor", json()), s.coat_color);
+    s.coat_roughness = JG(j, "coatRoughness", s.coat_roughness);
+    s.coat_roughness_anisotropy = JG(j, "coatAniso", s.coat_roughness_anisotropy);
+    s.coat_ior = JG(j, "coatIor", s.coat_ior);
+    s.coat_affect_color = JG(j, "coatAffectColor", s.coat_affect_color);
+    s.coat_affect_roughness = JG(j, "coatAffectRough", s.coat_affect_roughness);
+    s.fuzz_weight = JG(j, "fuzzWeight", s.fuzz_weight);
+    s.fuzz_color = G3(j.value("fuzzColor", json()), s.fuzz_color);
+    s.fuzz_roughness = JG(j, "fuzzRoughness", s.fuzz_roughness);
+    s.thin_film_weight = JG(j, "thinFilmWeight", s.thin_film_weight);
+    s.thin_film_thickness = JG(j, "thinFilmThickness", s.thin_film_thickness);
+    s.thin_film_ior = JG(j, "thinFilmIor", s.thin_film_ior);
     s.emission_color = G3(j.value("emission", json()), s.emission_color);
     s.emission_luminance = JG(j, "emissionLum", s.emission_luminance);
-    s.coat_weight = JG(j, "coat", s.coat_weight);
 }
 
 json MaskToJson(const MaskSource& m) {
@@ -310,16 +406,28 @@ std::optional<LayerStack> LayerStackFromJsonString(const std::string& str) {
         HBE_ERROR("LayerStack: parse failed: {}", e.what());
         return std::nullopt;
     }
+    // A well-formed JSON document whose ROOT is not an object (e.g. "[]", "null", "5") must fail
+    // gracefully, not throw an uncaught type_error out of j.value(...). Guard every subtree.
+    if (!j.is_object()) {
+        HBE_ERROR("LayerStack: root is not an object");
+        return std::nullopt;
+    }
     LayerStack s;
-    if (const auto it = j.find("base"); it != j.end()) SurfaceFromJson(*it, s.base);
-    s.baseNormalTS = G3(j.value("baseNormal", json()), glm::vec3(0, 0, 1));
-    s.baseHeight = JG(j, "baseHeight", 0.5f);
-    if (const auto it = j.find("layers"); it != j.end() && it->is_array())
-        for (const auto& jl : *it) {
-            Layer l;
-            LayerFromJson(jl, l);
-            s.layers.push_back(std::move(l));
-        }
+    try {
+        if (const auto it = j.find("base"); it != j.end()) SurfaceFromJson(*it, s.base);
+        s.baseNormalTS = G3(j.value("baseNormal", json()), glm::vec3(0, 0, 1));
+        s.baseHeight = JG(j, "baseHeight", 0.5f);
+        if (const auto it = j.find("layers"); it != j.end() && it->is_array())
+            for (const auto& jl : *it) {
+                if (!jl.is_object()) continue; // skip a malformed layer element rather than throw
+                Layer l;
+                LayerFromJson(jl, l);
+                s.layers.push_back(std::move(l));
+            }
+    } catch (const std::exception& e) {
+        HBE_ERROR("LayerStack: malformed document: {}", e.what());
+        return std::nullopt;
+    }
     return s;
 }
 

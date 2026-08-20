@@ -407,6 +407,19 @@ struct PSOutput
 
 PSOutput PSMain(VSOutput input)
 {
+    // LOD cross-fade: stipple this pixel out while the LOD is mid-transition. gLodDither == 1 for
+    // every normal draw (a no-op). A transitioning mesh draws its finer LOD (gLodDither = f, keeps
+    // pixels where the noise < f) and its coarser LOD (gLodDither = -f, keeps noise >= f), so the
+    // two dissolve into each other across a distance band instead of popping. Interleaved-gradient
+    // noise keyed by pixel position is TAA-stable. The shadow pass is vertex-only -> shadows never
+    // dither. Done first, before any texture work.
+    if (abs(gLodDither) < 1.0f)
+    {
+        float ign = frac(52.9829189f * frac(dot(input.positionCS.xy, float2(0.06711056f, 0.00583715f))));
+        float f = abs(gLodDither);
+        if (gLodDither >= 0.0f ? (ign >= f) : (ign < f)) discard;
+    }
+
     // Terrain hole mask: clip painted-transparent terrain pixels so cliff/cave models
     // show through. The mask rides in the (terrain-unused) thickness-texture slot; we
     // discard early, before any shading. Mesh UV == terrain-wide UV for terrain chunks.

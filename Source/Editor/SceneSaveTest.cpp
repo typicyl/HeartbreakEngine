@@ -1056,4 +1056,89 @@ bool Editor::SceneSaveSelfTest(const fs::path& sceneFile) {
     return ok;
 }
 
+bool Editor::MaterialVolumeSaveSelfTest() {
+    bool ok = true;
+    const auto expect = [&ok](bool cond, const char* what) {
+        if (!cond) {
+            ok = false;
+            HBE_ERROR("matvolume: FAILED - {}", what);
+        }
+    };
+    const auto nearf = [](f32 a, f32 b) { return (a - b) < 1e-4f && (b - a) < 1e-4f; };
+
+    // Author one entity with a fully NON-default MaterialVolumeComponent, plus a bare entity that
+    // must not gain one; snapshot to a JSON string and parse it back (the Ctrl+S / collab path).
+    Scene s;
+    auto& reg = s.Registry();
+    const entt::entity ve = s.CreateEntity("Vol");
+    reg.emplace<Transform>(ve);
+    MaterialVolumeComponent mv;
+    mv.halfExtents = {3.0f, 1.5f, 4.25f};
+    mv.falloffType = 4; // Ease In
+    mv.falloffGamma = 2.5f;
+    mv.falloffWidth = 0.4f;
+    mv.strength = 0.8f;
+    mv.material = "materials/brick.hbmat";
+    mv.color = {0.2f, 0.4f, 0.6f, 0.9f};
+    mv.metallic = 0.7f;
+    mv.roughness = 0.33f;
+    mv.projection = 2; // Triplanar
+    mv.tileMeters = {0.5f, 1.25f, 2.0f};
+    mv.blend = 1; // Height
+    mv.opacity = 0.6f;
+    mv.enabled = false;
+    mv.bakeResolution = 2048;
+    reg.emplace<MaterialVolumeComponent>(ve, mv);
+
+    const entt::entity bare = s.CreateEntity("Bare");
+    reg.emplace<Transform>(bare);
+
+    const std::string text = scene::SaveSceneToString(s);
+    expect(!text.empty(), "SaveSceneToString produced a non-empty snapshot");
+
+    scene::SceneData d;
+    expect(scene::ParseSceneString(text, d), "ParseSceneString parses the snapshot");
+
+    const scene::EntityData* vd = nullptr;
+    const scene::EntityData* bd = nullptr;
+    for (const auto& e : d.entities) {
+        if (e.name == "Vol") vd = &e;
+        if (e.name == "Bare") bd = &e;
+    }
+    expect(vd != nullptr, "the volume entity survived the round trip");
+    expect(bd != nullptr, "the bare entity survived the round trip");
+    expect(bd && !bd->hasMaterialVolume, "the bare entity did NOT gain a material volume");
+
+    if (vd) {
+        expect(vd->hasMaterialVolume, "the volume entity kept its MaterialVolumeComponent");
+        const MaterialVolumeComponent& g = vd->materialVolume;
+        expect(nearf(g.halfExtents.x, 3.0f) && nearf(g.halfExtents.y, 1.5f) &&
+                   nearf(g.halfExtents.z, 4.25f),
+               "halfExtents round-trips");
+        expect(g.falloffType == 4, "falloffType round-trips");
+        expect(nearf(g.falloffGamma, 2.5f), "falloffGamma round-trips");
+        expect(nearf(g.falloffWidth, 0.4f), "falloffWidth round-trips");
+        expect(nearf(g.strength, 0.8f), "strength round-trips");
+        expect(g.material == "materials/brick.hbmat", "material ref round-trips");
+        expect(nearf(g.color.r, 0.2f) && nearf(g.color.g, 0.4f) && nearf(g.color.b, 0.6f) &&
+                   nearf(g.color.a, 0.9f),
+               "color round-trips");
+        expect(nearf(g.metallic, 0.7f), "metallic round-trips");
+        expect(nearf(g.roughness, 0.33f), "roughness round-trips");
+        expect(g.projection == 2, "projection round-trips");
+        expect(nearf(g.tileMeters.x, 0.5f) && nearf(g.tileMeters.y, 1.25f) &&
+                   nearf(g.tileMeters.z, 2.0f),
+               "tileMeters round-trips");
+        expect(g.blend == 1, "blend round-trips");
+        expect(nearf(g.opacity, 0.6f), "opacity round-trips");
+        expect(!g.enabled, "enabled=false round-trips");
+        expect(g.bakeResolution == 2048, "bakeResolution round-trips");
+    }
+
+    if (ok)
+        HBE_INFO("matvolume: MaterialVolumeComponent round-trips through the scene serializer "
+                 "with every field intact.");
+    return ok;
+}
+
 } // namespace hbe

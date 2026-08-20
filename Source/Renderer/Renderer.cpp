@@ -67,7 +67,12 @@ bool Instanceable(const rhi::DrawItem& it) {
     // boneCount test, so without this two blendshaped props with different
     // expressions instanced together and every one of them silently wore the first
     // one's face.
+    // lodDither too: a mid-LOD-cross-fade item carries a per-instance stipple factor in its
+    // ObjectCB, so folding two differently-faded instances into one run would make the followers
+    // wear the head's fade (some popping instead of dissolving). Fading items stay single draws;
+    // they are transient (only meshes inside a switch band) so the cost is negligible.
     return it.boneCount == 0 && it.morphCount == 0 && !it.paintColorTexture.IsValid() &&
+           it.lodDither >= 0.999f &&
            !(it.materialFlags &
              (rhi::MaterialFlag_Transparent | rhi::MaterialFlag_TerrainSplat));
 }
@@ -196,10 +201,10 @@ void Renderer::DestroyMesh(rhi::MeshHandle handle) {
     // the base leaves no orphaned LOD GPU buffers and no stale LOD-table entry (whose base id
     // could later be recycled by a different mesh and wrongly inherit these levels).
     if (const auto it = meshLods_.find(handle.id); it != meshLods_.end()) {
-        for (const LodEntry& e : it->second) {
-            if (e.handle.IsValid()) {
-                device_->DestroyMesh(e.handle);
-                meshBounds_.erase(e.handle.id);
+        for (const rhi::MeshHandle h : it->second) {
+            if (h.IsValid()) {
+                device_->DestroyMesh(h);
+                meshBounds_.erase(h.id);
             }
         }
         meshLods_.erase(it);
@@ -210,23 +215,11 @@ void Renderer::DestroyMesh(rhi::MeshHandle handle) {
 
 void Renderer::RegisterMeshLods(rhi::MeshHandle base, const std::vector<rhi::MeshHandle>& lods) {
     if (!base.IsValid() || lods.empty()) return;
-    // Thresholds on the FOV-normalized screen metric (see the selection block): the projected
-    // fraction of the viewport half-height an object covers. LOD1 kicks in below kFirstSwitch,
-    // each further level at half the previous. Resolution- AND fov-independent (a screen
-    // fraction, so a zoomed/scoped narrow-fov view keeps near-full detail), honoring the
-    // native-res "keep quality" mandate. 0.242 == the old radius/dist 0.14 preserved at the
-    // default 60-deg fovY (x 1/tan(30deg) == 1.732), so default-fov behavior is unchanged.
-    constexpr f32 kFirstSwitch = 0.242f;
-    constexpr f32 kFalloff = 0.5f;
-    std::vector<LodEntry> entries;
-    entries.reserve(lods.size());
-    f32 threshold = kFirstSwitch;
-    for (rhi::MeshHandle h : lods) {
-        if (!h.IsValid()) continue;
-        entries.push_back({h, threshold});
-        threshold *= kFalloff;
-    }
-    if (!entries.empty()) meshLods_[base.id] = std::move(entries);
+    std::vector<rhi::MeshHandle> valid;
+    valid.reserve(lods.size());
+    for (rhi::MeshHandle h : lods)
+        if (h.IsValid()) valid.push_back(h);
+    if (!valid.empty()) meshLods_[base.id] = std::move(valid); // thresholds computed live from lodTuning_
 }
 
 void Renderer::DestroyTexture(rhi::TextureHandle handle) {
@@ -310,7 +303,83 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         // time source and floating objects sit exactly on the rendered surface.
         drawItems_.clear();
         scene.CollectDrawItems(drawItems_);
-        const u32 itemCount = static_cast<u32>(drawItems_.size());
+
+        // --- Distance LODs + cross-fade. Runs BEFORE the frustum cull so a fade PAIR (the finer
+        // and coarser halves of a mesh mid-switch) shares ONE visibility decision and the
+        // shadow<->scene per-index coupling stays intact. Each drawable picks a level by FOV-
+        // normalized screen coverage (the fraction of the viewport half-height it spans); within the
+        // fade band straddling a switch it emits BOTH the finer LOD (fading OUT) and the coarser LOD
+        // (fading IN) with complementary screen-door dither, so the swap dissolves instead of
+        // popping. Near geometry keeps LOD0 at native detail. Skinned/morph and LOD-less draws are
+        // untouched. Thresholds are computed live from lodTuning_ (the editor LOD panel drives it),
+        // so retuning is instant. lodFades_ holds the coarser halves until after the loop so
+        // drawItems_ is never reallocated mid-iteration.
+        if (meshLodEnabled_ && !meshLods_.empty() && !drawItems_.empty()) {
+            const glm::vec3 camPos = view.cameraPos;
+            const f32 invTanHalfFov = 1.0f / glm::max(glm::tan(0.5f * camera_.FovY()), 1e-4f);
+            const f32 s0 = glm::max(lodTuning_.screen0, 1e-4f);
+            const f32 fall = glm::clamp(lodTuning_.falloff, 0.05f, 0.95f);
+            const f32 band = glm::clamp(lodTuning_.fadeBand, 0.0f, 0.45f);
+            lodFades_.clear();
+            const u32 baseCount = static_cast<u32>(drawItems_.size());
+            for (u32 i = 0; i < baseCount; ++i) {
+                rhi::DrawItem& it = drawItems_[i];
+                if (it.boneCount > 0 || it.morphCount > 0) continue;
+                const auto lit = meshLods_.find(it.mesh.id);
+                if (lit == meshLods_.end()) continue;
+                const std::vector<rhi::MeshHandle>& lods = lit->second;
+                const auto handleOf = [&](u32 lvl) -> rhi::MeshHandle {
+                    return lvl == 0 ? it.mesh : lods[lvl - 1]; // 0 = base (LOD0), k = LODk
+                };
+                if (forcedLod_ >= 0) { // editor inspection: pin one level, no distance, no fade
+                    it.mesh = handleOf(static_cast<u32>(
+                        glm::clamp(forcedLod_, 0, static_cast<int>(lods.size()))));
+                    it.lodDither = 1.0f;
+                    continue;
+                }
+                const auto bit = meshBounds_.find(it.mesh.id);
+                if (bit == meshBounds_.end()) continue;
+                glm::vec3 c, e;
+                WorldAabb(it.transform, bit->second.center, bit->second.extent, c, e);
+                const f32 dist = glm::length(camPos - c);
+                const f32 screen = (glm::length(e) / glm::max(dist, 1e-3f)) * invTanHalfFov;
+                // Fade band whose window contains `screen` (geometric thresholds don't overlap for
+                // band < ~1/3, so at most one matches). f = fraction of the finer level still shown.
+                int fadeK = -1;
+                f32 f = 1.0f;
+                {
+                    f32 t = s0;
+                    for (u32 k = 0; k < lods.size(); ++k, t *= fall) {
+                        const f32 lo = t * (1.0f - band), hi = t * (1.0f + band);
+                        if (screen >= lo && screen < hi) {
+                            fadeK = static_cast<int>(k);
+                            f = glm::clamp((screen - lo) / glm::max(hi - lo, 1e-6f), 0.0f, 1.0f);
+                            break;
+                        }
+                    }
+                }
+                if (band > 0.0f && fadeK >= 0 && f > 0.02f && f < 0.98f) {
+                    const rhi::MeshHandle finer = handleOf(static_cast<u32>(fadeK));
+                    const rhi::MeshHandle coarser = handleOf(static_cast<u32>(fadeK) + 1);
+                    rhi::DrawItem second = it;     // copy the original BEFORE mutating it.mesh
+                    it.mesh = finer;   it.lodDither = f;      // finer fades OUT (keep noise < f)
+                    second.mesh = coarser; second.lodDither = -f; // coarser fades IN (keep noise >= f)
+                    lodFades_.push_back(second);
+                } else {
+                    u32 lvl = 0; // coarsest level whose threshold `screen` has dropped below
+                    f32 t = s0;
+                    for (u32 k = 0; k < lods.size(); ++k, t *= fall) {
+                        if (screen < t) lvl = k + 1;
+                        else break;
+                    }
+                    it.mesh = handleOf(lvl);
+                    it.lodDither = 1.0f;
+                }
+            }
+            if (!lodFades_.empty())
+                drawItems_.insert(drawItems_.end(), lodFades_.begin(), lodFades_.end());
+        }
+        const u32 itemCount = static_cast<u32>(drawItems_.size()); // AFTER fade pairs are appended
 
         // --- Frustum culling: reorder drawItems_ IN PLACE to a visible-first
         // prefix. INVARIANT: the shadow pass gets the FULL list (off-screen
@@ -338,47 +407,6 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         stats_.total = itemCount;
         stats_.drawn = visibleCount;
         stats_.culled = itemCount - visibleCount;
-
-        // --- Distance LODs: swap each drawable to the coarsest level whose projected screen
-        // coverage still justifies it. Runs AFTER the cull for two reasons: the cull sees stable
-        // LOD0 bounds (near-identical to any LOD, and the full extent is the safe choice), and the
-        // two halves get treated differently. The VISIBLE prefix [0,visibleCount) is what the main
-        // AND shadow passes read at the SAME index, so it gets one handle (camera LOD) - the
-        // index-coupling invariant above is preserved. The off-screen SUFFIX is shadow-only, so it
-        // is floored one level finer than the coarsest, or a far off-screen caster would throw its
-        // faceted low-poly silhouette into a near shadow. Near geometry keeps LOD0 (native-res
-        // detail preserved). Skinned/morph and LOD-less draws are skipped -> cheap no-op when no
-        // LODs exist. The metric is FOV-normalized (screen fraction, not raw angular size) so a
-        // zoomed/scoped narrow-fov view keeps near-full detail.
-        if (meshLodEnabled_ && !meshLods_.empty() && itemCount > 0) {
-            const glm::vec3 camPos = view.cameraPos;
-            const f32 invTanHalfFov = 1.0f / glm::max(glm::tan(0.5f * camera_.FovY()), 1e-4f);
-            const auto pickLod = [&](rhi::DrawItem& it, bool shadowOnly) {
-                if (it.boneCount > 0 || it.morphCount > 0) return;
-                const auto lit = meshLods_.find(it.mesh.id);
-                if (lit == meshLods_.end()) return;
-                const auto bit = meshBounds_.find(it.mesh.id);
-                if (bit == meshBounds_.end()) return;
-                const glm::vec3 worldCenter =
-                    glm::vec3(it.transform * glm::vec4(bit->second.center, 1.0f));
-                const f32 scale = glm::max(glm::length(glm::vec3(it.transform[0])),
-                                           glm::max(glm::length(glm::vec3(it.transform[1])),
-                                                    glm::length(glm::vec3(it.transform[2]))));
-                const f32 radius = glm::length(bit->second.extent) * scale;
-                const f32 dist = glm::length(camPos - worldCenter);
-                const f32 screen = (radius / glm::max(dist, 1e-3f)) * invTanHalfFov;
-                const u32 total = static_cast<u32>(lit->second.size());
-                const u32 n = (shadowOnly && total > 1) ? total - 1 : total;
-                rhi::MeshHandle sel{};
-                for (u32 k = 0; k < n; ++k) {
-                    if (screen < lit->second[k].switchBelow) sel = lit->second[k].handle;
-                    else break;
-                }
-                if (sel.IsValid()) it.mesh = sel;
-            };
-            for (u32 i = 0; i < visibleCount; ++i) pickLod(drawItems_[i], /*shadowOnly*/ false);
-            for (u32 i = visibleCount; i < itemCount; ++i) pickLod(drawItems_[i], /*shadowOnly*/ true);
-        }
 
         // Sort the VISIBLE prefix for submission coherence: opaque first (matches
         // the backends' two-pass split), grouped by mesh (enables the IA-rebind

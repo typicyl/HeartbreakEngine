@@ -49,6 +49,9 @@ void ParseSettings(const json& j, ProjectSettings& s) {
     s.menuTag = j.value("menuTag", "");
     s.maxStreamedPaintResolution = j.value("maxStreamedPaintResolution", 0u);
     s.meshLodEnabled = j.value("meshLodEnabled", true);
+    s.lodScreen0 = j.value("lodScreen0", 0.242f);
+    s.lodFalloff = j.value("lodFalloff", 0.5f);
+    s.lodFadeBand = j.value("lodFadeBand", 0.15f);
     s.textureCompression = j.value("textureCompression", false);
     s.uiDocument = j.value("uiDocument", j.value("uiScene", ""));
     // SCREEN LIST. `uiDocuments` (one .hbui per screen) is authoritative when
@@ -400,6 +403,9 @@ bool Project::Save() const {
     j["menuTag"] = settings_.menuTag;
     j["maxStreamedPaintResolution"] = settings_.maxStreamedPaintResolution;
     j["meshLodEnabled"] = settings_.meshLodEnabled;
+    j["lodScreen0"] = settings_.lodScreen0;
+    j["lodFalloff"] = settings_.lodFalloff;
+    j["lodFadeBand"] = settings_.lodFadeBand;
     j["textureCompression"] = settings_.textureCompression;
     // Both keys, always. `uiDocuments` is the truth; `uiDocument` is its first
     // entry, emitted so an older reader (or anything still keyed on the old slot)

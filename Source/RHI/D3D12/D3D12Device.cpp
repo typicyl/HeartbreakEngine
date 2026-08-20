@@ -305,7 +305,7 @@ struct ObjectCB {
     glm::vec3 emissiveColor; f32 emissiveIntensity;
     u32 emissiveIndex; u32 skinned; u32 boneOffset; u32 boneCount;
     glm::mat4 prevModel;       // previous-frame world matrix (motion vectors)
-    u32 prevBoneOffset; u32 thicknessIndex; f32 subsurfaceRadius; f32 _padObj;
+    u32 prevBoneOffset; u32 thicknessIndex; f32 subsurfaceRadius; f32 lodDither; // was _padObj
     u32 paintColorIndex; u32 paintHeightIndex; f32 paintOpacity; f32 paintHeightScale;
     f32 paintLodBias; f32 paintTexel; u32 paintProjMode; f32 paintBoxInvM;
     glm::vec3 paintBoxCenter; f32 _padBoxC;
@@ -360,6 +360,7 @@ inline void FillObjectMaterial(ObjectCB& ocb, const DrawItem& it) {
     ocb.flags = it.materialFlags;
     ocb.subsurfaceColor = it.surface.subsurface_color;
     ocb.subsurfaceRadius = it.surface.subsurface_radius;
+    ocb.lodDither = it.lodDither; // LOD cross-fade stipple (1.0 = opaque; shadow pass ignores it)
     ocb.thicknessIndex = it.thicknessTexture.index;
     ocb.clearcoat = it.surface.coat_weight;
     ocb.clearcoatRoughness = it.surface.coat_roughness;
@@ -461,6 +462,7 @@ public:
     bool SupportsResourceReclaim() const override { return true; }
     bool SupportsBlockCompression() const override { return true; } // BC is core in D3D12
     ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
+    void DestroyComputePipeline(ComputePipelineHandle handle) override;
     void QueueCompute(const ComputeDispatch& d) override;
     void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
     void UpdateTexture(TextureHandle handle, const TextureDesc& desc) override;
@@ -657,6 +659,7 @@ private:
     std::vector<GpuBufferD3D12>      gpuBuffers_;      // handle.id - 1
     std::vector<u32>                 gpuBufferFree_;   // recycled indices
     std::vector<ComputePipelineD3D12> computePipes_;   // handle.id - 1
+    std::vector<u32>                 computePipeFree_; // recycled indices (DestroyComputePipeline)
     QueuedComputeD3D12 computeQueue_[kMaxQueuedComputeDispatches];
     u32 computeQueueCount_ = 0;
     // SetVertexShaderBuffer: applied at the top of DrawScene (root param 6).
@@ -4391,10 +4394,31 @@ ComputePipelineHandle D3D12Device::CreateComputePipeline(const ComputePipelineDe
         return {};
     }
     p.alive = true;
-    computePipes_.push_back(std::move(p));
+    // Reuse a slot freed by DestroyComputePipeline so re-compiling a kernel at runtime (the editor
+    // material-graph GPU preview) does not grow the vector unbounded.
+    u32 idx;
+    if (!computePipeFree_.empty()) {
+        idx = computePipeFree_.back();
+        computePipeFree_.pop_back();
+        computePipes_[idx] = std::move(p);
+    } else {
+        idx = static_cast<u32>(computePipes_.size());
+        computePipes_.push_back(std::move(p));
+    }
     HBE_INFO("[D3D12] Compute pipeline '{}' ready ({} UAV, {} SRV, {} B constants).", name,
              desc.uavCount, desc.srvCount, desc.constantBytes);
-    return ComputePipelineHandle{static_cast<u32>(computePipes_.size())};
+    return ComputePipelineHandle{idx + 1};
+}
+
+void D3D12Device::DestroyComputePipeline(ComputePipelineHandle handle) {
+    if (!handle.IsValid() || handle.id > computePipes_.size()) return;
+    ComputePipelineD3D12& p = computePipes_[handle.id - 1];
+    if (!p.alive) return;
+    WaitForGpuIdle(); // the PSO/root sig may still be referenced by in-flight command lists
+    p.pso.Reset();
+    p.rootSig.Reset();
+    p.alive = false;
+    computePipeFree_.push_back(handle.id - 1);
 }
 
 void D3D12Device::QueueCompute(const ComputeDispatch& d) {
@@ -4696,6 +4720,7 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
             ocb.flags = it.materialFlags;
             ocb.subsurfaceColor = it.surface.subsurface_color;
             ocb.subsurfaceRadius = it.surface.subsurface_radius;
+    ocb.lodDither = it.lodDither; // LOD cross-fade stipple (1.0 = opaque; shadow pass ignores it)
             ocb.thicknessIndex = it.thicknessTexture.index;
             ocb.clearcoat = it.surface.coat_weight;
             ocb.clearcoatRoughness = it.surface.coat_roughness;
@@ -5839,6 +5864,7 @@ void D3D12Device::DrawPreviewScene(const SceneView& view, const DrawItem* items,
             ocb.flags = it.materialFlags;
             ocb.subsurfaceColor = it.surface.subsurface_color;
             ocb.subsurfaceRadius = it.surface.subsurface_radius;
+    ocb.lodDither = it.lodDither; // LOD cross-fade stipple (1.0 = opaque; shadow pass ignores it)
             ocb.clearcoat = it.surface.coat_weight;
             ocb.clearcoatRoughness = it.surface.coat_roughness;
             ocb.emissiveColor = it.surface.emission_color;

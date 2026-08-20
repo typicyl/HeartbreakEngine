@@ -224,7 +224,7 @@ struct ObjectUBO {
     glm::vec3 emissiveColor; f32 emissiveIntensity;
     u32 emissiveIndex; u32 skinned; u32 boneOffset; u32 boneCount;
     glm::mat4 prevModel;       // previous-frame world matrix (motion vectors)
-    u32 prevBoneOffset; u32 thicknessIndex; f32 subsurfaceRadius; f32 _padObj;
+    u32 prevBoneOffset; u32 thicknessIndex; f32 subsurfaceRadius; f32 lodDither; // was _padObj
     u32 paintColorIndex; u32 paintHeightIndex; f32 paintOpacity; f32 paintHeightScale;
     f32 paintLodBias; f32 paintTexel; u32 paintProjMode; f32 paintBoxInvM;
     glm::vec3 paintBoxCenter; f32 _padBoxC;
@@ -333,6 +333,7 @@ public:
     bool SupportsResourceReclaim() const override { return true; }
     bool SupportsBlockCompression() const override { return bcSupported_; }
     ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc& desc) override;
+    void DestroyComputePipeline(ComputePipelineHandle handle) override;
     void QueueCompute(const ComputeDispatch& d) override;
     void SetVertexShaderBuffer(GpuBufferHandle handle, u32 firstElement) override;
     void UpdateTexture(TextureHandle handle, const TextureDesc& desc) override;
@@ -900,6 +901,7 @@ private:
     std::vector<GpuBufferVk>       gpuBuffers_;    // handle.id - 1
     std::vector<u32>               gpuBufferFree_; // recycled indices
     std::vector<ComputePipelineVk> computePipes_;  // handle.id - 1
+    std::vector<u32>               computePipeFree_; // recycled indices (DestroyComputePipeline)
     QueuedComputeVk computeQueue_[kMaxQueuedComputeDispatches];
     u32 computeQueueCount_ = 0;
     // Set 2 of pipelineLayout_ (the general VS-visible structured buffer).
@@ -5364,10 +5366,37 @@ ComputePipelineHandle VulkanDevice::CreateComputePipeline(const ComputePipelineD
     }
 
     p.alive = true;
-    computePipes_.push_back(p);
+    // Reuse a slot freed by DestroyComputePipeline so re-compiling a kernel at runtime (the editor
+    // material-graph GPU preview) does not grow the vector unbounded.
+    u32 idx;
+    if (!computePipeFree_.empty()) {
+        idx = computePipeFree_.back();
+        computePipeFree_.pop_back();
+        computePipes_[idx] = p;
+    } else {
+        idx = static_cast<u32>(computePipes_.size());
+        computePipes_.push_back(p);
+    }
     HBE_INFO("[Vulkan] Compute pipeline '{}' ready ({} UAV, {} SRV, {} B constants).", name,
              desc.uavCount, desc.srvCount, desc.constantBytes);
-    return ComputePipelineHandle{static_cast<u32>(computePipes_.size())};
+    return ComputePipelineHandle{idx + 1};
+}
+
+void VulkanDevice::DestroyComputePipeline(ComputePipelineHandle handle) {
+    if (!handle.IsValid() || handle.id > computePipes_.size()) return;
+    ComputePipelineVk& p = computePipes_[handle.id - 1];
+    if (!p.alive) return;
+    WaitForGpuIdle(); // may still be referenced by in-flight command buffers
+    for (u32 i = 0; i < framesInFlight_; ++i) {
+        if (p.cb[i]) vkDestroyBuffer(device_, p.cb[i], nullptr);
+        if (p.cbMem[i]) vkFreeMemory(device_, p.cbMem[i], nullptr); // implicitly unmaps
+    }
+    if (p.pool) vkDestroyDescriptorPool(device_, p.pool, nullptr); // frees its sets
+    if (p.pipeline) vkDestroyPipeline(device_, p.pipeline, nullptr);
+    if (p.layout) vkDestroyPipelineLayout(device_, p.layout, nullptr);
+    if (p.setLayout) vkDestroyDescriptorSetLayout(device_, p.setLayout, nullptr);
+    p = ComputePipelineVk{}; // clears alive + all handles
+    computePipeFree_.push_back(handle.id - 1);
 }
 
 void VulkanDevice::QueueCompute(const ComputeDispatch& d) {
@@ -5744,6 +5773,7 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         ocb.flags = it.materialFlags;
         ocb.subsurfaceColor = it.surface.subsurface_color;
         ocb.subsurfaceRadius = it.surface.subsurface_radius;
+        ocb.lodDither = it.lodDither; // LOD cross-fade stipple (1.0 = opaque; shadow pass ignores it)
         ocb.thicknessIndex = it.thicknessTexture.index;
         ocb.clearcoat = it.surface.coat_weight;
         ocb.clearcoatRoughness = it.surface.coat_roughness;
@@ -7110,6 +7140,7 @@ void VulkanDevice::DrawPreviewScene(const SceneView& view, const DrawItem* items
         ocb.flags = it.materialFlags;
         ocb.subsurfaceColor = it.surface.subsurface_color;
         ocb.subsurfaceRadius = it.surface.subsurface_radius;
+        ocb.lodDither = it.lodDither; // LOD cross-fade stipple (1.0 = opaque; shadow pass ignores it)
         ocb.clearcoat = it.surface.coat_weight;
         ocb.clearcoatRoughness = it.surface.coat_roughness;
         ocb.emissiveColor = it.surface.emission_color;

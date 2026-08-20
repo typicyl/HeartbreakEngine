@@ -27,6 +27,7 @@
 #include "Scene/CharacterSystem.h" // instantiate/swap modular characters
 #include "Scene/FacialSystem.h" // ClearEnvelopeCache on project switch
 #include "Engine/Engine.h"
+#include "Material/MaterialCook.h" // box-brush world tool: BakeMeshVolumesOverlay (+ LayerStack/BoxBrush)
 #include "Physics/PhysicsWorld.h"
 #include "Scene/AnimationSystem.h"
 #include "Scene/Hierarchy.h" // sibling order + the one parent->children walk
@@ -386,6 +387,7 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_Collaborate] = false;        // peer-to-peer session, opened on demand
         panelOpen_[Panel_People] = false;             // who may join this project
         panelOpen_[Panel_Review] = false;             // opens itself when there is a merge
+        panelOpen_[Panel_MaterialGraph] = false;      // Material Maker, opened on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -799,6 +801,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawArtEditor(engine);
     DrawSchematicEditor(engine);
     DrawDialogueEditor(engine);
+    DrawMaterialGraph(engine);    // Material Maker node-graph editor (Window > Material Graph)
     DrawInputIconsPanel(engine);
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
@@ -896,7 +899,7 @@ void Editor::DrawWindowMenu() {
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
         "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker",
-        "Vegetation", "Sequencer"};
+        "Vegetation", "Sequencer", "Material Graph"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -1137,6 +1140,10 @@ void Editor::ProcessEditRequest(Engine& engine) {
                            seqHistory_.Undo(editedSequence_)) {
                     seqSelTrack_ = seqSelSection_ = seqSelBinding_ = -1;
                     editedSequenceDirty_ = true;
+                } else if (ctx.focused == editor::SaveSurface::MaterialGraph &&
+                           mgHistory_.Undo(mgGraph_)) {
+                    mgSelected_ = 0; // the restored graph may not contain it
+                    mgDirty_ = true;
                 }
                 break;
             case editor::EditAction::AssetRedo:
@@ -1152,6 +1159,10 @@ void Editor::ProcessEditRequest(Engine& engine) {
                            seqHistory_.Redo(editedSequence_)) {
                     seqSelTrack_ = seqSelSection_ = seqSelBinding_ = -1;
                     editedSequenceDirty_ = true;
+                } else if (ctx.focused == editor::SaveSurface::MaterialGraph &&
+                           mgHistory_.Redo(mgGraph_)) {
+                    mgSelected_ = 0;
+                    mgDirty_ = true;
                 }
                 break;
             case editor::EditAction::AssetCut:
@@ -1174,6 +1185,7 @@ bool Editor::SurfaceHasSelection(editor::SaveSurface s) const {
             return selected_ != entt::null;
         case editor::SaveSurface::Schematic: return schemSelected_ != 0;
         case editor::SaveSurface::Dialogue: return dlgSelected_ != 0;
+        case editor::SaveSurface::MaterialGraph: return mgSelected_ != 0;
         default:
             // The remaining asset editors grant only Undo/Redo today, which do not
             // consult a selection. Reporting false keeps a future Cut/Duplicate from
@@ -1207,6 +1219,8 @@ bool Editor::SurfaceHistoryEmpty(editor::SaveSurface s, editor::EditVerb v) cons
             return redo ? csHistory_.redo.empty() : csHistory_.undo.empty();
         case editor::SaveSurface::Sequence:
             return redo ? seqHistory_.redo.empty() : seqHistory_.undo.empty();
+        case editor::SaveSurface::MaterialGraph:
+            return redo ? mgHistory_.redo.empty() : mgHistory_.undo.empty();
         default:
             // The remaining asset editors have no history yet, so their Undo/Redo
             // resolves to Ignored - a silent no-op. That is deliberate and is the SAFE
@@ -1230,6 +1244,7 @@ bool Editor::SurfaceHasContent(Engine& engine, editor::SaveSurface s) const {
             return editedCutsceneValid_ && !editedCutscenePath_.empty();
         case editor::SaveSurface::Sequence:
             return sequenceOpen_ && !editedSequencePath_.empty();
+        case editor::SaveSurface::MaterialGraph: return !mgPath_.empty();
         // The Music panel syncs its working graph from the project once per session,
         // and `musicLoaded_` goes true on its FIRST DRAW whether or not a graph
         // exists - so it alone is not "there is something to save". The path matters
@@ -1433,6 +1448,17 @@ void Editor::ProcessSaveRequest(Engine& engine) {
             else
                 SetSaveStatus("DIALOGUE SAVE FAILED - '" +
                                   editedDialoguePath_.filename().string() +
+                                  "' was NOT written.",
+                              true);
+            return;
+
+        case editor::SaveAction::MaterialGraph:
+            if (SaveMaterialGraph())
+                SetSaveStatus("Saved material graph '" + mgPath_.filename().string() + "' (" +
+                                  std::to_string(mgGraph_.nodes.size()) + " nodes).",
+                              false);
+            else
+                SetSaveStatus("MATERIAL GRAPH SAVE FAILED - '" + mgPath_.filename().string() +
                                   "' was NOT written.",
                               true);
             return;
@@ -1645,6 +1671,7 @@ void Editor::SaveAll(Engine& engine) {
     };
     asset(schematicDirty_ && !editedSchematic_.empty(), [&] { return SaveSchematic(); });
     asset(dlgDirty_ && !editedDialoguePath_.empty(), [&] { return SaveDialogue(); });
+    asset(mgDirty_ && !mgPath_.empty(), [&] { return SaveMaterialGraph(); });
     asset(editedCutsceneDirty_ && editedCutsceneValid_ && !editedCutscenePath_.empty(),
           [&] { return SaveCutsceneAsset(); });
     {
@@ -3250,6 +3277,146 @@ const MeshData* Editor::GetCpuMesh(Scene& scene, entt::entity e) {
     }
     auto [ins, ok] = cpuMeshCache_.emplace(src, std::move(md));
     return ins->second.vertices.empty() ? nullptr : &ins->second;
+}
+
+int Editor::BakeMaterialVolumes(Scene& scene, Renderer& renderer) {
+    auto& reg = scene.Registry();
+
+    // 1. Gather every ENABLED material volume as a (world box brush + resolved layer). The box's
+    //    transform is the entity's WORLD matrix, decomposed to T/R/S (handles parenting/scale) so
+    //    the weight field is evaluated in the same world space the mesh texels are baked in.
+    struct Vol {
+        mat::Layer layer;   // Box-masked material layer this volume contributes
+        mat::Aabb bounds;   // world AABB for cheap mesh overlap culling
+        int bakeRes = 1024;
+    };
+    std::vector<Vol> vols;
+    reg.view<MaterialVolumeComponent>().each([&](entt::entity e, MaterialVolumeComponent& mv) {
+        if (!mv.enabled) return;
+        const glm::mat4 m = scene.WorldMatrix(e);
+        const glm::vec3 c0(m[0]), c1(m[1]), c2(m[2]);
+        const glm::vec3 s(glm::length(c0), glm::length(c1), glm::length(c2));
+        const glm::mat3 rot(c0 / glm::max(s.x, 1e-6f), c1 / glm::max(s.y, 1e-6f),
+                            c2 / glm::max(s.z, 1e-6f));
+        mat::BoxBrush box;
+        box.position = glm::vec3(m[3]);
+        box.rotation = glm::quat_cast(rot);
+        box.scale = s;
+        box.size = mv.halfExtents * 2.0f;
+        box.falloff.type = static_cast<mat::FalloffType>(std::clamp(mv.falloffType, 0, 5));
+        box.falloff.gamma = glm::max(mv.falloffGamma, 1e-3f);
+        box.falloffWidth = std::clamp(mv.falloffWidth, 0.0f, 1.0f);
+        box.strength = std::clamp(mv.strength, 0.0f, 1.0f);
+        box.projection = static_cast<mat::BoxProjection>(std::clamp(mv.projection, 0, 2));
+        box.tileMeters = mv.tileMeters;
+        box.blendMode = mv.blend;
+        box.material = mv.material;
+
+        // Resolve the projected surface: a `.hbmat` ref if set, else the inline OpenPBR values.
+        SurfaceParams surf;
+        bool haveMat = false;
+        if (!mv.material.empty() && Project::HasActive()) {
+            if (auto ma = assets::LoadMaterial(Project::Active().AssetsDir() / mv.material)) {
+                surf = ma->surface;
+                haveMat = true;
+            }
+        }
+        if (!haveMat) {
+            surf.base_color = mv.color;
+            surf.base_metalness = std::clamp(mv.metallic, 0.0f, 1.0f);
+            surf.specular_roughness = std::clamp(mv.roughness, 0.0f, 1.0f);
+        }
+
+        Vol v;
+        v.layer.surface = surf;
+        v.layer.mask.kind = mat::MaskKind::Box;
+        v.layer.mask.box = box;
+        v.layer.opacity = std::clamp(mv.opacity, 0.0f, 1.0f);
+        v.layer.blend = static_cast<mat::BlendMode>(std::clamp(mv.blend, 0, 2));
+        v.bounds = box.Bounds();
+        v.bakeRes = std::clamp(mv.bakeResolution, 16, 4096);
+        vols.push_back(std::move(v));
+    });
+    if (vols.empty()) {
+        HBE_WARN("[material volume] no enabled MaterialVolumeComponent in the scene - nothing baked");
+        return 0;
+    }
+
+    // AABB-AABB overlap (conservative: the box's world AABB vs the mesh's world AABB).
+    const auto overlaps = [](const mat::Aabb& a, const glm::vec3& mn, const glm::vec3& mx) {
+        return a.min.x <= mx.x && a.max.x >= mn.x && a.min.y <= mx.y && a.max.y >= mn.y &&
+               a.min.z <= mx.z && a.max.z >= mn.z;
+    };
+
+    // 2. For each mesh, bake the overlapping volumes into a dedicated "Material Volumes" paint layer.
+    int baked = 0;
+    reg.view<MeshRef, MeshInstance>().each([&](entt::entity e, MeshRef&, MeshInstance&) {
+        const MeshData* md = GetCpuMesh(scene, e); // null for terrain / non-file meshes -> skip
+        if (!md || md->vertices.empty()) return;
+        const glm::mat4 mw = scene.WorldMatrix(e);
+
+        // Mesh world AABB (from the cached local AABB if present, else from the CPU vertices).
+        glm::vec3 lmin, lmax;
+        if (const AABB* box = reg.try_get<AABB>(e)) {
+            lmin = box->min;
+            lmax = box->max;
+        } else {
+            lmin = glm::vec3(1e30f);
+            lmax = glm::vec3(-1e30f);
+            for (const Vertex& vtx : md->vertices) {
+                lmin = glm::min(lmin, vtx.position);
+                lmax = glm::max(lmax, vtx.position);
+            }
+        }
+        glm::vec3 wmin(1e30f), wmax(-1e30f);
+        for (int c = 0; c < 8; ++c) {
+            const glm::vec3 corner((c & 1) ? lmax.x : lmin.x, (c & 2) ? lmax.y : lmin.y,
+                                   (c & 4) ? lmax.z : lmin.z);
+            const glm::vec3 wp = glm::vec3(mw * glm::vec4(corner, 1.0f));
+            wmin = glm::min(wmin, wp);
+            wmax = glm::max(wmax, wp);
+        }
+
+        mat::LayerStack stack;
+        int res = 0;
+        for (const Vol& v : vols)
+            if (overlaps(v.bounds, wmin, wmax)) {
+                stack.layers.push_back(v.layer);
+                res = glm::max(res, v.bakeRes);
+            }
+        if (stack.layers.empty()) return; // no volume reaches this mesh
+
+        // Match an existing paint canvas' resolution so the baked layer buffers line up; otherwise
+        // adopt the chosen bake resolution.
+        PaintComponent& pc = reg.get_or_emplace<PaintComponent>(e);
+        const u32 bakeRes = pc.layers.empty() ? static_cast<u32>(res) : pc.resolution;
+        if (pc.layers.empty()) pc.resolution = bakeRes;
+
+        const mat::BakedMaterial bm = mat::BakeMeshVolumesOverlay(*md, mw, stack, bakeRes);
+        if (!bm.Valid()) return;
+
+        // Find (or add) the dedicated overlay layer so a re-bake UPDATES it instead of stacking.
+        constexpr const char* kVolLayerName = "Material Volumes";
+        int li = -1;
+        for (usize k = 0; k < pc.layers.size(); ++k)
+            if (pc.layers[k].name == kVolLayerName) {
+                li = static_cast<int>(k);
+                break;
+            }
+        if (li < 0) li = paint::AddLayer(pc, kVolLayerName);
+        pc.layers[li].color = bm.color;
+        pc.layers[li].material = bm.material;
+        pc.layers[li].visible = true;
+        // Baked PIXELS with no stroke history: a rebake-from-strokes would erase them, so this
+        // canvas is no longer self-describing (see PaintComponent::strokesComplete).
+        pc.strokesComplete = false;
+        pc.dirty = true;
+        paint::Sync(renderer, pc); // upload now so the projection is visible immediately
+        ++baked;
+    });
+
+    HBE_INFO("[material volume] baked {} volume(s) into {} mesh(es)", vols.size(), baked);
+    return baked;
 }
 
 entt::entity Editor::TerrainPaintOwner(Scene& scene, entt::entity e) {
@@ -5086,6 +5253,66 @@ void Editor::DrawProjectSettings(Engine& engine) {
     }
     ImGui::SameLine();
     ImGui::TextDisabled("Stored in the .hbproj");
+
+    // --- Level of Detail: generation toggle + LIVE distance tuning + scene inspection. The sliders
+    // drive the renderer every frame, so you scrub them and watch placed meshes switch (cross-faded,
+    // no pop); the values persist to the .hbproj on release like the other settings here.
+    if (ImGui::CollapsingHeader("Level of Detail", ImGuiTreeNodeFlags_DefaultOpen)) {
+        Renderer& r = engine.GetRenderer();
+        static bool s_lodDirty = false;
+
+        if (ImGui::Checkbox("Generate LODs at import", &ps.meshLodEnabled)) Project::Active().Save();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Bake quadric-decimated LODs into each mesh's .uaf at import\n"
+                              "(non-destructive). Existing meshes gain LODs on the next project\n"
+                              "open (auto-upgrade) or on re-import.");
+
+        // Pin the whole scene to one level to eyeball it; 'Automatic' resumes distance selection.
+        const char* kForce[] = {"Automatic (by distance)", "LOD0 - full detail",
+                                "LOD1", "LOD2", "LOD3", "LOD4"};
+        int fi = r.ForcedLod() < 0 ? 0 : r.ForcedLod() + 1;
+        if (fi >= IM_ARRAYSIZE(kForce)) fi = IM_ARRAYSIZE(kForce) - 1;
+        if (ImGui::Combo("Force level (scene)", &fi, kForce, IM_ARRAYSIZE(kForce)))
+            r.SetForcedLod(fi == 0 ? -1 : fi - 1);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Force every LOD mesh to one level so you can inspect it in the scene.");
+
+        ImGui::Spacing();
+        Renderer::LodTuning t = r.GetLodTuning();
+        bool ch = false;
+        ch |= ImGui::SliderFloat("LOD1 screen size", &t.screen0, 0.03f, 0.6f, "%.3f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Screen coverage (fraction of viewport height) below which a mesh drops\n"
+                              "to LOD1. Smaller = LODs kick in farther away = more aggressive. The\n"
+                              "metres readout below turns this into a real distance for a 1 m object.");
+        ch |= ImGui::SliderFloat("Falloff per level", &t.falloff, 0.25f, 0.9f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Each further level switches at this fraction of the previous\n"
+                              "threshold's screen size (0.5 = each LOD spans ~2x the distance).");
+        ch |= ImGui::SliderFloat("Cross-fade band", &t.fadeBand, 0.0f, 0.4f, "%.2f");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Width of the dissolve between levels. 0 = hard swap (visible POP);\n"
+                              "~0.15 = smooth screen-door cross-fade (no pop).");
+        if (ch) {
+            r.SetLodTuning(t);
+            ps.lodScreen0 = t.screen0;
+            ps.lodFalloff = t.falloff;
+            ps.lodFadeBand = t.fadeBand;
+            s_lodDirty = true;
+        }
+        if (s_lodDirty && !ImGui::IsAnyItemActive()) {
+            Project::Active().Save();
+            s_lodDirty = false;
+        }
+
+        // Turn the screen-size thresholds into real switch distances for a reference 1 m-radius
+        // object at the current camera FOV, so you can tune in metres you can picture.
+        const f32 invTan = 1.0f / std::max(std::tan(0.5f * r.GetCamera().FovY()), 1e-4f);
+        const f32 d1 = invTan / std::max(t.screen0, 1e-4f);
+        const f32 fall = std::max(t.falloff, 0.05f);
+        ImGui::TextDisabled("A 1 m-radius object: LOD1 @ %.0f m, LOD2 @ %.0f m, LOD3 @ %.0f m",
+                            d1, d1 / fall, d1 / (fall * fall));
+    }
 
     // Regenerate the sky + image-based lighting from the edited parameters
     // (button-driven; reads the project's environment we just edited).
@@ -7131,6 +7358,13 @@ void Editor::DrawHierarchy(Engine& engine) {
             reg.emplace<MusicZone>(e);
             selected_ = e;
         }
+        if (ImGui::MenuItem("Material Volume")) {
+            PushUndo(scene);
+            const entt::entity e = scene.CreateEntity("Material Volume");
+            reg.emplace<Transform>(e, Transform{});
+            reg.emplace<MaterialVolumeComponent>(e);
+            selected_ = e;
+        }
         if (ImGui::MenuItem("Acoustic Space")) {
             PushUndo(scene);
             const entt::entity e = scene.CreateEntity("Acoustic Space");
@@ -8159,6 +8393,12 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
             if (!reg.all_of<CensorComponent>(sel) && ImGui::MenuItem("Painterly Censor")) {
                 PushUndo(scene);
                 reg.emplace<CensorComponent>(sel);
+                if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
+            }
+            if (!reg.all_of<MaterialVolumeComponent>(sel) &&
+                ImGui::MenuItem("Material Volume (Box Brush)")) {
+                PushUndo(scene);
+                reg.emplace<MaterialVolumeComponent>(sel);
                 if (!reg.all_of<Transform>(sel)) reg.emplace<Transform>(sel);
             }
             ImGui::EndMenu();
@@ -9415,6 +9655,85 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
         if (s.remove) {
             PushUndo(scene);
             reg.remove<MusicZone>(sel);
+        }
+    }
+
+    // --- Material Volume (box brush world tool) --------------------------------
+    if (MaterialVolumeComponent* mv = reg.try_get<MaterialVolumeComponent>(sel)) {
+        const SectionState s = ComponentSection("Material Volume");
+        if (s.open) {
+            ImGui::DragFloat3("Half Extents", glm::value_ptr(mv->halfExtents), 0.1f, 0.01f, 5000.0f);
+            undoOnActivate();
+
+            char mb[128];
+            std::snprintf(mb, sizeof(mb), "%s", mv->material.c_str());
+            if (ImGui::InputText("Material (.hbmat)", mb, sizeof(mb))) { mv->material = mb; }
+            undoOnActivate();
+            if (mv->material.empty()) {
+                ImGui::TextDisabled("No .hbmat set - using the inline surface below.");
+                ImGui::ColorEdit4("Color", glm::value_ptr(mv->color));
+                undoOnActivate();
+                ImGui::DragFloat("Metallic", &mv->metallic, 0.005f, 0.0f, 1.0f);
+                undoOnActivate();
+                ImGui::DragFloat("Roughness", &mv->roughness, 0.005f, 0.0f, 1.0f);
+                undoOnActivate();
+            } else {
+                ImGui::TextDisabled("Projecting the .hbmat above (inline colour ignored).");
+            }
+
+            ImGui::Separator();
+            const char* kFalloff[] = {"Constant", "Linear", "Smoothstep",
+                                      "Smootherstep", "Ease In", "Ease Out"};
+            ImGui::Combo("Falloff", &mv->falloffType, kFalloff, IM_ARRAYSIZE(kFalloff));
+            undoOnActivate();
+            ImGui::DragFloat("Falloff Width", &mv->falloffWidth, 0.005f, 0.0f, 1.0f);
+            undoOnActivate();
+            ImGui::DragFloat("Falloff Gamma", &mv->falloffGamma, 0.01f, 0.05f, 8.0f);
+            undoOnActivate();
+            ImGui::DragFloat("Strength", &mv->strength, 0.005f, 0.0f, 1.0f);
+            undoOnActivate();
+
+            ImGui::Separator();
+            const char* kProj[] = {"World", "Local", "Triplanar"};
+            ImGui::Combo("Tiling Space", &mv->projection, kProj, IM_ARRAYSIZE(kProj));
+            undoOnActivate();
+            ImGui::DragFloat3("Tile (metres)", glm::value_ptr(mv->tileMeters), 0.02f, 0.01f, 1000.0f);
+            undoOnActivate();
+            const char* kBlend[] = {"Linear", "Height", "Height + Noise"};
+            ImGui::Combo("Blend", &mv->blend, kBlend, IM_ARRAYSIZE(kBlend));
+            undoOnActivate();
+            ImGui::DragFloat("Opacity", &mv->opacity, 0.005f, 0.0f, 1.0f);
+            undoOnActivate();
+
+            const char* kRes[] = {"256", "512", "1024", "2048", "4096"};
+            const int resVals[] = {256, 512, 1024, 2048, 4096};
+            int resIdx = 2;
+            for (int i = 0; i < IM_ARRAYSIZE(resVals); ++i)
+                if (mv->bakeResolution == resVals[i]) resIdx = i;
+            if (ImGui::Combo("Bake Resolution", &resIdx, kRes, IM_ARRAYSIZE(kRes))) {
+                PushUndo(scene);
+                mv->bakeResolution = resVals[resIdx];
+            }
+
+            bool en = mv->enabled;
+            if (ImGui::Checkbox("Enabled", &en)) { PushUndo(scene); mv->enabled = en; }
+
+            ImGui::Separator();
+            // Bakes EVERY enabled volume in the scene into its overlapping meshes' paint canvases
+            // (non-destructive "Material Volumes" overlay layer). Re-run after moving/editing volumes.
+            static int lastBaked = -1;
+            if (ImGui::Button("Bake Volumes")) lastBaked = BakeMaterialVolumes(scene, renderer);
+            ImGui::SameLine();
+            ImGui::TextDisabled(lastBaked < 0 ? "projects all enabled volumes"
+                                              : (lastBaked == 0 ? "no meshes overlapped"
+                                                                : "baked into %d mesh(es)"),
+                                lastBaked);
+            ImGui::TextDisabled("Box uses this entity's Transform. The projection composites over\n"
+                                "each mesh's own material and is removable (delete the paint layer).");
+        }
+        if (s.remove) {
+            PushUndo(scene);
+            reg.remove<MaterialVolumeComponent>(sel);
         }
     }
 
@@ -18858,6 +19177,67 @@ void Editor::DrawAssetViewer(Engine& engine) {
                 ImGui::PopID();
             }
 
+            // --- Level of Detail: the mesh's LOD structure + where each level actually kicks in
+            // for THIS mesh's size, at the current tuning + camera FOV. The generic tuning lives in
+            // Project Settings; this turns it into concrete triangle counts and switch distances.
+            {
+                glm::vec3 mn(1e30f), mx(-1e30f);
+                u32 lodCount = 0;
+                for (const MeshData& md : previewModel_) {
+                    for (const Vertex& v : md.vertices) {
+                        mn = glm::min(mn, v.position);
+                        mx = glm::max(mx, v.position);
+                    }
+                    lodCount = std::max(lodCount, static_cast<u32>(md.lods.size()));
+                }
+                const f32 radius = (mx.x >= mn.x) ? glm::length((mx - mn) * 0.5f) : 1.0f;
+
+                ImGui::Separator();
+                if (lodCount == 0) {
+                    ImGui::TextDisabled("Level of Detail: none. Enable 'Generate LODs at import' in");
+                    ImGui::TextDisabled("Project Settings, then reopen the project (auto-upgrade) or re-import.");
+                } else {
+                    ImGui::Text("Level of Detail: %u level%s + full", lodCount,
+                                lodCount == 1 ? "" : "s");
+                    if (ImGui::BeginTable("lodtris", static_cast<int>(lodCount) + 2,
+                                          ImGuiTableFlags_Borders | ImGuiTableFlags_SizingStretchProp)) {
+                        ImGui::TableSetupColumn("Submesh");
+                        ImGui::TableSetupColumn("LOD0 tris");
+                        for (u32 k = 0; k < lodCount; ++k) {
+                            char h[12];
+                            std::snprintf(h, sizeof(h), "LOD%u tris", k + 1);
+                            ImGui::TableSetupColumn(h);
+                        }
+                        ImGui::TableHeadersRow();
+                        for (usize i = 0; i < previewModel_.size(); ++i) {
+                            const MeshData& md = previewModel_[i];
+                            ImGui::TableNextRow();
+                            ImGui::TableNextColumn();
+                            ImGui::Text("#%zu", i);
+                            ImGui::TableNextColumn();
+                            ImGui::Text("%zu", md.indices.size() / 3);
+                            for (u32 k = 0; k < lodCount; ++k) {
+                                ImGui::TableNextColumn();
+                                if (k < md.lods.size()) ImGui::Text("%zu", md.lods[k].indices.size() / 3);
+                                else ImGui::TextDisabled("-");
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                    const Renderer::LodTuning t = renderer.GetLodTuning();
+                    const f32 invTan = 1.0f / std::max(std::tan(0.5f * renderer.GetCamera().FovY()), 1e-4f);
+                    std::string line = "Switches at:";
+                    f32 thr = std::max(t.screen0, 1e-4f);
+                    for (u32 k = 0; k < lodCount; ++k, thr *= std::max(t.falloff, 0.05f)) {
+                        char b[40];
+                        std::snprintf(b, sizeof(b), "  LOD%u @ %.1f m", k + 1, radius * invTan / thr);
+                        line += b;
+                    }
+                    ImGui::TextWrapped("%s", line.c_str());
+                    ImGui::TextDisabled("(this mesh's %.2f m radius, at the current FOV)", radius);
+                }
+            }
+
             ImGui::Separator();
             if (ImGui::Button(previewMeshDirty_ ? "Save Mesh*" : "Save Mesh")) {
                 if (SaveViewedMesh())
@@ -20117,6 +20497,13 @@ void Editor::OnProjectChanged() {
     // every zone back first, so the world A leaves behind is never one with holes.
     if (engine_) LiveStreamUnbind(engine_->GetScene(), &engine_->GetRenderer());
     liveStreamError_.clear();
+    // Adopt the new project's LOD switch tuning and clear any scene force-level override, so the
+    // Project Settings sliders reflect the project you just opened rather than the last one.
+    if (engine_ && Project::HasActive()) {
+        const ProjectSettings& nps = Project::Active().Settings();
+        engine_->GetRenderer().SetLodTuning({nps.lodScreen0, nps.lodFalloff, nps.lodFadeBand});
+        engine_->GetRenderer().SetForcedLod(-1);
+    }
     // Process-wide gameplay caches key by asset path -> invalidate on project switch.
     spawn::ClearPrefabCache();
     facial::ClearEnvelopeCache();
@@ -20496,6 +20883,12 @@ void Editor::DrawSelectionOutline(Scene& scene, Renderer& renderer) {
         const ImU32 col = mz->active ? IM_COL32(230, 90, 220, 235)
                                      : IM_COL32(170, 90, 220, 200);
         drawBox(m, -mz->halfExtents, mz->halfExtents, col, 1.5f);
+    }
+    // Material volume / box brush (cyan = enabled, dim = disabled).
+    if (const MaterialVolumeComponent* mv = reg.try_get<MaterialVolumeComponent>(selected_)) {
+        const ImU32 col = mv->enabled ? IM_COL32(90, 210, 255, 235)
+                                      : IM_COL32(110, 160, 190, 170);
+        drawBox(m, -mv->halfExtents, mv->halfExtents, col, 1.5f);
     }
     // Acoustic space volume (orange = active/listener inside, amber = idle).
     if (const AcousticSpace* as = reg.try_get<AcousticSpace>(selected_)) {

@@ -44,12 +44,14 @@ using TextureProvider =
 struct Op {
     static constexpr u16 kNoReg = 0xFFFF;
 
+    static constexpr int kMaxInputs = 4; // Combine (r,g,b,a) is the widest non-Output node
+
     NodeType type = NodeType::Constant;
     Space space = Space::UV0;
     glm::vec4 constant{0.0f};
     std::string texture;        // Texture/NormalMap/Height/Mask reference
     std::vector<RampStop> ramp; // ColorRamp stops (sorted by pos)
-    u16 inputReg[3] = {kNoReg, kNoReg, kNoReg};
+    u16 inputReg[kMaxInputs] = {kNoReg, kNoReg, kNoReg, kNoReg};
     bool folded = false;
     glm::vec4 foldedValue{0.0f};
 };

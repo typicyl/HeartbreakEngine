@@ -339,6 +339,14 @@ struct ProjectSettings {
     // no near-quality cost. Turn off to import full-detail only; existing assets need a re-import
     // or `--generate-mesh-lods` to gain LODs. Matches the .value() fallback in Project.cpp.
     bool meshLodEnabled = true;
+    // Distance-LOD switch tuning (the editor's LOD panel writes these; runtime reads them into
+    // Renderer::SetLodTuning). Metric = FOV-normalized screen coverage (fraction of viewport
+    // half-height). LOD1 switches below lodScreen0, each further level at lodFalloff x the previous
+    // threshold; lodFadeBand is the cross-fade window half-width (fraction of a threshold) that
+    // dissolves the swap. lodFadeBand 0 = hard swap (no cross-fade). Match Project.cpp .value()s.
+    f32 lodScreen0 = 0.242f;
+    f32 lodFalloff = 0.5f;
+    f32 lodFadeBand = 0.15f;
 
     // Bake BC (block-compressed) texture variants at import and load them at runtime. LOSSY, so
     // default OFF: enable to trade a small quality loss for ~4-6x less texture VRAM + upload

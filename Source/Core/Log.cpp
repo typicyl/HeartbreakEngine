@@ -40,6 +40,9 @@ bool g_logFileTried = false;
 // See the note on SetTraceEnabled in Log.h: trace lines are per-frame diagnostics, and
 // every log line here is flushed and recorded into the boot screen's {log} ring.
 std::atomic<bool> g_traceEnabled{false};
+// Scoped mute nesting depth (LogMuteScope). >0 drops every line. Used by unit tests that
+// deliberately drive error-logging paths so a PASSING run stays clean.
+std::atomic<int> g_logMute{0};
 
 std::FILE* LogFile() {
     if (g_logFileTried) return g_logFile;
@@ -60,6 +63,9 @@ std::FILE* LogFile() {
 
 void SetTraceEnabled(bool enabled) { g_traceEnabled.store(enabled, std::memory_order_relaxed); }
 bool TraceEnabled() { return g_traceEnabled.load(std::memory_order_relaxed); }
+
+LogMuteScope::LogMuteScope() { g_logMute.fetch_add(1, std::memory_order_relaxed); }
+LogMuteScope::~LogMuteScope() { g_logMute.fetch_sub(1, std::memory_order_relaxed); }
 
 void FlushLog() {
     std::fflush(stdout);
@@ -99,6 +105,7 @@ void LogWrite(LogLevel level, std::string_view message) {
     // pay, and RecordLine below backs the boot/loading screen's {log} token, which must
     // not read as shard-spawn spam. See SetTraceEnabled in Log.h.
     if (level == LogLevel::Trace && !g_traceEnabled.load(std::memory_order_relaxed)) return;
+    if (g_logMute.load(std::memory_order_relaxed) > 0) return; // inside a LogMuteScope
     std::string line = std::string(LevelTag(level)) + " " + std::string(message) + "\n";
 
     std::FILE* out = (level == LogLevel::Error || level == LogLevel::Warn) ? stderr : stdout;

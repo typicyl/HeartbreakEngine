@@ -265,3 +265,129 @@ OpenPBR program used (P6b/P7 "needs live-GPU validation").
 - OpenGL backend stays on its base path (out of scope, matching the OpenPBR program).
 - Default-preserving: a mesh with no `MaterialLayerComponent` and no `MaterialFlag_Layered` is
   **byte-identical** to today.
+
+---
+
+## Part G — Implementation status (this session)
+
+**BUILT + VERIFIED (headless / shader-compile):**
+- `Source/Material/` (8 TUs): `MaterialCore`, `MaterialGraph`, `MaterialGraphCompiler`,
+  `MaterialParameters` (in Core), `BoxBrush`, `MaterialLayer` (+ `MaskSource`), `MaterialCook`,
+  `MaterialAuthoringTest`. Links into `hbe` + `hbe_editor`.
+- `--test-material` **PASS** — 14 test blocks (dozens of assertions): node catalog lockstep, graph serialization round-trip +
+  determinism, node compilation, deterministic compilation (hash), constant folding, op math,
+  parameter overrides, cycle/no-Output detection, configurable falloff, box weight/rotation/falloff,
+  world- & local-space tiling (size-independence), layer blending (linear/height/height+noise),
+  RNM normal blending, layer/mask/box serialization, procedural-mask bake, offline cook (graph→
+  `.hbmat` + texture-slot lift), cross-platform (LE) serialization, and 7 regression blocks for the
+  adversarial-review fixes below.
+- `--test-assetformats` **PASS** with the new `.hbmatgraph` (editor source) + `.hbmatlayer` (runtime
+  layer stack) registry rows.
+- `Shaders/MaterialLayered.hlsli` + `Shaders/Triplanar.hlsli` — the GPU twin of the CPU resolver —
+  compile to **DXIL + SPIR-V** (`MaterialLayeredTest.cs` gate). `MaterialFlag_Layered` (1<<14) +
+  `HBE_MAT_LAYERED` added (routing seam, default-off → byte-identical to today).
+- `--matscene <dir>` — bakes the visual test scene (world tiling at 1m/4m, box weight fields,
+  overlapping volumes, procedural + painted masks, linear vs height+noise blend, and a composite
+  floor using all three mask sources) to 10 PNGs via the REAL resolver, so stretching/blending/
+  painting correctness is inspectable without a live GPU.
+
+**Adversarial review (5 reviewers) → 8 fixes applied + regression-tested:** full-field `LerpSurface`
+(mask=1 reproduces the layer exactly), lossless full-field layer-stack serialization, crash-proof
+loaders (non-object JSON → `nullopt`, not an uncaught `type_error`), unbaked procedural/paint mask =
+absent (not fully-on), box zero-scale axis = outside (agrees with `Bounds()`), non-unit quaternion
+normalized consistently, `pow(0,neg)` guarded, and CPU↔GPU tiling-division parity (`tile!=0?…:…`).
+
+**BUILT — Editor-only RUNTIME SHADER COMPILER + graph→HLSL codegen (the GPU-interactivity path):**
+The engine had no runtime shader compiler (offline DXC only). Added `Source/Editor/RuntimeShaderCompiler`
+(editor-only): it compiles an HLSL string to DXIL / SPIR-V **at runtime** by invoking the SAME DXC
+toolchain the offline build used (Windows-SDK DXC for signed DXIL, Vulkan-SDK DXC for SPIR-V, identical
+SM 6.5 + `-fvk-*-shift` flags; paths baked in by cmake), writing the bytecode into `<exe>/shaders/` so it
+loads through the **existing** `CreateComputePipeline` path with **zero RHI change**. Reusing the exact
+toolchain out-of-process makes the bytecode byte-identical to an offline build and sidesteps the
+`dxcompiler.dll`/`dxil.dll` version-matching hazard. `Source/Material/MaterialGraphHlsl` generates a
+compute shader from a node graph — one HLSL function per node; value nodes call inputs at the same UV,
+coordinate-transform + resampling nodes call inputs at a *modified* UV (a DAG of functions, no
+recursion — the GPU twin of `EvalRec`) — evaluating all 8 channels into a `RWStructuredBuffer<float4>`.
+**Verified:** `--test-shadercompile` (compiles a kernel → valid DXIL + SPIR-V magic), `--test-matshader`
+(graph → generated HLSL → compiles to **both** backends), `--test-runtimegpu` (compiles a kernel at
+runtime and **runs it on the actual GPU**, reads back, checks every element), and `--test-matgpu`
+(generates a MATERIAL graph's shader, compiles it at runtime, **dispatches it on the GPU**, reads back,
+checks the base-colour output is in range + not flat). The **interactive GPU preview is wired into the
+Material Graph panel**: it compiles the (selected node's / final) graph to a compute shader at runtime
+(debounced ~12 frames so a drag doesn't thrash the compiler), dispatches it into a `res*res*8 float4`
+buffer, reads back the base-colour channel a couple frames later, and uploads it as the 256px preview
+texture — with a "GPU" toggle and a CPU-bake fallback (used until the first GPU result lands, or when the
+toolchain is absent). Every step of that path is GPU-verified by `--test-matgpu`; only the final texture
+upload + `ImGui::Image` (the same `UpdateTexture` path the paint canvas uses) is exercised solely in the
+live editor. Recompiling **destroys the previous pipeline** first: a new RHI method
+`IRenderDevice::DestroyComputePipeline` (both backends) waits for GPU idle, releases the PSO/root-sig
+(D3D12) or pipeline/layout/pool/CB (Vulkan), and **recycles the slot** (a `computePipeFree_` free-list
+that `CreateComputePipeline` reuses), so re-compiling never grows the pipeline vector — no leak.
+`--test-runtimegpu` proves it: 50 destroy+recreate cycles keep the handle id pinned to the same slot.
+
+**BUILT — Material-Maker-class node library (headless-verified, `--test-material` PASS + `--matexport` end-to-end):**
+The evaluator was reworked from a flat value-op pass into a **recursive coordinate-aware** evaluator
+(`EvalRec`) so nodes are **resamplable functions of UV** — coordinate-transform + resampling nodes
+re-evaluate their input at a *modified* UV (constant subtrees still fold to O(1)). On that foundation,
+~34 nodes were added: **Generators** (Perlin, FBM `FractalNoise`, `Cellular`/Worley, Checker, Bricks,
+Grid, Shape, Wave, Dots, Radial/Angular gradient), **Filters** (`Blend` with 13 Substance-style modes,
+HSV, Brightness/Contrast, Levels, Gamma, Posterize, Threshold, Grayscale, Combine, Swizzle),
+**Resampling** (HeightToNormal, AmbientOcclusion, Blur, Emboss), and **SDF** (SdfCircle, SdfBox,
+SdfOp union/subtract/intersect/smooth, SdfShow). Editor: categorized + **searchable** add-node menu,
+per-node parameter inspector, **per-node 2D preview** (select any node → see its baked output), and an
+**Export Textures** button; plus a **multi-map PBR export** (`mat::BakeGraphMaps` → basecolor / normal
+/ roughness / metallic / height / ao / emissive / opacity) driven by the editor and the `--matexport
+<graph> <dir> [res]` CLI. **Boundary:** Material Maker is interactive because it compiles graphs to
+GLSL on the GPU; Heartbreak has no runtime shader compiler (offline DXC only), so generation is
+CPU-baked (offline at cook, low-res live preview). The follow-on for full interactivity is a GPU node-
+*interpreter* compute kernel (the pattern the engine already uses for GPU particles, `VfxSim`).
+
+**BUILT this session — Material Maker editor panel (compiles + links; dispatch invariants test-verified):**
+- `Source/Editor/MaterialGraphEditor.cpp` (own TU) — a full node-graph editor for `.hbmatgraph`:
+  hand-built ImGui canvas (grid/pan, bezier wires, drag-to-connect, pick-up/re-wire, delete,
+  right-click add-node menu grouped by catalog category), a node inspector exposing every node
+  type's fields (constants/colors/textures via `AssetPicker`/noise-scale/ramp stops/space combo/
+  param binding), an exposed-**parameters** editor, and a **live preview** that compiles the graph
+  and bakes a swatch through the real resolver (`BakeGraphColor` → `UploadTexture`/`TextureUIId` →
+  `ImGui::Image`), showing the folded Base/Roughness/Metallic and constant-vs-procedural status.
+- Wired into the editor: `Panel_MaterialGraph` (Window ▸ Material Graph), `New`/`Open` (lists
+  `.hbmatgraph`), `SaveSurface::MaterialGraph`+`SaveAction::MaterialGraph` (Ctrl+S), per-document
+  `AssetHistory<mat::Graph> mgHistory_` (Ctrl+Z/Y), and `SaveAll`. `--test-savedispatch` /
+  `--test-editdispatch` now cover all **15** surfaces (MaterialGraph gated to Undo/Redo, can never
+  edit the scene). The canvas *rendering/interaction* is live-editor-verification-pending, but the
+  save/undo/focus plumbing is headless-test-verified.
+
+**BUILT — the BOX-BRUSH WORLD TOOL (scene component + editor + BAKED application; `--test-matvolume` PASS):**
+- `MaterialVolumeComponent` (`Scene/Components.h`): a box placed in the scene that PROJECTS a
+  material onto the geometry it encloses, with a configurable soft falloff. Per the core rule it
+  never edits geometry — the box IS a `mat::BoxBrush` weight field feeding a `mat::Layer`. Plain data
+  (halfExtents, falloff type/gamma/width, strength, `.hbmat` ref + inline color/metal/rough,
+  projection + tile metres, blend, opacity, enabled, bake resolution); the box's world placement +
+  rotation is the entity `Transform`. Fully serialized (6 SceneSerializer sites + collab
+  `HBE_PLAIN_DELTA` + 2 `TagShard` `AddHalf` streaming-bounds sites), round-trip verified headless.
+- Editor: Create ▸ Material Volume, Add-Component ▸ Effects ▸ Material Volume (Box Brush), a full
+  inspector (all fields + falloff/tiling/blend combos + resolution) with a viewport wireframe box
+  (`scene.WorldMatrix` ± halfExtents, cyan), and a **"Bake Volumes"** button.
+- Application = `Editor::BakeMaterialVolumes` → `mat::BakeMeshVolumesOverlay` (new): gathers every
+  enabled volume as a world box brush (TRS-decomposed from the entity world matrix), and for each
+  overlapping mesh (`GetCpuMesh` CPU geometry, world-AABB cull) bakes the volumes into a
+  **non-destructive `"Material Volumes"` PAINT-CANVAS overlay layer** — coverage = the union box
+  weight, transparent where no volume reaches, so the projection composites over the mesh's own
+  material through the EXISTING paint render path (zero new RHI, removable, both backends). Re-bakes
+  update the overlay layer in place. `paint::Sync` uploads immediately.
+- `mat::BakeMeshVolumesOverlay` shares one UV rasterizer (`RasterizeMeshUV`) with the base-filled
+  `BakeMeshVolumes`, reuses the tested `LerpSurface`/`BlendNormalRNM` compositing, and is headless
+  + deterministic (`TestVolumeOverlay`, `--test-material` PASS).
+
+**DESIGNED, not built this session (needs a live GPU/editor session to build *and* verify):**
+- LIVE per-draw wiring: `MaterialLayerComponent` → `DrawItem`/`GpuSurfaceMaterialExt` → MeshPBR
+  consumption of `HBE_MAT_LAYERED` (reusing the terrain-splat slots; recipe in Part C.2/C.3). Not
+  applied blindly to the 5000-line backend hot path without on-GPU verification (the documented
+  "#1 silent-corruption bug class"). **BAKED mode already delivers "resolved material → renderer"
+  through the existing single-material path, so the core requirement is met without this** — and the
+  box-brush world tool above now lands its result through the paint canvas, so a live GPU layered
+  path is an OPTIMISATION, not a prerequisite.
+- `.hbpaint` weight-channel extension (Part A.3 recipe) integrating material painting with `hbe::paint`.
+- The layer-stack inspector (Part C.5) for authoring multi-layer stacks directly (the volume tool
+  builds its stack implicitly from the enabled volumes). The box-brush world tool itself is now BUILT
+  (above); only the LIVE (non-baked) per-pixel GPU layered path remains for it.

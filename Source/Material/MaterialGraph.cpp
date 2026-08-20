@@ -49,6 +49,45 @@ const std::vector<NodeInfo>& NodeCatalog() {
         {NodeType::Mask,           "Mask",           1, true,  "Input"},
         {NodeType::MaterialLayer,  "MaterialLayer",  0, true,  "Layer"},
         {NodeType::Output,         "Output",         kChannelCount, false, "Output"},
+        // --- Coordinate transforms ---
+        {NodeType::Transform,      "Transform",      1, true,  "Transform"},
+        {NodeType::Tile,           "Tile",           1, true,  "Transform"},
+        {NodeType::Mirror,         "Mirror",         1, true,  "Transform"},
+        {NodeType::Warp,           "Warp",           2, true,  "Transform"},
+        {NodeType::Kaleidoscope,   "Kaleidoscope",   1, true,  "Transform"},
+        // --- Generators ---
+        {NodeType::Perlin,         "Perlin",         1, true,  "Generator"},
+        {NodeType::FractalNoise,   "FractalNoise",   1, true,  "Generator"},
+        {NodeType::Cellular,       "Cellular",       1, true,  "Generator"},
+        {NodeType::Checker,        "Checker",        1, true,  "Generator"},
+        {NodeType::Bricks,         "Bricks",         1, true,  "Generator"},
+        {NodeType::Grid,           "Grid",           1, true,  "Generator"},
+        {NodeType::Shape,          "Shape",          1, true,  "Generator"},
+        {NodeType::Wave,           "Wave",           1, true,  "Generator"},
+        {NodeType::Dots,           "Dots",           1, true,  "Generator"},
+        {NodeType::RadialGradient, "RadialGradient", 1, true,  "Generator"},
+        {NodeType::AngularGradient,"AngularGradient",1, true,  "Generator"},
+        // --- Filters ---
+        {NodeType::Blend,          "Blend",          2, false, "Filter"},
+        {NodeType::HSV,            "HSV",            1, false, "Filter"},
+        {NodeType::BrightnessContrast, "BrightnessContrast", 1, false, "Filter"},
+        {NodeType::Levels,         "Levels",         1, false, "Filter"},
+        {NodeType::Gamma,          "Gamma",          1, false, "Filter"},
+        {NodeType::Posterize,      "Posterize",      1, false, "Filter"},
+        {NodeType::Threshold,      "Threshold",      1, false, "Filter"},
+        {NodeType::Grayscale,      "Grayscale",      1, false, "Filter"},
+        {NodeType::Combine,        "Combine",        4, false, "Filter"},
+        {NodeType::Swizzle,        "Swizzle",        1, false, "Filter"},
+        // --- Resampling filters ---
+        {NodeType::HeightToNormal, "HeightToNormal", 1, true,  "Filter"},
+        {NodeType::AmbientOcclusion, "AmbientOcclusion", 1, true, "Filter"},
+        {NodeType::Blur,           "Blur",           1, true,  "Filter"},
+        {NodeType::Emboss,         "Emboss",         1, true,  "Filter"},
+        // --- SDF ---
+        {NodeType::SdfCircle,      "SdfCircle",      1, true,  "SDF"},
+        {NodeType::SdfBox,         "SdfBox",         1, true,  "SDF"},
+        {NodeType::SdfOp,          "SdfOp",          2, false, "SDF"},
+        {NodeType::SdfShow,        "SdfShow",        1, false, "SDF"},
     };
     return kCatalog;
 }
@@ -169,6 +208,7 @@ void ParamsFromJson(const json& arr, ParamSet& set) {
     set.params.clear();
     if (!arr.is_array()) return;
     for (const auto& jp : arr) {
+        if (!jp.is_object()) continue; // skip a malformed param element rather than throw
         Param p;
         p.name = JGet(jp, "name", std::string());
         p.type = static_cast<ParamType>(JGet(jp, "type", 0));
@@ -232,6 +272,7 @@ std::optional<Graph> ParseJson(const json& j) {
     std::unordered_set<u32> validIds;
     if (const auto it = j.find("nodes"); it != j.end() && it->is_array()) {
         for (const auto& node : *it) {
+            if (!node.is_object()) continue; // skip a malformed node element rather than throw
             const std::string typeName = JGet(node, "type", std::string());
             const auto nt = NodeTypeFromName(typeName);
             if (!nt) {
@@ -248,6 +289,7 @@ std::optional<Graph> ParseJson(const json& j) {
             n.uiPos = GetV2(node.value("ui", json()), glm::vec2(0.0f));
             if (const auto rit = node.find("ramp"); rit != node.end() && rit->is_array()) {
                 for (const auto& js : *rit) {
+                    if (!js.is_object()) continue; // skip a malformed ramp stop rather than throw
                     RampStop s;
                     s.pos = JGet(js, "pos", 0.0f);
                     s.color = GetV4(js.value("color", json()), glm::vec4(1.0f));
@@ -281,14 +323,14 @@ std::optional<Graph> ParseJson(const json& j) {
 std::string GraphToJsonString(const Graph& g) { return BuildJson(g).dump(2); }
 
 std::optional<Graph> GraphFromJsonString(const std::string& str) {
-    json j;
     try {
-        j = json::parse(str);
+        // ParseJson is inside the try too: a valid-JSON-but-wrong-shape document (a stray non-object
+        // element the guards miss) must return nullopt, not throw out of the loader.
+        return ParseJson(json::parse(str));
     } catch (const std::exception& e) {
         HBE_ERROR("MaterialGraph: parse failed: {}", e.what());
         return std::nullopt;
     }
-    return ParseJson(j);
 }
 
 bool SaveGraph(const fs::path& path, const Graph& g) {

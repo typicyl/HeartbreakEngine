@@ -43,6 +43,8 @@ set(HBE_ASSET_SOURCES
     "Source/Assets/SlotIdsTest.cpp"
     "Source/Assets/Fracture.cpp"
     "Source/Assets/MeshGenerator.cpp"
+    "Source/Assets/MeshCsg.cpp"
+    "Source/Assets/MeshCsgTest.cpp"
     "Source/Assets/StrokeGen.cpp"
     "Source/Assets/ModelLoader.cpp"
     "Source/Assets/UAF.cpp"
@@ -71,6 +73,8 @@ set(HBE_MATERIAL_SOURCES
     "Source/Material/MaterialGraphCompiler.cpp"
     "Source/Material/BoxBrush.cpp"
     "Source/Material/MaterialLayer.cpp"
+    "Source/Material/MaterialCook.cpp"
+    "Source/Material/MaterialGraphHlsl.cpp"
     "Source/Material/MaterialAuthoringTest.cpp")
 
 set(HBE_SCENE_SOURCES
@@ -322,6 +326,8 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/EditorZoneTest.cpp"
     "Source/Editor/PasteParentTest.cpp"
     "Source/Editor/DialogueEditor.cpp"
+    "Source/Editor/MaterialGraphEditor.cpp" # Material Maker node-graph panel (own TU; keeps Editor.cpp under /bigobj)
+    "Source/Editor/RuntimeShaderCompiler.cpp" # editor-only runtime HLSL->DXIL/SPIR-V compiler (invokes the toolchain DXC)
     "Source/Editor/UIEditor.cpp"
     "Source/Editor/SequencerEditor.cpp" # Sequencer NLE panel (own TU; keeps Editor.cpp under /bigobj)
     "Source/Editor/Importer.cpp"
@@ -356,6 +362,7 @@ set(HBE_RUNTIME_SOURCES
     ${HBE_CORE_SOURCES}
     ${HBE_VOLUME_SOURCES}
     ${HBE_ASSET_SOURCES}
+    ${HBE_MATERIAL_SOURCES}
     ${HBE_SCENE_SOURCES}
     ${HBE_PHYSICS_SOURCES}
     ${HBE_VEGETATION_SOURCES}
@@ -691,4 +698,13 @@ include(ShaderCompile)
 hbe_compile_engine_shaders(HeartbreakEditor)
 hbe_compile_engine_shaders(HeartbreakRuntime)
 hbe_compile_engine_shaders(HeartbreakArtEditor)
+
+# The EDITOR-ONLY RUNTIME shader compiler (Source/Editor/RuntimeShaderCompiler.cpp) invokes the SAME
+# DXC toolchain the offline build used, so it produces byte-identical bytecode. Bake the discovered
+# dxc paths + the shader include dir into hbe_editor (paths are CMake forward-slash form, so no C++
+# escape hazard). NOTFOUND becomes a path that simply won't exist at runtime -> Available() is false.
+target_compile_definitions(hbe_editor PRIVATE
+    "HBE_RT_DXC_DXIL=\"${HBE_DXC_DXIL}\""
+    "HBE_RT_DXC_SPIRV=\"${HBE_DXC_SPIRV}\""
+    "HBE_RT_SHADER_INCLUDE=\"${CMAKE_SOURCE_DIR}/HeartbreakEngine/Shaders\"")
 

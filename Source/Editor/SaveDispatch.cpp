@@ -80,6 +80,8 @@ SaveAction DecideSave(const SaveContext& ctx) {
             return ctx.surfaceHasContent ? SaveAction::AudioEvent : SaveAction::NothingOpen;
         case SaveSurface::MeshSlots:
             return ctx.surfaceHasContent ? SaveAction::MeshSlots : SaveAction::NothingOpen;
+        case SaveSurface::MaterialGraph:
+            return ctx.surfaceHasContent ? SaveAction::MaterialGraph : SaveAction::NothingOpen;
 
         case SaveSurface::Count:
             break;
@@ -104,6 +106,7 @@ const char* SaveSurfaceName(SaveSurface s) {
         case SaveSurface::MeshSlots:   return "Asset Viewer (mesh slots)";
         case SaveSurface::AssetViewer: return "Asset Viewer";
         case SaveSurface::Collaborate: return "Collaborate";
+        case SaveSurface::MaterialGraph: return "Material Graph";
         case SaveSurface::Count:       break;
     }
     return "?";
@@ -126,6 +129,7 @@ const char* SaveActionName(SaveAction a) {
         case SaveAction::Material:        return "Material";
         case SaveAction::AudioEvent:      return "AudioEvent";
         case SaveAction::MeshSlots:       return "MeshSlots";
+        case SaveAction::MaterialGraph:   return "MaterialGraph";
         case SaveAction::Count:           break;
     }
     return "?";
@@ -144,6 +148,7 @@ const char* SaveActionNoun(SaveAction a) {
         case SaveAction::Material:   return "material";
         case SaveAction::AudioEvent: return "audio event";
         case SaveAction::MeshSlots:  return "mesh material slots";
+        case SaveAction::MaterialGraph: return "material graph";
         default:                     return "";
     }
 }
@@ -185,6 +190,7 @@ constexpr Row kRows[] = {
     {SaveSurface::AssetViewer, SaveAction::NothingOpen},
     // The collaboration panels own no file either.
     {SaveSurface::Collaborate, SaveAction::NothingOpen},
+    {SaveSurface::MaterialGraph, SaveAction::MaterialGraph},
 };
 // kRows is HAND-MAINTAINED, and a surface simply missing from it is not a failure - the
 // sweeps below just never exercise it, and the suite still says PASS. That is how a new
@@ -386,6 +392,7 @@ constexpr u8 kCaps[static_cast<usize>(SaveSurface::Count)] = {
     // behaves normally, and every chord that reaches this table instead is swallowed
     // rather than cutting the level's selection.
     /* Collaborate */ 0,
+    /* MaterialGraph */ kU | kR, // node-graph editor: Undo/Redo only (no node clipboard yet)
 };
 static_assert(sizeof(kCaps) / sizeof(kCaps[0]) == static_cast<usize>(SaveSurface::Count),
               "kCaps must have one entry per SaveSurface, in the same order");

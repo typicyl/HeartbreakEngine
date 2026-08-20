@@ -56,6 +56,48 @@ enum class NodeType : u8 {
     Mask,         // a named mask input (external), scalar
     MaterialLayer,// reference to another material (paramName), external
     Output,       // the 8 surface channels (8 inputs)
+    // === Material-Maker-class library (append-only). Coordinate-transform + resampling nodes are
+    // context-dependent and re-evaluate their input at a MODIFIED uv (the resamplable-function
+    // model); see MaterialGraphCompiler.cpp. constant.xyzw meanings are documented there. ===
+    // --- Coordinate transforms (resample input at a modified UV) ---
+    Transform,      // translate(x,y) / rotate(z turns) / scale(w) the UV before sampling input
+    Tile,           // repeat: uv = frac(uv * (x,y))
+    Mirror,         // mirror uv (x: 0=X 1=Y 2=both)
+    Warp,           // uv += (offsetField-0.5)*2*amount, then sample source (2 inputs)
+    Kaleidoscope,   // radial mirror into `count` (x) segments
+    // --- Generators (procedural patterns; optional coord input, else ctx uv) ---
+    Perlin,         // gradient (Perlin) noise; x=scale y=seed
+    FractalNoise,   // FBM over Perlin; x=scale y=octaves z=persistence w=seed
+    Cellular,       // Worley; x=scale y=seed z=mode(0 F1,1 F2,2 F2-F1,3 cell)
+    Checker,        // checkerboard; x=tiles
+    Bricks,         // brick pattern; x=cols y=rows z=mortar w=rowOffset
+    Grid,           // grid lines; x=tiles y=lineWidth
+    Shape,          // circle/polygon fill; x=sides(0=circle) y=radius z=roundness
+    Wave,           // 1D wave along u; x=freq y=type(0 sine,1 tri,2 saw,3 square) z=phase
+    Dots,           // dot grid; x=tiles y=radius
+    RadialGradient, // radial gradient from center; x=radius
+    AngularGradient,// angular (sweep) gradient
+    // --- Filters (per-pixel) ---
+    Blend,          // a,b + x=mode y=opacity (Substance-style blend modes)
+    HSV,            // hue shift(x)/sat mul(y)/val mul(z)
+    BrightnessContrast, // x=brightness y=contrast
+    Levels,         // x=inLow y=inHigh z=outLow w=outHigh
+    Gamma,          // x=gamma
+    Posterize,      // x=levels
+    Threshold,      // x=threshold
+    Grayscale,      // luminance
+    Combine,        // r,g,b,a (4 inputs) -> rgba
+    Swizzle,        // x=channel(0 r,1 g,2 b,3 a,4 rgb->gray broadcast)
+    // --- Resampling filters (sample input at neighbouring UVs) ---
+    HeightToNormal, // x=strength y=epsilon -> tangent-space normal
+    AmbientOcclusion, // x=strength y=radius (from height)
+    Blur,           // x=radius (box blur, 9-tap)
+    Emboss,         // x=strength (directional derivative)
+    // --- SDF (2D signed distance fields) ---
+    SdfCircle,      // x=radius -> signed distance (centered)
+    SdfBox,         // x,y=half size -> signed distance
+    SdfOp,          // a,b + x=mode(0 union,1 sub,2 intersect,3 smooth-union) y=smooth
+    SdfShow,        // distance -> grayscale fill; x=width (antialias)
     Count
 };
 

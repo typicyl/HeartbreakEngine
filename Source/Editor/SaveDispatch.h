@@ -54,6 +54,9 @@ enum class SaveSurface : u8 {
     // Ctrl+X would cut the current selection out of it. They own no savable document, so
     // every chord here resolves to "swallowed", never to the scene.
     Collaborate,
+    // Material Graph editor (Material Maker) -> the open `.hbmatgraph`. Distinct from `Material`
+    // above, which is the Asset Viewer's `.hbmat` sub-editor.
+    MaterialGraph,
     Count
 };
 
@@ -76,6 +79,7 @@ enum class SaveAction : u8 {
     Material,
     AudioEvent,
     MeshSlots,
+    MaterialGraph,
     Count
 };
 

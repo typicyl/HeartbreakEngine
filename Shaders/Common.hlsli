@@ -188,7 +188,9 @@ cbuffer ObjectConstants : register(b1)
     uint     gPrevBoneOffset;  // previous-frame palette base (skinned motion)
     uint     gThicknessIndex;  // SSS transmission thickness map (0 = none)
     float    gSubsurfaceRadius;// SSS scatter scale (curvature multiplier)
-    float    _padObj;
+    float    gLodDither;       // LOD cross-fade: 1 = opaque; f in (0,1) fades a LOD out (keep
+                               // noise<f), -f fades the next LOD in (keep noise>=f). Applied at the
+                               // top of the mesh pixel shader; the VS-only shadow pass ignores it.
     // Art Editor surface paint canvas (0 = unpainted; composited over albedo).
     uint     gPaintColorIndex; // RGB pigment + A coverage (mipped)
     uint     gPaintHeightIndex;// R relief height (0.5 neutral), perturbs normal
@@ -264,6 +266,7 @@ cbuffer ObjectConstants : register(b1)
 #define HBE_MAT_CENSORED 1024u // entity carries a CensorComponent: paint strokes onto its surface (not the area around it)
 #define HBE_MAT_WIND 4096u     // vegetation vertex wind: the MeshPBR VS sways the vertex (stiffer at the base)
 #define HBE_MAT_ALPHATEST 8192u // alpha-cutout foliage: discard albedo texels below the cutoff (leaf shapes)
+#define HBE_MAT_LAYERED 16384u  // unified material layers (Shaders/MaterialLayered.hlsli); default off
 
 // ---------------------------------------------------------------------------
 // Bindless texture table.

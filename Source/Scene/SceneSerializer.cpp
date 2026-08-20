@@ -462,6 +462,7 @@ json BuildSceneJson(const Scene& scene,
     for (const entt::entity e : reg.view<const CameraComponent>()) add(e);
     for (const entt::entity e : reg.view<const CameraZone>()) add(e);
     for (const entt::entity e : reg.view<const MusicZone>()) add(e);
+    for (const entt::entity e : reg.view<const MaterialVolumeComponent>()) add(e);
     for (const entt::entity e : reg.view<const AcousticSpace>()) add(e);
     for (const entt::entity e : reg.view<const AcousticPortal>()) add(e);
     for (const entt::entity e : reg.view<const CameraSpline>()) add(e);
@@ -968,6 +969,23 @@ json EntityToJson(const entt::registry& reg, entt::entity e,
                                {"fadeSeconds", mz->fadeSeconds},
                                {"priority", mz->priority},
                                {"enabled", mz->enabled}};
+        }
+        if (const MaterialVolumeComponent* mv = reg.try_get<MaterialVolumeComponent>(e)) {
+            je["materialVolume"] = {{"halfExtents", ToJson(mv->halfExtents)},
+                                    {"falloffType", mv->falloffType},
+                                    {"falloffGamma", mv->falloffGamma},
+                                    {"falloffWidth", mv->falloffWidth},
+                                    {"strength", mv->strength},
+                                    {"material", mv->material},
+                                    {"color", ToJson(mv->color)},
+                                    {"metallic", mv->metallic},
+                                    {"roughness", mv->roughness},
+                                    {"projection", mv->projection},
+                                    {"tileMeters", ToJson(mv->tileMeters)},
+                                    {"blend", mv->blend},
+                                    {"opacity", mv->opacity},
+                                    {"enabled", mv->enabled},
+                                    {"bakeResolution", mv->bakeResolution}};
         }
         if (const AcousticSpace* as = reg.try_get<AcousticSpace>(e)) {
             je["acousticSpace"] = {{"halfExtents", ToJson(as->halfExtents)},
@@ -1816,6 +1834,25 @@ void ParseSceneJson(const json& root, SceneData& out) {
             mz.fadeSeconds = it->value("fadeSeconds", -1.0f);
             mz.priority = it->value("priority", 0);
             mz.enabled = it->value("enabled", true);
+        }
+        if (auto it = je.find("materialVolume"); it != je.end()) {
+            d.hasMaterialVolume = true;
+            MaterialVolumeComponent& mv = d.materialVolume;
+            mv.halfExtents = Vec3(it->value("halfExtents", json()), mv.halfExtents);
+            mv.falloffType = it->value("falloffType", mv.falloffType);
+            mv.falloffGamma = it->value("falloffGamma", mv.falloffGamma);
+            mv.falloffWidth = it->value("falloffWidth", mv.falloffWidth);
+            mv.strength = it->value("strength", mv.strength);
+            mv.material = it->value("material", "");
+            mv.color = Vec4(it->value("color", json()), mv.color);
+            mv.metallic = it->value("metallic", mv.metallic);
+            mv.roughness = it->value("roughness", mv.roughness);
+            mv.projection = it->value("projection", mv.projection);
+            mv.tileMeters = Vec3(it->value("tileMeters", json()), mv.tileMeters);
+            mv.blend = it->value("blend", mv.blend);
+            mv.opacity = it->value("opacity", mv.opacity);
+            mv.enabled = it->value("enabled", true);
+            mv.bakeResolution = it->value("bakeResolution", mv.bakeResolution);
         }
         if (auto it = je.find("acousticSpace"); it != je.end()) {
             d.hasAcousticSpace = true;
@@ -3315,6 +3352,7 @@ void Instantiate(Scene& scene, Renderer& renderer, const SceneData& data,
         if (d.hasCamera) reg.emplace<CameraComponent>(e, d.camera);
         if (d.hasCameraZone) reg.emplace<CameraZone>(e, d.cameraZone);
         if (d.hasMusicZone) reg.emplace<MusicZone>(e, d.musicZone);
+        if (d.hasMaterialVolume) reg.emplace<MaterialVolumeComponent>(e, d.materialVolume);
         if (d.hasAcousticSpace) reg.emplace<AcousticSpace>(e, d.acousticSpace);
         if (d.hasAcousticPortal) reg.emplace<AcousticPortal>(e, d.acousticPortal);
         if (d.hasCameraSpline) reg.emplace<CameraSpline>(e, d.cameraSpline);
@@ -5109,6 +5147,7 @@ HBE_PLAIN_DELTA(Cam, "camera", hasCamera, camera, CameraComponent)
 HBE_PLAIN_DELTA(CamZone, "cameraZone", hasCameraZone, cameraZone, CameraZone)
 HBE_PLAIN_DELTA(CamSpline, "cameraSpline", hasCameraSpline, cameraSpline, CameraSpline)
 HBE_PLAIN_DELTA(MusZone, "musicZone", hasMusicZone, musicZone, MusicZone)
+HBE_PLAIN_DELTA(MatVolume, "materialVolume", hasMaterialVolume, materialVolume, MaterialVolumeComponent)
 HBE_PLAIN_DELTA(AcSpace, "acousticSpace", hasAcousticSpace, acousticSpace, AcousticSpace)
 HBE_PLAIN_DELTA(AcPortal, "acousticPortal", hasAcousticPortal, acousticPortal, AcousticPortal)
 HBE_PLAIN_DELTA(PostVol, "postVolume", hasPostVolume, postVolume, PostVolume)
@@ -5148,6 +5187,7 @@ const DeltaApplier kAppliers[] = {
     {"cameraZone", &CamZoneApply, &CamZoneRemove},
     {"cameraSpline", &CamSplineApply, &CamSplineRemove},
     {"musicZone", &MusZoneApply, &MusZoneRemove},
+    {"materialVolume", &MatVolumeApply, &MatVolumeRemove},
     {"acousticSpace", &AcSpaceApply, &AcSpaceRemove},
     {"acousticPortal", &AcPortalApply, &AcPortalRemove},
     {"postVolume", &PostVolApply, &PostVolRemove},

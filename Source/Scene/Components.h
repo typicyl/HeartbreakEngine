@@ -894,6 +894,43 @@ struct MusicZone {
     bool active = false;          // runtime state (set by the engine's music-zone update)
 };
 
+// A MATERIAL VOLUME (the box-brush WORLD TOOL): a box placed in the scene that PROJECTS a material
+// onto the geometry it encloses, with a configurable soft falloff. Per the design's core rule the
+// box never edits geometry - it produces a spatial WEIGHT FIELD (mat::BoxBrush) that feeds a
+// material LAYER; the editor's "Bake Volumes" action composites every enabled volume into each
+// overlapping mesh's PAINT CANVAS as a non-destructive overlay (mat::BakeMeshVolumesOverlay), so the
+// projected material blends over the mesh's own material at its true world size and is removable.
+// The box's world placement + rotation IS this entity's Transform; `halfExtents` is its local
+// half-size. Enum-typed authoring lives as ints so this scene header stays free of the Material
+// module; the editor maps them onto the mat:: enums when it builds the box brush.
+struct MaterialVolumeComponent {
+    glm::vec3 halfExtents{2.0f}; // local box half-size (scaled + rotated by this entity's Transform)
+
+    // Weight field (mat::Falloff on the box SDF).
+    int falloffType = 2;         // mat::FalloffType (0 Constant,1 Linear,2 Smoothstep,3 Smoother,4 In,5 Out)
+    f32 falloffGamma = 1.0f;     // final shaping exponent (>0; 1 = none)
+    f32 falloffWidth = 0.25f;    // fraction of each half-extent the edge fades over
+    f32 strength = 1.0f;         // 0..1 multiplier on the produced weight
+
+    // Material this volume projects. `material` is a `.hbmat` ref (rel to Assets/); when empty the
+    // inline OpenPBR-legacy values below define the surface.
+    std::string material;
+    glm::vec4 color{0.8f, 0.8f, 0.8f, 1.0f}; // inline base colour (rgb) + opacity (a)
+    f32 metallic = 0.0f;
+    f32 roughness = 0.6f;
+
+    // Tiling / projection of the projected material (size-independent; mat::BoxProjection as int).
+    int projection = 0;          // 0 World, 1 Local, 2 Triplanar
+    glm::vec3 tileMeters{1.0f};  // metres per material tile, independent per axis
+
+    // Layer compositing.
+    int blend = 0;               // mat::BlendMode (0 Linear, 1 Height, 2 Height+Noise)
+    f32 opacity = 1.0f;          // layer strength on top of the mask
+
+    bool enabled = true;         // include in the bake + draw the wireframe
+    int bakeResolution = 1024;   // paint-canvas resolution the bake writes
+};
+
 // A ROOM / enclosed acoustic space: a box region whose dimensions + wall/floor/ceiling acoustic
 // materials define the reverberation + early reflections heard while the LISTENER is inside it.
 // The highest-priority enabled space containing the listener drives the spatial backend's room

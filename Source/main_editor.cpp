@@ -9,11 +9,14 @@
 #include "Assets/AssetFormats.h" // --test-assetformats (the registry's own invariants)
 #include "Assets/Compression.h"  // --test-compress (the portable zstd/zlib codec seam)
 #include "Assets/MeshCodec.h"    // --test-meshcodec (quantized + meshopt geometry codec)
+#include "Assets/MeshCsg.h"      // --test-csg (BSP CSG for the blockout box brush)
 #include "Assets/UAF.h"          // --test-audiocodec (v11 compressed-source audio)
 #include "Assets/CookStats.h"    // --cook-stats / --test-cookstats (why is this build big?)
 #include "Assets/AssetRefs.h"    // --test-packclosure (the pack dependency closure)
 #include "Assets/MaterialXInterop.h" // --test-openpbr (.hbmat/.mtlx round-trip + variant routing)
 #include "Material/MaterialAuthoringTest.h" // --test-material (graph/compile/layers/box/paint)
+#include "Material/MaterialCook.h"           // --matscene (bake the visual test scene to PNGs)
+#include "Material/MaterialGraphHlsl.h"      // --test-matshader (graph -> HLSL -> runtime compile)
 #include "Assets/SeamWeld.h"
 #include "Navigation/NavBaker.h" // --test-nav (Recast bake -> Detour stream/query/obstacles)
 #include "Scene/BodyShape.h"
@@ -58,6 +61,7 @@
 #include "Volume/GpuEulerianSmokeSimulation.h" // --test-gpusolver (GPU solver golden-diff)
 #include "Volume/VolumeSimRegistry.h"   // --volume-sim-preview (create a solver by model id)
 #include "Editor/Editor.h"
+#include "Editor/RuntimeShaderCompiler.h" // --test-shadercompile (editor-only runtime HLSL->bytecode)
 #include "Editor/Importer.h"
 #include "Editor/MovieRender.h"
 #include "Engine/Engine.h"
@@ -481,6 +485,127 @@ int main(int argc, char** argv) {
             const bool ok = hbe::mat::SelfTest();
             std::printf("material %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
+        }
+        // --test-shadercompile: the EDITOR-ONLY RUNTIME shader compiler gate. Compiles a known
+        // compute kernel through the toolchain DXC (DXIL and/or SPIR-V, whichever is present) and
+        // checks the bytecode magic. Headless; no GPU/window/project. See RuntimeShaderCompiler.h.
+        if (std::strcmp(argv[i], "--test-shadercompile") == 0) {
+            const bool ok = hbe::editor::RuntimeShaderCompiler::SelfTest();
+            std::printf("shadercompile %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-matshader: the GRAPH -> GPU path. Generates an HLSL compute shader from a material
+        // node graph (a spread of generators / transforms / filters / resampling / SDF) and compiles
+        // it through the editor runtime shader compiler for whichever backends are present. Proves the
+        // node-graph -> HLSL -> GPU-bytecode pipeline headlessly. Optional: --test-matshader dump.hlsl
+        // writes the generated HLSL to a file for inspection.
+        if (std::strcmp(argv[i], "--test-matshader") == 0) {
+            using namespace hbe;
+            mat::Graph g;
+            g.name = "MatShaderTest";
+            const u32 fbm = g.AddNode(mat::NodeType::FractalNoise);
+            g.FindNode(fbm)->constant = {6.0f, 5.0f, 0.55f, 1.0f};
+            const u32 ramp = g.AddNode(mat::NodeType::ColorRamp);
+            g.FindNode(ramp)->ramp = {{0.0f, {0.2f, 0.13f, 0.08f, 1}}, {1.0f, {0.6f, 0.5f, 0.4f, 1}}};
+            const u32 warp = g.AddNode(mat::NodeType::Warp);
+            g.FindNode(warp)->constant = {0.15f, 0, 0, 0};
+            const u32 cell = g.AddNode(mat::NodeType::Cellular);
+            g.FindNode(cell)->constant = {9.0f, 2.0f, 2.0f, 0.0f};
+            const u32 h2n = g.AddNode(mat::NodeType::HeightToNormal);
+            g.FindNode(h2n)->constant = {4.0f, 0.01f, 0, 0};
+            const u32 sdf = g.AddNode(mat::NodeType::SdfCircle);
+            const u32 out = g.AddNode(mat::NodeType::Output);
+            g.Connect(fbm, warp, 0);   // warp the noise by itself
+            g.Connect(fbm, warp, 1);
+            g.Connect(warp, ramp, 0);
+            g.Connect(ramp, out, static_cast<u8>(mat::Channel::BaseColor));
+            g.Connect(fbm, h2n, 0);
+            g.Connect(h2n, out, static_cast<u8>(mat::Channel::Normal));
+            g.Connect(cell, out, static_cast<u8>(mat::Channel::Roughness));
+            g.Connect(fbm, out, static_cast<u8>(mat::Channel::Height));
+            g.Connect(sdf, out, static_cast<u8>(mat::Channel::AO));
+            const std::string hlsl = mat::GenerateComputeHlsl(g);
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                std::ofstream f(argv[i + 1]);
+                f << hlsl;
+                std::printf("matshader: wrote generated HLSL to %s (%zu bytes)\n", argv[i + 1],
+                            hlsl.size());
+            }
+            int tested = 0, failed = 0;
+            for (auto api : {rhi::GraphicsAPI::D3D12, rhi::GraphicsAPI::Vulkan}) {
+                if (!editor::RuntimeShaderCompiler::Available(api)) continue;
+                ++tested;
+                const auto r = editor::RuntimeShaderCompiler::Compile(api, hlsl, "CSMain", "cs",
+                                                                      "MatShaderTest");
+                if (!r.ok) {
+                    std::printf("matshader: compile FAILED (%s):\n%s\n",
+                                api == rhi::GraphicsAPI::Vulkan ? "SPIR-V" : "DXIL", r.log.c_str());
+                    ++failed;
+                } else {
+                    std::printf("matshader: %s OK (%zu bytes)\n",
+                                api == rhi::GraphicsAPI::Vulkan ? "SPIR-V" : "DXIL", r.bytecode.size());
+                }
+            }
+            const bool ok = (tested == 0) || (failed == 0);
+            std::printf("matshader %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --matscene [outDir]: bake the unified material system's VISUAL TEST SCENE to PNGs (world
+        // tiling at two sizes, box-brush weight fields, overlapping volumes, procedural + painted
+        // masks, linear vs height+noise blends, and a composite floor using all three mask sources).
+        // Makes stretching / blending / painting correctness visible WITHOUT a live GPU. Headless.
+        if (std::strcmp(argv[i], "--matscene") == 0) {
+            std::filesystem::path outDir =
+                (i + 1 < argc && argv[i + 1][0] != '-') ? std::filesystem::path(argv[i + 1])
+                                                        : std::filesystem::path("matscene_out");
+            std::error_code ec;
+            std::filesystem::create_directories(outDir, ec);
+            const auto imgs = hbe::mat::BuildDemoScene(256);
+            int ok = 0;
+            for (const auto& im : imgs) {
+                const auto p = outDir / (im.name + ".png");
+                if (hbe::movie::WritePng(p, im.width, im.height, im.rgba)) {
+                    ++ok;
+                    std::printf("  wrote %s\n", p.string().c_str());
+                }
+            }
+            std::printf("matscene wrote %d/%zu images to %s\n", ok, imgs.size(),
+                        outDir.string().c_str());
+            return ok == static_cast<int>(imgs.size()) ? 0 : 1;
+        }
+        // --matexport <graph.hbmatgraph> [outDir] [res]: compile a material graph and bake its full
+        // PBR texture set (basecolor/normal/roughness/metallic/height/ao/emissive/opacity) to PNGs.
+        // The Material-Maker-style "export textures". Headless.
+        if (std::strcmp(argv[i], "--matexport") == 0 && i + 1 < argc) {
+            const std::filesystem::path graphPath = argv[i + 1];
+            const std::filesystem::path outDir =
+                (i + 2 < argc && argv[i + 2][0] != '-') ? std::filesystem::path(argv[i + 2])
+                                                        : std::filesystem::path("matexport_out");
+            const hbe::u32 res = (i + 3 < argc) ? static_cast<hbe::u32>(std::atoi(argv[i + 3])) : 512u;
+            auto g = hbe::mat::LoadGraph(graphPath);
+            if (!g) {
+                std::printf("matexport: cannot load '%s'\n", graphPath.string().c_str());
+                return 1;
+            }
+            const hbe::mat::CompiledGraph c = hbe::mat::Compile(*g);
+            if (!c.ok) {
+                std::printf("matexport: compile error: %s\n", c.error.c_str());
+                return 1;
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(outDir, ec);
+            const auto maps = hbe::mat::BakeGraphMaps(c, res);
+            int ok = 0;
+            for (const auto& m : maps) {
+                const auto p = outDir / (m.name + ".png");
+                if (hbe::movie::WritePng(p, m.width, m.height, m.rgba)) {
+                    ++ok;
+                    std::printf("  wrote %s\n", p.string().c_str());
+                }
+            }
+            std::printf("matexport wrote %d/%zu maps (%ux%u) to %s\n", ok, maps.size(), res, res,
+                        outDir.string().c_str());
+            return ok == static_cast<int>(maps.size()) ? 0 : 1;
         }
         // --test-packclosure: THE GATE for "Pack only referenced assets". Builds
         // a synthetic project exercising every format in the reference matrix,
@@ -1087,6 +1212,20 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-tagpolicy") == 0) {
             const bool ok = hbe::stream::PolicySelfTest();
             std::printf("tagpolicy %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-matvolume: MaterialVolumeComponent (box-brush world tool) save round-trip.
+        // Headless: no GPU, no window, no project, no ImGui context.
+        if (std::strcmp(argv[i], "--test-matvolume") == 0) {
+            const bool ok = hbe::Editor::MaterialVolumeSaveSelfTest();
+            std::printf("matvolume %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-csg: BSP constructive-solid-geometry correctness for the blockout box brush.
+        // Headless: no GPU, no window, no project.
+        if (std::strcmp(argv[i], "--test-csg") == 0) {
+            const bool ok = hbe::csg::SelfTest();
+            std::printf("csg %s\n", ok ? "PASS" : "FAIL");
             return ok ? 0 : 1;
         }
         if (std::strcmp(argv[i], "--test-paintcanvas") == 0) {
@@ -2691,6 +2830,199 @@ int main(int argc, char** argv) {
         gcEngine.Run(config);
         std::printf("gpucompute %s (%s)\n", t.pass ? "PASS" : "FAIL", t.why);
         return t.pass ? 0 : 1;
+    }
+
+    // --test-runtimegpu: the END-TO-END proof of the EDITOR RUNTIME SHADER COMPILER. Compiles a
+    // compute kernel from an HLSL STRING at runtime (RuntimeShaderCompiler), then - exactly like
+    // --test-gpucompute - creates a pipeline from that runtime-compiled bytecode, dispatches it, and
+    // reads the result back off the GPU, checking every element. Proves runtime-compiled bytecode
+    // RUNS correctly on the active backend, not merely that it compiles. Needs a real device.
+    bool testRuntimeGpu = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-runtimegpu") == 0) testRuntimeGpu = true;
+    if (testRuntimeGpu) {
+        hbe::rhi::GraphicsAPI api = hbe::rhi::GraphicsAPI::D3D12;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--vulkan") == 0) api = hbe::rhi::GraphicsAPI::Vulkan;
+            else if (std::strcmp(argv[i], "--opengl") == 0) api = hbe::rhi::GraphicsAPI::OpenGL;
+        }
+        // Same math as GpuComputeTest.hlsl, but compiled from a STRING at runtime. Explicit
+        // [[vk::binding]] matches the ComputeDispatch binding convention (b0 / u0 / t0).
+        const std::string src =
+            "[[vk::binding(0,0)]] cbuffer TestCB : register(b0){ uint gCount; uint gP0; uint gP1; uint gP2; };\n"
+            "[[vk::binding(1,0)]] RWStructuredBuffer<uint> gOut : register(u0);\n"
+            "[[vk::binding(2,0)]] StructuredBuffer<uint>   gIn  : register(t0);\n"
+            "[numthreads(64,1,1)]\n"
+            "void CSMain(uint3 id : SV_DispatchThreadID){ uint i=id.x; if(i>=gCount) return; gOut[i]=gIn[i]*2u+1u+(gCount<<16); }\n";
+        const auto cr = hbe::editor::RuntimeShaderCompiler::Compile(api, src, "CSMain", "cs", "RuntimeGpuTest");
+        if (!cr.ok) {
+            std::printf("runtimegpu: RUNTIME COMPILE FAILED:\n%s\nruntimegpu FAIL\n", cr.log.c_str());
+            return 1;
+        }
+        std::printf("runtimegpu: compiled %zu bytes at runtime; dispatching on GPU...\n", cr.bytecode.size());
+        static constexpr hbe::u32 kN = 1024;
+        struct RtGpu {
+            hbe::rhi::GpuBufferHandle in, out;
+            hbe::rhi::ComputePipelineHandle pipe;
+            int frame = 0;
+            bool queued = false, done = false, pass = false;
+            const char* why = "no result";
+        };
+        static RtGpu t;
+        hbe::Engine rgEngine;
+        rgEngine.SetOnInit([](hbe::Engine& e) {
+            e.GetPhysics().SetRunning(false);
+            e.SetGameCameraEnabled(false);
+        });
+        rgEngine.SetOnFrame([](hbe::Engine& e) {
+            auto& r = e.GetRenderer();
+            if (t.done) return;
+            if (++t.frame == 2) {
+                if (!r.SupportsGpuCompute()) { t.why = "backend has no compute"; t.done = true; e.Quit(); return; }
+                hbe::rhi::GpuBufferDesc inD{};
+                inD.elementCount = kN; inD.elementStride = sizeof(hbe::u32);
+                inD.usage = hbe::rhi::GpuBufferUsage::ShaderRead | hbe::rhi::GpuBufferUsage::CpuWrite;
+                inD.debugName = "RtGpuIn";
+                t.in = r.CreateGpuBuffer(inD);
+                hbe::rhi::GpuBufferDesc outD{};
+                outD.elementCount = kN; outD.elementStride = sizeof(hbe::u32);
+                outD.usage = hbe::rhi::GpuBufferUsage::ShaderWrite | hbe::rhi::GpuBufferUsage::ShaderRead;
+                outD.debugName = "RtGpuOut";
+                t.out = r.CreateGpuBuffer(outD);
+                hbe::rhi::ComputePipelineDesc pd{};
+                pd.shaderName = "RuntimeGpuTest"; // <- the RUNTIME-compiled bytecode file
+                pd.constantBytes = 16; pd.uavCount = 1; pd.srvCount = 1;
+                t.pipe = r.CreateComputePipeline(pd);
+                if (!t.in.IsValid() || !t.out.IsValid() || !t.pipe.IsValid()) {
+                    t.why = "resource/pipeline creation failed (runtime bytecode did not load)";
+                    t.done = true; e.Quit(); return;
+                }
+                if (auto* s = static_cast<hbe::u32*>(r.MapGpuBuffer(t.in)))
+                    for (hbe::u32 i = 0; i < kN; ++i) s[i] = i * 7u + 3u;
+                struct CB { hbe::u32 c, a, b, d; } cb{kN, 0, 0, 0};
+                hbe::rhi::ComputeDispatch d{};
+                d.pipeline = t.pipe; d.constants = &cb; d.constantBytes = sizeof(cb);
+                d.uavs[0] = t.out; d.uavCount = 1; d.srvs[0] = t.in; d.srvCount = 1;
+                d.groupsX = (kN + 63) / 64;
+                r.QueueCompute(d);
+                t.queued = true;
+            } else if (t.queued && t.frame >= 5) {
+                std::vector<hbe::u32> got(kN, 0);
+                t.pass = r.ReadGpuBuffer(t.out, got.data(), static_cast<hbe::u32>(got.size() * sizeof(hbe::u32)));
+                if (!t.pass) t.why = "ReadGpuBuffer failed";
+                else {
+                    t.why = "ok";
+                    for (hbe::u32 i = 0; i < kN; ++i) {
+                        const hbe::u32 want = (i * 7u + 3u) * 2u + 1u + (kN << 16);
+                        if (got[i] != want) { t.pass = false; t.why = "element mismatch"; break; }
+                    }
+                }
+                // Prove DestroyComputePipeline RECYCLES the slot (no leak): destroy + recreate many
+                // times; the returned handle id must NOT grow (a leak would push it up every rep).
+                if (t.pass) {
+                    const hbe::u32 firstId = t.pipe.id;
+                    for (int rep = 0; rep < 50 && t.pass; ++rep) {
+                        r.DestroyComputePipeline(t.pipe);
+                        hbe::rhi::ComputePipelineDesc pd2{};
+                        pd2.shaderName = "RuntimeGpuTest"; pd2.constantBytes = 16; pd2.uavCount = 1; pd2.srvCount = 1;
+                        t.pipe = r.CreateComputePipeline(pd2);
+                        if (!t.pipe.IsValid() || t.pipe.id > firstId + 1) {
+                            t.pass = false; t.why = "DestroyComputePipeline did not recycle the slot (leak)";
+                        }
+                    }
+                    if (t.pass) std::printf("  pipeline create/destroy x50 stayed at slot id %u (no leak)\n", t.pipe.id);
+                    r.DestroyComputePipeline(t.pipe);
+                }
+                r.DestroyGpuBuffer(t.in); r.DestroyGpuBuffer(t.out);
+                t.done = true; e.Quit();
+            } else if (t.frame > 120) { t.why = "timed out"; t.done = true; e.Quit(); }
+        });
+        rgEngine.Run(config);
+        std::printf("runtimegpu %s (%s)\n", t.pass ? "PASS" : "FAIL", t.why);
+        return t.pass ? 0 : 1;
+    }
+
+    // --test-matgpu: verifies the interactive GPU preview's COMPUTE PATH on hardware. Generates a
+    // material node graph's compute shader (GenerateComputeHlsl), compiles it at runtime, dispatches
+    // the 2D kernel into a res*res*8 float4 buffer, reads it back, and checks the base-colour channel
+    // is in range and NOT flat. This is exactly what the editor GPU preview does minus the (trivial)
+    // texture upload + ImGui::Image, so it verifies the preview's compute+readback end to end.
+    bool testMatGpu = false;
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--test-matgpu") == 0) testMatGpu = true;
+    if (testMatGpu) {
+        using namespace hbe;
+        rhi::GraphicsAPI api = rhi::GraphicsAPI::D3D12;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--vulkan") == 0) api = rhi::GraphicsAPI::Vulkan;
+            else if (std::strcmp(argv[i], "--opengl") == 0) api = rhi::GraphicsAPI::OpenGL;
+        mat::Graph g;
+        const u32 fbm = g.AddNode(mat::NodeType::FractalNoise);
+        g.FindNode(fbm)->constant = {6.0f, 5.0f, 0.55f, 1.0f};
+        const u32 ramp = g.AddNode(mat::NodeType::ColorRamp);
+        g.FindNode(ramp)->ramp = {{0.0f, {0.2f, 0.13f, 0.08f, 1}}, {1.0f, {0.6f, 0.5f, 0.4f, 1}}};
+        const u32 cell = g.AddNode(mat::NodeType::Cellular);
+        g.FindNode(cell)->constant = {9.0f, 2.0f, 2.0f, 0.0f};
+        const u32 out = g.AddNode(mat::NodeType::Output);
+        g.Connect(fbm, ramp, 0);
+        g.Connect(ramp, out, static_cast<u8>(mat::Channel::BaseColor));
+        g.Connect(cell, out, static_cast<u8>(mat::Channel::Roughness));
+        const std::string hlsl = mat::GenerateComputeHlsl(g);
+        const auto cr = editor::RuntimeShaderCompiler::Compile(api, hlsl, "CSMain", "cs", "MatGpuTest");
+        if (!cr.ok) { std::printf("matgpu: compile FAILED:\n%s\nmatgpu FAIL\n", cr.log.c_str()); return 1; }
+        std::printf("matgpu: material shader compiled (%zu bytes); dispatching on GPU...\n", cr.bytecode.size());
+        static constexpr hbe::u32 kRes = 64;
+        struct MatGpu {
+            hbe::rhi::GpuBufferHandle buf;
+            hbe::rhi::ComputePipelineHandle pipe;
+            int frame = 0; bool queued = false, done = false, pass = false;
+            const char* why = "no result";
+        };
+        static MatGpu m;
+        hbe::Engine e2;
+        e2.SetOnInit([](hbe::Engine& e) { e.GetPhysics().SetRunning(false); e.SetGameCameraEnabled(false); });
+        e2.SetOnFrame([](hbe::Engine& e) {
+            auto& r = e.GetRenderer();
+            if (m.done) return;
+            if (++m.frame == 2) {
+                if (!r.SupportsGpuCompute()) { m.why = "backend has no compute"; m.done = true; e.Quit(); return; }
+                hbe::rhi::GpuBufferDesc bd{};
+                bd.elementCount = kRes * kRes * 8; bd.elementStride = sizeof(glm::vec4);
+                bd.usage = hbe::rhi::GpuBufferUsage::ShaderWrite | hbe::rhi::GpuBufferUsage::ShaderRead;
+                bd.debugName = "MatGpuBuf";
+                m.buf = r.CreateGpuBuffer(bd);
+                hbe::rhi::ComputePipelineDesc pd{};
+                pd.shaderName = "MatGpuTest"; pd.constantBytes = 16; pd.uavCount = 1; pd.srvCount = 0;
+                m.pipe = r.CreateComputePipeline(pd);
+                if (!m.buf.IsValid() || !m.pipe.IsValid()) { m.why = "resource/pipeline creation failed"; m.done = true; e.Quit(); return; }
+                struct CB { hbe::u32 res, a, b, c; } cb{kRes, 0, 0, 0};
+                hbe::rhi::ComputeDispatch d{};
+                d.pipeline = m.pipe; d.constants = &cb; d.constantBytes = sizeof(cb);
+                d.uavs[0] = m.buf; d.uavCount = 1;
+                d.groupsX = (kRes + 7) / 8; d.groupsY = (kRes + 7) / 8;
+                r.QueueCompute(d);
+                m.queued = true;
+            } else if (m.queued && m.frame >= 5) {
+                std::vector<glm::vec4> data(static_cast<size_t>(kRes) * kRes * 8);
+                m.pass = r.ReadGpuBuffer(m.buf, data.data(), static_cast<hbe::u32>(data.size() * sizeof(glm::vec4)));
+                if (!m.pass) m.why = "ReadGpuBuffer failed";
+                else {
+                    float mn = 1e9f, mx = -1e9f; bool inRange = true;
+                    for (hbe::u32 p = 0; p < kRes * kRes; ++p) {
+                        const glm::vec4 base = data[static_cast<size_t>(p) * 8 + 0];
+                        for (int ch = 0; ch < 3; ++ch) { if (base[ch] < -0.01f || base[ch] > 1.01f) inRange = false; mn = base[ch] < mn ? base[ch] : mn; mx = base[ch] > mx ? base[ch] : mx; }
+                    }
+                    if (!inRange) { m.pass = false; m.why = "base colour out of [0,1]"; }
+                    else if (mx - mn < 0.02f) { m.pass = false; m.why = "base colour is flat (shader produced nothing)"; }
+                    else { m.why = "ok"; std::printf("  base colour range [%.3f, %.3f]\n", mn, mx); }
+                }
+                r.DestroyGpuBuffer(m.buf);
+                m.done = true; e.Quit();
+            } else if (m.frame > 120) { m.why = "timed out"; m.done = true; e.Quit(); }
+        });
+        e2.Run(config);
+        std::printf("matgpu %s (%s)\n", m.pass ? "PASS" : "FAIL", m.why);
+        return m.pass ? 0 : 1;
     }
 
     // --test-bc: prove BC (block-compressed) texture STAGING on the ACTIVE backend (--d3d12 /

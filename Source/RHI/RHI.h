@@ -597,6 +597,14 @@ enum MaterialFlags : u32 {
     // leaf-cluster texture on a quad renders as leaf shapes (not a solid card). PS-only discard in
     // the opaque pass; pairs with the two-sided foliage PSO where available.
     MaterialFlag_AlphaTest = 1u << 13,
+    // Unified material LAYERS (Source/Material): blend up to 4 material layers by per-layer masks
+    // with arbitrary projection (UV/World/Triplanar), height blending, and RNM normal blending -
+    // the generalisation of TerrainSplat. Reuses the same overloaded splat texture slots; the GPU
+    // resolver lives in Shaders/MaterialLayered.hlsli. Consumption in MeshPBR + the scene component
+    // wiring is the LIVE-mode integration (docs/Design-MaterialAuthoring.md, Part D); BAKED mode
+    // needs no flag (it composites offline into the normal single-material path). Default off ->
+    // byte-identical to today for every existing draw.
+    MaterialFlag_Layered = 1u << 14,
 };
 
 // Curated OpenPBR shader-specialization variants (P3). The opaque forward pass binds one
@@ -704,6 +712,13 @@ struct DrawItem {
     // 0xFF (all bits) = "affects every cascade", so an item the renderer never
     // touches behaves exactly as before.
     u8 cascadeMask = 0xFF;
+
+    // LOD cross-fade screen-door factor (main pass only; the shadow pass is VS-only so it never
+    // dithers). 1.0 = fully opaque (every non-fading draw). A transitioning mesh emits TWO draws:
+    // the finer LOD with lodDither = f in [0,1) (keeps the stippled pixels where noise < f, fading
+    // OUT as f->0) and the coarser LOD with lodDither = -f (keeps noise >= f, fading IN). Together
+    // they cover every pixel with no overlap, so the LOD swap dissolves instead of popping.
+    f32 lodDither = 1.0f;
 
     // Facial blendshapes: `morphTexture` is a bindless RGBA16F delta atlas
     // (width = vertex count, one ROW per morph target = xyz position delta). The VS
@@ -1083,6 +1098,11 @@ public:
     // Builds a compute pipeline from a precompiled kernel. Invalid handle when
     // the shader is missing or the backend has no compute.
     virtual ComputePipelineHandle CreateComputePipeline(const ComputePipelineDesc&) { return {}; }
+
+    // Destroys a compute pipeline and recycles its slot (waits for the GPU to idle first, since it
+    // may still be referenced by in-flight command lists). Used by tools that RE-compile a kernel at
+    // runtime (the editor Material-graph GPU preview) so re-creation does not accumulate pipelines.
+    virtual void DestroyComputePipeline(ComputePipelineHandle) {}
 
     // Queues a dispatch to run at the START of the next frame, BEFORE any render
     // pass opens. Call it before Renderer::RenderScene - Vulkan cannot record compute

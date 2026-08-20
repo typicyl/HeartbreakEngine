@@ -72,6 +72,21 @@ public:
     void SetMeshLodEnabled(bool on) { meshLodEnabled_ = on; }
     bool MeshLodEnabled() const { return meshLodEnabled_; }
 
+    // --- Distance-LOD tuning (live; the editor's LOD panel drives these) --------------------
+    // Switch metric is FOV-normalized screen coverage: a mesh's bounding-sphere radius / camera
+    // distance / tan(fovY/2) = the fraction of the viewport half-height it spans. LOD1 kicks in
+    // below `screen0`, each further level at `falloff`x the previous threshold. `fadeBand` is the
+    // half-width (fraction of a threshold) of the cross-fade window straddling each switch, where
+    // the two levels dissolve into each other with screen-door dither instead of popping.
+    // Thresholds are computed live from these, so retuning updates every mesh instantly.
+    struct LodTuning { f32 screen0 = 0.242f; f32 falloff = 0.5f; f32 fadeBand = 0.15f; };
+    void SetLodTuning(const LodTuning& t) { lodTuning_ = t; }
+    LodTuning GetLodTuning() const { return lodTuning_; }
+    // Force every LOD-bearing mesh to a fixed level for inspection (-1 = automatic distance
+    // selection; 0 = LOD0/full detail; k = LODk). No cross-fade while forced. Editor preview use.
+    void SetForcedLod(int level) { forcedLod_ = level; }
+    int ForcedLod() const { return forcedLod_; }
+
     // True if the active backend can render geometry (vs. clear-only).
     bool SupportsScene() const;
 
@@ -195,6 +210,9 @@ public:
     rhi::ComputePipelineHandle CreateComputePipeline(const rhi::ComputePipelineDesc& desc) {
         return device_ ? device_->CreateComputePipeline(desc) : rhi::ComputePipelineHandle{};
     }
+    void DestroyComputePipeline(rhi::ComputePipelineHandle h) {
+        if (device_) device_->DestroyComputePipeline(h);
+    }
     void QueueCompute(const rhi::ComputeDispatch& d) {
         if (device_) device_->QueueCompute(d);
     }
@@ -306,15 +324,14 @@ private:
         glm::vec3 extent{0.0f}; // half-size
     };
     std::unordered_map<u32, MeshBounds> meshBounds_;
-    // Distance-LOD table: base (LOD0) handle id -> its reduced levels, each with the projected
-    // screen-size (bounding-sphere radius / camera distance) BELOW which that level is selected.
-    // Thresholds strictly decrease down the vector, so selection is a short walk. Empty for
-    // meshes without LODs (the common case), so LOD selection is a cheap no-op for them.
-    struct LodEntry {
-        rhi::MeshHandle handle;
-        f32 switchBelow = 0.0f; // use this level when screenSize < switchBelow (and >= the next)
-    };
-    std::unordered_map<u32, std::vector<LodEntry>> meshLods_;
+    // Distance-LOD table: base (LOD0) handle id -> its reduced level handles (LOD1..N, decreasing
+    // detail). Switch thresholds are NOT stored here - they are computed live from lodTuning_ at
+    // selection time (threshold[k] = screen0 * falloff^k), so retuning updates every mesh instantly.
+    // Empty for meshes without LODs (the common case) -> LOD selection is a cheap no-op for them.
+    std::unordered_map<u32, std::vector<rhi::MeshHandle>> meshLods_;
+    std::vector<rhi::DrawItem> lodFades_; // per-frame scratch: the coarser half of each cross-fade
+    LodTuning lodTuning_;
+    int forcedLod_ = -1; // -1 = auto; >=0 = force this level everywhere (editor inspection)
     bool meshLodEnabled_ = true;
     FrameStats stats_;
     bool cullingEnabled_ = true;

@@ -33,6 +33,19 @@ void FlushLog();
 void SetTraceEnabled(bool enabled);
 bool TraceEnabled();
 
+// RAII scoped log MUTE: every log line emitted while an instance is alive is dropped (all levels).
+// Purpose: unit tests that deliberately drive error-logging code paths - malformed-input rejection,
+// forward-compat "unknown node dropped" warnings - so a PASSING test run does not print scary
+// [warn]/[error] lines that read like failures. Nestable. Keep it to short synchronous sections
+// (it is process-global, not thread-local); the production loaders still log normally outside it.
+class LogMuteScope {
+public:
+    LogMuteScope();
+    ~LogMuteScope();
+    LogMuteScope(const LogMuteScope&) = delete;
+    LogMuteScope& operator=(const LogMuteScope&) = delete;
+};
+
 namespace detail {
 // Writes an already-formatted line to the console (and the debugger on Windows).
 void LogWrite(LogLevel level, std::string_view message);

@@ -10,13 +10,27 @@ namespace hbe::mat {
 
 using json = nlohmann::json;
 
+namespace {
+// Rotation may be authored/deserialized non-unit; normalize before use so ToLocal (which inverts
+// the quaternion) and Bounds (which rotates corners) describe the SAME box. Guards a zero quat.
+glm::quat SafeRot(const glm::quat& r) {
+    const f32 n2 = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
+    return n2 > 1e-12f ? r * (1.0f / std::sqrt(n2)) : glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+}
+} // namespace
+
 glm::vec3 BoxBrush::ToLocal(const glm::vec3& worldPos) const {
     // Undo T, then R, then S: local = (R^-1 (world - T)) / scale.
     const glm::vec3 rel = worldPos - position;
-    const glm::vec3 unrot = glm::inverse(rotation) * rel;
-    return glm::vec3(scale.x != 0.0f ? unrot.x / scale.x : unrot.x,
-                     scale.y != 0.0f ? unrot.y / scale.y : unrot.y,
-                     scale.z != 0.0f ? unrot.z / scale.z : unrot.z);
+    const glm::vec3 unrot = glm::inverse(SafeRot(rotation)) * rel;
+    auto axis = [](f32 u, f32 s) -> f32 {
+        if (s != 0.0f) return u / s;
+        // A zero-scale (flat/degenerate) axis has ZERO extent: on the plane (u==0) the point is
+        // inside, off it far outside - so EvaluateBrush agrees with the zero-extent Bounds() rather
+        // than treating the axis as a phantom full-size slab.
+        return (u == 0.0f) ? 0.0f : (u > 0.0f ? 1e30f : -1e30f);
+    };
+    return glm::vec3(axis(unrot.x, scale.x), axis(unrot.y, scale.y), axis(unrot.z, scale.z));
 }
 
 f32 BoxBrush::EvaluateBrush(const glm::vec3& worldPos) const {
@@ -65,12 +79,13 @@ glm::vec2 BoxBrush::ProjectUV(const glm::vec3& worldPos, const glm::vec3& normal
 
 Aabb BoxBrush::Bounds() const {
     const glm::vec3 half = 0.5f * size;
+    const glm::quat q = SafeRot(rotation); // same normalized rotation ToLocal uses
     Aabb box;
     bool first = true;
     for (int i = 0; i < 8; ++i) {
         const glm::vec3 corner((i & 1) ? half.x : -half.x, (i & 2) ? half.y : -half.y,
                                (i & 4) ? half.z : -half.z);
-        const glm::vec3 world = position + rotation * (corner * scale);
+        const glm::vec3 world = position + q * (corner * scale);
         if (first) {
             box.min = box.max = world;
             first = false;

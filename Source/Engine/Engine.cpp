@@ -1207,6 +1207,12 @@ int Engine::Run(const EngineConfig& configIn) {
     // Record BC (block-compressed) texture support once, so worker-thread streaming can decide
     // whether to load a `.bc.uaf` variant (P6). Constant after init; atomic for the worker readers.
     assets::SetBlockCompressionAvailable(renderer.SupportsBlockCompression());
+    // Apply the project's distance-LOD switch tuning to the renderer (the editor's LOD panel
+    // retunes it live afterwards). Runtime + editor both hit this on boot.
+    if (Project::HasActive()) {
+        const auto& ps = Project::Active().Settings();
+        renderer.SetLodTuning({ps.lodScreen0, ps.lodFalloff, ps.lodFadeBand});
+    }
 
     bool sceneBuilt = false;
 

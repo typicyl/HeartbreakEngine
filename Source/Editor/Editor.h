@@ -8,6 +8,7 @@
 #include "Cinematics/SequenceAsset.h" // cine::LoadSequence / SaveSequence
 #include "Assets/DialogueAsset.h"
 #include "Dialogue/DialogueGraph.h" // branching-dialogue graph editor
+#include "Material/MaterialGraph.h" // Material Maker node-graph editor (.hbmatgraph)
 #include "Assets/CharacterAsset.h"
 #include "Assets/MaterialAsset.h"
 #include "Assets/SeamWeld.h"
@@ -216,6 +217,12 @@ public:
     //
     // Headless: no GPU, no window, no ImGui context.
     static bool SceneSaveSelfTest(const std::filesystem::path& sceneFile);
+
+    // `--test-matvolume`: MaterialVolumeComponent (box-brush world tool) SAVE ROUND-TRIP.
+    // Proves every authored field survives SaveSceneToString -> ParseSceneString (the same
+    // JSON path Ctrl+S and the collab delta use), and that an entity without the component
+    // does not gain one. Headless: no GPU, no window, no project, no ImGui context.
+    static bool MaterialVolumeSaveSelfTest();
 
     // `--test-editorzones`: LIVE EDITOR ZONES, end to end through the real Editor.
     //
@@ -1150,6 +1157,32 @@ private:
     bool dlgDragFromOutput_ = false;
     bool dlgDragging_ = false;
 
+    // --- Material Maker node-graph editor (its own window; MaterialGraphEditor.cpp) ---
+    // Authors a mat::Graph (.hbmatgraph) that compiles to the engine's one SurfaceParams runtime
+    // material (Source/Material). Same Blueprints-style canvas as the schematic/dialogue editors,
+    // adapted for DATA flow (N inputs on the left, one output on the right; the Output node has the
+    // 8 surface-channel input pins). A live preview compiles + bakes the graph to a swatch.
+    void DrawMaterialGraph(Engine& engine);       // toolbar + preview + canvas + node inspector
+    void DrawMaterialGraphCanvas(Engine& engine, float width); // node canvas
+    void OpenMaterialGraph(const std::filesystem::path& path);
+    bool SaveMaterialGraph();                       // writes mgGraph_ back to mgPath_
+    std::filesystem::path CreateMaterialGraphAsset(const std::filesystem::path& dir = {},
+                                                   const std::string& name = {});
+    std::filesystem::path mgPath_;                  // open .hbmatgraph (empty = none)
+    mat::Graph mgGraph_;                            // working copy
+    bool mgDirty_ = false;
+    bool mgFocus_ = false;                          // focus the panel when a graph opens
+    glm::vec2 mgPan_{0.0f, 0.0f};
+    glm::vec2 mgAddPos_{0.0f, 0.0f};
+    u32 mgSelected_ = 0;
+    u32 mgDragNode_ = 0;
+    u32 mgDragPin_ = 0;
+    bool mgDragFromOutput_ = false;
+    bool mgDragging_ = false;
+    u64 mgPreviewId_ = 0;                            // ImGui id of the baked swatch (0 = none)
+    u64 mgPreviewHash_ = 0;                          // compiled-graph hash the swatch was baked from
+    // mgHistory_ is declared with the other AssetHistory<T> members, BELOW the template definition.
+
     // -- Project settings (environment / skybox / lighting) -----------------------
     // Edits Project::Settings().environment; "Rebuild Sky" regenerates the
     // procedural sky + IBL so changes are visible immediately.
@@ -1243,6 +1276,7 @@ private:
     // desynchronise the way an incremental log can.
     AssetHistory<CutsceneAsset> csHistory_;
     AssetHistory<cine::Sequence> seqHistory_; // Sequencer per-document undo (whole-asset copy)
+    AssetHistory<mat::Graph> mgHistory_;      // Material Maker per-document undo (whole-graph copy)
     // Set while a drag is in flight so the snapshot is taken ONCE, at the grab, rather
     // than every frame the mouse moves - otherwise one drag fills the whole 64-entry
     // history with intermediate positions and Ctrl+Z walks back a pixel at a time.
@@ -1373,6 +1407,10 @@ private:
     // brush raycast.
     const MeshData* GetCpuMesh(Scene& scene, entt::entity e);
     std::unordered_map<std::string, MeshData> cpuMeshCache_;
+    // Box-brush WORLD TOOL: composite every enabled MaterialVolumeComponent into each overlapping
+    // mesh's paint canvas as a non-destructive overlay (mat::BakeMeshVolumesOverlay), then upload.
+    // Returns the number of meshes baked. Defined in Editor.cpp near GetCpuMesh.
+    int BakeMaterialVolumes(Scene& scene, Renderer& renderer);
     // TERRAIN is the one paintable surface GetCpuMesh can never answer for: chunk
     // meshes are generated procedurally into a GPU buffer and the CPU copy is
     // dropped, so a chunk has no MeshRef and no cacheable source. That is why
@@ -1647,6 +1685,7 @@ private:
         Panel_VolumeBaker,
         Panel_Vegetation,
         Panel_Sequencer,
+        Panel_MaterialGraph,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

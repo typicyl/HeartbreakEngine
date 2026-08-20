@@ -810,6 +810,7 @@ std::vector<BakeRow> Rows(const scene::SceneData& data) {
         if (d.hasSpawner) AddHalf(b, d.spawner.halfExtents);
         if (d.hasCameraZone) AddHalf(b, d.cameraZone.halfExtents);
         if (d.hasMusicZone) AddHalf(b, d.musicZone.halfExtents);
+        if (d.hasMaterialVolume) AddHalf(b, d.materialVolume.halfExtents);
         if (d.hasPostVolume) AddHalf(b, d.postVolume.halfExtents);
         if (d.hasProbe) AddHalf(b, d.probe.halfExtents);
         if (d.hasCensor) AddSphere(b, d.censor.offset, d.censor.radius);
@@ -890,6 +891,8 @@ std::vector<BakeRow> Rows(const Scene& scene, const std::function<bool(entt::ent
         if (const Spawner* c = reg.try_get<Spawner>(e)) AddHalf(b, c->halfExtents);
         if (const CameraZone* c = reg.try_get<CameraZone>(e)) AddHalf(b, c->halfExtents);
         if (const MusicZone* c = reg.try_get<MusicZone>(e)) AddHalf(b, c->halfExtents);
+        if (const MaterialVolumeComponent* c = reg.try_get<MaterialVolumeComponent>(e))
+            AddHalf(b, c->halfExtents);
         if (const PostVolume* c = reg.try_get<PostVolume>(e)) AddHalf(b, c->halfExtents);
         if (const ReflectionProbe* c = reg.try_get<ReflectionProbe>(e)) AddHalf(b, c->halfExtents);
         if (const CensorComponent* c = reg.try_get<CensorComponent>(e))

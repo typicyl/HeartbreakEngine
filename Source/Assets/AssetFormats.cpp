@@ -118,6 +118,13 @@ const std::vector<EngineAsset> kEngineAssets = {
     {".hbvolsim",   "Volume Sim",       false, RefScan::Leaf,     nullptr,
      "editor-only volume authoring config (VolumeSimConfig); the offline baker turns it into a "
      ".hbvol which the runtime consumes. Pure numeric JSON, references no other asset, never packed"},
+    {".hbmatgraph", "Material Graph",   false, RefScan::JsonScan, nullptr,
+     "editor-only Material Maker node graph (Source/Material). The cooker resolves it to a .hbmat "
+     "(constant materials) and/or baked mask/channel .uaf textures the runtime consumes; JsonScan "
+     "so a Texture node's .uaf path still seeds the closure. Never packed itself"},
+    {".hbmatlayer", "Material Layers",  true,  RefScan::JsonScan, nullptr,
+     "LIVE-mode material LAYER STACK (Source/Material/MaterialLayer); names child .hbmat layers + "
+     "paint/box masks as JSON strings, so JsonScan packs them. The runtime resolver blends them"},
     // NOT packed by extension - each for a specific reason. Do not "fix" these to
     // true: .hbproj IS read at runtime through the VFS, but it ships via the
     // separate uap::ExtraFile path (BuildShipping packs it under the virtual name
