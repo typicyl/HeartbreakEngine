@@ -25,6 +25,36 @@ glm::vec4 RV4(const json& j, glm::vec4 def) {
     return {j[0].get<f32>(), j[1].get<f32>(), j[2].get<f32>(), j[3].get<f32>()};
 }
 
+// Value-over-life curves: a gradient stop is [t, r, g, b, a]; a curve key is [t, v]. Compact and
+// order-preserving; an absent/malformed array reads back as an empty curve (= the feature off).
+json GradientToJson(const VfxGradient& g) {
+    json a = json::array();
+    for (const VfxGradient::Stop& s : g.stops)
+        a.push_back(json::array({s.t, s.color.r, s.color.g, s.color.b, s.color.a}));
+    return a;
+}
+VfxGradient GradientFromJson(const json& j) {
+    VfxGradient g;
+    if (!j.is_array()) return g;
+    for (const auto& s : j)
+        if (s.is_array() && s.size() >= 5)
+            g.stops.push_back({s[0].get<f32>(),
+                               {s[1].get<f32>(), s[2].get<f32>(), s[3].get<f32>(), s[4].get<f32>()}});
+    return g;
+}
+json CurveToJson(const VfxCurve& c) {
+    json a = json::array();
+    for (const VfxCurve::Key& k : c.keys) a.push_back(json::array({k.t, k.v}));
+    return a;
+}
+VfxCurve CurveFromJson(const json& j) {
+    VfxCurve c;
+    if (!j.is_array()) return c;
+    for (const auto& k : j)
+        if (k.is_array() && k.size() >= 2) c.keys.push_back({k[0].get<f32>(), k[1].get<f32>()});
+    return c;
+}
+
 } // namespace
 
 json EmitterToJson(const ParticleEmitter& e) {
@@ -52,6 +82,7 @@ json EmitterToJson(const ParticleEmitter& e) {
         {"spin", e.spin},
         {"texture", e.texture},
         {"additive", e.additive},
+        {"effekseerEffect", e.effekseerEffect},
         {"shape", static_cast<u32>(e.shape)},
         {"boxHalfExtents", V3(e.boxHalfExtents)},
         {"coneAngle", e.coneAngle},
@@ -78,6 +109,13 @@ json EmitterToJson(const ParticleEmitter& e) {
         {"sizeVariance", e.sizeVariance},
         {"gpuExpand", e.gpuExpand},
         {"gpuSim", e.gpuSim},
+        {"useColorCurve", e.useColorCurve},
+        {"colorCurve", GradientToJson(e.colorCurve)},
+        {"useSizeCurve", e.useSizeCurve},
+        {"sizeCurve", CurveToJson(e.sizeCurve)},
+        {"onDeathEffect", e.onDeathEffect},
+        {"onDeathChance", e.onDeathChance},
+        {"particleMesh", e.particleMesh},
     };
 }
 
@@ -104,6 +142,7 @@ void EmitterFromJson(const json& j, ParticleEmitter& e) {
     e.spin = j.value("spin", e.spin);
     e.texture = j.value("texture", std::string());
     e.additive = j.value("additive", e.additive);
+    e.effekseerEffect = j.value("effekseerEffect", std::string());
     e.shape = static_cast<ParticleEmitter::Shape>(j.value("shape", static_cast<u32>(e.shape)));
     e.boxHalfExtents = RV3(j.value("boxHalfExtents", json()), e.boxHalfExtents);
     e.coneAngle = j.value("coneAngle", e.coneAngle);
@@ -130,6 +169,13 @@ void EmitterFromJson(const json& j, ParticleEmitter& e) {
     e.sizeVariance = glm::clamp(j.value("sizeVariance", e.sizeVariance), 0.0f, 1.0f);
     e.gpuExpand = j.value("gpuExpand", e.gpuExpand);
     e.gpuSim = j.value("gpuSim", e.gpuSim);
+    e.useColorCurve = j.value("useColorCurve", e.useColorCurve);
+    if (const auto it = j.find("colorCurve"); it != j.end()) e.colorCurve = GradientFromJson(*it);
+    e.useSizeCurve = j.value("useSizeCurve", e.useSizeCurve);
+    if (const auto it = j.find("sizeCurve"); it != j.end()) e.sizeCurve = CurveFromJson(*it);
+    e.onDeathEffect = j.value("onDeathEffect", std::string());
+    e.onDeathChance = j.value("onDeathChance", e.onDeathChance);
+    e.particleMesh = j.value("particleMesh", std::string());
 }
 
 std::string EffectToString(const ParticleEmitter& e) {
@@ -200,6 +246,7 @@ bool SelfTest() {
     a.spin = 3.0f;
     a.texture = "vfx/spark.uaf";
     a.additive = false;
+    a.effekseerEffect = "vfx/explosion.efkefc";
     a.shape = ParticleEmitter::Shape::Cone;
     a.boxHalfExtents = {2.0f, 0.5f, 1.0f};
     a.coneAngle = 42.0f;
@@ -241,7 +288,8 @@ bool SelfTest() {
               "motion fields");
         check(r.startColor == a.startColor && r.endColor == a.endColor &&
                   r.startSize == a.startSize && r.endSize == a.endSize && r.spin == a.spin &&
-                  r.texture == a.texture && r.additive == a.additive,
+                  r.texture == a.texture && r.additive == a.additive &&
+                  r.effekseerEffect == a.effekseerEffect,
               "look fields");
         check(r.shape == a.shape && r.boxHalfExtents == a.boxHalfExtents &&
                   r.coneAngle == a.coneAngle && r.burst == a.burst && r.loop == a.loop &&

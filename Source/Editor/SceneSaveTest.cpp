@@ -631,6 +631,7 @@ bool Editor::SceneSaveSelfTest(const fs::path& sceneFile) {
         reg.emplace<DebrisChunk>(plain("Debris"), DebrisChunk{});
         reg.emplace<Persistent>(plain("ResidentUI"));
         reg.emplace<UIDocMember>(plain("MenuButton"), UIDocMember{});
+        reg.emplace<ParticlePreviewTag>(plain("ParticlePreview"));
         expect(scene::SaveScene(s, ex), "save a scene holding one entity per exclusion row");
 
         scene::SceneData d;

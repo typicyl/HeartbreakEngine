@@ -270,8 +270,11 @@ struct RunStats {
 //
 // `user` is forwarded to every kernel as ParticleView::user and is only meaningful
 // for the Legacy.* compatibility modules (Vfx/VfxLegacy.h); pass nullptr otherwise.
+// `deathsOut`, if non-null, receives the world position of every particle retired this frame (before
+// swap-pop overwrites it) - the seam for sub-emitters ("spawn a child effect where a particle died").
+// Additive + default-null, so it costs nothing and changes nothing for callers that do not want it.
 RunStats RunFrame(const CompiledStack& stack, EmitterState& em, ParticleSoA& pool, f32 dt,
-                  const void* user = nullptr);
+                  const void* user = nullptr, std::vector<glm::vec3>* deathsOut = nullptr);
 
 // Sizes `pool` for `stack` and RESETS it to zero live particles. Call once after
 // Compile, never per frame. It commits an initial slice rather than the whole authored

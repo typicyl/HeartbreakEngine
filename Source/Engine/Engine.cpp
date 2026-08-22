@@ -236,7 +236,38 @@ int Engine::Run(const EngineConfig& configIn) {
                 }
             }
             if (!baseName.empty() && vfs::MountPacks(exeDir, baseName, exeDir / "Assets")) {
+                // Install the shader provider the INSTANT the packs mount - before
+                // reading the project and regardless of whether it survives in them.
+                // Shader availability must not be hostage to the project file: if the
+                // project pack is renamed/removed but the shader bytes are in a
+                // surviving pack, the game must still render. (On a miss the provider
+                // returns false and the backend falls back to a loose shaders/ folder,
+                // so dev runs are unaffected.) See ReadBinaryFile in the RHI backends.
+                const std::filesystem::path assetsRoot = exeDir / "Assets";
+                rhi::SetShaderProvider(
+                    [assetsRoot](const std::string& leaf, std::vector<u8>& out) -> bool {
+                        auto bytes = vfs::ReadFile(assetsRoot / "Shaders" / leaf);
+                        if (!bytes) return false;
+                        out = std::move(*bytes);
+                        return true;
+                    });
                 packedProject = Project::Active().OpenPacked(exeDir);
+                if (!packedProject) {
+                    HBE_ERROR("Boot: mounted the data packs but found no playable project "
+                              "in them (expected '__project.hbproj' inside '{}_N.uap' beside "
+                              "the executable). The packs look incomplete or were renamed. "
+                              "The game will start in a limited safe mode - reinstall or "
+                              "verify the game files to play.", baseName);
+                }
+            } else if (!baseName.empty()) {
+                HBE_ERROR("Boot: found pack(s) named '{}_N.uap' beside the executable but "
+                          "could not mount them (renamed, moved, or corrupt). The game will "
+                          "start in a limited safe mode - reinstall or verify the game files.",
+                          baseName);
+            } else {
+                HBE_ERROR("Boot: no data packs ('*_N.uap') found beside the executable "
+                          "({}). The game will start in a limited safe mode - reinstall or "
+                          "verify the game files.", exeDir.string());
             }
         }
 
@@ -249,19 +280,8 @@ int Engine::Run(const EngineConfig& configIn) {
                                 Project::Active().AssetsDir());
             }
 
-            // Shipped builds serve shaders from the packs (no loose shaders/
-            // folder). Only for a truly packed export, so dev runs with loose
-            // shaders aren't slowed by pack misses.
-            if (packedProject) {
-                const std::filesystem::path assetsRoot = Project::Active().AssetsDir();
-                rhi::SetShaderProvider(
-                    [assetsRoot](const std::string& leaf, std::vector<u8>& out) -> bool {
-                        auto bytes = vfs::ReadFile(assetsRoot / "Shaders" / leaf);
-                        if (!bytes) return false;
-                        out = std::move(*bytes);
-                        return true;
-                    });
-            }
+            // (The pack shader provider is installed above, the moment the packs
+            // mount - decoupled from whether the project file survived in them.)
 
             // Apply the build configuration (game name / resolution / backend);
             // explicit command-line options win.
@@ -278,6 +298,22 @@ int Engine::Run(const EngineConfig& configIn) {
             if (!config.fullscreenExplicit) config.fullscreen = build.fullscreen;
             if (!config.vsyncExplicit) config.vsync = build.vsync;
             if (!config.apiExplicit) config.api = ApiFromString(build.backend);
+        }
+
+        // A shipped runtime that never got a playable project is the deepest data
+        // failure - there is nothing to run. Flag it for the safe-mode banner.
+        if (!Project::HasActive()) {
+            bootHealth_ = BootHealth::Critical;
+        } else if (vfs::IsMounted()) {
+            // The project loaded, but whole pack chunk(s) may have been renamed/removed -
+            // and a pack holds ANYTHING (audio, a menu background, a whole level), on load
+            // paths the per-asset tally never sees. A pack-count shortfall catches them
+            // ALL, regardless of contents. Any missing pack -> the important tier.
+            if (const u32 missing = vfs::MissingPackCount(); missing > 0) {
+                HBE_ERROR("Boot: {} data pack(s) missing (renamed/removed) - the install is "
+                          "incomplete. Verify or reinstall the game files.", missing);
+                bootHealth_ = BootHealth::Major;
+            }
         }
     }
 #endif
@@ -1451,6 +1487,10 @@ int Engine::Run(const EngineConfig& configIn) {
         if (!sceneBuilt) {
             HBE_WARN("Startup scene '{}' failed to load.",
                      Project::Active().Settings().startupScene);
+            // The game's actual world could not be loaded (its scene file or the pack
+            // holding it is gone). Nothing playable remains, so the safe-mode banner
+            // shows the Critical message over whatever fallback world comes up.
+            bootHealth_ = BootHealth::Critical;
         }
     }
     if (!sceneBuilt && !config.modelPath.empty()) {
@@ -1727,7 +1767,9 @@ int Engine::Run(const EngineConfig& configIn) {
         // gameplay, the cutscene clock) stops together by construction. dt_ - the
         // PRESENTATION clock used by the flow fades and the caption crawl - is
         // deliberately untouched, so the pause menu still animates.
-        const f32 pauseScale = paused_ ? 0.0f : 1.0f;
+        // The "data incomplete" modal pauses the sim exactly like the player pause, so
+        // the world freezes behind it until the player acknowledges (clicks its X).
+        const f32 pauseScale = (paused_ || SafeModeModalActive()) ? 0.0f : 1.0f;
         const f32 dt =
             (renderFixedDt_ > 0.0f) ? renderFixedDt_ : (dtSmooth * devTimeScale_ * pauseScale);
 
@@ -1902,6 +1944,8 @@ int Engine::Run(const EngineConfig& configIn) {
         terrain::Update(scene, renderer);
         // Rebuild any dirty CSG blockout brush geometry (cheap when nothing changed).
         brush::Update(scene, renderer);
+        // Advance the Effekseer VFX simulation (no-op unless the backend has Effekseer + live effects).
+        renderer.VfxUpdate(dt);
         // Water surfaces: build/refresh their grids, age ripples, spawn rain splashes.
         water::Update(scene, renderer, dt);
         // Motion matching picks each animator's clip from movement intent BEFORE
@@ -2248,6 +2292,10 @@ int Engine::Run(const EngineConfig& configIn) {
                         audio.SetMusicGraph(*g, assets);
                         const std::string& start = Project::Active().Settings().musicStartState;
                         audio.PlayMusicState(start.empty() ? g->initialState : start, 0.5f);
+                    } else {
+                        // The shipped .hbmusic graph could not be read -> no music. Cosmetic:
+                        // the game still plays, it just may not sound as intended.
+                        assets::NoteMissingAsset(/*important*/ false);
                     }
                 }
                 musicStarted = true;
@@ -2496,6 +2544,14 @@ int Engine::Run(const EngineConfig& configIn) {
                                    pUp, dt, particleAlpha);
             renderer.SetParticles(particleAlpha, particleAdd);
 
+            // Mesh-particle emitters: resolve their mesh + build one DrawItem per particle, handed to
+            // the renderer to append to the draw list (auto-instanced). No-op unless an emitter uses
+            // Render::Mesh, so the common case costs nothing. Reused buffer: no per-frame alloc.
+            static std::vector<rhi::DrawItem> meshParticleItems;
+            meshParticleItems.clear();
+            particle::CollectMeshParticles(scene, renderer, assetsDir, meshParticleItems);
+            renderer.SetParticleMeshItems(meshParticleItems);
+
             // GPU vertex expansion for emitters that opted in: upload 64-byte
             // records instead of six 40-byte world-space vertices and let the VS
             // build the quads. Mapped BEFORE RenderScene, like the QueueCompute
@@ -2630,6 +2686,7 @@ int Engine::Run(const EngineConfig& configIn) {
                           uiTarget, uiConfig, uiVertices, &worldUIBatches, uiCtx_);
         BuildFadeCurtain(uiVertices); // loading fade-to/from-black over the world + UI
         BuildDevOverlay(uiVertices);  // dev stats panel on top (when toggled on)
+        BuildSafeModeBanner(uiVertices); // player-facing "data incomplete" notice, on top
         renderer.SetUIOverlay(uiVertices);
         worldUIDraws.clear();
         for (const ui::WorldUIBatch& b : worldUIBatches) {
@@ -3386,6 +3443,7 @@ bool Engine::LoadGame(const std::string& slot) {
     // respawned.) The snapshot itself needs none of it: its runtime fields are baked in.
     game::DeserializeState(j.value("game", std::string()));
     scene::StagedAssets staged;
+    assets::ResetMissTally(); // a restored world = fresh miss accounting for the banner
     scene::StageAssets(data, Project::Active().AssetsDir(), staged);
     scene::Instantiate(*scene_, *renderer_, data, staged, scene::LoadMode::Replace);
     // Make the area CURRENT again (so the World schematic nodes resolve "" to here)
@@ -4204,6 +4262,160 @@ void Engine::BuildFadeCurtain(std::vector<rhi::UIVertex>& out) {
     const rhi::UIVertex v01{-1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, a, 0};
     out.push_back(v00); out.push_back(v10); out.push_back(v11);
     out.push_back(v00); out.push_back(v11); out.push_back(v01);
+}
+
+Engine::BootHealth Engine::EffectiveHealth() const {
+    // Critical (no project / startup scene) dominates everything.
+    if (bootHealth_ == BootHealth::Critical) return BootHealth::Critical;
+    // Otherwise take the WORST of the boot-time verdict (already Major if pack chunks are
+    // missing) and the live streaming miss tally (structural -> Major, cosmetic -> Minor).
+    BootHealth sev = bootHealth_;
+    const assets::MissCounts m = assets::MissTally();
+    if (m.important > 0 && sev < BootHealth::Major) sev = BootHealth::Major;
+    else if (m.cosmetic > 0 && sev < BootHealth::Minor) sev = BootHealth::Minor;
+    return sev;
+}
+
+bool Engine::SafeModeModalActive() const {
+#if HBE_EDITOR
+    return false;
+#else
+    const BootHealth sev = EffectiveHealth();
+    return (sev == BootHealth::Minor || sev == BootHealth::Major) && !safeModeAck_;
+#endif
+}
+
+void Engine::BuildSafeModeBanner(std::vector<rhi::UIVertex>& out) {
+#if HBE_EDITOR
+    (void)out; // player-facing only; the editor surfaces missing assets its own way
+#else
+    const BootHealth sev = EffectiveHealth();
+    // A tier CHANGE re-arms the modal: a newly-discovered, worse miss must be seen even
+    // if the player already dismissed a milder one.
+    if (sev != safeModeSev_) { safeModeSev_ = sev; safeModeAck_ = false; }
+    if (sev == BootHealth::Healthy || !renderer_) return;
+    // Minor/Major are a dismissable MODAL (X to close) that pauses the game until the
+    // player acknowledges it. Critical is a permanent overlay - the game can't run, so
+    // there is no X and nothing to resume.
+    const bool modal = (sev != BootHealth::Critical);
+    if (modal && safeModeAck_) return; // dismissed
+
+    const glm::vec2 target = renderer_->RenderTargetSize();
+    if (target.x < 1.0f || target.y < 1.0f) return;
+    ui::FontAtlas& font = ui::SharedFont();
+    font.Initialize(*renderer_);
+    if (!font.Ready()) {
+        // No OS UI font (rare) -> we cannot draw a dismissable modal at all. Do NOT let
+        // it pause + swallow input forever with no visible X: auto-acknowledge so the
+        // game stays playable (the failure is still on the log).
+        if (modal) safeModeAck_ = true;
+        return;
+    }
+
+    const char* title = "";
+    std::string msg;
+    glm::vec3 accent(1.0f);
+    switch (sev) {
+        case BootHealth::Minor:
+            title = "SOME GAME FILES ARE MISSING";
+            msg = "Some game files could not be loaded. The game may not look, sound, or play as "
+                  "intended.";
+            accent = {1.00f, 0.78f, 0.28f}; // amber
+            break;
+        case BootHealth::Major:
+            title = "GAME FILES ARE MISSING";
+            msg = "Some game files could not be loaded. The game may not look, sound, or play as "
+                  "intended. Please verify or reinstall your game files.";
+            accent = {1.00f, 0.55f, 0.20f}; // orange
+            break;
+        default: // Critical
+            title = "GAME DATA IS MISSING";
+            msg = "Core game data could not be found, so the game cannot start. Please verify or "
+                  "reinstall your game files.";
+            accent = {0.96f, 0.30f, 0.24f}; // red
+            break;
+    }
+
+    // Same NDC + vertex conventions as BuildDevOverlay/BuildFadeCurtain (tex 0 = the
+    // 1x1 white texture for solid fills; glyph quads carry their own atlas page).
+    const auto ndc = [&](f32 x, f32 y) {
+        return glm::vec2(x / target.x * 2.0f - 1.0f, 1.0f - y / target.y * 2.0f);
+    };
+    const auto addRect = [&](f32 x0, f32 y0, f32 x1, f32 y1, f32 r, f32 g, f32 b, f32 a) {
+        const glm::vec2 p0 = ndc(x0, y0), p1 = ndc(x1, y1);
+        const rhi::UIVertex a00{p0.x, p0.y, 0, 0, r, g, b, a, 0};
+        const rhi::UIVertex a10{p1.x, p0.y, 1, 0, r, g, b, a, 0};
+        const rhi::UIVertex a11{p1.x, p1.y, 1, 1, r, g, b, a, 0};
+        const rhi::UIVertex a01{p0.x, p1.y, 0, 1, r, g, b, a, 0};
+        out.push_back(a00); out.push_back(a10); out.push_back(a11);
+        out.push_back(a00); out.push_back(a11); out.push_back(a01);
+    };
+    const auto emit = [&](f32 x, f32 y, const std::vector<ui::GlyphQuad>& q, f32 r, f32 g, f32 b) {
+        for (const ui::GlyphQuad& gq : q) {
+            const glm::vec2 p0 = ndc(x + gq.x0, y + gq.y0), p1 = ndc(x + gq.x1, y + gq.y1);
+            const rhi::UIVertex a00{p0.x, p0.y, gq.u0, gq.v0, r, g, b, 1.0f, gq.atlas};
+            const rhi::UIVertex a10{p1.x, p0.y, gq.u1, gq.v0, r, g, b, 1.0f, gq.atlas};
+            const rhi::UIVertex a11{p1.x, p1.y, gq.u1, gq.v1, r, g, b, 1.0f, gq.atlas};
+            const rhi::UIVertex a01{p0.x, p1.y, gq.u0, gq.v1, r, g, b, 1.0f, gq.atlas};
+            out.push_back(a00); out.push_back(a10); out.push_back(a11);
+            out.push_back(a00); out.push_back(a11); out.push_back(a01);
+        }
+    };
+
+    const f32 titlePx = 16.0f, msgPx = 21.0f, hintPx = 14.0f;
+    const f32 wrapW = glm::min(target.x * 0.82f, 620.0f);
+    std::vector<ui::GlyphQuad> tq, mq, hq;
+    f32 tw = 0, th = 0, mw = 0, mh = 0, hw = 0, hh = 0;
+    font.Layout(title, titlePx, tq, tw, th);
+    font.LayoutWrapped(msg, msgPx, wrapW, mq, mw, mh);
+    if (modal) font.Layout("Click the X or press Enter to continue.", hintPx, hq, hw, hh);
+
+    const f32 padX = 32.0f, padY = 26.0f, gap = 12.0f, bar = 5.0f, xBtn = 30.0f;
+    const f32 contentW = glm::max(glm::max(tw, mw), hw);
+    const f32 panelW = contentW + padX * 2.0f + (modal ? xBtn : 0.0f);
+    const f32 panelH =
+        bar + padY + th + gap + mh + (modal ? gap + hh : 0.0f) + padY;
+    // Centered for every tier now - it is a modal, not a passive lower-third banner.
+    const f32 pxl = glm::max((target.x - panelW) * 0.5f, 0.0f);
+    const f32 pyt = glm::max((target.y - panelH) * 0.5f, 0.0f);
+
+    addRect(0, 0, target.x, target.y, 0, 0, 0, 0.6f);                            // dim backdrop
+    addRect(pxl, pyt, pxl + panelW, pyt + panelH, 0.06f, 0.07f, 0.09f, 0.97f);   // panel
+    addRect(pxl, pyt, pxl + panelW, pyt + bar, accent.r, accent.g, accent.b, 1.0f); // accent bar
+    // Glyph quads use a top-left layout origin, so pass the TOP of each text block.
+    emit(pxl + padX, pyt + bar + padY, tq, accent.r, accent.g, accent.b);
+    emit(pxl + padX, pyt + bar + padY + th + gap, mq, 0.92f, 0.94f, 0.98f);
+
+    if (modal) {
+        emit(pxl + padX, pyt + bar + padY + th + gap + mh + gap, hq, 0.62f, 0.66f, 0.72f);
+        // X close button in the top-right; hit-test the mouse in the SAME pixel space
+        // BuildSafeModeBanner draws in (RenderTargetSize == client pixels in this build).
+        const f32 xsz = 26.0f, inset = 12.0f;
+        const f32 bx1 = pxl + panelW - inset, bx0 = bx1 - xsz;
+        const f32 by0 = pyt + bar + inset, by1 = by0 + xsz;
+        const f32 mx = input_ ? input_->MouseX() : -1.0f;
+        const f32 my = input_ ? input_->MouseY() : -1.0f;
+        const bool hover = mx >= bx0 && mx <= bx1 && my >= by0 && my <= by1;
+        addRect(bx0, by0, bx1, by1, hover ? 0.34f : 0.16f, hover ? 0.14f : 0.17f,
+                hover ? 0.14f : 0.21f, 1.0f);
+        std::vector<ui::GlyphQuad> xq;
+        f32 xw = 0, xh = 0;
+        font.Layout("X", 18.0f, xq, xw, xh);
+        emit(bx0 + (xsz - xw) * 0.5f, by0 + (xsz - xh) * 0.5f, xq, 0.96f, 0.96f, 0.98f);
+        // Dismiss on the X click OR any confirm/cancel key/button, so mouse, keyboard,
+        // AND controller players can all escape the modal (it pauses the game). Edge-
+        // triggered, so a key already held when the modal appears does not auto-dismiss.
+        if (input_) {
+            const bool clickX = hover && input_->WasMousePressed(MouseButton::Left);
+            const bool keyOk = input_->WasKeyPressed(Key::Enter) ||
+                               input_->WasKeyPressed(Key::Escape) ||
+                               input_->Gamepad(0).WasPressed(Gamepad_A) ||
+                               input_->Gamepad(0).WasPressed(Gamepad_B) ||
+                               input_->Gamepad(0).WasPressed(Gamepad_Start);
+            if (clickX || keyOk) safeModeAck_ = true;
+        }
+    }
+#endif
 }
 
 void Engine::SeedSettingsWidgets() {
@@ -5030,7 +5242,10 @@ void Engine::UpdateGameFlow(f32 dt) {
         break;
     }
     case GameState::MainMenu: {
-        const std::string act = PollClickedAction(*scene_);
+        // While the data-incomplete modal is up it OWNS input: swallow all game-UI
+        // actions (menu Play/Settings, the pause panel) so nothing fires behind it. Its
+        // own X is hit-tested separately in BuildSafeModeBanner.
+        const std::string act = SafeModeModalActive() ? std::string() : PollClickedAction(*scene_);
         // A "rebind:<Action>" button starts listening for the next key/button; the
         // rebind poll (top of the update) captures + persists it.
         if (!devMenuOpen_ && act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));
@@ -5160,9 +5375,13 @@ void Engine::UpdateGameFlow(f32 dt) {
         // `paused_` is listed explicitly rather than relying on the Pause panel being
         // up: pause works in a project that has not authored one yet, and a paused
         // game holding the cursor captive for mouse-look would be unescapable.
-        const bool wantFreeCursor = menuOpen || dialogueChoiceActive_ || paused_;
+        const bool wantFreeCursor =
+            menuOpen || dialogueChoiceActive_ || paused_ || SafeModeModalActive();
         if (IsCursorLocked() == wantFreeCursor) SetCursorLocked(!wantFreeCursor);
-        const std::string act = PollClickedAction(*scene_);
+        // While the data-incomplete modal is up it OWNS input: swallow all game-UI
+        // actions (menu Play/Settings, the pause panel) so nothing fires behind it. Its
+        // own X is hit-tested separately in BuildSafeModeBanner.
+        const std::string act = SafeModeModalActive() ? std::string() : PollClickedAction(*scene_);
         // A "rebind:<Action>" button starts listening for the next key/button; the
         // rebind poll (top of the update) captures + persists it.
         if (!devMenuOpen_ && act.rfind("rebind:", 0) == 0) actionMap_.BeginRebind(act.substr(7));

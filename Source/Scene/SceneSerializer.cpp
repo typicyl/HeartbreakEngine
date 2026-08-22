@@ -341,6 +341,10 @@ constexpr Exclusion kExclusions[] = {
      "UIDocMember",
      "a .hbui DOCUMENT's entities are ASSET content with their own file; the editor "
      "writes them through SaveUIDocument and rebuilds them from it on the next open"},
+    {[](const entt::registry& r, entt::entity e) { return r.all_of<ParticlePreviewTag>(e); },
+     "ParticlePreviewTag",
+     "the Particle Editor's live preview emitter is an editor-only object, rebuilt from the panel's "
+     "authored effect each time the panel opens; it is never part of the saved scene"},
 };
 } // namespace
 
@@ -2709,7 +2713,15 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         Project::HasActive() && Project::Active().Settings().textureCompression;
     // Anything already resident in the persistent Instantiate caches skips its
     // disk IO entirely (snapshots restore instantly on undo/redo).
-    const auto stageTexture = [&](const std::string& tex) {
+    // `shipped` marks a texture that is an AUTHORED, standalone asset the cook packs
+    // and validates - an `.hbmat` slot. The closure walks those refs, `onlyReferenced`
+    // keeps them, and the cook FAILS on a dangling one, so at runtime a failed read
+    // means a genuinely-missing SHIPPED file -> count it for the safe-mode banner. It
+    // is FALSE for a mesh's EMBEDDED material slot names (`md.material.*`): those pixels
+    // live inside the mesh `.uaf` and have no standalone file, so a failed read there is
+    // a NORMAL state in a healthy build and must NOT count (counting it false-fired the
+    // "some game files are missing" banner on a clean, freshly-built game).
+    const auto stageTexture = [&](const std::string& tex, bool shipped) {
         if (tex.empty() || out.textures.contains(tex)) return;
         if (CacheHasTexture(tex)) return; // GPU-resident
         std::optional<uaf::Texture> t;
@@ -2726,6 +2738,8 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
             // (measured ~700ms cold finalize = material-texture mip-gen + upload, not paint).
             assets::GenerateMips(*t);
             out.textures.emplace(tex, std::move(*t));
+        } else if (shipped) {
+            assets::NoteMissingAsset(/*important*/ false); // missing SHIPPED texture -> Minor tier
         }
     };
     // Material JSONs are tiny; always (re)load so factor edits apply, but skip
@@ -2735,11 +2749,12 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         std::optional<MaterialAsset> mat = assets::LoadMaterial(assetsDir / matRef);
         if (!mat) {
             HBE_WARN("Scene: missing material asset '{}'.", matRef);
+            assets::NoteMissingAsset(/*important*/ true); // structural -> Major tier
             return;
         }
         for (const std::string& tex : {mat->albedoTex, mat->normalTex, mat->mrTex,
                                        mat->aoTex, mat->emissiveTex}) {
-            stageTexture(tex);
+            stageTexture(tex, /*shipped*/ true); // authored .hbmat slot = a packed asset
         }
         out.materials.emplace(matRef, std::move(*mat));
     };
@@ -2765,6 +2780,7 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
                 out.paints.emplace(d.paintSource, std::move(canvas));
             } else {
                 HBE_WARN("Scene: missing paint canvas '{}'.", d.paintSource);
+                assets::NoteMissingAsset(/*important*/ false); // cosmetic -> Minor tier
             }
         }
     }
@@ -2803,6 +2819,7 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
         std::optional<Model> model = assets::LoadMesh(assetsDir / rel);
         if (!model) {
             HBE_WARN("Scene: missing mesh asset '{}'.", rel);
+            assets::NoteMissingAsset(/*important*/ true); // structural -> Major tier
             continue;
         }
         // Pull in every texture the model's materials reference, plus any
@@ -2811,7 +2828,7 @@ void StageAssets(const SceneData& data, const fs::path& assetsDir, StagedAssets&
             for (const std::string& tex :
                  {md.material.baseColorTex, md.material.normalTex, md.material.mrTex,
                   md.material.aoTex, md.material.emissiveTex}) {
-                stageTexture(tex);
+                stageTexture(tex, /*shipped*/ false); // embedded slot name, no standalone file
             }
             stageMaterial(md.material.materialAsset);
         }
@@ -2943,6 +2960,10 @@ void ApplyEnvironment(Scene& scene, Renderer& renderer, const SceneData& data) {
 }
 
 void BindWorld(Scene& scene, Renderer& renderer, const SceneData& data) {
+    // A level (re)bind is a fresh world: clear the missing-asset tally so the safe-mode
+    // banner tracks THIS level. BindWorld creates no entities - the shards that follow
+    // stage their assets after this returns, so they repopulate the tally cleanly.
+    assets::ResetMissTally();
     DestroyWorld(scene);
     ApplyEnvironment(scene, renderer, data);
     HBE_INFO("Scene: world bound (environment applied, 0 entities created).");
@@ -3537,6 +3558,11 @@ fs::path FindAssetsDir(const fs::path& scenePath) {
 bool LoadScene(Scene& scene, Renderer& renderer, const fs::path& path, LoadMode mode) {
     SceneData data;
     if (!ParseSceneFile(path, data)) return false;
+    // A full-world (Replace) load starts a FRESH accounting of missing assets, so the
+    // safe-mode banner reflects the world now on screen rather than a session-long
+    // high-water mark. (Additive loads add to the current world and keep its running
+    // tally.) Must run BEFORE StageAssets below - that is what records the misses.
+    if (mode == LoadMode::Replace) assets::ResetMissTally();
     StagedAssets staged;
     StageAssets(data, FindAssetsDir(path), staged);
     // Additive loads tag their entities with the scene PATH so the hierarchy can

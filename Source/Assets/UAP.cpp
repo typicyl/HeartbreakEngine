@@ -335,8 +335,8 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
         result.rawBytes += loaded[i].rawSize;
     }
 
-    // v5 header: magic(4) + version + slotCount + codec + alignment = 4 + 4*u32.
-    constexpr u64 kHeaderSize = 4 + 4 * sizeof(u32);
+    // v6 header: magic(4) + version + slotCount + codec + alignment + packCount = 4 + 5*u32.
+    constexpr u64 kHeaderSize = 4 + 5 * sizeof(u32);
     // v5 TOC record: pathLen(u32) + path + offset(u64) + storedSize(u64) + rawSize(u64)
     //                + contentHash(u64).
     const auto tocRecordSize = [](usize pathLen) -> u64 {
@@ -414,6 +414,7 @@ std::optional<PackBuildResult> WritePacks(const fs::path& outDir, const std::str
         pod(kSlotsPerPack);
         pod(static_cast<u32>(codec));
         pod(kBlobAlignment);
+        pod(packCount); // v6: total chunk count, so any surviving pack reveals a missing one
         for (const SlotEntry& e : chunk) {
             pod(static_cast<u32>(e.path.size()));
             if (!e.path.empty()) {
@@ -511,6 +512,8 @@ bool PackReader::Open(const fs::path& packFile) {
     u32 alignment = 1;
     if (version >= 5) pod(alignment); // recorded for validation / mmap consumers
     (void)alignment;
+    totalPacks_ = 0;
+    if (version >= 6) pod(totalPacks_); // v6: total chunk count (missing-pack detection)
     codec_ = static_cast<u32>(ResolveCodec(version, codecField));
     // A pack we cannot decode (a legacy LZMS pack on a non-Windows build) must fail to
     // mount loudly rather than hand back garbage on the first Read.
@@ -568,13 +571,51 @@ std::optional<std::vector<u8>> PackReader::Read(const std::string& relPath) cons
 
 bool PackSet::Open(const fs::path& dir, const std::string& baseName) {
     readers_.clear();
-    for (u32 p = 0;; ++p) {
-        const fs::path packFile = dir / (baseName + "_" + std::to_string(p) + ".uap");
-        std::error_code ec;
-        if (!fs::exists(packFile, ec)) break;
+    packIndices_.clear();
+    // Gap-TOLERANT discovery. Mount EVERY `<base>_<n>.uap` present in `dir`, not just
+    // a contiguous 0..k run. A shipped title can lose a pack in the wild - a player
+    // renames or deletes one, an antivirus quarantines one, a download is partial -
+    // and the SURVIVING packs (with the shaders and assets sharded into them) must
+    // still mount. The old code walked n = 0,1,2,... and STOPPED at the first missing
+    // index, which discarded every higher-numbered pack the instant one went missing
+    // (and mounted nothing at all if `_0` was the one lost). Slots stay globalized by
+    // each pack's OWN file index (see Entries()), so a hole in the sequence just leaves
+    // a hole in slot space without disturbing the survivors.
+    const std::string prefix = baseName + "_";
+    std::error_code ec;
+    std::map<u32, fs::path> present; // pack index -> file, ascending & gap-tolerant
+    for (fs::directory_iterator it(dir, ec), end; it != end; it.increment(ec)) {
+        if (ec) break;
+        std::error_code fec;
+        if (!it->is_regular_file(fec)) continue;
+        const fs::path& p = it->path();
+        if (p.extension() != ".uap") continue;
+        const std::string stem = p.stem().string(); // "<base>_<n>"
+        if (stem.size() <= prefix.size() || stem.compare(0, prefix.size(), prefix) != 0)
+            continue;
+        const std::string digits = stem.substr(prefix.size());
+        if (!std::all_of(digits.begin(), digits.end(),
+                         [](char c) { return c >= '0' && c <= '9'; }))
+            continue; // a sibling pack with a different base, or an unrelated `.uap`
+        u32 n = 0;
+        try {
+            n = static_cast<u32>(std::stoul(digits));
+        } catch (...) {
+            continue; // not a representable chunk index
+        }
+        present.emplace(n, p);
+    }
+    for (const auto& [n, packFile] : present) {
         PackReader reader;
-        if (!reader.Open(packFile)) return false;
+        if (!reader.Open(packFile)) {
+            // A corrupt/unreadable chunk must not sink the whole mount - skip it and
+            // keep the rest. Its assets are simply unreachable, exactly as if the file
+            // had been renamed away.
+            HBE_WARN("UAP: skipping unreadable pack chunk '{}'.", packFile.string());
+            continue;
+        }
         readers_.push_back(std::move(reader));
+        packIndices_.push_back(n);
     }
     return !readers_.empty();
 }
@@ -585,11 +626,29 @@ u32 PackSet::AssetCount() const {
     return n;
 }
 
+u32 PackSet::ExpectedPackCount() const {
+    // Prefer the authoritative header count (v6+): every sibling pack carries the same
+    // number, so ANY survivor reveals how many chunks were shipped - even if the removed
+    // one was the last. Fall back to the gap heuristic (highest present index + 1) for
+    // pre-v6 packs, which detects a missing MIDDLE chunk but not a removed trailing one.
+    u32 stored = 0, maxIndex = 0;
+    for (usize i = 0; i < readers_.size(); ++i) {
+        stored = std::max(stored, readers_[i].TotalPackCount());
+        if (i < packIndices_.size()) maxIndex = std::max(maxIndex, packIndices_[i]);
+    }
+    if (stored > 0) return stored;
+    return readers_.empty() ? 0 : maxIndex + 1;
+}
+
 std::vector<Entry> PackSet::Entries() const {
     std::vector<Entry> all;
-    for (usize p = 0; p < readers_.size(); ++p) {
-        for (Entry e : readers_[p].Entries()) {
-            e.slot += static_cast<u32>(p) * kSlotsPerPack; // globalize
+    for (usize i = 0; i < readers_.size(); ++i) {
+        // Globalize by the pack's OWN file index, not its position in readers_.
+        // With gap-tolerant discovery a missing middle chunk would otherwise renumber
+        // every later pack's slots; packIndices_[i] is the true `<base>_<n>` index.
+        const u32 n = i < packIndices_.size() ? packIndices_[i] : static_cast<u32>(i);
+        for (Entry e : readers_[i].Entries()) {
+            e.slot += n * kSlotsPerPack; // globalize
             all.push_back(std::move(e));
         }
     }
@@ -733,6 +792,8 @@ bool PackSelfTest() {
     // Read every asset back and byte-compare; check content hash + alignment.
     PackSet set;
     check(set.Open(outA, "T"), "PackSet must open the cooked packs");
+    check(set.ExpectedPackCount() == res->packCount && set.PackCount() == res->packCount,
+          "a v6 pack must self-report the total chunk count (no missing chunks here)");
     for (const Item& it : items) {
         auto got = set.Read(it.name);
         check(got.has_value(), "each asset must read back");
@@ -770,6 +831,31 @@ bool PackSelfTest() {
         check(r.Open(legacyDir / "L_0.uap"), "v5 reader must open a v4 pack");
         auto got = r.Read("old/thing.uaf");
         check(got && *got == payload, "v4 stored entry must read back unchanged");
+    }
+
+    // Gap tolerance: a mount must survive a MISSING middle chunk and still expose every
+    // surviving pack (a renamed/deleted/quarantined pack in the wild - the exact case
+    // that used to drop the project + shaders and strand the game in safe mode). Write
+    // G_0 and G_2 (no G_1) and confirm both open and read back across the hole.
+    {
+        const fs::path gapDir = dir / "gap";
+        fs::create_directories(gapDir, ec);
+        std::vector<u8> pa(321), pc(654);
+        for (usize i = 0; i < pa.size(); ++i) pa[i] = static_cast<u8>((i * 7) & 0xFF);
+        for (usize i = 0; i < pc.size(); ++i) pc[i] = static_cast<u8>((i * 13) & 0xFF);
+        check(WriteLegacyV4Pack(gapDir / "G_0.uap", "zero/a.uaf", pa), "write gap pack 0");
+        check(WriteLegacyV4Pack(gapDir / "G_2.uap", "two/c.uaf", pc), "write gap pack 2");
+        PackSet gset;
+        check(gset.Open(gapDir, "G"), "PackSet must open across a missing middle chunk");
+        check(gset.PackCount() == 2, "both surviving chunks must mount despite the gap");
+        // v4 packs carry no packCount, so ExpectedPackCount falls back to the gap
+        // heuristic: highest present index (2) + 1 = 3 -> 2 mounted, so 1 is missing.
+        check(gset.ExpectedPackCount() == 3,
+              "gap heuristic must expect 3 chunks from present indices {0,2}");
+        auto g0 = gset.Read("zero/a.uaf");
+        auto g2 = gset.Read("two/c.uaf");
+        check(g0 && *g0 == pa, "pack 0 asset must read back");
+        check(g2 && *g2 == pc, "pack 2 asset (past the gap) must read back");
     }
 
     fs::remove_all(dir, ec);

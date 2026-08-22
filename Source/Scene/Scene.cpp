@@ -498,6 +498,8 @@ rhi::SceneView Scene::MakeView(const Camera& camera) const {
     const glm::mat4 viewProj = camera.ViewProjection();
     rhi::SceneView v;
     v.viewProj = viewProj;
+    v.view = camera.View();       // separate view + proj for the Effekseer VFX backend
+    v.proj = camera.Projection();
     v.cameraPos = camera.Position();
     v.exposure = env_.exposure;
     v.ambientIntensity = env_.ambientIntensity;

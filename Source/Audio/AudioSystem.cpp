@@ -8,6 +8,7 @@
 
 #include "Assets/AudioEvent.h"
 #include "Assets/MusicGraph.h"
+#include "Assets/AssetLoader.h" // assets::ReadAudioTracked (feeds the safe-mode miss tally)
 #include "Assets/UAF.h"
 #include "Core/Log.h"
 #include "Scene/Components.h"
@@ -603,7 +604,7 @@ struct AudioSystem::Impl {
             if (!c.enabled) continue;
             const AudioEventSound* pick = WeightedPick(c.sounds);
             if (!pick || pick->asset.empty()) continue;
-            const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / pick->asset);
+            const std::optional<uaf::Audio> audio = assets::ReadAudioTracked(assetsDir / pick->asset);
             if (!audio) {
                 HBE_WARN("Audio: event component '{}' sound '{}' failed to load.", c.name,
                          pick->asset);
@@ -830,7 +831,7 @@ u32 AudioSystem::PostEvent(const AudioEvent& ev, const std::filesystem::path& as
     const AudioEventSound* pick = impl_->WeightedPick(ev.sounds);
     if (!pick || pick->asset.empty()) return 0;
 
-    const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / pick->asset);
+    const std::optional<uaf::Audio> audio = assets::ReadAudioTracked(assetsDir / pick->asset);
     if (!audio) {
         HBE_WARN("Audio: event sound '{}' failed to load.", pick->asset);
         return 0;
@@ -889,7 +890,7 @@ bool AudioSystem::PlayUAF(const std::filesystem::path& uafPath, const std::strin
     const std::string key = uafPath.string();
     auto it = impl_->uafCache.find(key);
     if (it == impl_->uafCache.end()) {
-        std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
+        std::optional<uaf::Audio> audio = assets::ReadAudioTracked(uafPath);
         if (!audio) {
             HBE_WARN("Audio: failed to read '{}'.", uafPath.string());
             return false;
@@ -912,7 +913,7 @@ bool AudioSystem::PlayUAFAt(const std::filesystem::path& uafPath, const glm::vec
     const std::string key = uafPath.string();
     auto it = impl_->uafCache.find(key);
     if (it == impl_->uafCache.end()) {
-        std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
+        std::optional<uaf::Audio> audio = assets::ReadAudioTracked(uafPath);
         if (!audio) {
             HBE_WARN("Audio: failed to read '{}'.", uafPath.string());
             return false;
@@ -1022,7 +1023,7 @@ void AudioSystem::PlayMusicState(const std::string& state, f32 fadeSeconds) {
     for (const MusicLayer& layer : st->layers) {
         if (layer.asset.empty()) continue;
         const std::optional<uaf::Audio> audio =
-            uaf::ReadAudio(impl_->musicAssets / layer.asset);
+            assets::ReadAudioTracked(impl_->musicAssets / layer.asset);
         if (!audio) {
             HBE_WARN("Music: layer '{}' failed to load.", layer.asset);
             continue;
@@ -1123,7 +1124,7 @@ bool AudioSystem::HasMusicGraph() const { return impl_ && impl_->musicHasGraph; 
 void AudioSystem::PostStinger(const std::filesystem::path& uafPath, const std::string& bus,
                               f32 volume) {
     if (!IsAvailable()) return;
-    const std::optional<uaf::Audio> audio = uaf::ReadAudio(uafPath);
+    const std::optional<uaf::Audio> audio = assets::ReadAudioTracked(uafPath);
     if (!audio) {
         HBE_WARN("Music: stinger '{}' failed to load.", uafPath.string());
         return;
@@ -1256,7 +1257,7 @@ void AudioSystem::UpdateScene(Scene& scene, const std::filesystem::path& assetsD
             src.voiceId = AudioSource::kNoVoice;
         }
         if (it == impl_->spatial.end()) {
-            const std::optional<uaf::Audio> audio = uaf::ReadAudio(assetsDir / src.asset);
+            const std::optional<uaf::Audio> audio = assets::ReadAudioTracked(assetsDir / src.asset);
             if (!audio) continue;
 
             // Closed caption: surface the asset's caption when this voice starts.

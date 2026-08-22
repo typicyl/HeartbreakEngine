@@ -667,7 +667,7 @@ void RunStage(const CompiledStack& stack, const EmitterState& em, ModuleStage st
 } // namespace
 
 RunStats RunFrame(const CompiledStack& stack, EmitterState& em, ParticleSoA& pool, f32 dt,
-                  const void* user) {
+                  const void* user, std::vector<glm::vec3>* deathsOut) {
     RunStats st;
     st.live = pool.count;
     if (!stack.valid || dt <= 0.0f) return st;
@@ -698,8 +698,10 @@ RunStats RunFrame(const CompiledStack& stack, EmitterState& em, ParticleSoA& poo
     // 4. Retire. Swap-pop, so the survivor moved into slot i is examined next
     //    iteration (hence no ++i on the kill branch).
     if (pool.Has(Attr::Age) && pool.Has(Attr::Lifetime)) {
+        const bool capture = deathsOut != nullptr && pool.Has(Attr::Position);
         for (u32 i = 0; i < pool.count;) {
             if (pool.age[i] >= pool.lifetime[i]) {
+                if (capture) deathsOut->push_back(pool.position[i]); // before SwapPop overwrites it
                 pool.SwapPop(i);
                 ++st.killed;
             } else {

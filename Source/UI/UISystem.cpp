@@ -258,8 +258,19 @@ u32 LoadUITexture(Renderer& renderer, const std::filesystem::path& assetsDir,
     // sized to the element in ResolveTexture.
     if (svg::IsSvgPath(rel)) return svg::ResolveSvg(renderer, assetsDir, rel, 256, 256);
     auto& cache = UITexCache();
-    if (auto it = cache.find(rel); it != cache.end()) return it->second.index;
+    if (auto it = cache.find(rel); it != cache.end()) {
+        // Cached failure (index 0) - re-note through the resettable once-set so a missing
+        // UI image is re-counted after a world load (which zeroes the tally) even though
+        // this persistent cache still remembers the failed load.
+        if (it->second.index == 0) assets::NoteMissingAssetOnce("ui:" + rel, /*important*/ false);
+        return it->second.index;
+    }
     const rhi::TextureHandle handle = assets::LoadTexture(renderer, assetsDir / rel);
+    if (!handle.IsValid()) {
+        // A shipped .hbui image (el.texture / sprite frame / widget skin) that won't
+        // load. Cosmetic - the UI still works, it just may not look as intended.
+        assets::NoteMissingAssetOnce("ui:" + rel, /*important*/ false);
+    }
     cache[rel] = {handle.index, 0, 0};
     return handle.index;
 }

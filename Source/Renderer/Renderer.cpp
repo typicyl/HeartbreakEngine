@@ -303,6 +303,10 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         // time source and floating objects sit exactly on the rendered surface.
         drawItems_.clear();
         scene.CollectDrawItems(drawItems_);
+        // Mesh particles (built this frame by particle::CollectMeshParticles) join the draw list here
+        // so they flow through the same cull / LOD / instancing / shadow path as any other mesh.
+        if (!particleMeshItems_.empty())
+            drawItems_.insert(drawItems_.end(), particleMeshItems_.begin(), particleMeshItems_.end());
 
         // --- Distance LODs + cross-fade. Runs BEFORE the frustum cull so a fade PAIR (the finer
         // and coarser halves of a mesh mid-switch) shares ONE visibility decision and the
@@ -588,11 +592,17 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         }
         uiVertices_ = nullptr; // one frame only
     } else {
-        // Fallback (backend without geometry support): animated gradient clear.
-        const f32 r = 0.5f + 0.5f * std::sin(time_ * 0.6f);
-        const f32 g = 0.5f + 0.5f * std::sin(time_ * 0.6f + 2.094f);
-        const f32 b = 0.5f + 0.5f * std::sin(time_ * 0.6f + 4.188f);
-        device_->ClearBackBuffer(r * 0.25f, g * 0.25f, b * 0.30f, 1.0f);
+        // Safe mode: the scene pipeline is unavailable (a required shader could not be
+        // loaded, so SupportsSceneRendering() is false). Do NOT show a full-saturation
+        // animated rainbow here - it reads as a crash/hang and hides the real problem.
+        // Present a calm, near-static cool-slate field with a barely-perceptible slow
+        // breath, so it is unmistakably a live app waiting on missing data, not a frozen
+        // one. The actionable reason (incomplete/renamed data packs) is logged loudly at
+        // boot; a player-facing on-screen message would need the UI shader, which is
+        // exactly what may be missing, so it cannot be relied on from here.
+        const f32 breath = 0.5f + 0.5f * std::sin(time_ * 0.9f); // 0..1, ~7 s period
+        const f32 base = 0.055f + 0.015f * breath;               // 0.055 .. 0.070
+        device_->ClearBackBuffer(base * 0.80f, base * 0.90f, base * 1.15f, 1.0f);
     }
 
     // Editor overlay records into the same frame, after the scene.

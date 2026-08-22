@@ -23,12 +23,14 @@ class Renderer;
 
 namespace spawn {
 
-// Instantiate a `.hbvfx` particle effect at a world transform (loaded + cached from Assets/). Adds
-// a Transform + ParticleEmitter entity; a one-shot (non-looping) effect also gets an EffectLifetime
-// so it self-destroys when finished. Returns the created entity (entt::null on failure). This is the
-// immediate form used by the editor preview + the drain of game::SpawnEffect. `name`'s `.hbvfx`
-// extension is optional.
-entt::entity SpawnEffect(Scene& scene, const std::string& name, const glm::mat4& transform);
+// Instantiate a `.hbvfx` particle effect at a world transform (loaded + cached from Assets/). If the
+// effect names an Effekseer file (ParticleEmitter::effekseerEffect) AND the renderer has Effekseer,
+// it plays through the Effekseer runtime (returns entt::null - Effekseer owns the instance). Otherwise
+// it adds a native Transform + ParticleEmitter entity (a one-shot also gets an EffectLifetime so it
+// self-destroys). Returns the created entity, or entt::null for the Effekseer path / on failure. The
+// immediate form used by the drain of game::SpawnEffect. `name`'s `.hbvfx` extension is optional.
+entt::entity SpawnEffect(Scene& scene, Renderer& renderer, const std::string& name,
+                         const glm::mat4& transform);
 
 // Ticks Spawners: trigger eval, prefab burst instantiation, tagging, throttle,
 // respawn, despawn. Needs the Renderer to upload spawned GPU resources.

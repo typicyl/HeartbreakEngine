@@ -113,6 +113,43 @@ struct EditorUIShow {};
 // which reproduce the old fixed loop bit-exactly. The `use*` / `simulate*` flags at
 // the bottom are the opt-ins that swap a legacy module for a real one; every one of
 // them defaults to the value that keeps an already-authored emitter identical.
+// Value-over-life authoring for the Particle Editor's curve widgets. Both are keyframes over
+// NORMALIZED particle age t in [0,1], linearly interpolated (constant-clamped past the ends).
+// EMPTY means the feature is off and the caller falls back to the start/end fields, so an emitter
+// that never touched a curve serializes and renders byte-identically to before they existed.
+struct VfxCurve {
+    struct Key { f32 t = 0.0f; f32 v = 0.0f; };
+    std::vector<Key> keys; // kept sorted ascending by t
+    f32 Eval(f32 t) const {
+        if (keys.empty()) return 0.0f;
+        if (t <= keys.front().t) return keys.front().v;
+        if (t >= keys.back().t) return keys.back().v;
+        for (usize i = 1; i < keys.size(); ++i)
+            if (t <= keys[i].t) {
+                const f32 span = keys[i].t - keys[i - 1].t;
+                const f32 f = span > 1e-6f ? (t - keys[i - 1].t) / span : 0.0f;
+                return keys[i - 1].v + (keys[i].v - keys[i - 1].v) * f;
+            }
+        return keys.back().v;
+    }
+};
+struct VfxGradient {
+    struct Stop { f32 t = 0.0f; glm::vec4 color{1.0f}; };
+    std::vector<Stop> stops; // kept sorted ascending by t
+    glm::vec4 Eval(f32 t) const {
+        if (stops.empty()) return glm::vec4(1.0f);
+        if (t <= stops.front().t) return stops.front().color;
+        if (t >= stops.back().t) return stops.back().color;
+        for (usize i = 1; i < stops.size(); ++i)
+            if (t <= stops[i].t) {
+                const f32 span = stops[i].t - stops[i - 1].t;
+                const f32 f = span > 1e-6f ? (t - stops[i - 1].t) / span : 0.0f;
+                return stops[i - 1].color + (stops[i].color - stops[i - 1].color) * f;
+            }
+        return stops.back().color;
+    }
+};
+
 struct ParticleEmitter {
     // Emission
     f32 rate = 24.0f;          // particles/second (continuous)
@@ -145,6 +182,12 @@ struct ParticleEmitter {
     std::string texture;       // sprite .uaf (empty = soft round dot)
     bool additive = true;      // additive (fire/sparks) vs alpha blend (smoke)
 
+    // Effekseer effect file (`.efk` / `.efkefc`, relative to Assets/). When set AND the backend has
+    // Effekseer, game::SpawnEffect plays THIS through the Effekseer runtime instead of the native
+    // module-stack emitter - so a `.hbvfx` can be either a native emitter OR an Effekseer effect,
+    // authored the same way and spawned by the same SpawnEffect(name) call. Empty = native emitter.
+    std::string effekseerEffect;
+
     // --- Volumetric overhaul (defaults reproduce the legacy sphere emitter) ---
     // Emission shape (how spawn position + direction are sampled).
     enum class Shape : u32 { Point = 0, Sphere, Hemisphere, Box, Disc, Cone };
@@ -163,12 +206,28 @@ struct ParticleEmitter {
     f32 fadeIn = 0.0f;
     f32 fadeOut = 0.0f;
     // Rendering.
-    enum class Render : u32 { Billboard = 0, Stretched, Horizontal };
+    // APPEND-ONLY (serialized as u32). Ribbon connects the emitter's particles, ordered by age,
+    // into ONE camera-facing strip - sword/projectile/magic trails. Best with Point spawn on a
+    // moving emitter so the particles form a path. Mesh draws `particleMesh` once per particle
+    // (debris/rocks/shells) via the instanced mesh path, tinted by the particle colour.
+    enum class Render : u32 { Billboard = 0, Stretched, Horizontal, Ribbon, Mesh };
     Render render = Render::Billboard;   // Stretched = velocity streaks (rain/sparks)
     f32 stretch = 2.0f;                  // length/width aspect for Stretched mode
     u32 subUVCols = 1, subUVRows = 1;    // sprite-sheet grid (1x1 = single frame)
     f32 subUVFps = 0.0f;                 // >0 loops the sheet; 0 plays it once over life
     f32 softFade = 0.0f;                 // soft-particle depth-fade distance (0 = hard)
+
+    // Sub-emitter: when a particle DIES, spawn this child `.hbvfx` at its position (fireworks,
+    // layered explosions, spark bursts). Empty = none. onDeathChance in [0,1] fires probabilistically.
+    // Handled by the play-gated spawn system (spawn::Update drains the death queue), so children run
+    // in Play mode / at runtime; the PARENT still previews live in edit mode. CPU-sim emitters only
+    // (a gpuSim emitter retires on the GPU, so its deaths are not visible to the CPU).
+    std::string onDeathEffect;
+    f32 onDeathChance = 1.0f;
+
+    // Mesh-particle geometry (`.uaf`, used only when render == Render::Mesh). Resolved lazily to a
+    // GPU handle by particle::CollectMeshParticles (like the sprite texture cache). Empty = none.
+    std::string particleMesh;
 
     // (Legacy per-emitter volumetric splatting was removed; real smoke/fire is now the baked
     //  VolumeComponent path - author it with the Volume Baker panel.)
@@ -199,6 +258,16 @@ struct ParticleEmitter {
     f32 colorVariance = 0.0f; // 0..1 per-particle brightness spread
     bool simulateSize = false;
     f32 sizeVariance = 0.0f;  // 0..1 per-particle size spread
+
+    // Value-over-life CURVES (Particle Editor). Opt-in and RENDER-TIME (evaluated in BuildVertices,
+    // never a simulated attribute), so they cannot perturb the module-stack sim state that
+    // --test-vfxcompat pins bit-exactly. When useColorCurve is on the RGBA gradient replaces the
+    // start->end colour lerp; when useSizeCurve is on the size curve replaces the start->end size
+    // lerp (the curve value IS the world-space size). Both default off/empty = the legacy path.
+    bool useColorCurve = false;
+    VfxGradient colorCurve;
+    bool useSizeCurve = false;
+    VfxCurve sizeCurve;
 
     // Render.GpuExpand: build the billboard quads in the VERTEX SHADER instead of on
     // the CPU. The simulation is unchanged - only the expansion moves. The CPU then
@@ -240,6 +309,12 @@ struct ParticleEmitter {
     u64 stackSignature = 0;     // structural hash; 0 == never compiled
     u32 textureCache = 0;       // resolved bindless index
     bool textureResolved = false;
+    rhi::MeshHandle meshCache;   // resolved particleMesh handle (render == Mesh); NOT serialized
+    bool meshResolved = false;
+    // Death positions captured THIS frame by RunFrame (for onDeathEffect). NOT serialized; refilled
+    // every frame by particle::Update and drained by the play-gated spawn system. Bounded to one
+    // frame's deaths, so it never grows even in the editor where the drainer does not run.
+    std::vector<glm::vec3> deaths;
 
     // --- GPU simulation runtime (NOT serialized; see Scene/ParticleGpuSim.h) ---
     // The pool for a `gpuSim` emitter is a RING of fixed slots inside one shared
@@ -1317,6 +1392,12 @@ struct UIAnimator {
 // destroys everything else). The engine applies it to the persistent UI scene so the
 // menus / HUD stay resident across gameplay scene swaps. NOT serialized.
 struct Persistent {};
+
+// Editor-only tag: the live preview emitter the Particle Editor (Window > Particle Editor) drops
+// into the scene so particle::Update simulates it in edit mode. It is a real emitter for the sim +
+// renderer but must NEVER be written into the user's scene, so it is a scene-serializer write
+// exclusion (see SceneSerializer.cpp kExclusions). The editor destroys it when the panel closes.
+struct ParticlePreviewTag {};
 
 // Which OPEN `.hbui` document instance this entity was created by (UI/UIDocument.h).
 // Runtime-only: NEVER serialized into a .hbscene, a .hbprefab or a .hbsave - a

@@ -43,7 +43,7 @@ inline constexpr char kMagic[4] = {'U', 'A', 'P', '1'};
 // load. NOT encryption - just a datamining deterrent.
 // v5: PORTABLE codec id (was the Windows COMPRESS_ALGORITHM_* enum value) + per-entry
 // content hash + aligned blobs + within-pack content dedup. Reads v2/v3/v4.
-inline constexpr u32 kVersion = 5;
+inline constexpr u32 kVersion = 6; // v6: header carries the total pack count (missing-pack detection)
 inline constexpr u32 kSlotsPerPack = 50;
 // Blob alignment (bytes) for v5 packs: 16 is enough for SIMD/DMA-friendly mapped reads
 // while wasting at most 15 bytes per stored blob. Recorded in the header.
@@ -114,12 +114,17 @@ public:
     const std::vector<Entry>& Entries() const { return entries_; }
     bool Contains(const std::string& relPath) const { return index_.count(relPath) != 0; }
     std::optional<std::vector<u8>> Read(const std::string& relPath) const;
+    // Total chunk count the cook wrote into this pack's header (v6+); 0 for older packs
+    // that predate the field. Every sibling pack carries the same number, so any single
+    // survivor reveals how many chunks SHOULD be present.
+    u32 TotalPackCount() const { return totalPacks_; }
 
 private:
     std::filesystem::path file_;
     std::vector<Entry> entries_;
     std::unordered_map<std::string, usize> index_;
-    u32 codec_ = 0; // resolved comp::Codec id for this pack (portable; 0 = stored)
+    u32 codec_ = 0;      // resolved comp::Codec id for this pack (portable; 0 = stored)
+    u32 totalPacks_ = 0; // header packCount (v6+), else 0 (unknown)
 };
 
 // --test-uapv5: the v5 format gate. Cooks a synthetic asset set (with byte-identical
@@ -133,7 +138,11 @@ bool PackSelfTest();
 class PackSet {
 public:
     bool Open(const std::filesystem::path& dir, const std::string& baseName);
-    u32 PackCount() const { return static_cast<u32>(readers_.size()); }
+    u32 PackCount() const { return static_cast<u32>(readers_.size()); } // mounted (present)
+    // How many chunks SHOULD exist: the authoritative header count (v6+), else a gap
+    // heuristic (highest present index + 1, which misses only a removed LAST pack).
+    // ExpectedPackCount() > PackCount() means some chunks were renamed/removed.
+    u32 ExpectedPackCount() const;
     u32 AssetCount() const;
     // All occupied entries across chunks.
     std::vector<Entry> Entries() const;
@@ -142,6 +151,11 @@ public:
 
 private:
     std::vector<PackReader> readers_;
+    // The `<base>_<n>.uap` file index each reader came from, parallel to readers_.
+    // Discovery is gap-TOLERANT (a missing middle chunk does not stop the scan), so
+    // a reader's position here is NOT necessarily its file index; Entries() globalizes
+    // slots by this stored index, not by the array position.
+    std::vector<u32> packIndices_;
 };
 
 } // namespace hbe::uap

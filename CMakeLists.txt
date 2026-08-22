@@ -183,7 +183,8 @@ set(HBE_GAME_SOURCES
 # Runtime-side on purpose: the editor only authors these stacks, it does not own them.
 set(HBE_VFX_SOURCES
     "Source/Vfx/VfxStack.cpp"
-    "Source/Vfx/VfxLegacy.cpp")
+    "Source/Vfx/VfxLegacy.cpp"
+    "Source/Vfx/EffekseerBackend.cpp") # Effekseer VFX backend (body gated by HBE_HAVE_EFFEKSEER)
 
 set(HBE_AUDIO_SOURCES
     "Source/Audio/AudioSystem.cpp"
@@ -331,6 +332,7 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/DialogueEditor.cpp"
     "Source/Editor/MaterialGraphEditor.cpp" # Material Maker node-graph panel (own TU; keeps Editor.cpp under /bigobj)
     "Source/Editor/MaterialLayerEditor.cpp" # material LAYER STACK panel (own TU)
+    "Source/Editor/ParticleEditor.cpp" # dedicated PARTICLE authoring panel + live preview (own TU)
     "Source/Editor/RuntimeShaderCompiler.cpp" # editor-only runtime HLSL->DXIL/SPIR-V compiler (invokes the toolchain DXC)
     "Source/Editor/UIEditor.cpp"
     "Source/Editor/SequencerEditor.cpp" # Sequencer NLE panel (own TU; keeps Editor.cpp under /bigobj)
@@ -394,6 +396,27 @@ function(hbe_configure_engine_lib tgt is_editor)
 
     target_link_libraries(${tgt} PUBLIC glm::glm EnTT::EnTT)
     target_link_libraries(${tgt} PRIVATE assimp::assimp nlohmann_json::nlohmann_json)
+    # Effekseer: the particle/VFX runtime + its DX12 renderer (Source/Vfx/EffekseerBackend).
+    # Linking EffekseerRendererDX12 pulls in Effekseer + RendererCommon + RendererLLGI + LLGI.
+    # HBE_HAVE_EFFEKSEER (compile def) gates the backend so a build without the checkout still works.
+    if(HBE_HAVE_EFFEKSEER)
+        target_link_libraries(${tgt} PRIVATE Effekseer EffekseerRendererDX12)
+        target_compile_definitions(${tgt} PUBLIC HBE_HAVE_EFFEKSEER=1)
+        target_include_directories(${tgt} PRIVATE
+            "${CMAKE_SOURCE_DIR}/third_party/Effekseer/Dev/Cpp/Effekseer"
+            "${CMAKE_SOURCE_DIR}/third_party/Effekseer/Dev/Cpp/EffekseerRendererCommon"
+            "${CMAKE_SOURCE_DIR}/third_party/Effekseer/Dev/Cpp/EffekseerRendererDX12")
+        if(HBE_EFFEKSEER_VK)
+            # LLGI's Vulkan shader compiler (inside EffekseerRendererVulkan/LLGI) references glslang;
+            # LLGI does not propagate those static libs to the final link, so name them explicitly.
+            target_link_libraries(${tgt} PRIVATE EffekseerRendererVulkan
+                glslang SPIRV glslang-default-resource-limits MachineIndependent
+                GenericCodeGen OSDependent SPVRemapper)
+            target_compile_definitions(${tgt} PRIVATE HBE_EFFEKSEER_VK=1)
+            target_include_directories(${tgt} PRIVATE
+                "${CMAKE_SOURCE_DIR}/third_party/Effekseer/Dev/Cpp/EffekseerRendererVulkan")
+        endif()
+    endif()
     # XInput (gamepad). xinput9_1_0 ships with Windows itself (no redist).
     target_link_libraries(${tgt} PRIVATE xinput9_1_0)
     # shell32 = DragAcceptFiles / WM_DROPFILES (OS file drops onto the window).
@@ -702,6 +725,13 @@ include(ShaderCompile)
 hbe_compile_engine_shaders(HeartbreakEditor)
 hbe_compile_engine_shaders(HeartbreakRuntime)
 hbe_compile_engine_shaders(HeartbreakArtEditor)
+
+# Stage the generated open-source attribution notice (ThirdParty.txt) next to the
+# game runtime, so the shipping step (Editor::BuildShipping) can copy it into the
+# game folder alongside the exe. hbe_stage_thirdparty_notice is defined by
+# cmake/ThirdPartyNotice.cmake (included from the top-level CMakeLists). The runtime is
+# the artifact that ships; ThirdParty.txt reflects the runtime's third-party closure.
+hbe_stage_thirdparty_notice(HeartbreakRuntime)
 
 # The EDITOR-ONLY RUNTIME shader compiler (Source/Editor/RuntimeShaderCompiler.cpp) invokes the SAME
 # DXC toolchain the offline build used, so it produces byte-identical bytecode. Bake the discovered

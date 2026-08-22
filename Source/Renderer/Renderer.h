@@ -141,6 +141,11 @@ public:
         particleAddCount_ = static_cast<u32>(additive.size());
     }
 
+    // MESH PARTICLES for this frame (built by particle::CollectMeshParticles). RenderScene appends
+    // them to the draw-item list right after CollectDrawItems, so they flow through the normal cull /
+    // LOD / instancing / shadow path. Set every frame (empty when none) - never stale.
+    void SetParticleMeshItems(const std::vector<rhi::DrawItem>& items) { particleMeshItems_ = items; }
+
     // GPU-EXPANDED particle batches for this frame. Deferred exactly like
     // SetParticles (forwarded inside RenderScene, cleared after one frame) so the
     // batch vector's lifetime rule is the same one callers already follow.
@@ -213,6 +218,23 @@ public:
     void DestroyComputePipeline(rhi::ComputePipelineHandle h) {
         if (device_) device_->DestroyComputePipeline(h);
     }
+
+    // --- Effekseer VFX (forwards to the backend; inert unless it has Effekseer) --------------
+    bool VfxAvailable() const { return device_ && device_->VfxAvailable(); }
+    u32 VfxLoadEffect(const char* absPath) {
+        return device_ ? device_->VfxLoadEffect(absPath) : 0;
+    }
+    int VfxPlay(u32 effectId, const glm::vec3& worldPos) {
+        return device_ ? device_->VfxPlay(effectId, worldPos) : -1;
+    }
+    void VfxStop(int handle) { if (device_) device_->VfxStop(handle); }
+    void VfxStopAll() { if (device_) device_->VfxStopAll(); }
+    void VfxSetLocation(int handle, const glm::vec3& p) {
+        if (device_) device_->VfxSetLocation(handle, p);
+    }
+    bool VfxExists(int handle) const { return device_ && device_->VfxExists(handle); }
+    void VfxUpdate(f32 dt) { if (device_) device_->VfxUpdate(dt); }
+    int VfxLiveInstanceCount() const { return device_ ? device_->VfxLiveInstanceCount() : 0; }
     void QueueCompute(const rhi::ComputeDispatch& d) {
         if (device_) device_->QueueCompute(d);
     }
@@ -294,6 +316,7 @@ private:
     std::unique_ptr<rhi::IRenderDevice> device_;
     Camera camera_;
     std::vector<rhi::DrawItem> drawItems_; // reused each frame
+    std::vector<rhi::DrawItem> particleMeshItems_; // mesh-particle draws, appended in RenderScene
     const std::vector<rhi::UIVertex>* uiVertices_ = nullptr; // set per frame
     const std::vector<WorldUIDraw>* worldUIDraws_ = nullptr; // set per frame
     rhi::TextureHandle editorUITarget_;                       // set per frame (editor canvas)

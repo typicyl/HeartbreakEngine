@@ -2,6 +2,8 @@
 #include "Scene/ParticleSystem.h"
 
 #include "Assets/AssetLoader.h"
+#include "Assets/Mesh.h"           // Model / MeshData (mesh particles)
+#include "RHI/MaterialCompiler.h"  // material::ComputeShaderVariant (mesh-particle DrawItems)
 #include "Scene/ParticleGpuSim.h"
 #include "Core/Log.h"
 #include "Renderer/Renderer.h"
@@ -20,6 +22,95 @@
 #include <vector>
 
 namespace hbe::particle {
+
+// True for an emitter that uses a CPU-only render feature (a value-over-life curve/gradient). Such
+// an emitter must be CPU-expanded even if it opted into GPU vertex expansion: the 128-byte
+// GpuEmitter record carries only start/end colour + size, so the vertex shader cannot evaluate a
+// curve. Routing it through BuildVertices instead keeps curves working without a shader change.
+static bool UsesCpuOnlyRenderFeature(const ParticleEmitter& em) {
+    return (em.useColorCurve && !em.colorCurve.stops.empty()) ||
+           (em.useSizeCurve && !em.sizeCurve.keys.empty()) ||
+           em.render == ParticleEmitter::Render::Ribbon; // a strip, not per-particle quads
+}
+
+// Per-particle render colour + size at its normalized age, honouring the simulated attributes, the
+// value-over-life curves, and the alpha fade envelope. Shared by the quad path and the ribbon path
+// so both evaluate an effect's look identically. `t` is the caller's precomputed normalized age.
+static void EvalLook(const ParticleEmitter& em, u32 i, f32 t, bool simColor, bool simSize,
+                     bool useColorC, bool useSizeC, f32& sizeOut, glm::vec4& colOut) {
+    sizeOut = simSize ? em.pool.sizeX[i]
+                      : (useSizeC ? em.sizeCurve.Eval(t) : glm::mix(em.startSize, em.endSize, t));
+    if (simColor) {
+        colOut = em.pool.color[i];
+    } else {
+        colOut = useColorC ? em.colorCurve.Eval(t) : glm::mix(em.startColor, em.endColor, t);
+        f32 env = 1.0f;
+        if (em.fadeIn > 0.0f && t < em.fadeIn) env *= t / em.fadeIn;
+        if (em.fadeOut > 0.0f && t > 1.0f - em.fadeOut) env *= (1.0f - t) / em.fadeOut;
+        colOut.a *= glm::clamp(env, 0.0f, 1.0f);
+    }
+}
+
+// Builds ONE camera-facing ribbon strip through an emitter's live particles, ordered oldest->newest
+// by age (their spawn path). Each particle is a cross-section whose width is its (curve-aware) size
+// and whose colour is its (curve-aware) colour; consecutive cross-sections are joined by two
+// triangles. The width axis is perpendicular to the ribbon's screen-space direction, so it always
+// faces the camera. Emits into `out` (the emitter's alpha/additive list, chosen by the caller).
+static void BuildRibbon(const ParticleEmitter& em, u32 tex, const glm::vec3& camRight,
+                        const glm::vec3& camUp, bool simColor, bool simSize, bool useColorC,
+                        bool useSizeC, std::vector<rhi::ParticleVertex>& out) {
+    const u32 count = em.pool.count;
+    if (count < 2) return;
+    // Order particles oldest -> newest (largest age first).
+    static std::vector<u32> order; // reused; BuildVertices is single-threaded per frame
+    order.resize(count);
+    for (u32 i = 0; i < count; ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+              [&](u32 a, u32 b) { return em.pool.age[a] > em.pool.age[b]; });
+
+    const u32 segs = count - 1;
+    out.reserve(out.size() + static_cast<usize>(segs) * 6);
+
+    // Precompute each cross-section's two edge vertices.
+    struct Edge { glm::vec3 a, b; glm::vec4 col; f32 u; };
+    static std::vector<Edge> edges;
+    edges.resize(count);
+    for (u32 k = 0; k < count; ++k) {
+        const u32 i = order[k];
+        const glm::vec3 pos = em.pool.position[i];
+        const f32 t = glm::clamp(em.pool.age[i] / glm::max(em.pool.lifetime[i], 1e-4f), 0.0f, 1.0f);
+        f32 size;
+        glm::vec4 col;
+        EvalLook(em, i, t, simColor, simSize, useColorC, useSizeC, size, col);
+        // Tangent = direction to the neighbour along the ribbon (forward, or backward at the tail).
+        const u32 iN = order[k + 1 < count ? k + 1 : k];
+        const u32 iP = order[k > 0 ? k - 1 : k];
+        glm::vec3 tan = em.pool.position[iN] - em.pool.position[iP];
+        // Perpendicular to the tangent in SCREEN space, so the ribbon width faces the camera.
+        glm::vec2 ts(glm::dot(tan, camRight), glm::dot(tan, camUp));
+        const f32 tl = glm::length(ts);
+        glm::vec3 side = tl > 1e-5f ? (camRight * (-ts.y / tl) + camUp * (ts.x / tl)) : camRight;
+        const glm::vec3 off = side * (size * 0.5f);
+        edges[k] = {pos + off, pos - off, col, static_cast<f32>(k) / static_cast<f32>(segs)};
+    }
+
+    const auto V = [&](const glm::vec3& wp, f32 uu, f32 vv, const glm::vec4& col) {
+        rhi::ParticleVertex v;
+        v.x = wp.x; v.y = wp.y; v.z = wp.z;
+        v.u = uu; v.v = vv;
+        v.r = col.r; v.g = col.g; v.b = col.b; v.a = col.a;
+        v.texIndex = tex;
+        return v;
+    };
+    for (u32 k = 0; k + 1 < count; ++k) {
+        const Edge& e0 = edges[k];
+        const Edge& e1 = edges[k + 1];
+        const rhi::ParticleVertex a = V(e0.a, e0.u, 0.0f, e0.col), b = V(e1.a, e1.u, 0.0f, e1.col),
+                                  cc = V(e1.b, e1.u, 1.0f, e1.col), d = V(e0.b, e0.u, 1.0f, e0.col);
+        out.push_back(a); out.push_back(b); out.push_back(cc);
+        out.push_back(a); out.push_back(cc); out.push_back(d);
+    }
+}
 
 // vfx::LegacyShape is a copy of ParticleEmitter::Shape kept in Source/Vfx so the VFX
 // core does not depend on Scene. This is the lockstep guard: the two enums are one
@@ -232,7 +323,16 @@ void StepEmitter(ParticleEmitter& em, const glm::mat4& world, f32 dt, bool emitt
         em.state.burstFired = false;
     }
     em.state.emitting = active;
-    vfx::RunFrame(em.stack, em.state, em.pool, dt, &em.legacy);
+    // Sub-emitter: capture this frame's death positions only when a child effect is set. The buffer
+    // is cleared each frame (bounded to one frame's deaths) and drained by the play-gated spawn
+    // system; when nothing consumes it (editor edit mode) it simply never grows.
+    if (!em.onDeathEffect.empty()) {
+        em.deaths.clear();
+        vfx::RunFrame(em.stack, em.state, em.pool, dt, &em.legacy, &em.deaths);
+    } else {
+        if (!em.deaths.empty()) em.deaths.clear();
+        vfx::RunFrame(em.stack, em.state, em.pool, dt, &em.legacy);
+    }
 }
 
 } // namespace
@@ -272,7 +372,13 @@ void BuildVertices(Scene& scene, Renderer& renderer, const std::filesystem::path
         // seam one step further out - its records are written by the compute shader,
         // so it has no CPU pool at all (count would already be 0; named anyway so
         // the exclusion is a statement rather than a side effect).
-        if (em.gpuExpand || em.gpuSim) continue;
+        // gpuSim has no CPU pool at all. gpuExpand normally skips here too (the vertex shader
+        // expands its records) - EXCEPT when the emitter uses a curve the GpuEmitter record cannot
+        // carry, in which case it falls back to CPU expansion so the curve still applies.
+        if (em.gpuSim) continue;
+        if (em.gpuExpand && !UsesCpuOnlyRenderFeature(em)) continue;
+        // Mesh particles are drawn as instanced meshes by CollectMeshParticles, not billboards.
+        if (em.render == ParticleEmitter::Render::Mesh) continue;
 
         // Resolve the sprite once (cached). 0 = procedural soft dot in the shader.
         if (!em.textureResolved) {
@@ -300,24 +406,24 @@ void BuildVertices(Scene& scene, Renderer& renderer, const std::filesystem::path
         // those pointers NULL rather than zeroed. Read them through the mask.
         const bool hasRot = em.pool.Has(vfx::Attr::Rotation);
         const bool hasVel = em.pool.Has(vfx::Attr::Velocity);
+        // Value-over-life curves (opt-in, render-time). Precomputed so the hot loop just branches.
+        const bool useColorC = em.useColorCurve && !em.colorCurve.stops.empty();
+        const bool useSizeC = em.useSizeCurve && !em.sizeCurve.keys.empty();
+
+        // Ribbon: one connected camera-facing strip through the particles, not per-particle quads.
+        if (em.render == ParticleEmitter::Render::Ribbon) {
+            BuildRibbon(em, tex, camRight, camUp, simColor, simSize, useColorC, useSizeC, out);
+            continue;
+        }
 
         const u32 cols = glm::max(1u, em.subUVCols), rows = glm::max(1u, em.subUVRows);
         for (u32 i = 0; i < count; ++i) {
             const glm::vec3 pos = em.pool.position[i];
             const f32 age = em.pool.age[i];
             const f32 t = glm::clamp(age / glm::max(em.pool.lifetime[i], 1e-4f), 0.0f, 1.0f);
-            const f32 size = simSize ? em.pool.sizeX[i] : glm::mix(em.startSize, em.endSize, t);
+            f32 size;
             glm::vec4 col;
-            if (simColor) {
-                col = em.pool.color[i];
-            } else {
-                col = glm::mix(em.startColor, em.endColor, t);
-                // Alpha fade-in/out envelope (fractions of life).
-                f32 env = 1.0f;
-                if (em.fadeIn > 0.0f && t < em.fadeIn) env *= t / em.fadeIn;
-                if (em.fadeOut > 0.0f && t > 1.0f - em.fadeOut) env *= (1.0f - t) / em.fadeOut;
-                col.a *= glm::clamp(env, 0.0f, 1.0f);
-            }
+            EvalLook(em, i, t, simColor, simSize, useColorC, useSizeC, size, col);
 
             // Sub-UV (sprite-sheet) cell -> local UV rect.
             f32 u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
@@ -378,6 +484,56 @@ void BuildVertices(Scene& scene, Renderer& renderer, const std::filesystem::path
     }
 }
 
+void CollectMeshParticles(Scene& scene, Renderer& renderer, const std::filesystem::path& assetsDir,
+                          std::vector<rhi::DrawItem>& out) {
+    auto& reg = scene.Registry();
+    for (const entt::entity e : reg.view<ParticleEmitter>()) {
+        ParticleEmitter& em = reg.get<ParticleEmitter>(e);
+        if (em.render != ParticleEmitter::Render::Mesh || em.gpuSim || em.pool.count == 0) continue;
+
+        // Resolve the mesh once (first submesh), cached like the sprite texture.
+        if (!em.meshResolved) {
+            em.meshResolved = true;
+            em.meshCache = {};
+            if (!em.particleMesh.empty() && !assetsDir.empty())
+                if (auto model = assets::LoadMesh(assetsDir / em.particleMesh);
+                    model && !model->empty())
+                    em.meshCache = renderer.UploadMesh((*model)[0]);
+        }
+        if (!em.meshCache.IsValid()) continue;
+
+        const bool simColor = em.pool.Has(vfx::Attr::Color);
+        const bool simSize = em.pool.Has(vfx::Attr::Size);
+        const bool useColorC = em.useColorCurve && !em.colorCurve.stops.empty();
+        const bool useSizeC = em.useSizeCurve && !em.sizeCurve.keys.empty();
+        const bool hasRot = em.pool.Has(vfx::Attr::Rotation);
+        out.reserve(out.size() + em.pool.count);
+        for (u32 i = 0; i < em.pool.count; ++i) {
+            const f32 t =
+                glm::clamp(em.pool.age[i] / glm::max(em.pool.lifetime[i], 1e-4f), 0.0f, 1.0f);
+            f32 size;
+            glm::vec4 col;
+            EvalLook(em, i, t, simColor, simSize, useColorC, useSizeC, size, col);
+            const f32 rot = hasRot ? em.pool.rotation[i] : 0.0f;
+            glm::mat4 m = glm::translate(glm::mat4(1.0f), em.pool.position[i]);
+            if (rot != 0.0f) m = glm::rotate(m, rot, glm::vec3(0.0f, 1.0f, 0.0f));
+            m = glm::scale(m, glm::vec3(glm::max(size, 1e-4f)));
+
+            rhi::DrawItem it;
+            it.mesh = em.meshCache;
+            it.transform = m;
+            it.prevTransform = m; // no per-particle motion history -> zero velocity
+            it.surface.base_color = col;
+            it.surface.specular_roughness = 0.7f;
+            it.surface.base_metalness = 0.0f;
+            // Uniform-colour emitters produce byte-identical DrawItems -> the renderer's run-builder
+            // folds them into ONE instanced draw; per-particle colour falls back to N draws.
+            it.shaderVariant = material::ComputeShaderVariant(it.surface, 0);
+            out.push_back(it);
+        }
+    }
+}
+
 bool AnyGpuExpand(Scene& scene) {
     auto& reg = scene.Registry();
     for (const entt::entity e : reg.view<ParticleEmitter>()) {
@@ -419,7 +575,9 @@ u32 BuildGpuRecords(Scene& scene, Renderer& renderer, const std::filesystem::pat
 
     for (const entt::entity e : reg.view<ParticleEmitter>()) {
         ParticleEmitter& em = reg.get<ParticleEmitter>(e);
-        if (!em.gpuExpand || em.pool.count == 0) continue;
+        // A curve-using emitter is CPU-expanded by BuildVertices (the GpuEmitter record cannot carry
+        // a curve), so it must NOT also be written here - that would draw it twice.
+        if (!em.gpuExpand || em.pool.count == 0 || UsesCpuOnlyRenderFeature(em)) continue;
         // Every emitter block starts 256-byte aligned. The batch base reaches Vulkan
         // as a DYNAMIC STORAGE-BUFFER OFFSET, which must be a multiple of
         // minStorageBufferOffsetAlignment - 32 on this project's dev GPU but up to

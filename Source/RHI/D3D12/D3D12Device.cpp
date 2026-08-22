@@ -4,6 +4,7 @@
 // selection, swapchain, RTV heap, per-frame command allocators, and a clear.
 #include "RHI/D3D12/D3D12Device.h"
 #include "Core/Platform.h"
+#include "Vfx/EffekseerBackend.h" // Effekseer VFX runtime (DX12 backend owns it)
 #include "Assets/Mesh.h"
 #include "Assets/StrokeGen.h"
 #include "Core/Log.h"
@@ -471,6 +472,24 @@ public:
                       const ParticleVertex* additive, u32 addCount) override;
     void SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
                          u32 count) override;
+
+    // Effekseer VFX seam (see the base RHI declarations + Vfx/EffekseerBackend).
+    bool VfxAvailable() const override { return effekseer_.Available(); }
+    u32 VfxLoadEffect(const char* absPath) override {
+        return EnsureEffekseer() ? effekseer_.LoadEffect(absPath ? absPath : "") : 0;
+    }
+    int VfxPlay(u32 effectId, const glm::vec3& worldPos) override {
+        return EnsureEffekseer() ? effekseer_.Play(effectId, worldPos) : -1;
+    }
+    void VfxStop(int handle) override { effekseer_.Stop(handle); }
+    void VfxStopAll() override { effekseer_.StopAll(); }
+    void VfxSetLocation(int handle, const glm::vec3& p) override { effekseer_.SetLocation(handle, p); }
+    bool VfxExists(int handle) const override { return effekseer_.Exists(handle); }
+    void VfxUpdate(f32 dt) override {
+        if (effekseer_.Available()) effekseer_.Update(dt);
+    }
+    int VfxLiveInstanceCount() const override { return effekseer_.LiveInstanceCount(); }
+
     void SetGrass(GpuBufferHandle blades, u32 bladeCount) override;
     void SetGrassIndirect(GpuBufferHandle blades, GpuBufferHandle args, u32 maxBlades) override;
     // Reflects the ACTUAL indirect grass pipeline, not a blanket capability: if the
@@ -714,6 +733,20 @@ private:
     const ParticleVertex* particleAdd_ = nullptr;
     u32 particleAlphaCount_ = 0;
     u32 particleAddCount_ = 0;
+
+    // Effekseer VFX runtime (this backend owns it - it needs the native device/queue). Lazily
+    // created on first use; drawn in DrawScene's transparent slot. See Vfx/EffekseerBackend.
+    hbe::vfx::EffekseerBackend effekseer_;
+    bool effekseerTried_ = false; // init attempted (success or failure) - don't retry every frame
+    bool EnsureEffekseer() {
+        if (effekseer_.Available()) return true;
+        if (effekseerTried_) return false;
+        effekseerTried_ = true;
+        return effekseer_.Init(device_.Get(), queue_.Get(),
+                               static_cast<u32>(DXGI_FORMAT_R16G16B16A16_FLOAT),
+                               static_cast<u32>(DXGI_FORMAT_D32_FLOAT), /*hasDepth=*/true,
+                               static_cast<int>(backBufferCount_));
+    }
     // GPU vertex expansion: no vertex buffer, no input layout - the VS builds the
     // quad from SV_VertexID out of the record buffer (Shaders/ParticleGpu.hlsl).
     // Vulkan twin: particleGpuPipeline_ / particleGpuPipelineAdd_.
@@ -4990,6 +5023,13 @@ void D3D12Device::DrawScene(const SceneView& view, const DrawItem* items, u32 co
         DrawGpuParticleBatches(false);
         DrawGpuParticleBatches(true);
     }
+
+    // Effekseer VFX: draws into the SAME HDR target + scene depth (bound above), right after the
+    // native billboards, using the frame's view/proj. Effekseer manages its own PSOs/root sig/
+    // descriptor heaps inside Begin/EndCommandList; the post stack that follows rebinds everything,
+    // so its state changes don't leak. No-op unless the runtime is up and effects are alive.
+    if (effekseer_.Available()) effekseer_.Draw(cmdList_.Get(), view.view, view.proj);
+
     // One frame only, like SetParticles. Cleared here (not in the block above) so a
     // frame with batches but no CPU verts still drops them.
     ClearGpuParticleGroups();

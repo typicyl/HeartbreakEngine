@@ -7,6 +7,7 @@
 #include "Project/Project.h"
 #include "Scene/Components.h"
 #include "Scene/EffectAsset.h" // particle::LoadEffect (.hbvfx)
+#include "Renderer/Renderer.h" // renderer.Vfx* (Effekseer effect routing)
 #include "Scene/Hierarchy.h" // scene::BuildChildrenMap (one parent->children pass)
 #include "Scene/Scene.h"
 #include "Scene/SceneSerializer.h"
@@ -207,9 +208,23 @@ void FireClearedAction(const Encounter& en) {
 
 } // namespace
 
-entt::entity SpawnEffect(Scene& scene, const std::string& name, const glm::mat4& transform) {
+entt::entity SpawnEffect(Scene& scene, Renderer& renderer, const std::string& name,
+                         const glm::mat4& transform) {
     const ParticleEmitter* asset = GetEffect(name);
     if (!asset) return entt::null;
+
+    // EFFEKSEER path: if the effect names an Effekseer file and the backend has Effekseer, play it
+    // through the real Effekseer runtime (it owns the instance - no scene entity). Falls through to
+    // the native emitter if the file can't be loaded, so a bad ref degrades gracefully.
+    if (!asset->effekseerEffect.empty() && renderer.VfxAvailable() && Project::HasActive()) {
+        const std::filesystem::path abs = Project::Active().AssetsDir() / asset->effekseerEffect;
+        const u32 fx = renderer.VfxLoadEffect(abs.string().c_str());
+        if (fx != 0) {
+            renderer.VfxPlay(fx, glm::vec3(transform[3]));
+            return entt::null;
+        }
+    }
+
     entt::registry& reg = scene.Registry();
     const entt::entity e = scene.CreateEntity("FX:" + name);
 
@@ -238,7 +253,36 @@ void Update(Scene& scene, Renderer& renderer, f32 dt) {
     entt::registry& reg = scene.Registry();
 
     // Drain deferred game::SpawnEffect requests (gameplay/schematics enqueue; we own the Scene).
-    for (game::EffectReq req; game::ConsumeEffect(req);) SpawnEffect(scene, req.name, req.transform);
+    for (game::EffectReq req; game::ConsumeEffect(req);)
+        SpawnEffect(scene, renderer, req.name, req.transform);
+
+    // Sub-emitters: each CPU-sim emitter with an onDeathEffect spawns that child `.hbvfx` at every
+    // death position captured this frame (particle::Update fills ParticleEmitter::deaths before this
+    // runs). A per-emitter per-frame cap bounds a dense emitter - or a self-referential child - from
+    // flooding the scene; onDeathChance thins them with a deterministic per-death hash (no global RNG,
+    // so a movie re-render is reproducible). Consumed here (deaths cleared) so each death fires once.
+    {
+        constexpr u32 kMaxChildrenPerEmitterPerFrame = 64;
+        const auto hash32 = [](u32 x) {
+            x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x;
+        };
+        for (auto e : reg.view<ParticleEmitter>()) {
+            ParticleEmitter& em = reg.get<ParticleEmitter>(e);
+            if (em.onDeathEffect.empty() || em.deaths.empty()) continue;
+            const f32 chance = glm::clamp(em.onDeathChance, 0.0f, 1.0f);
+            u32 made = 0;
+            for (u32 di = 0; di < em.deaths.size() && made < kMaxChildrenPerEmitterPerFrame; ++di) {
+                if (chance < 1.0f) {
+                    const u32 h = hash32(static_cast<u32>(e) * 2654435761u + di);
+                    if (static_cast<f32>(h & 0xffffffu) / 16777216.0f > chance) continue;
+                }
+                SpawnEffect(scene, renderer, em.onDeathEffect,
+                            glm::translate(glm::mat4(1.0f), em.deaths[di]));
+                ++made;
+            }
+            em.deaths.clear();
+        }
+    }
 
     // Age one-shot effects; destroy those whose particles have all died.
     {

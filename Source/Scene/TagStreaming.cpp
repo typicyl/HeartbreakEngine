@@ -3,6 +3,7 @@
 
 #include "Scene/StreamingSalvage.h" // SALVAGE 2 (hysteresis), 3 (finalize budget), 4 (settle)
 
+#include "Assets/AssetLoader.h" // assets::NoteMissingAsset (safe-mode banner)
 #include "Core/JobSystem.h"
 #include "Core/Log.h"
 #include "Renderer/Renderer.h"
@@ -1116,6 +1117,10 @@ void Streamer::Update(Scene& scene, Renderer& renderer, const std::vector<glm::v
         } else if (s == salvage::RegionState::Failed && !sr.failWarned) {
             sr.failWarned = true;
             ++stats_.failures;
+            // A whole streamed region failed to stage (a corrupt/missing .uaf/.hbmat under
+            // its tag) - that is missing world geometry, so it is important (Major tier).
+            // Latched by failWarned, so it counts once per shard, not every frame.
+            assets::NoteMissingAsset(/*important*/ true);
             sr.staged = scene::StagedAssets{};
             // TERMINAL, not reset to Unloaded. See the header: the original's reset
             // re-entered Loading the same Update, so a durably broken shard retried

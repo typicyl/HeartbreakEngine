@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace hbe::assets {
 
@@ -120,6 +122,38 @@ std::string BcVariantName(const std::string& uafRef) {
 }
 void SetBlockCompressionAvailable(bool v) { g_bcAvailable.store(v, std::memory_order_relaxed); }
 bool BlockCompressionAvailable() { return g_bcAvailable.load(std::memory_order_relaxed); }
+
+namespace {
+std::atomic<u32> g_missImportant{0};
+std::atomic<u32> g_missCosmetic{0};
+std::mutex g_notedMissMutex;
+std::unordered_set<std::string> g_notedMisses; // distinct once-keyed misses (audio, UI, ...)
+} // namespace
+void NoteMissingAsset(bool important) {
+    (important ? g_missImportant : g_missCosmetic).fetch_add(1, std::memory_order_relaxed);
+}
+void NoteMissingAssetOnce(const std::string& key, bool important) {
+    std::lock_guard<std::mutex> lock(g_notedMissMutex);
+    if (g_notedMisses.insert(key).second) NoteMissingAsset(important);
+}
+MissCounts MissTally() {
+    return {g_missImportant.load(std::memory_order_relaxed),
+            g_missCosmetic.load(std::memory_order_relaxed)};
+}
+void ResetMissTally() {
+    g_missImportant.store(0, std::memory_order_relaxed);
+    g_missCosmetic.store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(g_notedMissMutex);
+    g_notedMisses.clear(); // keep the once-dedupe in lockstep with the counters
+}
+
+std::optional<uaf::Audio> ReadAudioTracked(const std::filesystem::path& path) {
+    std::optional<uaf::Audio> a = uaf::ReadAudio(path);
+    // A missing shipped audio file is cosmetic (the game still plays). Skip a pathless
+    // load (an empty asset ref resolves to the assets DIR, not a real missing file).
+    if (!a && path.has_filename()) NoteMissingAssetOnce(path.generic_string(), /*important*/ false);
+    return a;
+}
 
 rhi::TextureHandle LoadTexture(Renderer& renderer, const std::filesystem::path& uaf) {
     std::optional<uaf::Texture> tex = uaf::ReadTexture(uaf);

@@ -41,5 +41,28 @@ std::string BcVariantName(const std::string& uafRef);
 void SetBlockCompressionAvailable(bool v);
 bool BlockCompressionAvailable();
 
+// --- Missing-asset tally (safe-mode banner) --------------------------------
+// A runtime asset that cannot be loaded is non-fatal: the loader logs + skips it
+// and the game keeps running. But the player should be told their files are
+// incomplete, so StageAssets NOTES each miss here and the engine reads the totals
+// each frame to pick a safe-mode tier. IMPORTANT = structural (mesh/material) ->
+// the game won't play correctly; COSMETIC = texture/paint -> it just looks wrong.
+// Incremented from streaming worker threads, so the counters are atomic.
+struct MissCounts { u32 important = 0; u32 cosmetic = 0; };
+void NoteMissingAsset(bool important);
+// Note a miss AT MOST ONCE per distinct `key` (until the next ResetMissTally). For load
+// paths that are retried every frame or hit repeatedly (audio, UI images), so a single
+// missing asset counts once, not thousands of times. Thread-safe.
+void NoteMissingAssetOnce(const std::string& key, bool important);
+MissCounts MissTally();
+void ResetMissTally();
+
+// Runtime audio load that FEEDS the miss tally. Wraps uaf::ReadAudio and, on a miss,
+// notes ONE cosmetic miss per DISTINCT path (some callers retry a missing clip every
+// frame, so it dedupes). Audio is cosmetic - the game still plays, it just may not sound
+// as intended. For shipped, referenced audio only - NOT editor/import reads (those also
+// touch non-shipped files). The dedupe set is cleared by ResetMissTally on each world load.
+std::optional<uaf::Audio> ReadAudioTracked(const std::filesystem::path& path);
+
 } // namespace assets
 } // namespace hbe

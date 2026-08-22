@@ -26,6 +26,12 @@ bool MountPacks(const std::filesystem::path& packDir, const std::string& baseNam
 void Unmount();
 bool IsMounted();
 
+// How many pack chunks are renamed/removed relative to how many were shipped (0 when not
+// mounted, or when every chunk is present). A positive result means the install is
+// incomplete - whole packs (with whatever they held: audio, textures, a level...) are
+// gone. Authoritative for v6+ packs; a gap heuristic for older ones (see PackSet).
+u32 MissingPackCount();
+
 // Last-chance resolution root: when a read misses, the file NAME is searched
 // under this directory (and across mounted pack entries) so refs survive
 // assets being organized into subfolders. Set when a project opens.

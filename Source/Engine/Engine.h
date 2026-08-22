@@ -671,6 +671,26 @@ private:
     void BuildDevOverlay(std::vector<rhi::UIVertex>& out);
     // Full-screen black fade curtain (loading transitions); appends a quad at fadeAlpha_.
     void BuildFadeCurtain(std::vector<rhi::UIVertex>& out);
+
+    // Tiered "safe mode" banner: an on-screen message when the game's data is
+    // incomplete. CRITICAL (no project / startup scene failed) = the game can't
+    // run; MAJOR (missing mesh/material) = won't run right; MINOR (missing
+    // texture/paint) = looks wrong. Drawn from the OS system font (ui::SharedFont),
+    // so it needs no shipped asset; appended to the UI overlay, so it shows over
+    // whatever the frame is (empty scene / demo world). Runtime only (the editor has
+    // its own diagnostics). Does NOT cover a missing UI/mesh SHADER - that takes the
+    // renderer's slate path where no overlay draws.
+    enum class BootHealth { Healthy, Minor, Major, Critical };
+    void BuildSafeModeBanner(std::vector<rhi::UIVertex>& out);
+    BootHealth EffectiveHealth() const; // bootHealth_ merged with the live miss tally
+    // True while a Minor/Major "data incomplete" MODAL is up and unacknowledged: the sim
+    // pauses and the cursor frees until the player clicks its X. Critical is NOT a modal
+    // (the game can't run) - it stays a permanent overlay. Runtime only (editor: false).
+    bool SafeModeModalActive() const;
+    BootHealth bootHealth_ = BootHealth::Healthy;  // stamped at boot / startup-scene load
+    BootHealth safeModeSev_ = BootHealth::Healthy; // last tier shown (a change re-arms the modal)
+    bool safeModeAck_ = false;                     // player clicked the modal's X for this tier
+
     bool      devMenuOpen_ = false;
 
     // --- Developer debug menu (TLOU-style, shipped-build, gated by BuildSettings.devMenu) ---

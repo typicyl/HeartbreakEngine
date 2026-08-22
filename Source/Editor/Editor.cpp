@@ -392,6 +392,7 @@ void Editor::BuildUI(Engine& engine) {
         panelOpen_[Panel_Review] = false;             // opens itself when there is a merge
         panelOpen_[Panel_MaterialGraph] = false;      // Material Maker, opened on demand
         panelOpen_[Panel_MaterialLayers] = false;     // layer-stack editor, opened on demand
+        panelOpen_[Panel_ParticleEditor] = false;     // particle authoring, opened on demand
         if (artMode_) {
             // Artist build: show only the painting-relevant panels.
             for (bool& b : panelOpen_) b = false;
@@ -807,6 +808,7 @@ void Editor::BuildUI(Engine& engine) {
     DrawDialogueEditor(engine);
     DrawMaterialGraph(engine);    // Material Maker node-graph editor (Window > Material Graph)
     DrawMaterialLayers(engine);   // layer-stack editor (Window > Material Layers)
+    DrawParticleEditor(engine);   // particle authoring + live preview (Window > Particle Editor)
     DrawInputIconsPanel(engine);
     DrawObjectives(engine);       // task-goal browser (Window > Objectives)
     DrawCharacterEditor(engine);  // modular-rig .hbchar authoring (Window > Character Editor)
@@ -907,7 +909,7 @@ void Editor::DrawWindowMenu() {
         "Schematic Editor", "Music", "Cutscene Timeline", "Dialogue Editor", "Input",
         "Objectives", "Character Editor", "Movie Render", "UI Document",
         "Tags", "UI Editor", "Collaborate", "People", "Review changes", "Volume Baker",
-        "Vegetation", "Sequencer", "Material Graph", "Material Layers"};
+        "Vegetation", "Sequencer", "Material Graph", "Material Layers", "Particle Editor"};
     // The enum only WARNS about the lockstep in a comment; this makes forgetting a
     // string a build error instead of a null-titled menu item at MenuItem() below.
     static_assert(std::size(kNames) == Panel_Count,
@@ -9810,6 +9812,19 @@ void Editor::DrawInspector(Scene& scene, Renderer& renderer) {
                 PushUndo(scene);
                 pe->texture = tpick;
                 pe->textureResolved = false;
+            }
+            // Effekseer effect: when set (and the backend has Effekseer), game::SpawnEffect plays
+            // THIS through the Effekseer runtime instead of the native emitter above.
+            {
+                std::string efkPick;
+                if (AssetPicker("Effekseer (.efkefc)", pe->effekseerEffect, ".efkefc",
+                                uaf::AssetType::Unknown, efkPick, "(native emitter)")) {
+                    PushUndo(scene);
+                    pe->effekseerEffect = efkPick;
+                }
+                if (!pe->effekseerEffect.empty())
+                    ImGui::TextDisabled("Effekseer-backed: SpawnEffect plays this .efkefc (the "
+                                        "native fields above are ignored at runtime).");
             }
             AssetDropTarget(".uaf", uaf::AssetType::Texture,
                             [&](const std::filesystem::path& dropped) {
@@ -20188,6 +20203,30 @@ bool Editor::BuildShipping(std::string& outMessage) {
                                                             : gameName);
     if (exeStem.empty()) exeStem = "Game";
     bool ok = copy(runtimeDir / "HeartbreakRuntime.exe", dst / (exeStem + ".exe"));
+
+    // 1b) The open-source attribution notice. A shipped game MUST carry it: many of the
+    //     engine's third-party libraries that link into the runtime - assimp, FreeType,
+    //     HarfBuzz, Jolt, Effekseer, zstd, Resonance Audio, NanoVDB and more - require
+    //     their copyright/license notice to be reproduced in a binary distribution.
+    //     ThirdParty.txt is generated at build time from cmake/thirdparty/manifest.json and
+    //     staged next to the runtime exe (hbe_stage_thirdparty_notice). It is placed beside
+    //     the game exe here. Its absence means the runtime was built without the attribution
+    //     step, and shipping without it would violate those licenses - so a MISSING notice
+    //     is a hard failure, not a warning, and never silent.
+    const fs::path noticeSrc = runtimeDir / "ThirdParty.txt";
+    if (fs::exists(noticeSrc, ec)) {
+        if (!copy(noticeSrc, dst / "ThirdParty.txt")) {
+            ok = false;
+            HBE_ERROR("Shipping: failed to copy ThirdParty.txt into the build.");
+        }
+    } else {
+        ok = false;
+        HBE_ERROR("Shipping: ThirdParty.txt is missing next to the runtime ({}). The "
+                  "open-source attribution notice is REQUIRED in a shipped build. Rebuild "
+                  "the HeartbreakRuntime target so the notice is generated (see "
+                  "cmake/ThirdPartyNotice.cmake), then ship again.",
+                  noticeSrc.string());
+    }
 
     // 2) DLLs. Native deps link statically and the MSVC runtime is /MT (static), so a
     //    shipped build normally needs NO DLLs. Copy any that are genuinely present, but

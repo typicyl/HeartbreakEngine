@@ -63,6 +63,13 @@ void BuildVertices(Scene& scene, Renderer& renderer,
                    const glm::vec3& camUp, std::vector<rhi::ParticleVertex>& alphaOut,
                    std::vector<rhi::ParticleVertex>& addOut);
 
+// Mesh particles: for every emitter with render == Render::Mesh, resolve its `.uaf` mesh (cached)
+// and append one rhi::DrawItem per live particle (transform + particle-colour tint) to `out`. The
+// renderer's run-builder auto-instances the identical-material ones. A no-op unless an emitter opts
+// into Mesh mode, so existing scenes are unaffected. Call before the renderer collects draw items.
+void CollectMeshParticles(Scene& scene, Renderer& renderer, const std::filesystem::path& assetsDir,
+                          std::vector<rhi::DrawItem>& out);
+
 // True if any emitter in the scene opted into GPU vertex expansion. Cheap; the
 // caller uses it to avoid allocating the record buffer in projects that never do.
 bool AnyGpuExpand(Scene& scene);

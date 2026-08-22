@@ -1175,6 +1175,7 @@ private:
     void DrawMaterialGraph(Engine& engine);       // toolbar + preview + canvas + node inspector
     void DrawMaterialGraphCanvas(Engine& engine, float width); // node canvas
     void DrawMaterialLayers(Engine& engine);      // Photoshop-style .hbmatlayer stack editor
+    void DrawParticleEditor(Engine& engine);      // dedicated .hbvfx particle authoring + live preview
     void OpenMaterialGraph(const std::filesystem::path& path);
     bool SaveMaterialGraph();                       // writes mgGraph_ back to mgPath_
     std::filesystem::path CreateMaterialGraphAsset(const std::filesystem::path& dir = {},
@@ -1716,6 +1717,7 @@ private:
         Panel_Sequencer,
         Panel_MaterialGraph,
         Panel_MaterialLayers,
+        Panel_ParticleEditor,
         Panel_Count
     };
     bool panelOpen_[Panel_Count];

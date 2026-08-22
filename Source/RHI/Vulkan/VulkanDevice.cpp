@@ -5,6 +5,7 @@
 // use a uniform buffer; per-draw constants use a dynamic uniform buffer arena
 // addressed with dynamic offsets.
 #include "RHI/Vulkan/VulkanDevice.h"
+#include "Vfx/EffekseerBackend.h" // Effekseer VFX runtime (Vulkan backend owns it)
 #include "RHI/Vulkan/VulkanSurface.h" // OS-abstracted VkSurfaceKHR creation - the ONE Win32 seam
 #include "Core/Platform.h"
 #include "Assets/Mesh.h"
@@ -342,6 +343,55 @@ public:
                       const ParticleVertex* additive, u32 addCount) override;
     void SetGpuParticles(GpuBufferHandle records, const GpuParticleBatch* batches,
                          u32 count) override;
+
+    // Effekseer VFX seam (see the base RHI declarations + Vfx/EffekseerBackend). Mirrors the D3D12
+    // backend: this device owns the Effekseer runtime, lazily inits it from the native Vulkan handles
+    // + the HDR scene pass' formats, and draws it in DrawScene's transparent slot.
+    hbe::vfx::EffekseerBackend effekseer_;
+    bool effekseerTried_ = false;
+    bool EnsureEffekseer() {
+        if (effekseer_.Available()) return true;
+        if (effekseerTried_) return false;
+        effekseerTried_ = true;
+        // Effekseer's Vulkan path is fully working + validation-clean on hardware (verified on an
+        // RTX 3060 with the Khronos layers: draw has no VUIDs, teardown leaks nothing, instances
+        // live). kVulkanEffekseer is a kill-switch: set it false to force the native module-stack
+        // particle system on Vulkan (e.g. to sidestep a driver-specific Effekseer bug) - DX12 is
+        // unaffected either way. The draw itself lives in RunPostStack (a dedicated single-colour
+        // pass), NOT here; see effekseerRenderPass_.
+        static constexpr bool kVulkanEffekseer = true;
+        if (!kVulkanEffekseer) {
+            HBE_INFO("Effekseer: Vulkan backend disabled by kill-switch; using the native particle "
+                     "system on Vulkan.");
+            return false;
+        }
+        // Effekseer draws in its OWN single-colour render pass (effekseerRenderPass_) over the HDR
+        // colour + scene depth, NOT the 3-attachment MRT hdrRenderPass_ - Effekseer builds single-RT
+        // pipelines (its subpass has one colour attachment), so it is render-pass INCOMPATIBLE with
+        // the MRT pass (validation: pColorAttachments[1] used vs UNUSED). A transparent overlay does
+        // not belong in the G-buffer/velocity pass anyway. So give it ONE colour format = the HDR
+        // colour, matching effekseerRenderPass_.
+        const u32 rtFormats[1] = {static_cast<u32>(VK_FORMAT_R16G16B16A16_SFLOAT)};
+        return effekseer_.InitVulkan(physical_, device_, queue_, commandPool_, rtFormats,
+                                     /*colorAttachmentCount=*/1, static_cast<u32>(depthFormat_),
+                                     static_cast<int>(kMaxFramesInFlight));
+    }
+    bool VfxAvailable() const override { return effekseer_.Available(); }
+    u32 VfxLoadEffect(const char* absPath) override {
+        return EnsureEffekseer() ? effekseer_.LoadEffect(absPath ? absPath : "") : 0;
+    }
+    int VfxPlay(u32 effectId, const glm::vec3& worldPos) override {
+        return EnsureEffekseer() ? effekseer_.Play(effectId, worldPos) : -1;
+    }
+    void VfxStop(int handle) override { effekseer_.Stop(handle); }
+    void VfxStopAll() override { effekseer_.StopAll(); }
+    void VfxSetLocation(int handle, const glm::vec3& p) override { effekseer_.SetLocation(handle, p); }
+    bool VfxExists(int handle) const override { return effekseer_.Exists(handle); }
+    void VfxUpdate(f32 dt) override {
+        if (effekseer_.Available()) effekseer_.Update(dt);
+    }
+    int VfxLiveInstanceCount() const override { return effekseer_.LiveInstanceCount(); }
+
     void SetGrass(GpuBufferHandle blades, u32 bladeCount) override;
     void SetGrassIndirect(GpuBufferHandle blades, GpuBufferHandle args, u32 maxBlades) override;
     // Reflects the ACTUAL indirect grass pipeline (see the D3D12 twin for why).
@@ -696,6 +746,12 @@ private:
     // stays writable (transparent-depth strokes still write depth). Leaves everything SHADER_READ_ONLY.
     VkRenderPass hdrLoadRenderPass_ = VK_NULL_HANDLE;
     VkRenderPass previewRenderPass_ = VK_NULL_HANDLE; // single color + D32 (editor preview)
+    // Effekseer overlay: ONE colour attachment (HDR colour, LOADED) + scene depth (LOADED, read-only).
+    // Effekseer builds single-RT pipelines, so its draws are render-pass-INCOMPATIBLE with the
+    // 3-attachment MRT hdrRenderPass_ (VUID-vkCmdDrawIndexed-renderPass-02684). This dedicated pass
+    // reopens just the colour so particles composite over the lit scene and depth-test against it.
+    VkRenderPass effekseerRenderPass_ = VK_NULL_HANDLE;
+    VkFramebuffer effekseerFramebuffer_ = VK_NULL_HANDLE;
     VkRenderPass postPass16_ = VK_NULL_HANDLE;        // RGBA16F, discard -> sampled
     VkRenderPass postPass16Load_ = VK_NULL_HANDLE;    // RGBA16F, load (additive) -> sampled
     VkRenderPass postPass8_ = VK_NULL_HANDLE;         // RGBA8, discard -> sampled
@@ -3242,6 +3298,88 @@ bool VulkanDevice::CreatePostRenderPasses() {
                  "vkCreateRenderPass(hdrWater)");
     }
 
+    // Effekseer overlay pass: ONE colour attachment (the HDR colour, LOADED) + the scene depth
+    // (LOADED, read-only). Effekseer compiles single-RT pipelines, which are render-pass-INCOMPATIBLE
+    // with hdrRenderPass_'s 3 colour attachments (VUID-vkCmdDrawIndexed-renderPass-02684). We reopen
+    // just the colour so particles composite over the lit scene and depth-test against it; particles
+    // are alpha-blended and don't write depth, so read-only depth is safe. Everything is handed back
+    // SHADER_READ_ONLY, so the post stack (which follows) samples colour + depth unchanged.
+    {
+        VkAttachmentDescription atts[2]{};
+        atts[0].format = VK_FORMAT_R16G16B16A16_SFLOAT;   // HDR colour, matches hdr_.view
+        atts[0].samples = VK_SAMPLE_COUNT_1_BIT;
+        atts[0].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;      // preserve the lit HDR scene
+        atts[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        atts[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        atts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        atts[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL; // where the scene pass left it
+        atts[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;   // hand back to post
+        atts[1] = atts[0];
+        atts[1].format = depthFormat_;
+        atts[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;   // post stack samples depth (slotDepth_)
+        VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        // WRITABLE depth: Effekseer's effect materials can enable depthWrite (block_simple.efk does),
+        // and a read-only depth layout with depthWrite=TRUE is illegal (VUID-vkCmdDrawIndexed-None-06886).
+        // A writable depth ref also matches LLGI's own subpass, keeping the passes compatible.
+        VkAttachmentReference depthRef{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &colorRef;
+        sub.pDepthStencilAttachment = &depthRef;
+
+        // Render-pass COMPATIBILITY (VUID-vkCmdDrawIndexed-renderPass-02684) is checked against the
+        // pass Effekseer built its pipelines with; the validator compares dependencyCount too. LLGI's
+        // non-present 1-colour+depth pass declares exactly FOUR BY_REGION dependencies (colour
+        // before/after + depth before/after). Replicate them verbatim so this pass is compatible - they
+        // also correctly bracket the SHADER_READ_ONLY <-> attachment transitions we need (the scene
+        // pass left colour + depth SHADER_READ_ONLY; we hand both back the same way for the post stack).
+        VkSubpassDependency edeps[4]{};
+        edeps[0].srcSubpass = VK_SUBPASS_EXTERNAL;      // colour: before
+        edeps[0].dstSubpass = 0;
+        edeps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        edeps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        edeps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        edeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        edeps[0].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+        edeps[1].srcSubpass = 0;                        // colour: after
+        edeps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        edeps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        edeps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        edeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        edeps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        edeps[1].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+        edeps[2].srcSubpass = VK_SUBPASS_EXTERNAL;      // depth: before
+        edeps[2].dstSubpass = 0;
+        edeps[2].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        edeps[2].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        edeps[2].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        edeps[2].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        edeps[2].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+        edeps[3].srcSubpass = 0;                        // depth: after
+        edeps[3].dstSubpass = VK_SUBPASS_EXTERNAL;
+        edeps[3].srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        edeps[3].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        edeps[3].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        edeps[3].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        edeps[3].dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+
+        VkRenderPassCreateInfo ci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ci.attachmentCount = 2;
+        ci.pAttachments = atts;
+        ci.subpassCount = 1;
+        ci.pSubpasses = &sub;
+        ci.dependencyCount = 4;
+        ci.pDependencies = edeps;
+        VK_CHECK(vkCreateRenderPass(device_, &ci, nullptr, &effekseerRenderPass_),
+                 "vkCreateRenderPass(effekseer)");
+    }
+
     // Transmission/refraction load pass (P6b): identical to hdrWaterRenderPass_ (LOAD the lit HDR,
     // hand everything back SHADER_READ_ONLY, compatible with hdr_.framebuffer) EXCEPT the depth
     // attachment stays WRITABLE - the transparent pass depth-tests AND the depth-write variant writes
@@ -3532,6 +3670,7 @@ void VulkanDevice::DestroyPostTargets() {
     destroy(adaptedLum_[0]);
     destroy(adaptedLum_[1]);
     for (u32 i = 0; i < kBloomMaxMips; ++i) destroy(bloom_[i]);
+    if (effekseerFramebuffer_) { vkDestroyFramebuffer(device_, effekseerFramebuffer_, nullptr); effekseerFramebuffer_ = VK_NULL_HANDLE; }
     if (hdrDepthView_) { vkDestroyImageView(device_, hdrDepthView_, nullptr); hdrDepthView_ = VK_NULL_HANDLE; }
     if (hdrDepth_) { vkDestroyImage(device_, hdrDepth_, nullptr); hdrDepth_ = VK_NULL_HANDLE; }
     if (hdrDepthMem_) { vkFreeMemory(device_, hdrDepthMem_, nullptr); hdrDepthMem_ = VK_NULL_HANDLE; }
@@ -3659,6 +3798,18 @@ bool VulkanDevice::CreatePostTargets(u32 width, u32 height) {
         fci.layers = 1;
         VK_CHECK(vkCreateFramebuffer(device_, &fci, nullptr, &hdr_.framebuffer),
                  "vkCreateFramebuffer(hdr)");
+
+        // Effekseer overlay framebuffer: just the HDR colour + scene depth, for effekseerRenderPass_.
+        const VkImageView efkAtt[2] = {hdr_.view, hdrDepthView_};
+        VkFramebufferCreateInfo efci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        efci.renderPass = effekseerRenderPass_;
+        efci.attachmentCount = 2;
+        efci.pAttachments = efkAtt;
+        efci.width = width;
+        efci.height = height;
+        efci.layers = 1;
+        VK_CHECK(vkCreateFramebuffer(device_, &efci, nullptr, &effekseerFramebuffer_),
+                 "vkCreateFramebuffer(effekseer)");
     }
 
     // Half-resolution SSAO targets.
@@ -3862,6 +4013,34 @@ void VulkanDevice::RunPostStack(const SceneView& view) {
     // The bindless set stays bound from the scene pass; rebind defensively.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
                             &bindlessSet_, 0, nullptr);
+
+    // --- Effekseer VFX overlay -------------------------------------------------------------------
+    // Effekseer builds single-RT pipelines, so it can't draw inside the 3-attachment MRT scene pass
+    // (VUID-vkCmdDrawIndexed-renderPass-02684). Composite its particles here, in a dedicated
+    // single-colour pass (effekseerRenderPass_) over the resolved HDR colour + scene depth, both just
+    // left SHADER_READ_ONLY by the scene pass. The pass transitions colour to COLOR_ATTACHMENT, blends
+    // the particles depth-tested against the (read-only) scene depth, and hands colour back
+    // SHADER_READ_ONLY for the post stack below. Effekseer's renderer draws into an already-active
+    // pass (it doesn't begin its own). No-op unless the runtime is up with live instances.
+    if (effekseer_.Available() && effekseerFramebuffer_ != VK_NULL_HANDLE) {
+        VkRenderPassBeginInfo erp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        erp.renderPass = effekseerRenderPass_;
+        erp.framebuffer = effekseerFramebuffer_;
+        erp.renderArea = {{0, 0}, {sceneW_, sceneH_}};
+        erp.clearValueCount = 0; // both attachments are LOADED
+        vkCmdBeginRenderPass(cmd, &erp, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport vp{0.0f, 0.0f, static_cast<float>(sceneW_), static_cast<float>(sceneH_), 0.0f, 1.0f};
+        VkRect2D sc{{0, 0}, {sceneW_, sceneH_}};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        effekseer_.Draw(cmd, view.view, view.proj);
+        vkCmdEndRenderPass(cmd);
+        // Effekseer bound its own pipeline/descriptors inside Begin/EndCommandList; restore the
+        // bindless set for the post stack.
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+                                &bindlessSet_, 0, nullptr);
+    }
+
     // NOTE: GpuMark("particles") deliberately does NOT live here. It is emitted at the
     // end of the particle block in DrawScene, matching D3D12 exactly. The end-of-pass
     // work above (vkCmdEndRenderPass + the defensive rebind) therefore falls into the
@@ -6065,6 +6244,11 @@ void VulkanDevice::DrawScene(const SceneView& view, const DrawItem* items, u32 c
         DrawGpuParticleBatches(cmd, false);
         DrawGpuParticleBatches(cmd, true);
     }
+
+    // Effekseer VFX does NOT draw here: its single-RT pipelines are render-pass-INCOMPATIBLE with
+    // this 3-attachment MRT pass (VUID-vkCmdDrawIndexed-renderPass-02684). It draws in RunPostStack,
+    // in a dedicated single-colour pass (effekseerRenderPass_) reopened over the resolved HDR colour.
+
     // One frame only, like SetParticles.
     ClearGpuParticleGroups();
 
@@ -7205,6 +7389,15 @@ VulkanDevice::~VulkanDevice() {
     }
 
     vkDeviceWaitIdle(device_);
+
+    // Release the Effekseer runtime NOW, while device_ is still valid. Its Manager/renderer/memory
+    // pool own real Vulkan buffers + images created on device_; the effekseer_ member destructor
+    // would otherwise run AFTER ~VulkanDevice destroys the device (vkDestroyDevice below), calling
+    // vkDestroyBuffer on a dead device (object-leak reports + an access violation). Explicit shutdown
+    // here frees them in order; the later member-destructor Shutdown() then no-ops. (D3D12 needs no
+    // equivalent: its device is a ref-counted ComPtr that Effekseer keeps alive until it releases.)
+    effekseer_.Shutdown();
+
 #if HBE_EDITOR
     ShutdownUI();
 #endif
@@ -7325,6 +7518,7 @@ VulkanDevice::~VulkanDevice() {
     if (hdrWaterRenderPass_) vkDestroyRenderPass(device_, hdrWaterRenderPass_, nullptr);
     if (hdrLoadRenderPass_) vkDestroyRenderPass(device_, hdrLoadRenderPass_, nullptr);
     if (previewRenderPass_) vkDestroyRenderPass(device_, previewRenderPass_, nullptr);
+    if (effekseerRenderPass_) vkDestroyRenderPass(device_, effekseerRenderPass_, nullptr);
     if (postPass16_) vkDestroyRenderPass(device_, postPass16_, nullptr);
     if (postPass16Load_) vkDestroyRenderPass(device_, postPass16Load_, nullptr);
     if (postPass8_) vkDestroyRenderPass(device_, postPass8_, nullptr);

@@ -187,6 +187,14 @@ bool IsMounted() {
     return TheMount().active;
 }
 
+u32 MissingPackCount() {
+    const Mount& m = TheMount();
+    if (!m.active) return 0;
+    const u32 expected = m.packs.ExpectedPackCount();
+    const u32 mounted = m.packs.PackCount();
+    return expected > mounted ? expected - mounted : 0;
+}
+
 void SetSearchRoot(const fs::path& assetsRoot) {
     Mount& m = TheMount();
     std::error_code ec;

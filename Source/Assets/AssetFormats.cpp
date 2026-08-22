@@ -131,6 +131,12 @@ const std::vector<EngineAsset> kEngineAssets = {
     {".hbdecal",    "Decal",            true,  RefScan::JsonScan, nullptr,
      "reusable decal preset = the authored DecalComponent fields (Scene/DecalAsset); a decal library "
      "entry. JsonScan so its albedo/normal/mr .uaf textures seed the pack closure"},
+    {".efkefc",     "Effekseer Effect", true,  RefScan::Leaf,     nullptr,
+     "Effekseer effect PACKAGE (self-contained: geometry + textures embedded). Loaded by "
+     "Vfx/EffekseerBackend; a .hbvfx's effekseerEffect ref (JsonScan) pulls it into the pack closure"},
+    {".efk",        "Effekseer Effect (legacy)", true, RefScan::Leaf, nullptr,
+     "older Effekseer effect format; references EXTERNAL textures/models (prefer the self-contained "
+     ".efkefc for shipping, or place its textures beside it). Loaded by Vfx/EffekseerBackend"},
     // NOT packed by extension - each for a specific reason. Do not "fix" these to
     // true: .hbproj IS read at runtime through the VFS, but it ships via the
     // separate uap::ExtraFile path (BuildShipping packs it under the virtual name

@@ -426,6 +426,11 @@ struct PostSettings {
 // Per-frame view + lighting environment.
 struct SceneView {
     glm::mat4 viewProj{1.0f};
+    // Separate view + projection (viewProj == proj * view). Needed by backends that drive an
+    // external renderer wanting the camera and projection apart (Effekseer VFX). Populated by the
+    // Renderer alongside viewProj; safe CPU-side additions (SceneView is not a GPU cbuffer).
+    glm::mat4 view{1.0f};
+    glm::mat4 proj{1.0f};
     glm::vec3 cameraPos{0.0f};
     f32       exposure = 1.0f;
     DirectionalLight light;
@@ -1162,6 +1167,23 @@ public:
     // cannot share one call. Each call adds one (buffer, batches) group; the whole
     // set is consumed and cleared by DrawScene.
     virtual void SetGpuParticles(GpuBufferHandle, const GpuParticleBatch*, u32 /*count*/) {}
+
+    // --- Effekseer VFX (backend-owned; DX12 only today, no-ops elsewhere) ---------------------
+    // The backend owns the Effekseer runtime (it needs the native device). These forward the
+    // Heartbreak-facing VFX seam (Vfx/EffekseerBackend) to it. `VfxAvailable` reports whether the
+    // backend actually has Effekseer; the rest are inert when it does not, so gameplay can always
+    // call them and fall back to the native particle system.
+    virtual bool VfxAvailable() const { return false; }
+    virtual u32  VfxLoadEffect(const char* /*absPath*/) { return 0; }
+    virtual int  VfxPlay(u32 /*effectId*/, const glm::vec3& /*worldPos*/) { return -1; }
+    virtual void VfxStop(int /*handle*/) {}
+    virtual void VfxStopAll() {}
+    virtual void VfxSetLocation(int /*handle*/, const glm::vec3& /*worldPos*/) {}
+    virtual bool VfxExists(int /*handle*/) const { return false; }
+    // Advance the VFX simulation once per frame (before DrawScene). The backend draws the effects
+    // itself inside DrawScene's HDR transparent slot, using SceneView.view / SceneView.proj.
+    virtual void VfxUpdate(f32 /*dt*/) {}
+    virtual int  VfxLiveInstanceCount() const { return 0; }
 
     // GPU-DRIVEN GRASS: a compute-written blade buffer (`blades`, a ByteAddressBuffer of
     // 32-byte records) drawn as `bladeCount` blades of 6 vertices each. Bound on the same
