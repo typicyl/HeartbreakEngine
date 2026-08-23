@@ -598,11 +598,16 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
         // Present a calm, near-static cool-slate field with a barely-perceptible slow
         // breath, so it is unmistakably a live app waiting on missing data, not a frozen
         // one. The actionable reason (incomplete/renamed data packs) is logged loudly at
-        // boot; a player-facing on-screen message would need the UI shader, which is
-        // exactly what may be missing, so it cannot be relied on from here.
+        // boot. The UI overlay pipeline is built independently of the mesh pipeline, so
+        // when the UI shaders DID load (the common case - only MeshPBR is missing) the
+        // menu / safe-mode modal still draw over this slate, giving a player-facing
+        // on-screen message. It draws its own dim backdrop, so the slate stays as-is.
         const f32 breath = 0.5f + 0.5f * std::sin(time_ * 0.9f); // 0..1, ~7 s period
         const f32 base = 0.055f + 0.015f * breath;               // 0.055 .. 0.070
         device_->ClearBackBuffer(base * 0.80f, base * 0.90f, base * 1.15f, 1.0f);
+        if (device_->SupportsUIOverlay() && uiVertices_ && !uiVertices_->empty())
+            device_->DrawUIOverlay(uiVertices_->data(), static_cast<u32>(uiVertices_->size()));
+        uiVertices_ = nullptr; // one frame only
     }
 
     // Editor overlay records into the same frame, after the scene.
@@ -611,6 +616,7 @@ void Renderer::RenderScene(const Scene& scene, f32 dt) {
 }
 
 bool Renderer::SupportsUI() const { return device_ && device_->SupportsUI(); }
+bool Renderer::SupportsUIOverlay() const { return device_ && device_->SupportsUIOverlay(); }
 
 bool Renderer::InitUI(void* nativeWindowHandle) {
     return device_ && device_->InitUI(nativeWindowHandle);

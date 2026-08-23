@@ -195,6 +195,16 @@ u32 MissingPackCount() {
     return expected > mounted ? expected - mounted : 0;
 }
 
+f32 MissingPackFraction() {
+    const Mount& m = TheMount();
+    if (!m.active) return 0.0f;
+    const u32 expected = m.packs.ExpectedPackCount();
+    if (expected == 0) return 0.0f;
+    const u32 mounted = m.packs.PackCount();
+    const u32 missing = expected > mounted ? expected - mounted : 0;
+    return static_cast<f32>(missing) / static_cast<f32>(expected);
+}
+
 void SetSearchRoot(const fs::path& assetsRoot) {
     Mount& m = TheMount();
     std::error_code ec;

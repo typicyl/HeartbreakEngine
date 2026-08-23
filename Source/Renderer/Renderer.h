@@ -245,6 +245,11 @@ public:
     void Resize(u32 width, u32 height);
     void Shutdown();
 
+    // True when the in-game UI OVERLAY pipeline is built (it comes up independently of
+    // the mesh pipeline). False = not even the safe-mode modal can be drawn on screen,
+    // so the caller must fall back to a native OS dialog to inform the player.
+    bool SupportsUIOverlay() const;
+
     // -- Editor UI -----------------------------------------------------------
     bool SupportsUI() const;
     bool InitUI(void* nativeWindowHandle);

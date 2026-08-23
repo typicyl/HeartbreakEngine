@@ -1011,6 +1011,12 @@ public:
     // True if this backend can upload meshes and record DrawScene.
     virtual bool SupportsSceneRendering() const { return false; }
 
+    // True if this backend can record DrawUIOverlay, INDEPENDENTLY of scene
+    // rendering. A backend whose UI shaders loaded but whose mesh shader did
+    // not can still present the menu / safe-mode modal (this stays true while
+    // SupportsSceneRendering() is false).
+    virtual bool SupportsUIOverlay() const { return false; }
+
     // Uploads a CPU mesh to the GPU. Returns an invalid handle if unsupported.
     virtual MeshHandle CreateMesh(const hbe::MeshData&) { return {}; }
 

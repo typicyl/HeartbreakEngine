@@ -20,6 +20,22 @@ namespace fs = std::filesystem;
 
 namespace hbe::platform {
 
+void ShowErrorDialog(const std::string& title, const std::string& message) {
+    const auto widen = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return std::wstring();
+        const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                            nullptr, 0);
+        if (n <= 0) return std::wstring();
+        std::wstring w(static_cast<size_t>(n), L'\0');
+        ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+        return w;
+    };
+    // TOPMOST + SETFOREGROUND so it surfaces over a (borderless-)fullscreen game window,
+    // which is exactly the situation where nothing else on screen can inform the player.
+    ::MessageBoxW(nullptr, widen(message).c_str(), widen(title).c_str(),
+                  MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
 fs::path ExecutablePath() {
     // GROWS RATHER THAN TRUNCATING. Every one of the twelve hand-rolled copies of this in
     // the tree used a fixed MAX_PATH buffer, which silently returns a TRUNCATED path when

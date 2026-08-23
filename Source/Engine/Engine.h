@@ -687,9 +687,14 @@ private:
     // pauses and the cursor frees until the player clicks its X. Critical is NOT a modal
     // (the game can't run) - it stays a permanent overlay. Runtime only (editor: false).
     bool SafeModeModalActive() const;
+    // Show a native OS "game files missing" dialog (titled with the game name) and Quit().
+    // The last-resort notice for a broken install when the on-screen path can't help - no UI
+    // shader (nothing renders) or the level hangs loading on missing data. Fires at most once.
+    void FatalDataError(const std::string& message);
     BootHealth bootHealth_ = BootHealth::Healthy;  // stamped at boot / startup-scene load
     BootHealth safeModeSev_ = BootHealth::Healthy; // last tier shown (a change re-arms the modal)
     bool safeModeAck_ = false;                     // player clicked the modal's X for this tier
+    bool fatalErrorShown_ = false;                 // the native fatal dialog has fired (once)
 
     bool      devMenuOpen_ = false;
 

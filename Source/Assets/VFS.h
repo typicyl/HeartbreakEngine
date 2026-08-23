@@ -32,6 +32,11 @@ bool IsMounted();
 // gone. Authoritative for v6+ packs; a gap heuristic for older ones (see PackSet).
 u32 MissingPackCount();
 
+// The FRACTION of shipped pack chunks that are missing (0.0 when complete or not mounted,
+// approaching 1.0 as more are gone). A proxy for "how much of the game's content is lost" -
+// each pack holds roughly equal data - so a big value means a substantial loss, not a nick.
+f32 MissingPackFraction();
+
 // Last-chance resolution root: when a read misses, the file NAME is searched
 // under this directory (and across mounted pack entries) so refs survive
 // assets being organized into subfolders. Set when a project opens.

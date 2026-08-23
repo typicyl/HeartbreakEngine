@@ -1736,6 +1736,20 @@ int Engine::Run(const EngineConfig& configIn) {
                  config.benchmarkFrames, config.benchmarkWarmup);
     }
 
+#if !HBE_EDITOR
+    // LAST-RESORT player notice. If the in-game UI overlay cannot be drawn - the UI shader
+    // itself is missing, so not even the safe-mode modal (or the menu) can render - fall back
+    // to a native OS dialog, the only way left to tell the player something is wrong (a
+    // shipped runtime always ships the UI shader, so this state means the install is
+    // incomplete). With no UI the game is UNNAVIGABLE - the player can't see or click the menu
+    // even if the 3D scene still renders - so it is effectively unplayable: close the game
+    // once they acknowledge, rather than strand them on an inert screen.
+    if (!renderer.SupportsUIOverlay()) {
+        FatalDataError("Some required game files are missing or damaged, so this game cannot "
+                       "run correctly.\n\nPlease verify or reinstall the game files.");
+    }
+#endif
+
     while (true) {
         // Roll input edge state, then pump: this frame's events land in `input`.
         input.NewFrame();
@@ -3347,6 +3361,10 @@ void Engine::LoadGameplayScene(const std::filesystem::path& scenePath) {
         Project::HasActive() ? Project::Active().Settings().tags : kNoTags;
     if (!tagStream_.BindLevel(*scene_, *renderer_, scenePath, assets, tags)) {
         HBE_WARN("LoadGameplayScene: '{}' failed to load.", scenePath.string());
+        // A level transition whose target could not be loaded (its .hbscene / pack is gone)
+        // strands the player - the door leads nowhere. Fatal for a broken install.
+        FatalDataError("A game level could not be loaded. Some game files are missing or "
+                       "damaged.\n\nPlease verify or reinstall the game files.");
         return;
     }
     currentScenePath_ = scenePath;
@@ -3577,6 +3595,11 @@ static constexpr f32 kLoadDuration = 1.25f;
 // Safety cap: reveal even if the world never reports "settled" (a broken cell, a
 // stuck terrain build), so a content bug can't hang on the loading screen forever.
 static constexpr f32 kMaxLoadDuration = 30.0f;
+// A load STILL not settled this long into a KNOWN-broken install (missing structural data)
+// is stuck for good, not slow. Bail with a native "could not load" dialog rather than sit to
+// the 30 s reveal cap and drop the player into a half-empty/black world. Shorter than
+// kMaxLoadDuration so they get a clear answer, not a silent broken reveal.
+static constexpr f32 kLoadStuckTimeout = 12.0f;
 // Loading-transition fade durations (seconds).
 static constexpr f32 kFadeInDur = 0.4f;      // black curtain lifts: loading screen appears
 static constexpr f32 kWheelFadeDur = 0.35f;  // loading wheel eases in
@@ -3764,6 +3787,16 @@ void Engine::FlowMainMenu() {
 
 void Engine::FlowPlay() {
     if (!flowActive_ || !scene_ || !renderer_ || !Project::HasActive()) return;
+    // Playing needs the 3D scene to render. If the mesh pipeline is missing (a shader pack
+    // is gone), a gameplay level can never load or display - it would hang on the loading
+    // screen and then reveal a black world (audio still playing). Fail IMMEDIATELY with the
+    // native notice the instant Play is pressed, rather than starting a doomed load. (The
+    // menu still ran because it only needs the UI overlay, which survived.)
+    if (!renderer_->SupportsScene()) {
+        FatalDataError("This game cannot start - required game files are missing or damaged.\n\n"
+                       "Please verify or reinstall the game files.");
+        return;
+    }
     // Leaving a 3D menu: the backdrop is DISPOSABLE. Its bind never entered an
     // area, so it must not be captured; Reset (no capture) forgets it and
     // LoadGameplayWorld's Fresh bind sweeps the leftover entities. Clearing the
@@ -3861,6 +3894,15 @@ void Engine::LoadGameplayWorld() {
     if (!loaded) {
         HBE_WARN("Game flow: startup scene '{}' failed to load.", s.startupScene);
         tagStream_.Reset(scene_); // nothing bound; do not leave a half-binding behind
+        // A startup scene WAS specified but its .hbscene (or the pack holding it) is gone,
+        // so there is nothing to play - just an empty sky with no menu. Tell the player and
+        // exit rather than strand them in a void. (An intentionally-empty startupScene is a
+        // game-design choice, not a broken install, so it is left alone.)
+        if (!s.startupScene.empty()) {
+            FatalDataError("This game's level data could not be loaded. Some game files are "
+                           "missing or damaged.\n\nPlease verify or reinstall the game files.");
+            return;
+        }
     }
     // (The area entry that used to be a separate world::RestoreArea call is now inside
     // BindLevel - it has to be, because a shard spawn must not bump the visit count and
@@ -4276,6 +4318,18 @@ Engine::BootHealth Engine::EffectiveHealth() const {
     return sev;
 }
 
+void Engine::FatalDataError(const std::string& message) {
+    if (fatalErrorShown_) return; // once - the dialog is modal and we are about to quit
+    fatalErrorShown_ = true;
+    std::string game = "The game";
+    if (Project::HasActive()) {
+        const auto& s = Project::Active().Settings();
+        game = s.build.gameName.empty() ? s.name : s.build.gameName;
+    }
+    platform::ShowErrorDialog(game + " - game files missing", message);
+    Quit(); // close cleanly once the player acknowledges (the loop exits on RequestClose)
+}
+
 bool Engine::SafeModeModalActive() const {
 #if HBE_EDITOR
     return false;
@@ -4336,6 +4390,22 @@ void Engine::BuildSafeModeBanner(std::vector<rhi::UIVertex>& out) {
             break;
     }
 
+    // Substantial-loss escalation: losing a big fraction of the packs (a quarter or more)
+    // GUTS the game rather than nicking it, so flag the Major notice RED with a stronger
+    // message. It stays a dismissable modal (the game MAY still limp along if its scene
+    // survived; if the scene pack is among the missing, pressing Play fatals separately).
+    constexpr f32 kSubstantialLossFraction = 0.25f; // >= 1/4 of the shipped packs gone
+    const bool substantialLoss =
+        (sev == BootHealth::Major && vfs::MissingPackFraction() >= kSubstantialLossFraction);
+    if (substantialLoss) {
+        // Too much is gone to play. This notice STOPS the game (its dismiss EXITS, below) -
+        // it does not let the player continue into a gutted experience.
+        title = "MAJOR GAME DATA MISSING";
+        msg = "A large amount of this game's data is missing or damaged, so this game cannot "
+              "run properly.\n\nPlease verify or reinstall your game files.";
+        accent = {0.96f, 0.30f, 0.24f}; // red
+    }
+
     // Same NDC + vertex conventions as BuildDevOverlay/BuildFadeCurtain (tex 0 = the
     // 1x1 white texture for solid fills; glyph quads carry their own atlas page).
     const auto ndc = [&](f32 x, f32 y) {
@@ -4368,7 +4438,9 @@ void Engine::BuildSafeModeBanner(std::vector<rhi::UIVertex>& out) {
     f32 tw = 0, th = 0, mw = 0, mh = 0, hw = 0, hh = 0;
     font.Layout(title, titlePx, tq, tw, th);
     font.LayoutWrapped(msg, msgPx, wrapW, mq, mw, mh);
-    if (modal) font.Layout("Click the X or press Enter to continue.", hintPx, hq, hw, hh);
+    if (modal) font.Layout(substantialLoss ? "Click the X or press Enter to exit."
+                                            : "Click the X or press Enter to continue.",
+                           hintPx, hq, hw, hh);
 
     const f32 padX = 32.0f, padY = 26.0f, gap = 12.0f, bar = 5.0f, xBtn = 30.0f;
     const f32 contentW = glm::max(glm::max(tw, mw), hw);
@@ -4379,7 +4451,7 @@ void Engine::BuildSafeModeBanner(std::vector<rhi::UIVertex>& out) {
     const f32 pxl = glm::max((target.x - panelW) * 0.5f, 0.0f);
     const f32 pyt = glm::max((target.y - panelH) * 0.5f, 0.0f);
 
-    addRect(0, 0, target.x, target.y, 0, 0, 0, 0.6f);                            // dim backdrop
+    addRect(0, 0, target.x, target.y, 0, 0, 0, 1.0f);                            // opaque black (hide the scene/sky behind the notice)
     addRect(pxl, pyt, pxl + panelW, pyt + panelH, 0.06f, 0.07f, 0.09f, 0.97f);   // panel
     addRect(pxl, pyt, pxl + panelW, pyt + bar, accent.r, accent.g, accent.b, 1.0f); // accent bar
     // Glyph quads use a top-left layout origin, so pass the TOP of each text block.
@@ -4412,7 +4484,10 @@ void Engine::BuildSafeModeBanner(std::vector<rhi::UIVertex>& out) {
                                input_->Gamepad(0).WasPressed(Gamepad_A) ||
                                input_->Gamepad(0).WasPressed(Gamepad_B) ||
                                input_->Gamepad(0).WasPressed(Gamepad_Start);
-            if (clickX || keyOk) safeModeAck_ = true;
+            if (clickX || keyOk) {
+                if (substantialLoss) Quit(); // too broken to play - acknowledging EXITS
+                else safeModeAck_ = true;    // recoverable tier - dismiss + keep playing
+            }
         }
     }
 #endif
@@ -5314,6 +5389,19 @@ void Engine::UpdateGameFlow(f32 dt) {
             const bool streamReady =
                 tagStream_.IsSettled(StreamFoci(*scene_, *renderer_));
             const bool ready = terrainReady && streamReady;
+
+            // Stuck-load watchdog: a missing structural asset (a mesh/material/whole pack) can
+            // leave a level that never settles. Rather than sit to the 30 s reveal cap and then
+            // strand the player in a broken world, tell them and bail once it is clearly stuck.
+            // Gated on a Major+ health so a merely-slow load (or one missing only cosmetics) is
+            // never falsely killed.
+            const BootHealth sev = EffectiveHealth();
+            if (!ready && loadTimer_ >= kLoadStuckTimeout &&
+                (sev == BootHealth::Major || sev == BootHealth::Critical)) {
+                FatalDataError("This game could not finish loading. Some game files are missing "
+                               "or damaged.\n\nPlease verify or reinstall the game files.");
+                return;
+            }
 
             const f32 p = (ready && loadTimer_ >= kLoadDuration)
                               ? 1.0f

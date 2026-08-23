@@ -314,6 +314,7 @@ public:
     void WaitForGpuIdle() override;
 
     bool SupportsSceneRendering() const override { return meshPipelineReady_; }
+    bool SupportsUIOverlay() const override { return uiPipeline_ != VK_NULL_HANDLE; }
     MeshHandle CreateMesh(const hbe::MeshData& mesh) override;
     MeshHandle CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
                                   u32 indexCapacity) override;
@@ -454,6 +455,10 @@ private:
     bool CreateDescriptorResources();
     bool CreateBindlessResources();
     bool CreateMeshPipeline();
+    // UI overlay pipeline. Built independently of the mesh pipeline (its own
+    // 2-set bindless layout) so the menu / safe-mode modal render even when
+    // MeshPBR is missing.
+    bool CreateUIOverlayPipeline();
     bool CreateShadowResources();
 #if HBE_EDITOR
     bool CreateViewportTarget(u32 width, u32 height);
@@ -545,7 +550,11 @@ private:
     bool                  strokeSurfaceReady_ = false;
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
-    VkPipeline uiPipeline_ = VK_NULL_HANDLE; // uses pipelineLayout_ (bindless set 1)
+    VkPipeline uiPipeline_ = VK_NULL_HANDLE; // uses uiPipelineLayout_ (bindless set 1)
+    // Independent 2-set layout {descriptorLayout_@0, bindlessLayout_@1}; does NOT
+    // borrow the mesh pipelineLayout_ (which also needs set 2), so the overlay
+    // builds even when the mesh pipeline does not.
+    VkPipelineLayout uiPipelineLayout_ = VK_NULL_HANDLE;
     static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~37449 verts @ 56 B)
     VkBuffer       uiVertexBuffers_[kMaxFramesInFlight]{};
     VkDeviceMemory uiVertexMemory_[kMaxFramesInFlight]{};
@@ -1073,18 +1082,28 @@ bool VulkanDevice::Initialize(const RenderDeviceDesc& desc) {
     if (!CreateSyncAndCommands()) return false;
 
     // Scene-rendering resources are optional; failure leaves a clear-only device.
-    if (CreateDescriptorResources() && CreateBindlessResources() && CreateMeshPipeline()) {
-        meshPipelineReady_ = true;
-        if (!CreateShadowResources()) {
-            HBE_WARN("[Vulkan] Shadow resources unavailable; shadows disabled.");
+    if (CreateDescriptorResources() && CreateBindlessResources()) {
+        // The UI overlay pipeline is bindless-only (sets 0/1), so it builds
+        // independently of the mesh pipeline: the menu / safe-mode modal still
+        // render when MeshPBR is missing and scene rendering stays disabled.
+        if (!CreateUIOverlayPipeline())
+            HBE_WARN("[Vulkan] UI overlay pipeline unavailable (UI shaders missing?).");
+        if (CreateMeshPipeline()) {
+            meshPipelineReady_ = true;
+            if (!CreateShadowResources()) {
+                HBE_WARN("[Vulkan] Shadow resources unavailable; shadows disabled.");
+            }
+        } else {
+            HBE_WARN("[Vulkan] Mesh pipeline unavailable; scene rendering disabled.");
         }
     } else {
-        HBE_WARN("[Vulkan] Mesh pipeline unavailable; scene rendering disabled.");
+        HBE_WARN("[Vulkan] descriptor/bindless resources unavailable; rendering disabled.");
     }
 
-    HBE_INFO("[Vulkan] Device initialized ({} images, {}x{}, scene={})",
+    HBE_INFO("[Vulkan] Device initialized ({} images, {}x{}, scene={}, ui={})",
              static_cast<u32>(images_.size()), extent_.width, extent_.height,
-             meshPipelineReady_ ? "on" : "off");
+             meshPipelineReady_ ? "on" : "off",
+             uiPipeline_ != VK_NULL_HANDLE ? "on" : "off");
     return true;
 }
 
@@ -2745,157 +2764,13 @@ bool VulkanDevice::CreateMeshPipeline() {
     if (skyVs) vkDestroyShaderModule(device_, skyVs, nullptr);
     if (skyPs) vkDestroyShaderModule(device_, skyPs, nullptr);
 
-    // In-game UI overlay pipeline: textured 2D triangles, alpha blend, no
-    // depth. Reuses the mesh pipeline layout so the shader sees the bindless
-    // texture set (set 1); same render pass as the scene.
+    // Particle billboard vertex buffers (host-visible, mapped). The mesh/water
+    // pipelines and these particle billboards live in this function; the UI
+    // overlay pipeline (and its own vertex buffers) is built independently in
+    // CreateUIOverlayPipeline().
     {
-        VkShaderModule uiVs = LoadShaderModule(dir + L"UI.vs.spv");
-        VkShaderModule uiPs = LoadShaderModule(dir + L"UI.ps.spv");
-        bool ok = uiVs != VK_NULL_HANDLE && uiPs != VK_NULL_HANDLE;
-        if (ok) {
-            stages[0].module = uiVs;
-            stages[1].module = uiPs;
-
-            VkVertexInputBindingDescription uiBinding{0, sizeof(UIVertex),
-                                                      VK_VERTEX_INPUT_RATE_VERTEX};
-            VkVertexInputAttributeDescription uiAttrs[6] = {
-                {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, x)},
-                {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, u)},
-                {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(UIVertex, r)},
-                {3, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, texIndex)},
-                {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,
-                 offsetof(UIVertex, clipX0)},                     // NDC clip rect
-                {5, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, fx)}, // effect id (P7)
-            };
-            VkPipelineVertexInputStateCreateInfo uiVi{
-                VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-            uiVi.vertexBindingDescriptionCount = 1;
-            uiVi.pVertexBindingDescriptions = &uiBinding;
-            uiVi.vertexAttributeDescriptionCount = 6;
-            uiVi.pVertexAttributeDescriptions = uiAttrs;
-
-            VkPipelineDepthStencilStateCreateInfo uiDs{
-                VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-
-            VkPipelineColorBlendAttachmentState uiCba = cbaArr[0];
-            uiCba.blendEnable = VK_TRUE;
-            uiCba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-            uiCba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-            uiCba.colorBlendOp = VK_BLEND_OP_ADD;
-            uiCba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-            uiCba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-            uiCba.alphaBlendOp = VK_BLEND_OP_ADD;
-            VkPipelineColorBlendStateCreateInfo uiCb = cb;
-            uiCb.attachmentCount = 1; // UI target is single-colour (cb may be MRT)
-            uiCb.pAttachments = &uiCba;
-
-            VkGraphicsPipelineCreateInfo uiPci = pci;
-            uiPci.pVertexInputState = &uiVi;
-            uiPci.pDepthStencilState = &uiDs;
-            uiPci.pColorBlendState = &uiCb;
-            // UI is screen-space 2D: never cull. `pci` still points at rsCull
-            // (the opaque mesh's back-face cull), which would drop the
-            // oppositely-wound UI quads, so force the double-sided state.
-            uiPci.pRasterizationState = &rs;
-            uiPci.layout = pipelineLayout_; // mesh layout: set 1 = bindless
-            // The UI overlay draws into the post-FXAA final target (swapchain
-            // or viewport pass), not the HDR scene pass.
-            uiPci.renderPass = renderPass_;
-
-            ok = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &uiPci, nullptr,
-                                           &uiPipeline_) == VK_SUCCESS;
-
-            // World-UI variant: the same UI pipeline against a small offscreen
-            // pass (canvas texture a lit quad in the scene samples). The pass's
-            // finalLayout hands the image to the fragment shader - it does ALL
-            // layout transitions (vpRenderPass_ precedent). Failure only disables
-            // world-space canvases, never the overlay.
-            if (ok && worldUIRenderPass_ == VK_NULL_HANDLE) {
-                VkAttachmentDescription color{};
-                color.format = VK_FORMAT_R8G8B8A8_UNORM;
-                color.samples = VK_SAMPLE_COUNT_1_BIT;
-                color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-                color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-                color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-                color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-                VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-                VkSubpassDescription subpass{};
-                subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-                subpass.colorAttachmentCount = 1;
-                subpass.pColorAttachments = &colorRef;
-
-                VkSubpassDependency deps[2]{};
-                deps[0].srcSubpass = VK_SUBPASS_EXTERNAL; // prior frame's sampling
-                deps[0].dstSubpass = 0;
-                deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-                deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                deps[1].srcSubpass = 0; // this frame's scene pass samples the page
-                deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-                deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-                deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-                deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-                VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-                rci.attachmentCount = 1;
-                rci.pAttachments = &color;
-                rci.subpassCount = 1;
-                rci.pSubpasses = &subpass;
-                rci.dependencyCount = 2;
-                rci.pDependencies = deps;
-                if (vkCreateRenderPass(device_, &rci, nullptr, &worldUIRenderPass_) !=
-                    VK_SUCCESS)
-                    worldUIRenderPass_ = VK_NULL_HANDLE;
-            }
-            if (ok && worldUIRenderPass_ != VK_NULL_HANDLE) {
-                VkGraphicsPipelineCreateInfo uiwPci = uiPci;
-                uiwPci.renderPass = worldUIRenderPass_;
-                if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &uiwPci, nullptr,
-                                              &uiWorldPipeline_) != VK_SUCCESS) {
-                    HBE_WARN("[Vulkan] world-UI pipeline unavailable.");
-                    uiWorldPipeline_ = VK_NULL_HANDLE;
-                }
-            }
-        }
         const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        for (u32 i = 0; ok && i < framesInFlight_; ++i) {
-            ok = CreateBuffer(kUIVertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                              hostVisible, uiVertexBuffers_[i], uiVertexMemory_[i]);
-            if (ok) {
-                void* mapped = nullptr;
-                ok = vkMapMemory(device_, uiVertexMemory_[i], 0, kUIVertexBufferSize, 0,
-                                 &mapped) == VK_SUCCESS;
-                uiVertexCpu_[i] = static_cast<u8*>(mapped);
-            }
-        }
-        // World-UI vertex buffers: SEPARATE from the overlay's (offset-0 memcpy
-        // per call would alias) - bump-allocated across the frame per canvas.
-        if (uiWorldPipeline_ != VK_NULL_HANDLE) {
-            for (u32 i = 0; i < framesInFlight_; ++i) {
-                bool wok = CreateBuffer(kUIVertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                        hostVisible, uiWorldVertexBuffers_[i],
-                                        uiWorldVertexMemory_[i]);
-                if (wok) {
-                    void* mapped = nullptr;
-                    wok = vkMapMemory(device_, uiWorldVertexMemory_[i], 0, kUIVertexBufferSize,
-                                      0, &mapped) == VK_SUCCESS;
-                    uiWorldVertexCpu_[i] = static_cast<u8*>(mapped);
-                }
-                if (!wok) {
-                    HBE_WARN("[Vulkan] world-UI vertex buffers unavailable.");
-                    vkDestroyPipeline(device_, uiWorldPipeline_, nullptr);
-                    uiWorldPipeline_ = VK_NULL_HANDLE;
-                    break;
-                }
-            }
-        }
-        // Particle vertex buffers (host-visible, mapped); same lifetime as UI.
         if (particlePipeline_ != VK_NULL_HANDLE) {
             for (u32 i = 0; i < framesInFlight_; ++i) {
                 if (!CreateBuffer(kParticleVertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -2911,15 +2786,238 @@ bool VulkanDevice::CreateMeshPipeline() {
                 }
             }
         }
-        if (!ok) {
-            HBE_WARN("[Vulkan] UI overlay pipeline unavailable.");
-            if (uiPipeline_) vkDestroyPipeline(device_, uiPipeline_, nullptr);
-            uiPipeline_ = VK_NULL_HANDLE;
-        }
-        if (uiVs) vkDestroyShaderModule(device_, uiVs, nullptr);
-        if (uiPs) vkDestroyShaderModule(device_, uiPs, nullptr);
     }
     return true;
+}
+
+bool VulkanDevice::CreateUIOverlayPipeline() {
+    // In-game UI overlay pipeline: textured 2D triangles, alpha blend, no depth.
+    // Built INDEPENDENTLY of the mesh pipeline: its own 2-set layout
+    // {descriptorLayout_@0, bindlessLayout_@1} (no set 2), and all sub-states
+    // constructed locally rather than inherited from the mesh `pci`. The shader
+    // reads only the bindless texture set (set 1). Requires CreateDescriptorResources()
+    // + CreateBindlessResources() to have run first (their set layouts).
+    const std::wstring dir = ExecutableDir() + L"shaders\\";
+    VkShaderModule uiVs = LoadShaderModule(dir + L"UI.vs.spv");
+    VkShaderModule uiPs = LoadShaderModule(dir + L"UI.ps.spv");
+    if (uiVs == VK_NULL_HANDLE || uiPs == VK_NULL_HANDLE) {
+        HBE_WARN("[Vulkan] UI SPIR-V not found next to the executable.");
+        if (uiVs) vkDestroyShaderModule(device_, uiVs, nullptr);
+        if (uiPs) vkDestroyShaderModule(device_, uiPs, nullptr);
+        return false;
+    }
+
+    // Independent pipeline layout: sets 0 (frame descriptor) + 1 (bindless). The
+    // mesh pipelineLayout_ also carries set 2 (the VS structured buffer) and is
+    // built in CreateMeshPipeline; borrowing it would couple the overlay to the
+    // mesh pipeline, which is exactly what this refactor removes.
+    const VkDescriptorSetLayout setLayouts[2] = {descriptorLayout_, bindlessLayout_};
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 2;
+    plci.pSetLayouts = setLayouts;
+    if (vkCreatePipelineLayout(device_, &plci, nullptr, &uiPipelineLayout_) != VK_SUCCESS) {
+        HBE_WARN("[Vulkan] UI pipeline layout creation failed.");
+        vkDestroyShaderModule(device_, uiVs, nullptr);
+        vkDestroyShaderModule(device_, uiPs, nullptr);
+        return false;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = uiVs;
+    stages[0].pName = "VSMain";
+    stages[1] = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = uiPs;
+    stages[1].pName = "PSMain";
+
+    VkVertexInputBindingDescription uiBinding{0, sizeof(UIVertex), VK_VERTEX_INPUT_RATE_VERTEX};
+    VkVertexInputAttributeDescription uiAttrs[6] = {
+        {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, x)},
+        {1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(UIVertex, u)},
+        {2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(UIVertex, r)},
+        {3, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, texIndex)},
+        {4, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(UIVertex, clipX0)}, // NDC clip rect
+        {5, 0, VK_FORMAT_R32_UINT, offsetof(UIVertex, fx)},                // effect id (P7)
+    };
+    VkPipelineVertexInputStateCreateInfo uiVi{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    uiVi.vertexBindingDescriptionCount = 1;
+    uiVi.pVertexBindingDescriptions = &uiBinding;
+    uiVi.vertexAttributeDescriptionCount = 6;
+    uiVi.pVertexAttributeDescriptions = uiAttrs;
+
+    VkPipelineInputAssemblyStateCreateInfo uiIa{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    uiIa.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo uiVp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    uiVp.viewportCount = 1;
+    uiVp.scissorCount = 1;
+
+    // UI is screen-space 2D: never cull (its quads are oppositely wound to the
+    // back-face-culled mesh).
+    VkPipelineRasterizationStateCreateInfo uiRs{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    uiRs.polygonMode = VK_POLYGON_MODE_FILL;
+    uiRs.cullMode = VK_CULL_MODE_NONE;
+    uiRs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    uiRs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo uiMs{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    uiMs.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo uiDs{
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+
+    const VkColorComponentFlags rgba = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendAttachmentState uiCba{};
+    uiCba.colorWriteMask = rgba;
+    uiCba.blendEnable = VK_TRUE;
+    uiCba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    uiCba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    uiCba.colorBlendOp = VK_BLEND_OP_ADD;
+    uiCba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    uiCba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    uiCba.alphaBlendOp = VK_BLEND_OP_ADD;
+    VkPipelineColorBlendStateCreateInfo uiCb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    uiCb.attachmentCount = 1; // UI target is single-colour
+    uiCb.pAttachments = &uiCba;
+
+    const VkDynamicState dynamics[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo uiDyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    uiDyn.dynamicStateCount = 2;
+    uiDyn.pDynamicStates = dynamics;
+
+    VkGraphicsPipelineCreateInfo uiPci{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    uiPci.stageCount = 2;
+    uiPci.pStages = stages;
+    uiPci.pVertexInputState = &uiVi;
+    uiPci.pInputAssemblyState = &uiIa;
+    uiPci.pViewportState = &uiVp;
+    uiPci.pRasterizationState = &uiRs;
+    uiPci.pMultisampleState = &uiMs;
+    uiPci.pDepthStencilState = &uiDs;
+    uiPci.pColorBlendState = &uiCb;
+    uiPci.pDynamicState = &uiDyn;
+    uiPci.layout = uiPipelineLayout_; // set 1 = bindless
+    // The UI overlay draws into the post-FXAA final target (swapchain or viewport
+    // pass), not the HDR scene pass.
+    uiPci.renderPass = renderPass_;
+    uiPci.subpass = 0;
+
+    bool ok = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &uiPci, nullptr,
+                                        &uiPipeline_) == VK_SUCCESS;
+
+    // World-UI variant: the same UI pipeline against a small offscreen pass
+    // (canvas texture a lit quad in the scene samples). The pass's finalLayout
+    // hands the image to the fragment shader - it does ALL layout transitions
+    // (vpRenderPass_ precedent). Failure only disables world-space canvases,
+    // never the overlay.
+    if (ok && worldUIRenderPass_ == VK_NULL_HANDLE) {
+        VkAttachmentDescription color{};
+        color.format = VK_FORMAT_R8G8B8A8_UNORM;
+        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+
+        VkSubpassDependency deps[2]{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL; // prior frame's sampling
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0; // this frame's scene pass samples the page
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        VkRenderPassCreateInfo rci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        rci.attachmentCount = 1;
+        rci.pAttachments = &color;
+        rci.subpassCount = 1;
+        rci.pSubpasses = &subpass;
+        rci.dependencyCount = 2;
+        rci.pDependencies = deps;
+        if (vkCreateRenderPass(device_, &rci, nullptr, &worldUIRenderPass_) != VK_SUCCESS)
+            worldUIRenderPass_ = VK_NULL_HANDLE;
+    }
+    if (ok && worldUIRenderPass_ != VK_NULL_HANDLE) {
+        VkGraphicsPipelineCreateInfo uiwPci = uiPci;
+        uiwPci.renderPass = worldUIRenderPass_;
+        if (vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &uiwPci, nullptr,
+                                      &uiWorldPipeline_) != VK_SUCCESS) {
+            HBE_WARN("[Vulkan] world-UI pipeline unavailable.");
+            uiWorldPipeline_ = VK_NULL_HANDLE;
+        }
+    }
+
+    const VkMemoryPropertyFlags hostVisible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (u32 i = 0; ok && i < framesInFlight_; ++i) {
+        ok = CreateBuffer(kUIVertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, hostVisible,
+                          uiVertexBuffers_[i], uiVertexMemory_[i]);
+        if (ok) {
+            void* mapped = nullptr;
+            ok = vkMapMemory(device_, uiVertexMemory_[i], 0, kUIVertexBufferSize, 0, &mapped) ==
+                 VK_SUCCESS;
+            uiVertexCpu_[i] = static_cast<u8*>(mapped);
+        }
+    }
+    // World-UI vertex buffers: SEPARATE from the overlay's (offset-0 memcpy per
+    // call would alias) - bump-allocated across the frame per canvas.
+    if (uiWorldPipeline_ != VK_NULL_HANDLE) {
+        for (u32 i = 0; i < framesInFlight_; ++i) {
+            bool wok = CreateBuffer(kUIVertexBufferSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                    hostVisible, uiWorldVertexBuffers_[i],
+                                    uiWorldVertexMemory_[i]);
+            if (wok) {
+                void* mapped = nullptr;
+                wok = vkMapMemory(device_, uiWorldVertexMemory_[i], 0, kUIVertexBufferSize, 0,
+                                  &mapped) == VK_SUCCESS;
+                uiWorldVertexCpu_[i] = static_cast<u8*>(mapped);
+            }
+            if (!wok) {
+                HBE_WARN("[Vulkan] world-UI vertex buffers unavailable.");
+                vkDestroyPipeline(device_, uiWorldPipeline_, nullptr);
+                uiWorldPipeline_ = VK_NULL_HANDLE;
+                break;
+            }
+        }
+    }
+    if (!ok) {
+        HBE_WARN("[Vulkan] UI overlay pipeline unavailable.");
+        if (uiPipeline_) vkDestroyPipeline(device_, uiPipeline_, nullptr);
+        uiPipeline_ = VK_NULL_HANDLE;
+        // The world-UI pipeline shares uiPipelineLayout_ (destroyed just below), so it must
+        // go too - otherwise DrawUIToTexture (which gates only on uiWorldPipeline_) would bind
+        // a destroyed layout. Its render pass is created here as well; drop it for symmetry.
+        if (uiWorldPipeline_) vkDestroyPipeline(device_, uiWorldPipeline_, nullptr);
+        uiWorldPipeline_ = VK_NULL_HANDLE;
+        if (worldUIRenderPass_) vkDestroyRenderPass(device_, worldUIRenderPass_, nullptr);
+        worldUIRenderPass_ = VK_NULL_HANDLE;
+        if (uiPipelineLayout_) vkDestroyPipelineLayout(device_, uiPipelineLayout_, nullptr);
+        uiPipelineLayout_ = VK_NULL_HANDLE;
+    }
+    if (uiVs) vkDestroyShaderModule(device_, uiVs, nullptr);
+    if (uiPs) vkDestroyShaderModule(device_, uiPs, nullptr);
+    return uiPipeline_ != VK_NULL_HANDLE;
 }
 
 bool VulkanDevice::CreateShadowResources() {
@@ -6410,7 +6508,7 @@ void VulkanDevice::DrawUIOverlay(const UIVertex* vertices, u32 count) {
     VkCommandBuffer cmd = commandBuffers_[frameIndex_];
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uiPipeline_);
     // The shader reads only set 1 (the bindless textures).
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uiPipelineLayout_, 1, 1,
                             &bindlessSet_, 0, nullptr);
     const VkDeviceSize offset = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &uiVertexBuffers_[frameIndex_], &offset);
@@ -6583,7 +6681,7 @@ void VulkanDevice::DrawUIToTexture(TextureHandle target, const UIVertex* vertice
 
     if (count > 0) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uiWorldPipeline_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout_, 1, 1,
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, uiPipelineLayout_, 1, 1,
                                 &bindlessSet_, 0, nullptr);
         const VkDeviceSize offset = uiWorldVertexHead_;
         vkCmdBindVertexBuffers(cmd, 0, 1, &uiWorldVertexBuffers_[frameIndex_], &offset);
@@ -7538,6 +7636,7 @@ VulkanDevice::~VulkanDevice() {
     if (meshPipelineSingle_) vkDestroyPipeline(device_, meshPipelineSingle_, nullptr);
     if (pipelineLayout_) vkDestroyPipelineLayout(device_, pipelineLayout_, nullptr);
     if (uiPipeline_) vkDestroyPipeline(device_, uiPipeline_, nullptr);
+    if (uiPipelineLayout_) vkDestroyPipelineLayout(device_, uiPipelineLayout_, nullptr);
     if (particlePipeline_) vkDestroyPipeline(device_, particlePipeline_, nullptr);
     if (particlePipelineAdd_) vkDestroyPipeline(device_, particlePipelineAdd_, nullptr);
     // No RAII on this side: the D3D12 twin's ComPtrs release themselves, these do not.

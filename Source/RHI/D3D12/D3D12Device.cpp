@@ -445,6 +445,7 @@ public:
     void WaitForGpuIdle() override;
 
     bool SupportsSceneRendering() const override { return meshPipelineReady_; }
+    bool SupportsUIOverlay() const override { return uiReady_; }
     MeshHandle CreateMesh(const hbe::MeshData& mesh) override;
     MeshHandle CreateMeshReserved(const hbe::MeshData& initial, u32 vertexCapacity,
                                   u32 indexCapacity) override;
@@ -549,6 +550,9 @@ private:
     // Scene-rendering setup.
     bool CreateDepthResources(u32 width, u32 height);
     bool CreateMeshPipeline();
+    // UI overlay pipeline. Built independently of the mesh pipeline (bindless-only
+    // root sig) so the menu / safe-mode modal render even when MeshPBR is missing.
+    bool CreateUIPipeline();
 
     // Set only for the duration of one CreateMeshReserved call; 0 = allocate exactly.
     u64 reserveVertices_ = 0;
@@ -697,7 +701,9 @@ private:
     bool waterReady_ = false;
 
     // -- In-game UI overlay (alpha-blended textured 2D triangles) -------------
-    ComPtr<ID3D12PipelineState> uiPSO_; // uses meshRootSig_ (bindless table)
+    ComPtr<ID3D12PipelineState> uiPSO_; // uses uiRootSig_ (bindless table only)
+    ComPtr<ID3D12RootSignature> uiRootSig_; // bindless-only UI root sig, independent of meshRootSig_
+    bool uiReady_ = false;
     static constexpr u64 kUIVertexBufferSize = 2u << 20; // 2 MB/frame (~37449 verts @ 56 B)
     ComPtr<ID3D12Resource> uiVertexBuffers_[kMaxBackBuffers];
     u8* uiVertexCpu_[kMaxBackBuffers] = {};
@@ -1259,17 +1265,25 @@ bool D3D12Device::Initialize(const RenderDeviceDesc& desc) {
         HBE_WARN("[D3D12] Constant arena creation failed; scene rendering disabled.");
     } else if (!CreateBindlessResources()) {
         HBE_WARN("[D3D12] Bindless table creation failed; scene rendering disabled.");
-    } else if (!CreateMeshPipeline()) {
-        HBE_WARN("[D3D12] Mesh pipeline unavailable; scene rendering disabled.");
     } else {
-        meshPipelineReady_ = true;
-        if (!CreateShadowResources()) {
-            HBE_WARN("[D3D12] Shadow resources unavailable; shadows disabled.");
+        // The UI overlay pipeline is bindless-only, so it builds independently of
+        // the mesh pipeline: the menu / safe-mode modal still render when MeshPBR
+        // is missing and scene rendering stays disabled below.
+        uiReady_ = CreateUIPipeline();
+        if (!uiReady_) HBE_WARN("[D3D12] UI overlay pipeline unavailable (UI shaders missing?).");
+        if (!CreateMeshPipeline()) {
+            HBE_WARN("[D3D12] Mesh pipeline unavailable; scene rendering disabled.");
+        } else {
+            meshPipelineReady_ = true;
+            if (!CreateShadowResources()) {
+                HBE_WARN("[D3D12] Shadow resources unavailable; shadows disabled.");
+            }
         }
     }
 
-    HBE_INFO("[D3D12] Device initialized ({} back buffers, {}x{}, scene={})",
-             backBufferCount_, width_, height_, meshPipelineReady_ ? "on" : "off");
+    HBE_INFO("[D3D12] Device initialized ({} back buffers, {}x{}, scene={}, ui={})",
+             backBufferCount_, width_, height_, meshPipelineReady_ ? "on" : "off",
+             uiReady_ ? "on" : "off");
     return true;
 }
 
@@ -2395,97 +2409,6 @@ bool D3D12Device::CreateMeshPipeline() {
         HBE_WARN("[D3D12] Sky DXIL not found; no background pass.");
     }
 
-    // In-game UI overlay pipeline: textured 2D triangles, alpha blend, no
-    // depth. Shares the mesh root signature (bindless texture table + static
-    // sampler); vertices come from a small per-frame upload buffer.
-    {
-        const std::vector<u8> uiVs = ReadBinaryFile(dir + L"UI.vs.dxil");
-        const std::vector<u8> uiPs = ReadBinaryFile(dir + L"UI.ps.dxil");
-        bool ok = !uiVs.empty() && !uiPs.empty();
-        if (ok) {
-            const D3D12_INPUT_ELEMENT_DESC uiLayout[] = {
-                {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"TEXCOORD", 1, DXGI_FORMAT_R32_UINT, 0, 32,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
-                {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 36,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // NDC clip rect
-                {"TEXCOORD", 3, DXGI_FORMAT_R32_UINT, 0, 52,
-                 D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // effect id (P7)
-            };
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC ui = pso; // inherit, then adjust
-            ui.pRootSignature = meshRootSig_.Get();
-            ui.VS = {uiVs.data(), uiVs.size()};
-            ui.PS = {uiPs.data(), uiPs.size()};
-            ui.InputLayout = {uiLayout, _countof(uiLayout)};
-            // The UI overlay draws into the post-FXAA final target (the
-            // viewport texture / swapchain), which stays LDR.
-            ui.RTVFormats[0] = swapFormat_;
-            // UI is screen-space 2D: never cull (the mesh PSO this inherits from
-            // now back-face culls, which would drop the oppositely-wound quads).
-            ui.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-            ui.DepthStencilState.DepthEnable = FALSE;
-            ui.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
-            ui.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-            D3D12_RENDER_TARGET_BLEND_DESC& uiRt = ui.BlendState.RenderTarget[0];
-            uiRt.BlendEnable = TRUE;
-            uiRt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
-            uiRt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
-            uiRt.SrcBlendAlpha = D3D12_BLEND_ONE;
-            uiRt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
-            ok = SUCCEEDED(device_->CreateGraphicsPipelineState(&ui, IID_PPV_ARGS(&uiPSO_)));
-
-            // World-UI variant: the SAME UI pipeline against an R8G8B8A8_UNORM
-            // canvas texture instead of the swapchain (world canvases render to
-            // texture, then a lit quad in the scene shows it). Failure here only
-            // disables world-space canvases, never the overlay.
-            if (ok) {
-                D3D12_GRAPHICS_PIPELINE_STATE_DESC uiw = ui;
-                uiw.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
-                if (FAILED(device_->CreateGraphicsPipelineState(
-                        &uiw, IID_PPV_ARGS(&uiWorldPSO_)))) {
-                    HBE_WARN("[D3D12] world-UI pipeline unavailable.");
-                    uiWorldPSO_.Reset();
-                }
-            }
-        }
-        for (u32 i = 0; ok && i < backBufferCount_; ++i) {
-            uiVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kUIVertexBufferSize);
-            ok = uiVertexBuffers_[i] != nullptr;
-            if (ok) {
-                D3D12_RANGE noRead{0, 0};
-                void* mapped = nullptr;
-                ok = SUCCEEDED(uiVertexBuffers_[i]->Map(0, &noRead, &mapped));
-                uiVertexCpu_[i] = static_cast<u8*>(mapped);
-            }
-        }
-        // World-UI vertex buffers: SEPARATE from the overlay's (which memcpy at
-        // offset 0 per call and would alias) - bump-allocated across the frame.
-        for (u32 i = 0; uiWorldPSO_ && i < backBufferCount_; ++i) {
-            uiWorldVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kUIVertexBufferSize);
-            bool wok = uiWorldVertexBuffers_[i] != nullptr;
-            if (wok) {
-                D3D12_RANGE noRead{0, 0};
-                void* mapped = nullptr;
-                wok = SUCCEEDED(uiWorldVertexBuffers_[i]->Map(0, &noRead, &mapped));
-                uiWorldVertexCpu_[i] = static_cast<u8*>(mapped);
-            }
-            if (!wok) {
-                HBE_WARN("[D3D12] world-UI vertex buffers unavailable.");
-                uiWorldPSO_.Reset();
-                break;
-            }
-        }
-        if (!ok) {
-            HBE_WARN("[D3D12] UI overlay pipeline unavailable.");
-            uiPSO_.Reset();
-        }
-    }
-
     // In-scene particle billboards: world-space quads drawn in the HDR pass after
     // transparents, depth-TESTED against the scene (no write) so geometry occludes
     // them; alpha + additive variants. Shares the mesh root sig (frame CBV + bindless).
@@ -2666,6 +2589,181 @@ bool D3D12Device::CreateMeshPipeline() {
         }
     }
     return true;
+}
+
+bool D3D12Device::CreateUIPipeline() {
+    // In-game UI overlay pipeline: textured 2D triangles, alpha blend, no depth.
+    // Built INDEPENDENTLY of the mesh pipeline against a bindless-only root
+    // signature (no frame/object CBVs, no bone/instance SRVs), so the menu and
+    // safe-mode modal still render when MeshPBR is missing. UI.hlsl reads only the
+    // bindless Texture2D gUITextures[] (t0,space0) + gUISampler (s0,space0).
+    const std::wstring dir = ExecutableDir() + L"shaders\\";
+    const std::vector<u8> uiVs = ReadBinaryFile(dir + L"UI.vs.dxil");
+    const std::vector<u8> uiPs = ReadBinaryFile(dir + L"UI.ps.dxil");
+    if (uiVs.empty() || uiPs.empty()) {
+        HBE_WARN("[D3D12] UI DXIL not found next to the executable.");
+        return false;
+    }
+
+    // Root signature: a single unbounded SRV table (t0, space0) for the bindless
+    // texture array + one static anisotropic-wrap sampler (s0, space0). Root-sig
+    // 1.0 descriptor tables are implicitly volatile, which is what bindless needs.
+    D3D12_DESCRIPTOR_RANGE srvRange{};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = UINT_MAX; // unbounded
+    srvRange.BaseShaderRegister = 0;
+    srvRange.RegisterSpace = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+    D3D12_ROOT_PARAMETER param{};
+    param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    param.DescriptorTable.NumDescriptorRanges = 1;
+    param.DescriptorTable.pDescriptorRanges = &srvRange;
+    param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // s0 space0: a copy of the mesh root sig's anisotropic-wrap sampler[0].
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_ANISOTROPIC;
+    sampler.MaxAnisotropy = 8;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.RegisterSpace = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rsDesc{};
+    rsDesc.NumParameters = 1;
+    rsDesc.pParameters = &param;
+    rsDesc.NumStaticSamplers = 1;
+    rsDesc.pStaticSamplers = &sampler;
+    rsDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    ComPtr<ID3DBlob> sig, err;
+    HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+    if (FAILED(hr)) {
+        if (err) HBE_ERROR("[D3D12] UI RootSig: {}", static_cast<const char*>(err->GetBufferPointer()));
+        return false;
+    }
+    HR_CHECK(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                          IID_PPV_ARGS(&uiRootSig_)),
+             "CreateRootSignature(UI)");
+
+    const D3D12_INPUT_ELEMENT_DESC uiLayout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 16,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 1, DXGI_FORMAT_R32_UINT, 0, 32,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+        {"TEXCOORD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 36,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // NDC clip rect
+        {"TEXCOORD", 3, DXGI_FORMAT_R32_UINT, 0, 52,
+         D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}, // effect id (P7)
+    };
+
+    // Explicit PSO desc (the mesh `pso` no longer exists in this scope): screen-
+    // space 2D, no cull, depth off, straight-alpha-over into the LDR swapchain.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC ui{};
+    ui.pRootSignature = uiRootSig_.Get();
+    ui.VS = {uiVs.data(), uiVs.size()};
+    ui.PS = {uiPs.data(), uiPs.size()};
+    ui.InputLayout = {uiLayout, _countof(uiLayout)};
+    ui.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    ui.SampleMask = UINT_MAX;
+    ui.SampleDesc.Count = 1;
+    ui.NumRenderTargets = 1;
+    // The UI overlay draws into the post-FXAA final target (the viewport texture
+    // / swapchain), which stays LDR.
+    ui.RTVFormats[0] = swapFormat_;
+    // Match the depth format the swapchain DSV is created with (the mesh PSO used the same).
+    // Depth is disabled below, so this only keeps the PSO consistent with the DSV that
+    // BeginFrame leaves bound in both the scene and the scene-less (slate) paths - no
+    // debug-layer DSV-format-mismatch complaint.
+    ui.DSVFormat = depthFormat_;
+
+    // UI is screen-space 2D: never cull. Front faces are counter-clockwise here
+    // (matches the mesh PSO's FrontCounterClockwise = TRUE).
+    ui.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    ui.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    ui.RasterizerState.FrontCounterClockwise = TRUE;
+    ui.RasterizerState.DepthClipEnable = TRUE;
+    ui.RasterizerState.ConservativeRaster = D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
+
+    ui.DepthStencilState.DepthEnable = FALSE;
+    ui.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    ui.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    ui.DepthStencilState.StencilEnable = FALSE;
+    ui.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    ui.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    const D3D12_DEPTH_STENCILOP_DESC uiStencilOp{
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+        D3D12_COMPARISON_FUNC_ALWAYS};
+    ui.DepthStencilState.FrontFace = uiStencilOp;
+    ui.DepthStencilState.BackFace = uiStencilOp;
+
+    // Straight-alpha-over blend on the single colour target.
+    D3D12_RENDER_TARGET_BLEND_DESC& uiRt = ui.BlendState.RenderTarget[0];
+    uiRt.BlendEnable = TRUE;
+    uiRt.LogicOpEnable = FALSE;
+    uiRt.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+    uiRt.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    uiRt.BlendOp = D3D12_BLEND_OP_ADD;
+    uiRt.SrcBlendAlpha = D3D12_BLEND_ONE;
+    uiRt.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    uiRt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    uiRt.LogicOp = D3D12_LOGIC_OP_NOOP;
+    uiRt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    bool ok = SUCCEEDED(device_->CreateGraphicsPipelineState(&ui, IID_PPV_ARGS(&uiPSO_)));
+
+    // World-UI variant: the SAME UI pipeline against an R8G8B8A8_UNORM canvas
+    // texture instead of the swapchain (world canvases render to texture, then a
+    // lit quad in the scene shows it). Failure here only disables world-space
+    // canvases, never the overlay.
+    if (ok) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC uiw = ui;
+        uiw.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        if (FAILED(device_->CreateGraphicsPipelineState(&uiw, IID_PPV_ARGS(&uiWorldPSO_)))) {
+            HBE_WARN("[D3D12] world-UI pipeline unavailable.");
+            uiWorldPSO_.Reset();
+        }
+    }
+    for (u32 i = 0; ok && i < backBufferCount_; ++i) {
+        uiVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kUIVertexBufferSize);
+        ok = uiVertexBuffers_[i] != nullptr;
+        if (ok) {
+            D3D12_RANGE noRead{0, 0};
+            void* mapped = nullptr;
+            ok = SUCCEEDED(uiVertexBuffers_[i]->Map(0, &noRead, &mapped));
+            uiVertexCpu_[i] = static_cast<u8*>(mapped);
+        }
+    }
+    // World-UI vertex buffers: SEPARATE from the overlay's (which memcpy at
+    // offset 0 per call and would alias) - bump-allocated across the frame.
+    for (u32 i = 0; uiWorldPSO_ && i < backBufferCount_; ++i) {
+        uiWorldVertexBuffers_[i] = CreateUploadBuffer(device_.Get(), kUIVertexBufferSize);
+        bool wok = uiWorldVertexBuffers_[i] != nullptr;
+        if (wok) {
+            D3D12_RANGE noRead{0, 0};
+            void* mapped = nullptr;
+            wok = SUCCEEDED(uiWorldVertexBuffers_[i]->Map(0, &noRead, &mapped));
+            uiWorldVertexCpu_[i] = static_cast<u8*>(mapped);
+        }
+        if (!wok) {
+            HBE_WARN("[D3D12] world-UI vertex buffers unavailable.");
+            uiWorldPSO_.Reset();
+            break;
+        }
+    }
+    if (!ok) {
+        HBE_WARN("[D3D12] UI overlay pipeline unavailable.");
+        uiPSO_.Reset();
+    }
+    return uiPSO_ != nullptr;
 }
 
 bool D3D12Device::CreateShadowResources() {
@@ -5185,11 +5283,11 @@ void D3D12Device::DrawUIOverlay(const UIVertex* vertices, u32 count) {
     count = std::min(count, maxVerts - maxVerts % 3);
     std::memcpy(uiVertexCpu_[frameIndex_], vertices, count * sizeof(UIVertex));
 
-    cmdList_->SetGraphicsRootSignature(meshRootSig_.Get());
+    cmdList_->SetGraphicsRootSignature(uiRootSig_.Get());
     ID3D12DescriptorHeap* heaps[] = {bindlessHeap_.Get()};
     cmdList_->SetDescriptorHeaps(1, heaps);
     cmdList_->SetGraphicsRootDescriptorTable(
-        2, bindlessHeap_->GetGPUDescriptorHandleForHeapStart());
+        0, bindlessHeap_->GetGPUDescriptorHandleForHeapStart());
     cmdList_->SetPipelineState(uiPSO_.Get());
     cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     D3D12_VERTEX_BUFFER_VIEW vbv{};
@@ -5310,11 +5408,11 @@ void D3D12Device::DrawUIToTexture(TextureHandle target, const UIVertex* vertices
     cmdList_->RSSetScissorRects(1, &scissor);
 
     if (count > 0) {
-        cmdList_->SetGraphicsRootSignature(meshRootSig_.Get());
+        cmdList_->SetGraphicsRootSignature(uiRootSig_.Get());
         ID3D12DescriptorHeap* heaps[] = {bindlessHeap_.Get()};
         cmdList_->SetDescriptorHeaps(1, heaps);
         cmdList_->SetGraphicsRootDescriptorTable(
-            2, bindlessHeap_->GetGPUDescriptorHandleForHeapStart());
+            0, bindlessHeap_->GetGPUDescriptorHandleForHeapStart());
         cmdList_->SetPipelineState(uiWorldPSO_.Get());
         cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         D3D12_VERTEX_BUFFER_VIEW vbv{};

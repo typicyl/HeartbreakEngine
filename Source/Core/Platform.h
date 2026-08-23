@@ -72,6 +72,13 @@ std::filesystem::path UserDataRoot();
 // an installer, not for an engine.
 bool IsElevated();
 
+// Show a native, modal OS error dialog (one OK button, error icon), BLOCKING until the
+// user dismisses it. The LAST-RESORT way to tell the player something is wrong when the
+// engine cannot render its own on-screen message - e.g. the GPU shaders are missing, so
+// no in-app dialog is possible at all. `title` and `message` are UTF-8. On a headless /
+// GUI-less host it is a no-op that returns immediately.
+void ShowErrorDialog(const std::string& title, const std::string& message);
+
 // A stable identifier for this machine, derived from OS-provided identity rather than from
 // anything the user typed. Not a secret and not a licence key: it distinguishes installs.
 std::string MachineId();
