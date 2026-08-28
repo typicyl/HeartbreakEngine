@@ -38,6 +38,14 @@ cbuffer PostConstants : register(b1)
     // Volume raymarch color (0 elsewhere). Appended at the END so no existing pass offset moves.
     float4 gVolAlbedo;        // (albedo.rgb, emissionMode)
     float4 gVolEmission;      // (emissionColor.rgb, hasTemp)
+    // Procedural painterly BRUSH FIELD (Painterly pass only; 0 elsewhere). Appended
+    // at the END so no existing pass offset moves - the same discipline as the grade
+    // and volume blocks above. See Shaders/BrushField.hlsli.
+    float4 gBrush0;           // (mode, sizeBias, flowScale, aniso)
+    float4 gBrush1;           // (bristles, grain, hardness, scatter)
+    float4 gBrush2;           // (warpStrength, heightAmp, impastoLight, coverageAmount)
+    float4 gBrush3;           // (groundTone.rgb, groundTie)
+    float4 gBrush4;           // (octaves, levels, brushScale, refDist)
 };
 
 // Linear-clamp sampler for post sampling (the bindless s0 sampler wraps).

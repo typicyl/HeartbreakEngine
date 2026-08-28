@@ -57,6 +57,25 @@ inline nlohmann::json PostToJson(const rhi::PostSettings& p) {
         {"painterlyStrokeMaskMaxX", p.painterlyStrokeMaskMaxX},
         {"painterlyStrokeMaskMaxY", p.painterlyStrokeMaskMaxY},
         {"painterly3D", p.painterly3D},
+        // Procedural brush field (replaces the screen-space painterly terms).
+        {"brushMode", p.painterlyBrushMode},
+        {"brushSize", p.painterlyBrushSize},
+        {"brushFlowScale", p.painterlyBrushFlowScale},
+        {"brushAniso", p.painterlyBrushAniso},
+        {"brushBristles", p.painterlyBrushBristles},
+        {"brushGrain", p.painterlyBrushGrain},
+        {"brushHardness", p.painterlyBrushHardness},
+        {"brushScatter", p.painterlyBrushScatter},
+        {"brushWarp", p.painterlyBrushWarp},
+        {"brushHeight", p.painterlyBrushHeight},
+        {"brushImpasto", p.painterlyBrushImpasto},
+        {"brushCoverage", p.painterlyBrushCoverage},
+        {"brushGroundR", p.painterlyBrushGroundR},
+        {"brushGroundG", p.painterlyBrushGroundG},
+        {"brushGroundB", p.painterlyBrushGroundB},
+        {"brushGroundTie", p.painterlyBrushGroundTie},
+        {"brushOctaves", p.painterlyBrushOctaves},
+        {"brushLevels", p.painterlyBrushLevels},
         {"gradeEnabled", p.gradeEnabled},
         {"gradeTemperature", p.gradeTemperature}, {"gradeTint", p.gradeTint},
         {"gradeLift", {p.gradeLift.x, p.gradeLift.y, p.gradeLift.z}},
@@ -133,6 +152,26 @@ inline void PostFromJson(const nlohmann::json& j, rhi::PostSettings& p) {
     p.painterlyStrokeMaskMaxX = j.value("painterlyStrokeMaskMaxX", p.painterlyStrokeMaskMaxX);
     p.painterlyStrokeMaskMaxY = j.value("painterlyStrokeMaskMaxY", p.painterlyStrokeMaskMaxY);
     p.painterly3D = j.value("painterly3D", p.painterly3D);
+    // Procedural brush field. Absent keys keep the defaults, so a pre-field
+    // scene loads straight into the new look rather than into a blank one.
+    p.painterlyBrushMode = j.value("brushMode", p.painterlyBrushMode);
+    p.painterlyBrushSize = j.value("brushSize", p.painterlyBrushSize);
+    p.painterlyBrushFlowScale = j.value("brushFlowScale", p.painterlyBrushFlowScale);
+    p.painterlyBrushAniso = j.value("brushAniso", p.painterlyBrushAniso);
+    p.painterlyBrushBristles = j.value("brushBristles", p.painterlyBrushBristles);
+    p.painterlyBrushGrain = j.value("brushGrain", p.painterlyBrushGrain);
+    p.painterlyBrushHardness = j.value("brushHardness", p.painterlyBrushHardness);
+    p.painterlyBrushScatter = j.value("brushScatter", p.painterlyBrushScatter);
+    p.painterlyBrushWarp = j.value("brushWarp", p.painterlyBrushWarp);
+    p.painterlyBrushHeight = j.value("brushHeight", p.painterlyBrushHeight);
+    p.painterlyBrushImpasto = j.value("brushImpasto", p.painterlyBrushImpasto);
+    p.painterlyBrushCoverage = j.value("brushCoverage", p.painterlyBrushCoverage);
+    p.painterlyBrushGroundR = j.value("brushGroundR", p.painterlyBrushGroundR);
+    p.painterlyBrushGroundG = j.value("brushGroundG", p.painterlyBrushGroundG);
+    p.painterlyBrushGroundB = j.value("brushGroundB", p.painterlyBrushGroundB);
+    p.painterlyBrushGroundTie = j.value("brushGroundTie", p.painterlyBrushGroundTie);
+    p.painterlyBrushOctaves = j.value("brushOctaves", p.painterlyBrushOctaves);
+    p.painterlyBrushLevels = j.value("brushLevels", p.painterlyBrushLevels);
     p.gradeEnabled = j.value("gradeEnabled", p.gradeEnabled);
     p.gradeTemperature = j.value("gradeTemperature", p.gradeTemperature);
     p.gradeTint = j.value("gradeTint", p.gradeTint);

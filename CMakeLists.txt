@@ -225,7 +225,11 @@ set(HBE_RHI_SOURCES
 set(HBE_RENDERER_SOURCES
     "Source/Renderer/Renderer.cpp"
     "Source/Renderer/CameraController.cpp"
-    "Source/Renderer/IBL.cpp")
+    "Source/Renderer/IBL.cpp"
+    # Compiles Shaders/BrushField.hlsli AS C++ (see its __cplusplus shim) so the
+    # painterly brush field is proved by running the real shader code, not a
+    # CPU lookalike that could drift from it. Headless: --test-brushfield.
+    "Source/Renderer/BrushFieldTest.cpp")
 
 set(HBE_ENGINE_SOURCES
     "Source/Engine/CutscenePlayer.cpp"
@@ -342,6 +346,18 @@ set(HBE_EDITOR_SOURCES
     "Source/Editor/TextureCompress.cpp"
     "Source/Editor/MeshThumbnail.cpp"
     "Source/Editor/MovieRender.cpp"
+    # Ground-truth painting reference (--paint-reference): drives the REAL paint
+    # stroke/bake code headless and writes PNGs, so the procedural painterly
+    # renderer can be judged against what this engine's painting actually looks
+    # like. Editor-side because it uses movie::WritePng.
+    "Source/Scene/PaintReference.cpp"
+    # Procedural paint vs. the CPU painting oracle (--test-procpaint). Compiles
+    # Shaders/ProceduralPaint.hlsli AS C++ and diffs it against the real
+    # Stroke -> BakeFromStrokes -> Flatten realization of the SAME strokes.
+    "Source/Scene/ProcPaintTest.cpp"
+    # Stroke ARRANGEMENT under a varying direction field (--test-strokedir).
+    # Separate from the oracle test, which pins direction for correctness.
+    "Source/Scene/StrokeDirTest.cpp"
     "Source/Editor/MovieEncoder.cpp"
     "Source/Editor/stb_image_impl.cpp"
     "Source/Editor/stb_image_write_impl.cpp"

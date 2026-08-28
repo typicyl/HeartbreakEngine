@@ -294,6 +294,13 @@ struct PostCB {
     // reproduces today's grey smoke; emission tint inert until a temperature grid is fed (P2).
     glm::vec4 volAlbedo{1.0f, 1.0f, 1.0f, 0.0f};   // (albedo.rgb, emissionMode)
     glm::vec4 volEmission{1.0f, 0.45f, 0.15f, 0.0f}; // (emissionColor.rgb, hasTemp)
+    // Procedural painterly brush field (Painterly pass only). Appended at the END;
+    // must stay byte-identical to PostUBO and PostCommon.hlsli.
+    glm::vec4 brush0{0.0f}; // (mode, sizeBias, flowScale, aniso)
+    glm::vec4 brush1{0.0f}; // (bristles, grain, hardness, scatter)
+    glm::vec4 brush2{0.0f}; // (warpStrength, heightAmp, impastoLight, coverageAmount)
+    glm::vec4 brush3{0.0f}; // (groundTone.rgb, groundTie)
+    glm::vec4 brush4{0.0f}; // (octaves, levels, brushScale, refDist)
 };
 
 struct ObjectCB {
@@ -3490,6 +3497,33 @@ void D3D12Device::RunPostStack(const SceneView& view) {
         cb.params1 = {ps.painterlyLightTint, ps.painterlyWarmCool, ps.painterlyCanvasScale,
                       ps.painterlyCanvasStrength};
         cb.params2 = {ps.painterlyStrokeDetail, ps.painterlyPosterize, 0.0f, 0.0f};
+        // Procedural brush field (Shaders/BrushField.hlsli). mode 0 keeps the old
+        // screen-space terms for A/B; everything else is the field's parameters.
+        cb.brush0 = {static_cast<f32>(ps.painterlyBrushMode), ps.painterlyBrushSize,
+                     ps.painterlyBrushFlowScale, ps.painterlyBrushAniso};
+        cb.brush1 = {ps.painterlyBrushBristles, ps.painterlyBrushGrain, ps.painterlyBrushHardness,
+                     ps.painterlyBrushScatter};
+        cb.brush2 = {ps.painterlyBrushWarp, ps.painterlyBrushHeight, ps.painterlyBrushImpasto,
+                     ps.painterlyBrushCoverage};
+        cb.brush3 = {ps.painterlyBrushGroundR, ps.painterlyBrushGroundG, ps.painterlyBrushGroundB,
+                     ps.painterlyBrushGroundTie};
+        // brushScale/refDist are not artist-facing yet: the ladder's reference
+        // size and distance are a look decision that wants the size slider
+        // exercised first (it moves the same thing in octaves).
+        //
+        // FOV COMPENSATION. The ladder picks its level from DISTANCE, which keeps
+        // apparent mark size roughly constant as the camera dollies - but a LENS
+        // zoom changes apparent size without changing distance, so marks would
+        // balloon when zoomed in. Apparent size goes as 1/(d * tan(fovY/2)), so
+        // folding the FOV into the reference distance makes the level track both.
+        // proj[1][1] is 1/tan(fovY/2) for the perspectiveRH_ZO the camera builds.
+        constexpr f32 kRefTanHalfFov = 0.5773503f; // the 60 deg default FOV
+        const f32 tanHalfFov = (std::abs(view.proj[1][1]) > 1e-6f)
+                                   ? 1.0f / std::abs(view.proj[1][1])
+                                   : kRefTanHalfFov;
+        const f32 refDist = 6.0f * (kRefTanHalfFov / std::max(tanHalfFov, 1e-4f));
+        cb.brush4 = {static_cast<f32>(ps.painterlyBrushOctaves),
+                     static_cast<f32>(ps.painterlyBrushLevels), 0.16f, refDist};
         // FULL-res Kuwahara: half-res + bilinear upscale blurred the edge-aware regions
         // into mush (the filter's whole value is crisp region boundaries), so it runs at
         // full res. Painterly is the art style; spend the ms on it, save perf elsewhere.

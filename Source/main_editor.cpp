@@ -52,6 +52,10 @@
 #include "Core/JobSystem.h"
 #include "Core/Window.h"
 #include "Cinematics/CinematicsTest.h" // --test-cinematics / --test-curve (Sequencer + curve engine)
+#include "Renderer/BrushFieldTest.h"  // --test-brushfield (procedural painterly brush field)
+#include "Scene/PaintReference.h"     // --paint-reference (ground-truth painting swatches)
+#include "Scene/ProcPaintTest.h"      // --test-procpaint (procedural paint vs. the oracle)
+#include "Scene/StrokeDirTest.h"      // --test-strokedir (arrangement under varying direction)
 #include "Dialogue/DialogueGraph.h" // --test-graphfanin (node-graph reconvergence)
 #include "Scene/OceanFFT.h"         // --test-oceanfft (Tessendorf FFT reference/oracle)
 #include "Volume/VolumeNano.h"      // --test-nanovdb (header-only NanoVDB build gate)
@@ -163,6 +167,52 @@ int main(int argc, char** argv) {
         if (std::strcmp(argv[i], "--test-seamweld") == 0) {
             const bool ok = hbe::weld::SelfTest();
             std::printf("seamweld %s\n", ok ? "PASS" : "FAIL");
+            return ok ? 0 : 1;
+        }
+        // --test-brushfield: prove the procedural painterly BRUSH FIELD - the
+        // integer-lattice hash holds at world-scale coordinates (the frac()-based
+        // one collapsed to a constant past ~500 m), the anisotropic fBm shows no
+        // periodic structure, the world-space direction field is smooth on floors /
+        // walls / ceilings / spheres / cylinders / terrain, and everything is
+        // deterministic. Compiles Shaders/BrushField.hlsli AS C++, so it tests the
+        // shipped shader rather than a mirror. Headless, no GPU/window.
+        // --paint-reference <dir>: bake reference swatches with the REAL painting
+        // code (paint::Stroke -> BakeFromStrokes -> Flatten), one per built-in
+        // brush, and write colour + relief PNGs. The ground truth the procedural
+        // painterly renderer is judged against. Headless, no GPU/window/project.
+        // --test-procpaint [dir]: realize ONE procedural stroke set two ways -
+        // analytically (the evaluator MeshPBR will call) and through the real
+        // painting system (Stroke -> BakeFromStrokes -> Flatten) - and diff them.
+        // The oracle pattern --test-oceanfft uses. Headless, no GPU/window.
+        // --test-strokedir [dir]: render the BARE stroke body on a plane, a
+        // sphere and a box with a spatially VARYING stroke direction, plus a
+        // direction debug view, and measure direction continuity. Answers the
+        // question the fixed-direction oracle cannot: does this read as brush
+        // gestures or as procedural hatching? Headless, no GPU/window.
+        if (std::strcmp(argv[i], "--test-strokedir") == 0) {
+            const char* dir = (i + 1 < argc && argv[i + 1][0] != 0x2D) ? argv[i + 1] : "";
+            std::string report;
+            const bool ok = hbe::procpaint::DirectionSelfTest(dir, report);
+            std::printf("strokedir %s (%s)\n", ok ? "PASS" : "FAIL", report.c_str());
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-procpaint") == 0) {
+            const char* dir = (i + 1 < argc && argv[i + 1][0] != 0x2D) ? argv[i + 1] : "";
+            std::string report;
+            const bool ok = hbe::procpaint::OracleSelfTest(dir, report);
+            std::printf("procpaint %s (%s)\n", ok ? "PASS" : "FAIL", report.c_str());
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--paint-reference") == 0 && i + 1 < argc) {
+            std::string report;
+            const bool ok = hbe::paint::WriteReferenceSwatches(argv[i + 1], report);
+            std::printf("paint-reference %s (%s)\n", ok ? "OK" : "FAILED", report.c_str());
+            return ok ? 0 : 1;
+        }
+        if (std::strcmp(argv[i], "--test-brushfield") == 0) {
+            std::string report;
+            const bool ok = hbe::brushfield::SelfTest(report);
+            std::printf("brushfield %s (%s)\n", ok ? "PASS" : "FAIL", report.c_str());
             return ok ? 0 : 1;
         }
         // --test-curve: the reusable scalar animation-curve engine (Core/Curve):
@@ -2091,6 +2141,104 @@ int main(int argc, char** argv) {
             std::printf("upgrade-assets: %u scanned, %u mesh(es) -> v%u, %u BC texture(s) baked\n",
                         r.scanned, r.meshesUpgraded, hbe::uaf::kVersion, r.texturesBaked);
             return 0;
+        }
+    }
+
+    // --capture-painterly <dir> [--capture-orbit]: render the project's scene from a
+    // FIXED camera pose (or a slow orbit around it) and dump numbered PNGs plus
+    // frame-to-frame difference statistics. This is the visual + temporal half of
+    // validating the painterly brush field: run it once per --brushmode and compare.
+    //
+    // The static-camera case is the decisive shimmer test. Nothing in the scene
+    // animates (physics off, game camera off), so ANY frame-to-frame difference is
+    // the renderer failing to reproduce itself - which is exactly what a
+    // screen-locked pattern under a jittering/reprojecting post stack produces.
+    {
+        std::string capDir;
+        bool capOrbit = false;
+        for (int i = 1; i < argc; ++i) {
+            if (std::strcmp(argv[i], "--capture-painterly") == 0 && i + 1 < argc) capDir = argv[i + 1];
+            if (std::strcmp(argv[i], "--capture-orbit") == 0) capOrbit = true;
+        }
+        if (!capDir.empty()) {
+            if (!hbe::Project::HasActive()) {
+                std::printf("--capture-painterly requires --project\n");
+                return 1;
+            }
+            static hbe::Editor capEditor;
+            static std::string s_dir = capDir;
+            static bool s_orbit = capOrbit;
+            static int s_frame = 0;
+            static std::vector<hbe::u8> s_prev;
+            static double s_diffAcc = 0.0;
+            static double s_diffMax = 0.0;
+            static int s_diffN = 0;
+            static glm::vec3 s_eye{0.0f}, s_tgt{0.0f};
+            hbe::Engine capEngine;
+            capEngine.SetOnInit([](hbe::Engine& e) {
+                e.GetPhysics().SetRunning(false);
+                e.SetGameCameraEnabled(false);
+                e.GetScene().SetEditorView(true);
+                if (e.GetRenderer().InitUI(e.GetWindow().GetNativeHandle().hwnd))
+                    hbe::Editor::ApplyTheme();
+            });
+            capEngine.SetOnFrame([](hbe::Engine& e) {
+                capEditor.BuildUI(e);
+                hbe::Camera& cam = e.GetRenderer().GetCamera();
+                if (s_frame == 0) { s_eye = cam.Position(); s_tgt = s_eye + cam.Forward() * 6.0f; }
+                // Settle first: the post stack has history (TAA) and the streamer has
+                // work to finish, so capturing immediately would measure the warm-up.
+                const int kSettle = 90, kShots = 24, kStride = 4;
+                if (s_frame >= kSettle && s_orbit) {
+                    // A SLOW orbit about the initial focus point at a fixed radius.
+                    // Fixed radius on purpose: it isolates rotation, under which the
+                    // brush field must be bit-identical (only distance reaches it).
+                    const float t = static_cast<float>(s_frame - kSettle) * 0.0035f;
+                    const glm::vec3 off = s_eye - s_tgt;
+                    const float r = glm::length(glm::vec2(off.x, off.z));
+                    const float a = std::atan2(off.z, off.x) + t;
+                    cam.LookAt(glm::vec3(s_tgt.x + std::cos(a) * r, s_eye.y, s_tgt.z + std::sin(a) * r),
+                               s_tgt);
+                } else {
+                    cam.LookAt(s_eye, s_tgt);
+                }
+                ++s_frame;
+                if (s_frame < kSettle) return;
+                const int k = s_frame - kSettle;
+                if (k % kStride != 0) return;
+                const int shot = k / kStride;
+                if (shot > kShots) { e.Quit(); return; }
+
+                std::vector<hbe::u8> px;
+                hbe::u32 w = 0, h = 0;
+                if (!e.GetRenderer().ReadbackViewportColor(px, w, h)) return;
+                // Mean absolute difference from the previous capture, in 0..255
+                // units. With a static camera this is pure temporal instability.
+                if (!s_prev.empty() && s_prev.size() == px.size()) {
+                    double acc = 0.0;
+                    hbe::u8 mx = 0;
+                    for (hbe::usize i = 0; i < px.size(); ++i) {
+                        const int d = std::abs(static_cast<int>(px[i]) - static_cast<int>(s_prev[i]));
+                        acc += d;
+                        if (d > mx) mx = static_cast<hbe::u8>(d);
+                    }
+                    const double mean = acc / static_cast<double>(px.size());
+                    s_diffAcc += mean;
+                    s_diffMax = std::max(s_diffMax, static_cast<double>(mx));
+                    ++s_diffN;
+                }
+                s_prev = px;
+                char name[64];
+                std::snprintf(name, sizeof(name), "shot_%02d.png", shot);
+                hbe::movie::WritePng(std::filesystem::path(s_dir) / name, w, h, px);
+                if (shot == kShots) {
+                    std::printf("capture: %d shots %ux%u -> %s\n", kShots, w, h, s_dir.c_str());
+                    std::printf("capture: mean |frame delta| %.4f/255, worst channel delta %.0f/255\n",
+                                s_diffN ? s_diffAcc / s_diffN : 0.0, s_diffMax);
+                }
+            });
+            std::filesystem::create_directories(capDir);
+            return capEngine.Run(config);
         }
     }
 

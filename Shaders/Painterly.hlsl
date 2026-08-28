@@ -24,6 +24,7 @@
 //          gPostParams2 = (stroke detail, posterize levels [<2 = off], -, -)
 // Output : HDR (still pre-tonemap).
 #include "PostCommon.hlsli"
+#include "BrushField.hlsli" // the procedural brush field: B(P,N,d) -> warp/coverage/height
 
 static const float kPI = 3.14159265f;
 
@@ -80,6 +81,22 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float canvasStr = gPostParams1.w;
     const float strokeDetail = gPostParams2.x;
     const float levels = gPostParams2.y;
+    // Procedural brush field. mode 0 = the LEGACY screen-space terms, kept purely
+    // as an A/B regression reference (see PostSettings::painterlyBrushMode).
+    //
+    // HBE_PAINTERLY_FORCE_MODE pins the branch at COMPILE time (-1 = runtime, the
+    // default). Two uses: measuring each path's cost in isolation, since a runtime
+    // branch compiles both into one shader and hides the delta; and, once the
+    // legacy path is retired, compiling it out entirely rather than shipping dead
+    // bytecode.
+#ifndef HBE_PAINTERLY_FORCE_MODE
+#define HBE_PAINTERLY_FORCE_MODE -1
+#endif
+#if HBE_PAINTERLY_FORCE_MODE >= 0
+    const bool useField = (HBE_PAINTERLY_FORCE_MODE != 0);
+#else
+    const bool useField = gBrush0.x > 0.5f;
+#endif
 
     const float3 orig = FetchHDR(gInput0, uv);
     // Silhouette edge-stopping is ALWAYS on: without it the Kuwahara pulls flat
@@ -88,6 +105,56 @@ float4 PSMain(FSOutput input) : SV_Target {
     // now only scales HOW strict the depth stop is, never disables it.
     const bool useEdge = true;
     const float dc = SamplePost(gInput2, uv).r; // centre depth
+
+    // --- procedural brush field ---------------------------------------------
+    // ONE evaluation, in stable scene coordinates, feeding everything below.
+    // Inputs are world position (unprojected from depth), world surface normal
+    // (G-buffer), and camera DISTANCE - never a screen coordinate, a frame index
+    // or a view matrix, which is what makes the result stick to surfaces.
+    BfSample fld;
+    fld.warp = float2(0.0f, 0.0f);
+    fld.coverage = 1.0f;
+    fld.height = 0.0f;
+    fld.dir = float3(1.0f, 0.0f, 0.0f);
+    fld.across = float3(0.0f, 0.0f, 1.0f);
+    fld.confidence = 0.0f;
+    fld.load = 0.5f;
+    float3 worldP = float3(0.0f, 0.0f, 0.0f);
+    if (useField) {
+        float3 nrm;
+        if (dc < 1.0f) {
+            worldP = WorldFromDepthPost(uv, dc);
+            nrm = OctDecode(SamplePost(gInput1, uv).rg);
+        } else {
+            // SKY. There is no surface point, so anchor to the VIEW RAY direction
+            // on the unit sphere instead: the sky is at infinity, so that is
+            // stable under camera translation as well as rotation. Anchoring the
+            // sky to a reconstructed far-plane position would slide it as the
+            // camera moves, which is the exact failure this pass exists to fix.
+            const float3 rayDir = normalize(WorldFromDepthPost(uv, 0.999f) - gCameraPosWS);
+            worldP = gCameraPosWS + rayDir * 400.0f;
+            nrm = -rayDir;
+        }
+        BfParams bp = BfDefaultParams();
+        bp.sizeBias = gBrush0.y;
+        bp.flowScale = max(gBrush0.z, 1e-4f);
+        bp.aniso = max(gBrush0.w, 1.0f);
+        bp.bristles = gBrush1.x;
+        bp.grain = gBrush1.y;
+        bp.hardness = gBrush1.z;
+        bp.scatter = gBrush1.w;
+        bp.warpAlong = 0.55f * gBrush2.x;
+        bp.warpAcross = 0.18f * gBrush2.x;
+        bp.heightAmp = gBrush2.y;
+        bp.octaves = clamp((int)gBrush4.x, 1, 4);
+        bp.levels = clamp((int)gBrush4.y, 1, 2);
+        bp.brushScale = max(gBrush4.z, 1e-3f);
+        bp.refDist = max(gBrush4.w, 0.01f);
+        // The sky is at a fixed pretend distance so its marks do not grow without
+        // bound as the ladder walks out to the far plane.
+        const float fieldDist = (dc < 1.0f) ? length(gCameraPosWS - worldP) : bp.refDist * 4.0f;
+        fld = BfEval(worldP, nrm, fieldDist, bp);
+    }
 
     // Stroke length scale in pixels (the slider reads 1..7; paint wants real size).
     const float px = size * 3.0f;
@@ -178,17 +245,47 @@ float4 PSMain(FSOutput input) : SV_Target {
     const float strokeWidth = max(px * 0.45f, 1.5f);
     const float2 cellSize = float2(max(strokeLen, 1.0f), max(strokeWidth, 1.0f));
 
-    // SMOOTH pull toward the stroke spine, instead of snapping to a lattice cell.
-    // floor() is a STEP function: every cell boundary is a discontinuity, and that
-    // discontinuity IS the pixelation - anchoring only shrank its amplitude, it did
-    // not remove it. sin(2pi*frac) is periodic and C1-continuous, and vanishes at
-    // BOTH the spine and the boundary, so pigment still gathers along spines while
-    // neighbouring strokes blend into each other instead of tiling. Scaled by `coh`
-    // so smooth regions are not clustered at all.
-    const float2 sp = float2(dot(uv / d, tangent), dot(uv / d, acrossQ));
-    const float2 fc = frac(sp / cellSize);
-    const float2 pull = sin(kTwoPi * fc) * (cellSize / kTwoPi) * (0.55f * coh);
-    const float2 baseUv = uv + (pull.x * tangent + pull.y * acrossQ) * d;
+    // GATHER DISPLACEMENT. This is where the brush field enters the FILTER rather
+    // than being painted over its result: the line integral starts from a point
+    // the brush dragged the paint from, so the colour masses themselves come out
+    // brush-cut and ragged instead of straight-edged with texture on top.
+    //
+    // REPLACES the old screen-space stroke lattice, which was
+    //     sp   = screen pixel position projected on the stroke frame
+    //     pull = sin(2*pi*frac(sp / cellSize)) * ...
+    // - a PERIODIC function of SCREEN position. It repeated with the cell size and
+    // its phase slid across every surface as the camera moved, which is the
+    // swimming. (--test-brushfield measures that term's autocorrelation returning
+    // to 1.000 at every period, against 0.137 for the field.)
+    float2 baseUv = uv;
+    if (useField) {
+        // The field returns the displacement in the surface TANGENT frame, in
+        // world units, so it never sees a view matrix. Project it here: the
+        // shading point already lands at `uv`, so only the displaced point needs
+        // transforming - one matrix multiply, not two.
+        const float3 woff = fld.warp.x * fld.dir + fld.warp.y * fld.across;
+        const float4 clipW = mul(gViewProj, float4(worldP + woff, 1.0f));
+        if (clipW.w > 1e-4f) {
+            const float2 ndc = clipW.xy / clipW.w;
+            const float2 uvW = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+            // Clamp the drag so a grazing-angle pixel (where a small world offset
+            // projects to a huge screen offset) cannot fling the gather across the
+            // screen and smear an unrelated surface into this one.
+            const float2 delta = uvW - uv;
+            const float maxPx = px * 1.5f;
+            const float lenPx2 = dot(delta / d, delta / d);
+            baseUv = (lenPx2 > maxPx * maxPx)
+                         ? uv + delta * (maxPx * rsqrt(max(lenPx2, 1e-8f)))
+                         : uvW;
+        }
+    } else {
+        // LEGACY screen-space lattice (A/B reference only; removed once the field
+        // path is signed off).
+        const float2 sp = float2(dot(uv / d, tangent), dot(uv / d, acrossQ));
+        const float2 fc = frac(sp / cellSize);
+        const float2 pull = sin(kTwoPi * fc) * (cellSize / kTwoPi) * (0.55f * coh);
+        baseUv = uv + (pull.x * tangent + pull.y * acrossQ) * d;
+    }
 
     // Line integral along the stroke. TAPS is a compile-time constant so the
     // loop unrolls; the body has NO `continue` (that silently defeats [unroll]
@@ -220,13 +317,15 @@ float4 PSMain(FSOutput input) : SV_Target {
     }
     float3 painted = accW > 1e-4f ? acc / accW : orig;
 
-    // Bristle break-up ACROSS the stroke: a cheap 1D modulation of the value so
-    // the mark is not a flat slab of colour. This is the same idea as the
-    // stroke-detail term below but derived from the lattice, so it is free.
-    if (strokeDetail > 0.0f) {
+    // The in-filter bristle sawtooth used to live here: frac(sp.y / strokeWidth * 3),
+    // a periodic function of SCREEN position, so it tiled at the stroke width and
+    // crawled with the camera. Bristles are now anisotropy in the brush field
+    // (high frequency across the stroke, very low along it) applied through
+    // `coverage` below - real structure in a stable coordinate frame rather than a
+    // sawtooth multiplied over the colour. Kept only for the A/B reference path.
+    if (!useField && strokeDetail > 0.0f) {
+        const float2 sp = float2(dot(uv / d, tangent), dot(uv / d, acrossQ));
         const float bristle = frac(sp.y / max(strokeWidth, 1.0f) * 3.0f);
-        // Scaled by `coh` too: without it, turning Stroke texture up sprays
-        // high-frequency modulation across smooth skies where there is no stroke.
         const float b = (bristle - 0.5f) * strokeDetail * 0.25f * coh;
         painted *= 1.0f + b;
     }
@@ -353,31 +452,88 @@ float4 PSMain(FSOutput input) : SV_Target {
         col *= q / l;
     }
 
-    // --- Visible brush strokes: multi-scale, directional texture ------------
-    // The Kuwahara gives smooth masses; THIS is what makes them read as paint.
-    // Work in the stroke frame (pa = along the flow, pc = across it) and stack
-    // two scales: broad palette-knife marks that run along the stroke, plus fine
-    // bristle lines. Strong contrast so the marks are actually visible.
-    const float2 puv = uv / d; // pixel coordinates
-    if (strokeDetail > 0.0f) {
-        const float pa = dot(puv, along);
-        const float pc = dot(puv, across);
-        // Broad strokes: elongated ~3:1 along the flow.
-        const float broad = ValueNoise(float2(pc / max(rAcross * 0.7f, 1.5f),
-                                              pa / max(rAlong * 1.7f, 6.0f)));
-        // Fine bristle lines: high frequency across, streaked along.
-        const float bristle = ValueNoise(float2(pc / 2.2f, pa / max(rAlong * 0.9f, 4.0f)));
-        // Centre both to [-0.5,0.5]; sharpen the broad term so marks have edges.
-        const float marks = (broad - 0.5f) * 1.3f + (bristle - 0.5f) * 0.5f;
-        // Modulate value AND a touch of the existing chroma so strokes feel laid
-        // down, not just dimmed. *1.6 makes them read at the default detail level;
-        // clamped so marks can never over-amplify already-bright edge pixels.
-        col *= 1.0f + clamp(marks * strokeDetail * 1.6f, -0.35f, 0.35f);
-    }
-    if (canvasStr > 0.0f) {
-        // Soft value-noise tooth (no raw sin grid -> no Nyquist moiré).
-        const float weave = ValueNoise(puv / canvasCell) - 0.5f;
-        col *= 1.0f + weave * canvasStr;
+    if (useField) {
+        // ===================================================================
+        // BRUSH FIELD -> PAINT. Replaces the two screen-space overlays that used
+        // to sit here (a multi-scale ValueNoise "marks" field and a canvas
+        // weave), both evaluated at `uv / d` - i.e. PIXEL COORDINATES. The whole
+        // image was effectively one giant procedural texture pinned to the
+        // screen: it tiled, it slid over the geometry as the camera moved, and
+        // TAA (which runs after this pass and reprojects along GEOMETRY velocity)
+        // dragged and re-blended it against itself every frame.
+        //
+        // Nothing below multiplies noise into the colour. The field's structure
+        // acts through the two channels a real brush actually has: how much
+        // pigment was deposited, and how thick it sits.
+        // ===================================================================
+
+        // --- 1. COVERAGE -> a primed substrate showing through --------------
+        // Where the brush ran dry, the GROUND shows - not the untouched render.
+        // Revealing the original HDR would read as "pieces of the image are
+        // disappearing"; a substrate reads as paint laid onto a surface.
+        //
+        // The ground is NOT a screen-space canvas texture. Its variation comes
+        // from the field's own extremely low-frequency, world-stable deposition
+        // channel, so it is glued to the scene exactly like the rest of it.
+        const float coverAmt = saturate(gBrush2.w);
+        // Driven by `load`, NOT by coverage: load is the field's extremely
+        // low-frequency channel (tens of metres), so the substrate varies like a
+        // stained ground rather than flickering along with the bristles.
+        const float ground0 = lerp(0.82f, 1.18f, fld.load);
+        float3 ground = gBrush3.rgb * ground0;
+        // Tie the ground loosely to the local painted value so a dark passage
+        // does not sprout bright substrate patches (and vice versa). At tie = 0
+        // it is a flat imprimatura; at 1 it fully follows the painting's value.
+        const float tie = saturate(gBrush3.w);
+        const float pv = saturate(Luma(col) * 1.6f);
+        ground *= lerp(1.0f, 0.35f + 1.3f * pv, tie);
+        const float cov = lerp(1.0f, fld.coverage, coverAmt);
+        col = lerp(ground, col, cov);
+
+        // --- 2. HEIGHT -> impasto that catches the scene's real light -------
+        // ddx/ddy of a WORLD-STABLE scalar is itself stable (2x2-quad
+        // granularity, invisible at these frequencies) and costs two
+        // instructions instead of extra field taps. Perturbing by that gradient
+        // and lighting with gLightDirWS is what makes ridges read as thick
+        // paint: they change when the sun moves, like real relief, instead of
+        // being a baked highlight pattern.
+        const float impasto = saturate(gBrush2.z);
+        if (impasto > 0.0f) {
+            const float2 hg = float2(ddx(fld.height), ddy(fld.height));
+            // Light direction in SCREEN terms: only its projected xy matters for
+            // a relief gradient, and gLightDirWS points TOWARD the light.
+            const float4 lc = mul(gViewProj, float4(worldP + gLightDirWS * 0.25f, 1.0f));
+            float2 ls = float2(0.7071f, -0.7071f);
+            if (lc.w > 1e-4f) {
+                const float2 lndc = lc.xy / lc.w;
+                const float2 luv = float2(lndc.x * 0.5f + 0.5f, 0.5f - lndc.y * 0.5f) - uv;
+                if (dot(luv, luv) > 1e-12f) ls = normalize(luv);
+            }
+            // A ridge facing the light brightens, its lee darkens. The additive
+            // term carries the light's own colour, so coloured light bleeds into
+            // the impasto rather than only lifting its value.
+            const float relief = clamp(-dot(hg, ls) * 55.0f, -1.0f, 1.0f);
+            col *= 1.0f + relief * impasto * 0.35f;
+            col += gLightColor * (max(relief, 0.0f) * impasto * 0.06f * Luma(col));
+        }
+    } else {
+        // ---- LEGACY screen-space terms (A/B regression reference only) -----
+        // Kept verbatim so old-vs-new can be compared in one build. Removed once
+        // the field path is signed off; do not extend these.
+        const float2 puv = uv / d; // pixel coordinates
+        if (strokeDetail > 0.0f) {
+            const float pa = dot(puv, along);
+            const float pc = dot(puv, across);
+            const float broad = ValueNoise(float2(pc / max(rAcross * 0.7f, 1.5f),
+                                                  pa / max(rAlong * 1.7f, 6.0f)));
+            const float bristle = ValueNoise(float2(pc / 2.2f, pa / max(rAlong * 0.9f, 4.0f)));
+            const float marks = (broad - 0.5f) * 1.3f + (bristle - 0.5f) * 0.5f;
+            col *= 1.0f + clamp(marks * strokeDetail * 1.6f, -0.35f, 0.35f);
+        }
+        if (canvasStr > 0.0f) {
+            const float weave = ValueNoise(puv / canvasCell) - 0.5f;
+            col *= 1.0f + weave * canvasStr;
+        }
     }
 
     return float4(max(col, 0.0f), 1.0f);

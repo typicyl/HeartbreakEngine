@@ -1542,6 +1542,10 @@ int Engine::Run(const EngineConfig& configIn) {
     if (config.forceMotionBlur) scene.Environment().post.motionBlurEnabled = 1;
     if (config.forceSsr) scene.Environment().post.ssrEnabled = 1;
     if (config.forceAutoExposure) scene.Environment().post.autoExposureEnabled = 1;
+    if (config.forceBrushMode >= 0) {
+        rhi::PostSettings& p = scene.Environment().post;
+        p.painterlyBrushMode = config.forceBrushMode != 0 ? 1u : 0u;
+    }
     if (config.forcePainterly) {
         rhi::PostSettings& p = scene.Environment().post;
         p.painterlyEnabled = 1;
@@ -5592,6 +5596,8 @@ EngineConfig ParseCommandLine(int argc, char** argv) {
             // Optional numeric argument: --painterly 7
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 config.forcePainterlyRadius = std::stof(argv[++i]);
+        } else if (arg == "--brushmode" && i + 1 < argc) {
+            config.forceBrushMode = std::stoi(argv[++i]);
         } else if (arg == "--fracturetest") {
             config.fractureTest = true;
         } else if (arg == "--destructiontest") {

@@ -12311,10 +12311,73 @@ void Editor::DrawPostLookControls(rhi::PostSettings& p, f32* exposure) {
         ImGui::SliderFloat("Edge keep##paint", &p.painterlyEdge, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Light tint##paint", &p.painterlyLightTint, 0.0f, 1.0f, "%.2f");
         ImGui::SliderFloat("Warm/cool##paint", &p.painterlyWarmCool, 0.0f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Stroke texture##paint", &p.painterlyStrokeDetail, 0.0f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Canvas weave##paint", &p.painterlyCanvasStrength, 0.0f, 0.5f, "%.2f");
-        ImGui::SliderFloat("Canvas scale##paint", &p.painterlyCanvasScale, 2.0f, 32.0f, "%.0f px");
         ImGui::SliderFloat("Posterize steps##paint", &p.painterlyPosterize, 0.0f, 16.0f, "%.0f");
+
+        // --- Procedural brush field ---------------------------------------
+        ImGui::Spacing();
+        ImGui::SeparatorText("Brush field (procedural paint)");
+        bool fieldOn = p.painterlyBrushMode != 0;
+        if (ImGui::Checkbox("Procedural brush field", &fieldOn))
+            p.painterlyBrushMode = fieldOn ? 1u : 0u;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("ON  - paint structure is a continuous field in WORLD space:\n"
+                              "      glued to surfaces, no tiling, stable under camera motion.\n"
+                              "OFF - the old screen-space texture terms. A/B reference only;\n"
+                              "      they tile, swim with the camera and get smeared by TAA.");
+        if (fieldOn) {
+            ImGui::SliderFloat("Brush size##bf", &p.painterlyBrushSize, -2.0f, 2.0f, "%.2f oct");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Octaves on the scale ladder: +1 = twice as broad a mark.\n"
+                                  "Marks stay world-locked at every setting.");
+            ImGui::SliderFloat("Bristles##bf", &p.painterlyBrushBristles, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Grain##bf", &p.painterlyBrushGrain, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Hardness##bf", &p.painterlyBrushHardness, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Scatter (dry brush)##bf", &p.painterlyBrushScatter, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Elongation##bf", &p.painterlyBrushAniso, 1.0f, 16.0f, "%.1f");
+            ImGui::SliderFloat("Flow scale##bf", &p.painterlyBrushFlowScale, 0.01f, 0.4f, "%.3f /m");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How fast the stroke DIRECTION varies through the world.\n"
+                                  "Low = long sweeping passages; high = busy, swirlier.");
+            ImGui::SliderFloat("Drag (warp)##bf", &p.painterlyBrushWarp, 0.0f, 2.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("How far the field drags the filter's gather - this is what\n"
+                                  "gives colour masses brush-cut edges instead of clean ones.");
+            ImGui::SliderFloat("Impasto relief##bf", &p.painterlyBrushHeight, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Impasto light##bf", &p.painterlyBrushImpasto, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Ridges are lit by the REAL scene light, so they shift as\n"
+                                  "the sun moves rather than being a baked highlight.");
+            ImGui::Spacing();
+            ImGui::SliderFloat("Ground showing##bf", &p.painterlyBrushCoverage, 0.0f, 1.0f, "%.2f");
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Where the brush ran dry, a primed SUBSTRATE shows through\n"
+                                  "(not the raw render - that would read as the image\n"
+                                  "disappearing rather than as paint on a ground).");
+            float ground[3] = {p.painterlyBrushGroundR, p.painterlyBrushGroundG,
+                               p.painterlyBrushGroundB};
+            if (ImGui::ColorEdit3("Ground tone##bf", ground)) {
+                p.painterlyBrushGroundR = ground[0];
+                p.painterlyBrushGroundG = ground[1];
+                p.painterlyBrushGroundB = ground[2];
+            }
+            ImGui::SliderFloat("Ground tie##bf", &p.painterlyBrushGroundTie, 0.0f, 1.0f, "%.2f");
+            ImGui::Spacing();
+            int oct = static_cast<int>(p.painterlyBrushOctaves);
+            if (ImGui::SliderInt("Octaves (quality)##bf", &oct, 1, 4))
+                p.painterlyBrushOctaves = static_cast<u32>(oct);
+            int lvl = static_cast<int>(p.painterlyBrushLevels);
+            if (ImGui::SliderInt("Scale levels (quality)##bf", &lvl, 1, 2))
+                p.painterlyBrushLevels = static_cast<u32>(lvl);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("2 = cross-fade two world-locked scales so mark size stays\n"
+                                  "roughly constant on screen. 1 is cheaper (~40%%) but mark\n"
+                                  "size drifts within an octave as you dolly.");
+        } else {
+            ImGui::TextDisabled("Legacy screen-space terms (A/B reference):");
+            ImGui::SliderFloat("Stroke texture##paint", &p.painterlyStrokeDetail, 0.0f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Canvas weave##paint", &p.painterlyCanvasStrength, 0.0f, 0.5f, "%.2f");
+            ImGui::SliderFloat("Canvas scale##paint", &p.painterlyCanvasScale, 2.0f, 32.0f, "%.0f px");
+        }
         ImGui::Spacing();
         toggle("Real brush strokes", p.painterlyStrokes);
         // The stroke look applies to BOTH whole-scene strokes and Painterly Censor

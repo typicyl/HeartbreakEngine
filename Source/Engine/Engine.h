@@ -118,6 +118,12 @@ struct EngineConfig {
     // only way to attribute frame cost to it honestly. <0 = leave it alone.
     f32 forcePainterlyRadius = -1.0f;
     bool forcePainterly = false;
+    // --brushmode 0|1: override PostSettings::painterlyBrushMode every frame.
+    // 0 = the legacy screen-space painterly terms, 1 = the procedural brush field.
+    // Exists so the two can be A/B'd from one build on one scene without editing
+    // the project file - the same reason --painterly and --shadowcascades exist.
+    // Remove alongside the legacy path. <0 = leave the project's setting alone.
+    int forceBrushMode = -1;
     // TEMP (perf measurement): --shadowcascades N overrides the preset's active
     // cascade count (1..4) every frame, so 4-vs-2 shadow cost can be A/B'd on one
     // machine. 0 = off (use the preset). Remove after tuning.

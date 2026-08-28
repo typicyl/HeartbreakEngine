@@ -405,6 +405,40 @@ struct PostSettings {
     // (Art Editor) is the painterly path now.
     u32 painterly3D = 0;
 
+    // --- Procedural brush field (Shaders/BrushField.hlsli) -------------------
+    // Replaces the four SCREEN-SPACE procedural terms the painterly pass used to
+    // multiply over its result (stroke lattice, bristle sawtooth, marks noise,
+    // canvas weave). Those were periodic functions of screen position, so they
+    // tiled, swam under camera motion, and were smeared by TAA (which runs AFTER
+    // painterly and reprojects along GEOMETRY velocity). The field is a pure
+    // function of world position + surface normal + camera DISTANCE, so it is
+    // glued to surfaces and TAA reprojects it correctly instead of fighting it.
+    //
+    // 0 = LEGACY screen-space terms, kept only as an A/B regression reference and
+    //     slated for removal once the field path is signed off. 1 = brush field.
+    u32 painterlyBrushMode = 1;
+    f32 painterlyBrushSize = 0.0f;       // artist brush size, in ladder OCTAVES (+1 = twice as broad)
+    f32 painterlyBrushFlowScale = 0.08f; // cycles/metre of the direction field (low = broad sweeps)
+    f32 painterlyBrushAniso = 7.0f;      // bristle elongation along the stroke (1 = round)
+    f32 painterlyBrushBristles = 0.75f;  // strength of the directional streak structure (0..1)
+    f32 painterlyBrushGrain = 0.35f;     // chalky high-frequency breakup (0..1)
+    f32 painterlyBrushHardness = 0.5f;   // coverage contrast: 0 = feathered, 1 = firm-edged
+    f32 painterlyBrushScatter = 0.25f;   // dry-brush hole depth (0..1)
+    f32 painterlyBrushWarp = 1.0f;       // how far the field drags the filter's gather (0..2)
+    f32 painterlyBrushHeight = 0.6f;     // impasto relief amplitude (0..1)
+    f32 painterlyBrushImpasto = 0.5f;    // how strongly that relief catches the scene light (0..1)
+    f32 painterlyBrushCoverage = 0.45f;  // how much dry-brush drop-out shows the ground (0..1)
+    // Primed-substrate tone revealed where coverage is low. NOT a screen-space
+    // canvas texture: it is modulated by an extremely low-frequency, world-stable
+    // component of the field, so it reads as paint sitting on a ground rather than
+    // as pieces of the render disappearing.
+    f32 painterlyBrushGroundR = 0.30f;
+    f32 painterlyBrushGroundG = 0.26f;
+    f32 painterlyBrushGroundB = 0.22f;
+    f32 painterlyBrushGroundTie = 0.6f;  // tie the ground to the local painted value (0..1)
+    u32 painterlyBrushOctaves = 3;       // 1..4 bristle fBm octaves (quality knob)
+    u32 painterlyBrushLevels = 2;        // 1 or 2 scale-ladder levels (quality knob)
+
     // Shadow quality: number of cascaded-shadow-map slices actually rendered (and
     // sampled). The atlas is always allocated at its full 4x4k / 2x2 layout, but only
     // the first `shadowCascades` tiles are drawn each frame - so this directly scales
